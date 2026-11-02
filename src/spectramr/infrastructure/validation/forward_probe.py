@@ -832,6 +832,21 @@ def synthetic_forward_probe(
             if plow in ("contrast_id", "contrast_idx", "contrast_index"):
                 forward_extra[pname] = torch.zeros(batch_size, dtype=torch.long, device=device)
                 continue
+            # The protocol row training feeds a forward that names it (contrast 0, as above).
+            if pname == "acquisition_params":
+                from spectramr.infrastructure.training.strategies.mixins.contrast_forwarding import (
+                    contrast_inputs,
+                    declared_acquisition_lookup,
+                )
+
+                mc = getattr(getattr(config, "data", None), "multi_contrast", None)
+                if mc is not None and contrast_inputs(model.forward, mc)[1]:
+                    lookup = declared_acquisition_lookup(mc)
+                    if lookup is not None:
+                        forward_extra[pname] = lookup(
+                            torch.zeros(batch_size, dtype=torch.long, device=device)
+                        )
+                continue
             # Diffusion timestep on a forward that makes it OPTIONAL. Third
             # instance of the pattern the two branches above already handle: the
             # parameter carries a default, and the model nonetheless needs a real

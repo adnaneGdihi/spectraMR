@@ -121,9 +121,9 @@ def test_setup_reads_config_block(monkeypatch) -> None:
     import spectramr.infrastructure.training.strategies.certified_robustness_strategy as mod
 
     monkeypatch.setattr(
-        mod.AdversarialRobustnessStrategy,
+        mod.AdversarialRobustnessStrategy.__mro__[1],
         "_setup_strategy_specific_components",
-        lambda self: None,  # skip the heavy parent setup
+        lambda self: None,  # skip the heavy reconstruction setup; the knob read stays live
     )
     cfg_block = CertifiedRobustnessConfig(
         lambda_lipschitz=0.25, target_sigma=2.0, n_power_iterations=4, epsilon=0.05, attack_steps=7

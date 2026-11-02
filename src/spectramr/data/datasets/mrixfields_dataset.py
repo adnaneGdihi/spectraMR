@@ -145,7 +145,14 @@ def _load_central_slice(path: str) -> torch.Tensor:
     from spectramr.data.io_strategies import IOStrategyFactory
 
     depth = _nifti_depth(path)
-    metadata = {"slice_index": depth // 2} if depth is not None else None
+    if depth is None:
+        # A non-3-D file would take the get_fdata() branch and this cache would hold
+        # the whole volume (~30 GB per worker at 128 slots). Volume mode is the path.
+        raise ValueError(
+            f"central-slice load of non-3-D NIfTI {path!r}; use the volume mode, "
+            "which keeps full volumes in the bounded volume cache."
+        )
+    metadata = {"slice_index": depth // 2}
 
     loaded = IOStrategyFactory.get("nifti").load(path, metadata=metadata)
     if isinstance(loaded, dict):
@@ -1224,10 +1231,10 @@ class MRIxFieldsPairedDataset(torch.utils.data.Dataset):
             "input": sources[0],
             "field_strength": field_strengths[0],
             "target": self._img(tgt["primary_path"], slice_idx),
-            # multi-source TUPLE for the consensus loss (B-1.1). The renderer is
-            # field-invariant in encode() and renders at the target field, so per-source
-            # field values are intentionally NOT emitted (they would be inert).
+            # multi-source TUPLE for the consensus loss (B-1.1), with each source's field:
+            # the renderer's encoder conditions on it (the target is pinned, #197).
             "sources": sources,
+            "source_field_strengths": field_strengths,
             "contrast_id": torch.tensor(
                 _CONTRAST_INDEX.get(str(src_recs[0].get("contrast", "T1w")), 0)
             ),

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from spectramr.config.schemas.enums import ArtifactOrigin
 from spectramr.infrastructure.physics.degradations.conditions import (
     b0_condition,
@@ -62,7 +64,11 @@ ENTRIES = (
         fn=_delegate_b0,
         description="B0 inhomogeneity (delegated)",
         severity=SeveritySpec(
-            (_P("strength", "normalised field-map scale", 0.0, 1.0),),
+            (_P(
+                "strength", "normalised field-map scale", 0.0, 1.0,
+                endpoint_kwargs=(None, "max_strength"),
+                valid_min=0.0,
+            ),),
             notes="dimensionless scale on the polynomial field map (NOT Hz): drives "
             "both a phase ramp and intra-voxel-dephasing dropout. In volume modes the field "
             "is drawn on coordinates normalised by the grid's largest half-extent, so the "
@@ -81,7 +87,11 @@ ENTRIES = (
         fn=_delegate_b0_geometric,
         description="B0 voxel-shift distortion (delegated)",
         severity=SeveritySpec(
-            (_P("b0_strength", "normalised field-map scale", 0.0, 1.0),),
+            (_P(
+                "b0_strength", "normalised field-map scale", 0.0, 1.0,
+                endpoint_kwargs=(None, "max_b0_strength"),
+                valid_min=0.0,
+            ),),
             notes="spin-warp voxel shift along readout only, at a 5e-5 s dwell time; a "
             "scanner profile sets the dwell to 1 / (BW_px * W).",
         ),
@@ -97,7 +107,16 @@ ENTRIES = (
         fn=degrade_bias_field,
         description="Multiplicative bias field",
         severity=SeveritySpec(
-            (_P("max_log_bias", "log multiplicative", 0.0, 1.2),),
+            (
+                _P(
+                    "max_log_bias",
+                    "log multiplicative",
+                    0.0,
+                    1.2,
+                    endpoint_kwargs=(None, "max_log_b"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="smooth multiplicative bias field.",
         ),
         affects=MAG,  # real positive multiplicative field
@@ -111,7 +130,11 @@ ENTRIES = (
         fn=_delegate_chemical_shift,
         description="Chemical shift (delegated)",
         severity=SeveritySpec(
-            (_P("shift", "px", 0.0, 14.0),),
+            (_P(
+                "shift", "px", 0.0, 14.0,
+                endpoint_kwargs=(None, "max_shift_pixels"),
+                valid_min=0.0,
+            ),),
             notes="synthetic fat displacement along readout. The physical 3.5 ppm shift is "
             "gamma/2pi * B0 * 3.5e-6 / BW_pixel: about 0.1-0.5 px at 0.3 T and 0.5-2 px at "
             "1.5 T for 100-500 Hz/px, so 14 px is not a real field strength. Passing b0_T and "
@@ -135,7 +158,14 @@ ENTRIES = (
         severity=SeveritySpec(
             (
                 _P("phase_scale", "dimensionless", 0.0, 1.0),
-                _P("max_dropout", "fraction of signal", 0.0, 0.9817),  # 1 - exp(-4)
+                _P(
+                    "max_dropout",
+                    "fraction of signal",
+                    0.0,
+                    1.0 - math.exp(-4.0),
+                    curve="one_minus_exp",
+                    curve_rate=4.0,
+                ),  # kernel: peak dropout 1 - exp(-8 theta 0.5)
             ),
             notes="dipole field of a random smooth susceptibility map (not localised to "
             "air-tissue interfaces), B0 in the image plane (coronal/sagittal geometry); "
@@ -156,7 +186,16 @@ ENTRIES = (
         fn=degrade_coil_sensitivity_miscal,
         description="Coil-sensitivity miscalibration",
         severity=SeveritySpec(
-            (_P("relative_error", "fraction", 0.0, 1.0),),
+            (
+                _P(
+                    "relative_error",
+                    "fraction",
+                    0.0,
+                    1.0,
+                    endpoint_kwargs=(None, "max_relative_error"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="coil-sensitivity miscalibration.",
         ),
         affects=MAG,  # real non-negative ratio map
@@ -170,7 +209,11 @@ ENTRIES = (
         fn=_delegate_magic_angle,
         description="Magic-angle T2 modulation (delegated; applies MSK collagen patches to any anatomy)",
         severity=SeveritySpec(
-            (_P("t2_magic", "ms", 10.0, 30.0),),
+            (_P(
+                "t2_magic", "ms", 10.0, 30.0,
+                endpoint_kwargs=(None, "t2_magic"),
+                valid_min=10.0,
+            ),),
             notes="collagen-fibre orientation T2 lengthening at TE = 20 ms. Fibre "
             "patches are drawn from the SUPPORT of the anatomy and cover ~30% of it "
             "(an MSK slice through a tendon-rich region); before #223 they were drawn "
@@ -189,7 +232,16 @@ ENTRIES = (
         fn=degrade_concomitant_phase,
         description="Maxwell concomitant phase (low-field)",
         severity=SeveritySpec(
-            (_P("gradient_amplitude", "mT/m", 0.0, 30.0),),
+            (
+                _P(
+                    "gradient_amplitude",
+                    "mT/m",
+                    0.0,
+                    30.0,
+                    endpoint_kwargs=(None, "max_gradient_mT_per_m"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="Maxwell/concomitant-field phase at B0 = 0.3 T, or at a scanner profile's B0.",
         ),
         affects=PHASE_ONLY,  # THE pure-phase axis. Magnitude-scoring it yields a constant.

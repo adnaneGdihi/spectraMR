@@ -19,6 +19,7 @@ from spectramr.infrastructure.physics.degradations._common import (
     _generator,
     _isolated_rng,
     _signal_level,
+    reject_override_with_endpoint,
 )
 from spectramr.infrastructure.physics.degradations.geometry import (
     AcquisitionGeometry,
@@ -183,12 +184,16 @@ def spike_volume(
     seed: int,
     geometry: AcquisitionGeometry,
     probability: float | None = None,
+    max_probability: float = 0.05,
 ) -> Tensor:
     """D15 in 3-D: spikes at ``(kz, ky, kx)`` samples of the 3-D k-space, shared by coils."""
     dims = _encoded_dims(x, geometry)
     if geometry.mode is not AcquisitionMode.VOLUME_3D:
         raise ValueError(f"spike_volume is the 3-D realisation; got mode {geometry.mode!r}")
-    prob = float(theta) * 0.05 if probability is None else float(probability)
+    reject_override_with_endpoint(
+        "spike", "probability", probability, "max_probability", max_probability, 0.05
+    )
+    prob = float(theta) * float(max_probability) if probability is None else float(probability)
     if prob <= 0.0:
         return x
     x = _ensure_complex(x)

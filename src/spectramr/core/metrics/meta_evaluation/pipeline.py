@@ -30,6 +30,8 @@ import torch
 if TYPE_CHECKING:
     from spectramr.core.metrics.context import MetricContext
 
+from spectramr.core.metrics.metric_directions import metric_higher_is_better
+
 from .aggregation import AggregatorConfig, KemenyConfig, aggregate, kemeny_consensus
 from .betting import (
     BettingPartialOrder,
@@ -47,7 +49,7 @@ from .rankers import (
     SFARanker,
     Sim2RankRanker,
 )
-from .simulator import SimulatorConfig, precompute_metric_values, run_simulator
+from .simulator import SEED_SCHEME, SimulatorConfig, precompute_metric_values, run_simulator
 from .transfer import (
     TransferCertificate,
     tv_distance_joint_samples,
@@ -169,6 +171,17 @@ def resolve_eval_mode(mode: str) -> str:
     )
 
 
+def effective_sample_size(dataset: MetricEvaluationDataset) -> tuple[int, str]:
+    """Independent units behind the samples: distinct subjects, else distinct contents.
+
+    Samples of one content (every family and severity) and slices of one subject are
+    not independent replicates, so counting samples over-certifies pairwise orders.
+    """
+    if any(s.subject_id is not None for s in dataset.samples):
+        return len({s.subject_id or s.content_id for s in dataset.samples}), "subject"
+    return len({s.content_id for s in dataset.samples}), "content"
+
+
 def _bounded_scores(scores: dict[str, float]) -> dict[str, float]:
     """Linearly rescale finite scores into ``[-1, 1]`` (non-finite passed through).
 
@@ -197,7 +210,7 @@ class MetaEvaluationPipeline:
     rankers: list[BaseRanker]
     simulator_config: SimulatorConfig = field(default_factory=SimulatorConfig)
     aggregator_config: AggregatorConfig = field(default_factory=AggregatorConfig)
-    # Per-pair misordering budget for the powered certification gate (§3 repair).
+    # Family-wise (Holm, over pairs) misordering budget of the powered gate (§3 repair).
     powered_alpha: float = 0.05
     # Pool hygiene (§8 repair): when True, clones/broken metrics are screened out
     # of the voting pool before ranking. Off by default (changes the voting set).
@@ -304,12 +317,16 @@ class MetaEvaluationPipeline:
         metric_set: MetricSet,
         clean_volumes: Iterable[tuple[str, torch.Tensor]],
         assets_by_content: Mapping[str, MetricContext] | None = None,
+        subject_of: Mapping[str, str] | None = None,
     ) -> MetaEvaluationOutput:
         # Fail loud on an unimplemented dimensionality BEFORE any simulator /
         # metric work (pitfall #15). For "3d" this raises NotImplementedError.
         eval_mode = resolve_eval_mode(self.eval_mode)
         samples = run_simulator(
-            clean_volumes, self.simulator_config, assets_by_content=assets_by_content
+            clean_volumes,
+            self.simulator_config,
+            assets_by_content=assets_by_content,
+            subject_of=subject_of,
         )
         if not samples:
             raise ValueError("simulator produced no samples — empty input?")
@@ -352,13 +369,13 @@ class MetaEvaluationPipeline:
             aggregate_result = aggregate(per_method_results, self.aggregator_config)
         else:
             raise ValueError(f"unknown aggregator {self.aggregator!r}; expected 'z' or 'kemeny'")
-        # Powered certification: which per-axis pairwise verdicts are statistically
-        # supported at N = dataset.n_samples (Thm 5.1(3) / Lean powered_sample_size).
-        # Rescale each method's raw scores to the [-1, 1] bounded scale the powered
-        # Hoeffding gate assumes before certifying (critique A3).
+        # Powered certification at N_eff independent subjects (Thm 5.1(3) / Lean
+        # powered_sample_size), Holm-corrected over the pairs, on scores rescaled to
+        # the [-1, 1] scale the Hoeffding gate assumes (critique A3).
+        n_eff, _ = effective_sample_size(dataset)
         powered = {
             r.method: certify_partial_order(
-                _bounded_scores(r.scores), dataset.n_samples, self.powered_alpha
+                _bounded_scores(r.scores), n_eff, self.powered_alpha, correction="holm"
             )
             for r in per_method_results
         }
@@ -366,7 +383,7 @@ class MetaEvaluationPipeline:
         # L2⁺ betting certification (off unless use_betting). Shared with the
         # legacy ``scripts/sim2rank/sim2rank.py --novel-meta`` path via
         # :meth:`compute_betting` so both entry points use identical math.
-        betting = self.compute_betting(dataset)
+        betting = self.compute_betting(dataset, metric_set.higher_is_better)
 
         return MetaEvaluationOutput(
             dataset=dataset,
@@ -378,6 +395,7 @@ class MetaEvaluationPipeline:
             eval_mode=eval_mode,
             ranker_redundancy=ranker_redundancy,
             degradation_provenance={
+                **self._severity_provenance(),
                 # Which degradation SURFACE produced this run. The core
                 # ``DEGRADATION_LIBRARY`` and an injected physics ``operator_library``
                 # implement overlapping families with DIFFERENT severity→parameter
@@ -390,12 +408,24 @@ class MetaEvaluationPipeline:
                 "families": sorted({s.degradation_family for s in dataset.samples}),
                 "n_severities_per_family": self.simulator_config.n_severities_per_family,
                 "seed": self.simulator_config.seed,
+                "seed_scheme": SEED_SCHEME,
             },
         )
+
+    def _severity_provenance(self) -> dict[str, Any]:
+        """Local-severity axes and damage yardsticks of this run; empty when none were set."""
+        cfg = self.simulator_config
+        out: dict[str, Any] = {}
+        if cfg.severity_provenance:
+            out["severity_axes"] = dict(cfg.severity_provenance)
+        if cfg.damage_yardsticks:
+            out["damage_yardsticks"] = list(cfg.damage_yardsticks)
+        return out
 
     def compute_betting(
         self,
         dataset: MetricEvaluationDataset,
+        higher_is_better: Mapping[str, bool] | None = None,
     ) -> dict[str, BettingPartialOrder]:
         """Variance-adaptive, anytime-valid betting partial order (Lean Sim2Rank.Betting).
 
@@ -410,7 +440,9 @@ class MetaEvaluationPipeline:
         metric. All metrics share an identical increment length and per-position
         alignment (the per-sample index, *not* the ranker-method index), so the
         paired difference in :func:`certify_betting_order` is a genuine sequential,
-        anytime-valid statistic.
+        anytime-valid statistic. ``higher_is_better`` orients each metric so that
+        "responds correctly" is ``+1`` for both directions; when omitted, each
+        name is resolved strictly through :func:`metric_higher_is_better`.
 
         This replaces the earlier ``sign(z - median z)`` proxy, which indexed the
         "increments" by *ranker method* (~6 fixed values, no temporal order,
@@ -421,12 +453,15 @@ class MetaEvaluationPipeline:
         """
         if not self.use_betting:
             return {}
-        per_metric_inc = self._severity_concordance_increments(dataset)
+        if higher_is_better is None:
+            higher_is_better = {n: metric_higher_is_better(n) for n in dataset.metric_values}
+        per_metric_inc = self._severity_concordance_increments(dataset, higher_is_better)
         return {"aggregate": certify_betting_order(per_metric_inc, self.betting_alpha)}
 
     @staticmethod
     def _severity_concordance_increments(
         dataset: MetricEvaluationDataset,
+        higher_is_better: Mapping[str, bool],
     ) -> dict[str, list[float]]:
         """Per-metric ``[-1, 1]`` concordance increments along each severity sub-sweep.
 
@@ -435,8 +470,12 @@ class MetaEvaluationPipeline:
         signs of every metric's value trajectory. A crashed (NaN) value yields a
         ``0.0`` (neutral) increment at that step rather than dropping it — so every
         metric keeps the *same* increment length and position alignment, which the
-        paired confidence sequence relies on.
+        paired confidence sequence relies on. A higher-is-better metric's increments
+        are negated, since it tracks severity by *falling*.
         """
+        undeclared = sorted(set(dataset.metric_values) - set(higher_is_better))
+        if undeclared:
+            raise ValueError(f"betting needs a direction for every metric; none for {undeclared}")
         groups: dict[tuple[str, str], list[int]] = {}
         for idx, s in enumerate(dataset.samples):
             groups.setdefault((s.content_id, s.degradation_family), []).append(idx)
@@ -453,7 +492,8 @@ class MetaEvaluationPipeline:
                 vals = [values[i] for i in idxs]
                 sev = [dataset.samples[i].severity.get("theta", 0.0) for i in idxs]
                 inc.extend(kendall_concordance_increments(vals, sev))
-            per_metric_inc[name] = inc
+            sign = -1.0 if higher_is_better[name] else 1.0
+            per_metric_inc[name] = [sign * x for x in inc]
         return per_metric_inc
 
     def transfer_certificates(
@@ -559,12 +599,14 @@ class MetaEvaluationOutput:
     degradation_provenance: dict[str, object] = field(default_factory=dict)
 
     def to_summary(self) -> dict[str, object]:
+        n_eff, n_eff_unit = effective_sample_size(self.dataset)
         return {
             "eval_mode": self.eval_mode,
             "ranker_redundancy": self.ranker_redundancy,
             "degradation_provenance": self.degradation_provenance,
             "final_ranks": self.aggregate.final_ranks,
             "final_scores": self.aggregate.final_scores,
+            "final_mid_ranks": self.aggregate.final_mid_ranks,
             "defensibility_flags": self.aggregate.defensibility_flags,
             "defensibility_semantics": self.aggregate.defensibility_semantics,
             "weights": self.aggregate.weights,
@@ -572,8 +614,12 @@ class MetaEvaluationOutput:
             "per_method_ranks": {r.method: r.ranks for r in self.per_method},
             "per_method_scores": {r.method: r.scores for r in self.per_method},
             "n_samples": self.dataset.n_samples,
+            "n_eff": n_eff,
+            "n_eff_unit": n_eff_unit,
             "powered": {
                 method: {
+                    "n_samples": po.n_samples,
+                    "correction": po.correction,
                     "gap_threshold": po.gap_threshold,
                     "n_certified": po.n_certified,
                     "n_ambiguous": po.n_ambiguous,

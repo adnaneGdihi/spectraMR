@@ -54,9 +54,11 @@ def _one_group():
 
 
 def _two_groups():
-    from scripts.sim2rank.sim2rank import _discover_repetition_groups
+    from spectramr.data.datasets.contrast_grid import discover_m4raw_grid
 
-    groups = _discover_repetition_groups(_DATA_DIR, max_subjects=2, max_contrasts=1)
+    # The stem grouper capped at 2 x 1 returned one subject's two contrasts (C3).
+    grid = discover_m4raw_grid(_DATA_DIR, max_subjects=2, max_contrasts=1, allow_incomplete=True)
+    groups = [k.paths for k in grid.keys]
     if len(groups) < 2:
         pytest.skip("need >= 2 distinct subjects for the cross-reference test")
     return groups[0], groups[1]

@@ -58,3 +58,35 @@ def test_models_register_in_registry() -> None:
     cls_unet = get_model_class("hermitian_kspace_unet")
     assert cls_fno is not None
     assert cls_unet is not None
+
+
+def _flip_error(module: torch.nn.Module, x: torch.Tensor, dims: tuple[int, ...]) -> float:
+    with torch.no_grad():
+        y = module(x)
+        return ((module(x.flip(dims)) - y.flip(dims)).norm() / y.norm()).item()
+
+
+def test_spectral_conv_is_width_flip_equivariant() -> None:
+    """#2376: the old tie paired row i with frequency i - modes1, so no flip commuted."""
+    torch.manual_seed(0)
+    layer = HermitianSpectralConv2d(3, 4, modes1=6, modes2=5).double()
+    for h, w in ((24, 20), (23, 19)):
+        x = torch.randn(2, 3, h, w, dtype=torch.float64)
+        assert _flip_error(layer, x, (-1,)) < 1e-12
+
+
+def test_fno_block_is_width_flip_equivariant() -> None:
+    torch.manual_seed(0)
+    block = HermitianFNOBlock(width=8, modes1=6, modes2=6).double()
+    x = torch.randn(2, 8, 32, 28, dtype=torch.float64)
+    assert _flip_error(block, x, (-1,)) < 1e-12
+
+
+def test_imaginary_part_of_row_zero_is_inert() -> None:
+    torch.manual_seed(0)
+    layer = HermitianSpectralConv2d(2, 2, modes1=4, modes2=4).double()
+    x = torch.randn(1, 2, 16, 16, dtype=torch.float64)
+    with torch.no_grad():
+        y = layer(x)
+        layer.w_imag[:, :, 0].normal_()
+        assert torch.allclose(layer(x), y, atol=1e-14)

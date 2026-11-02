@@ -134,6 +134,7 @@ DATASET_TYPE_AXES: dict[str, frozenset[Axis]] = {
     # ``mrixfields``. ``mri_functional`` declares ``spatial_ranks={3}``, so an
     # honest skip is better than pinning a rank this table cannot see.
     "fmri": frozenset({Axis.TEMPORAL}),
+    "flow_synthetic": frozenset({Axis.VELOCITY_ENCODING, Axis.TEMPORAL, Axis.COIL}),
 }
 
 
@@ -305,6 +306,9 @@ DATASET_TYPE_RANKS: dict[str, int] = {
     # encoded and ``_rss_combine`` runs a per-slice 2-D ``ifft2c`` over (H, W).
     # The leading slice axis is an index, not a 3-D encoding direction.
     "m4raw": 2,
+    # The phantom is a 3D Cartesian acquisition served as readout slices of
+    # hybrid (x, ky, kz) space; the encoding, and the assembled volume, is 3D.
+    "flow_synthetic": 3,
     # ``mrixfields`` is deliberately OMITTED, for the same reason ``nifti`` is: the
     # served rank is decided by a knob this table cannot see. ``MRIxFieldsPairedDataset``
     # takes a ``mrixfields_slice_mode`` — ``central`` / ``all_slices`` serve a 2-D slice,

@@ -41,6 +41,7 @@ from .certified_robustness import CertifiedRobustnessConfig
 from .confluence import ConfluenceConfig
 from .cross_field import CrossFieldConfig, FieldCocycleConfig, FieldFlowConfig
 from .cycle_bloch import CycleBlochConfig
+from .disentangled_vae import DisentangledVAEConfig
 from .distillation import DistillationTrainingConfigSchema
 from .doob_bridge import DoobBridgeConfig
 from .equivariant_imaging import TrainingConfigEquivariantImaging
@@ -56,6 +57,7 @@ from .geomamba_ulf import GeoMambaULFTrainingConfigSchema
 from .hamiltonian_acquisition import HamiltonianAcquisitionConfig
 from .heteroscedastic_ulf import HeteroscedasticULFConfig
 from .koopman_field import KoopmanFieldConfig
+from .kspace_inr import KSpaceINRTrainingConfigSchema
 from .lora_modulation import LoRAModulationConfig
 from .low_rank_sparse import LowRankSparseTrainingConfigSchema
 from .mccann_field_path import McCannFieldPathConfig
@@ -745,14 +747,21 @@ class TrainingStrategyConfigSchema(BaseModel):
 
     @model_validator(mode="after")
     def _graph_cold_knobs_need_their_reader(self) -> "TrainingStrategyConfigSchema":
-        """Refuse the GraphCold-only diffusion knobs on any other strategy (NN8)."""
+        """Refuse the GraphCold-only diffusion knobs on any other strategy (NN8, #960).
+
+        ``degradation`` defaults to None, which GraphCold reads as ``kspace_mask``;
+        any declared value is a forward process only GraphCold builds.
+        """
         block = self.diffusion
         if block is None:
             return self
         declared = [
             name
             for name, on in (
-                ("degradation: rician", block.degradation == "rician"),
+                (
+                    f"degradation: {block.degradation}",
+                    block.degradation is not None,
+                ),
                 ("validation_timestep", block.validation_timestep is not None),
             )
             if on
@@ -814,6 +823,14 @@ class TrainingStrategyConfigSchema(BaseModel):
     )
     max_steps_per_epoch: int | None = Field(None, description="Max steps per epoch")
     task: str | None = Field(None, description="Task type (reconstruction, etc)")
+    validate_only: bool = Field(
+        False,
+        description=(
+            "The YAML spelling of `train --validate-only`: one validation pass on the "
+            "weights model.checkpoint_path (or --resume) loads, no optimizer step. "
+            "Raises without weights to grade."
+        ),
+    )
     device: str | None = Field(None, description="Device (cuda/cpu)")
     output_dir: str | None = Field(None, description="Output directory")
 
@@ -925,6 +942,10 @@ class TrainingStrategyConfigSchema(BaseModel):
             "self_supervised_reconstruction."
         ),
     )
+    kspace_inr: KSpaceINRTrainingConfigSchema | None = Field(
+        default=None,
+        description="Per-slice SIREN k-space fit knobs; required by training_mode kspace_inr.",
+    )
     equivariant_imaging: TrainingConfigEquivariantImaging | None = Field(
         default=None,
         description=(
@@ -1022,6 +1043,10 @@ class TrainingStrategyConfigSchema(BaseModel):
             "Field-conditioned Schrödinger-bridge knobs (entropic noise scale, "
             "sampler steps) for FieldBridgeStrategy (B-3.3)."
         ),
+    )
+    disentangled_vae: DisentangledVAEConfig | None = Field(
+        default=None,
+        description="Physics-axis source for DisentangledVAETrainingStrategy.",
     )
     cycle_bloch: CycleBlochConfig | None = Field(
         default=None,

@@ -190,3 +190,123 @@ def test_the_student_latent_probe_reads_through_a_wrapper() -> None:
     wrapped = torch.nn.DataParallel(_Student())
     assert ConcreteDistillationStrategy._student_returns_latent(wrapped)
     assert not ConcreteDistillationStrategy._student_returns_latent(torch.nn.Conv2d(1, 1, 1))
+
+
+# ── #183: train-side metrics on the pair validation_step scores ─────────────────
+
+
+class _Twin:
+    marker_mask = torch.ones(1, 1, 16, 16)
+
+    def __call__(self, image):
+        return image, torch.zeros_like(image), None
+
+
+def _strategy_for_losses(iteration: int):
+    from spectramr.core.metrics.computer import create_validation_metrics_computer
+    from spectramr.infrastructure.training.loop_state import LoopState
+    from spectramr.infrastructure.training.strategies.distillation_strategy import (
+        ConcreteDistillationStrategy,
+    )
+
+    s = ConcreteDistillationStrategy.__new__(ConcreteDistillationStrategy)
+    s.device = torch.device("cpu")
+    s.config = SimpleNamespace()
+    s.env = SimpleNamespace(generator=torch.nn.Conv2d(2, 2, 1))
+    s.loop_state = LoopState(iteration=iteration, epoch=0)
+    s.simulator = _Twin()
+    s._teacher = None
+    s._ensure_image_domain_target = lambda t: t
+    s.loss_l1 = s.loss_ssim = s.loss_hfen = lambda p, t: (p - t).abs().mean()
+    s.loss_marker = lambda p, t, **k: torch.zeros(())
+    s._lambda_l1 = s._lambda_ssim = s._lambda_hfen = 1.0
+    s._lambda_marker = s._lambda_distill = 0.0
+    s._training_computer = create_validation_metrics_computer(
+        ["psnr", "complex_hfen", "phase_mse"], device="cpu"
+    )
+    return s
+
+
+def test_a_training_step_reports_train_metrics_in_validation_units() -> None:
+    s = _strategy_for_losses(iteration=1)
+    target = torch.complex(torch.rand(2, 1, 16, 16), torch.rand(2, 1, 16, 16))
+    out = s._compute_losses_impl(input_batch=target, target_batch=target, epoch=0)
+    assert {"train_psnr", "train_complex_hfen", "train_phase_mse"} <= set(out)
+
+    # The same untransformed real-stacked pair validation_step hands its computer.
+    pred = s.generator_model(torch.cat([target.real, target.imag], dim=1)).detach()
+    clean = torch.cat([target.real, target.imag], dim=1)
+    expected = s._training_computer.compute(pred, clean)
+    assert out["train_psnr"] == pytest.approx(expected["psnr"])
+
+
+def test_an_off_cadence_or_eval_step_reports_no_train_metrics() -> None:
+    target = torch.complex(torch.rand(2, 1, 16, 16), torch.rand(2, 1, 16, 16))
+    off = _strategy_for_losses(iteration=101)
+    assert "train_psnr" not in off._compute_losses_impl(target, target, epoch=0)
+    ev = _strategy_for_losses(iteration=1)
+    ev.generator_model.eval()
+    assert "train_psnr" not in ev._compute_losses_impl(target, target, epoch=0)
+
+
+# ── training.distillation.validation_input: real-corruption evaluation ─────────
+
+
+class _TwinMustNotRun:
+    marker_mask = torch.ones(1, 1, 16, 16)
+
+    def __call__(self, image):
+        raise AssertionError("validation_input='loaded' must not run the digital twin")
+
+
+def _strategy_for_validation(validation_input: str):
+    from spectramr.core.metrics.computer import create_validation_metrics_computer
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+    config = SimpleNamespace(
+        training=SimpleNamespace(
+            strategy_class=None,
+            training_mode="distillation",
+            distillation=SimpleNamespace(teacher_checkpoint=None, validation_input=validation_input),
+        )
+    )
+    cls = TrainingStrategyFactory().get_strategy_class(config)
+    s = cls.__new__(cls)
+    s.device = torch.device("cpu")
+    s.config = config
+    s.env = SimpleNamespace(generator=torch.nn.Conv2d(2, 2, 1))
+    s.simulator = _TwinMustNotRun()
+    s._ensure_image_domain_target = lambda t: t
+    s._validation_computer = create_validation_metrics_computer(["psnr"], device="cpu")
+    s._validation_input = cls._resolve_validation_input(config)
+    return s
+
+
+def test_loaded_validation_grades_the_loaded_scan_without_the_twin() -> None:
+    s = _strategy_for_validation("loaded")
+    real_motion = torch.rand(2, 2, 16, 16)
+    clean = torch.rand(2, 2, 16, 16)
+    out = s.validation_step(real_motion, clean)
+    assert "val_psnr" in out
+
+    # The student read the loaded scan: its prediction is the generator applied to it.
+    expected = s._validation_computer.compute(s.generator_model(real_motion), clean)
+    assert out["val_psnr"] == pytest.approx(float(expected["psnr"]))
+
+
+def test_loaded_validation_refuses_a_reference_equal_to_the_input() -> None:
+    s = _strategy_for_validation("loaded")
+    scan = torch.rand(2, 2, 16, 16)
+    with pytest.raises(RuntimeError, match="no clean"):
+        s.validation_step(scan, scan.clone())
+
+
+def test_digital_twin_validation_still_runs_the_twin() -> None:
+    s = _strategy_for_validation("digital_twin")
+    with pytest.raises(AssertionError, match="digital twin"):
+        s.validation_step(torch.rand(2, 2, 16, 16), torch.rand(2, 2, 16, 16))
+
+
+def test_an_unknown_validation_input_raises() -> None:
+    with pytest.raises(ValueError, match="validation_input"):
+        _strategy_for_validation("simulated")

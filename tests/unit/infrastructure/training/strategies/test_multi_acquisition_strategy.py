@@ -1555,3 +1555,45 @@ def test_smoothness_term_is_reportable_but_off_by_configuration() -> None:
     assert st._lambda_smooth == 0.0
     pred = torch.randn(2, 1, 16, 16)
     assert float(st._spatial_smoothness(pred)) > 0.0  # the term still computes
+
+
+def test_conformal_strata_are_scored_on_the_prediction_not_the_truth() -> None:
+    """#2415: an inference-time interval cannot read the truth, so neither the
+    calibration nor the reported coverage and half-width may stratify by it."""
+    from spectramr.core.metrics.anchor_conformal import (
+        AnchorConformalCalibrator,
+        local_detail_score,
+    )
+
+    torch.manual_seed(0)
+    marker_hr = torch.rand(2, 1, 32, 32)
+    marker_pred = torch.rand(2, 1, 32, 32)
+    field, pred = torch.rand(2, 1, 32, 32), torch.rand(2, 1, 32, 32)
+    seen: dict[str, torch.Tensor] = {}
+
+    class _Spy(AnchorConformalCalibrator):
+        def fit(self, residual, difficulty, support=None):
+            seen["fit"] = difficulty
+            return super().fit(residual, difficulty, support)
+
+        def coverage(self, residual, difficulty, support=None):
+            seen["coverage"] = difficulty
+            return super().coverage(residual, difficulty, support)
+
+        def half_width(self, difficulty):
+            seen["half_width"] = difficulty
+            return super().half_width(difficulty)
+
+    st = ConcreteMultiAcquisitionStrategy.__new__(ConcreteMultiAcquisitionStrategy)
+    st._conformal = _Spy(alpha=0.1, n_strata=2)
+    st._subject_bank = None
+    st._marker_channels = False
+    st._last_shifts = None
+    st._append_shift_maps = lambda stack, shifts: stack
+    st.env = SimpleNamespace(generator=lambda _x: marker_pred)
+    res = SimpleNamespace(marker_stack=torch.zeros(2, 4, 16, 16), marker_hr=marker_hr, field=field)
+    out = st._calibrate_conformal(res, pred)
+    assert "conformal_mean_half_width" in out
+    assert torch.equal(seen["fit"], local_detail_score(marker_pred))
+    assert torch.equal(seen["coverage"], local_detail_score(pred))
+    assert torch.equal(seen["half_width"], local_detail_score(pred))

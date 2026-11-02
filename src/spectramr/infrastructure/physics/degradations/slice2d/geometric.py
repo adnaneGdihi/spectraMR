@@ -11,6 +11,7 @@ from spectramr.infrastructure.physics.degradations._common import (
     _ensure_complex,
     _generator,
     _isolated_rng,
+    reject_override_with_endpoint,
 )
 from spectramr.infrastructure.physics.digital_twin_simulator import simulate_gradient_nonlinearity
 
@@ -57,14 +58,17 @@ def degrade_geometric_warp(
     return torch.complex(real, imag)
 
 
-def _delegate_gradient_nl(x, theta, seed=0, **kw):
+def _delegate_gradient_nl(x, theta, seed=0, max_severity=7e-5, **kw):
     x = _ensure_complex(x)
+    reject_override_with_endpoint(
+        "gradient_nonlinearity", "severity", kw.get("severity"), "max_severity", max_severity, 7e-5
+    )
     with _isolated_rng(x.device, seed):
         torch.manual_seed(int(seed))
         if x.device.type == "cuda":
             torch.cuda.manual_seed(int(seed))
         # The primitive scales severity to normalised [-1, 1] coefficients at a fixed
         # reference grid, so the warp is a fixed FOV fraction: see the SeveritySpec.
-        severity = float(kw.get("severity", float(theta) * 7e-5))
+        severity = float(kw.get("severity", float(theta) * float(max_severity)))
         out = simulate_gradient_nonlinearity(x, x.shape[-2:], severity=severity)
     return out

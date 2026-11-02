@@ -118,3 +118,14 @@ def _isolated_rng(device: torch.device, seed: int):
         devices = [device]
     ctx = torch.random.fork_rng(devices=devices)
     return ctx
+
+
+def reject_override_with_endpoint(
+    axis: str, override: str, given: object, endpoint: str, value: float, default: float
+) -> None:
+    """Raise when a physical override is passed with a changed endpoint kwarg (the override would win silently)."""
+    if given is not None and value != default:
+        raise ValueError(
+            f"{axis}: {override} (the theta-scaled value itself) and {endpoint}={value} "
+            f"(a non-default theta=1 endpoint) cannot be combined; pass one"
+        )

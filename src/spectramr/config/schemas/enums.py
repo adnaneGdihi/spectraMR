@@ -10,6 +10,7 @@ Example:
 """
 
 from enum import Enum, StrEnum
+from typing import Any
 
 
 class TrainingMode(str, Enum):
@@ -73,6 +74,17 @@ class AccelerationSchedule(str, Enum):
     EXPONENTIAL = "exponential"
     STEP = "step"
     POWER_LAW = "power_law"
+    LOG = "log"  # physical-endpoint schedule only; see reject_log_schedule
+
+
+def reject_log_schedule(value: Any) -> Any:
+    """Refuse ``log`` on fields whose consumer ramps a severity or acceleration, not endpoints."""
+    members = value.values() if isinstance(value, dict) else (value,)
+    if any(getattr(m, "value", m) == "log" for m in members):
+        raise ValueError(
+            "log is applied to physical endpoints; only a severity-axis schedule may use it"
+        )
+    return value
 
 
 class OptimizerType(str, Enum):
@@ -751,6 +763,27 @@ DIFFUSION_PARADIGM_ALIASES: dict[str, str] = {
     "ColdDiffusion": DiffusionParadigm.COLD.value,
 }
 
+
+class CompressionQuantization(StrEnum):
+    """Post-training weight quantization of ``compression.quantization.method``.
+
+    Weight-only, symmetric, per-tensor; activations and biases stay fp32.
+    """
+
+    NONE = "none"
+    INT8_WEIGHT = "int8_weight"
+    INT4_WEIGHT = "int4_weight"
+
+
+class CompressionPruning(StrEnum):
+    """Post-training pruning of ``compression.pruning.method``."""
+
+    NONE = "none"
+    L1_GLOBAL = "l1_global"  # global magnitude threshold over every prunable weight
+    L2_FILTER = "l2_filter"  # per-layer: zero the output filters with the smallest L2 norm
+    RANDOM = "random"  # unstructured, seeded from run.seed (a pruning control)
+
+
 __all__ = [
     # Core enums
     "TrainingMode",
@@ -789,6 +822,8 @@ __all__ = [
     "SignalDomain",
     "DiffusionParadigm",
     "DIFFUSION_PARADIGM_ALIASES",
+    "CompressionQuantization",
+    "CompressionPruning",
     # Legacy enums (from domain/entities/enums)
     "LossTypes",
     "SchedulerTypes",

@@ -224,22 +224,58 @@ class ComplexUNet(nn.Module):
         # The bottleneck was the one stage without timestep conditioning.
         self.bottleneck_gain = ComplexChannelGain(time_embedding_dim, current_channels * 2)
 
-        # CC-OLMPA attention at bottleneck resolution (lowest spatial dims)
+        # CC-OLMPA: the bottleneck attends to the source contrast, which is the leading
+        # ``reference_channels`` of the input. Every trunk channel mixes both contrasts,
+        # so the source is encoded by its own branch, cropped onto the trunk's grid (#3032).
+        reference_channels = int(kwargs.pop("reference_channels", 0) or 0)
+        self.reference_channels = reference_channels if self.use_cc_olmpa else 0
+        self.ref_encoder: nn.ModuleList | None = None
         if self.use_cc_olmpa:
-            phase_safe_dim = kwargs.pop("phase_safe_dim", 128)
-            # `num_contrasts` is deliberately NOT read here. This block attends at
-            # BOTTLENECK resolution, where the source|target split is 1:1 by
-            # construction, so the contrast count is a data-level quantity that this
-            # module has no parameter for. The previous spelling popped it into a
-            # local and then hardcoded `num_contrasts=1` anyway, which read as a
-            # consumed knob while discarding the declared value -- the shape of
-            # pitfall #15 that is hardest to spot, because grep finds the key.
-            # Target channels = half of bottleneck output (source | target split)
-            target_ch = bottleneck_out_channels // 2
+            if reference_channels <= 0 or reference_channels % 2:
+                raise ValueError(
+                    "ComplexUNet: attention_type 'cross_contrast_olmpa' attends to the source "
+                    "contrast and needs an even model.model_kwargs.reference_channels > 0 with "
+                    f"data.pairing.source_layout: separate; got {reference_channels}. Without "
+                    "a source there is nothing to attend to (#3032)."
+                )
+            if reference_channels >= in_channels:
+                raise ValueError(
+                    f"ComplexUNet: reference_channels={reference_channels} leaves no target "
+                    f"channels in in_channels={in_channels}."
+                )
+            ref_stages: list[nn.Module] = [
+                ComplexConv2d(
+                    reference_channels // 2,
+                    features[0],
+                    kernel_size=3,
+                    padding=1,
+                    padding_mode=padding_mode,
+                    bias=False,
+                )
+            ]
+            ref_ch = features[0]
+            for feature in features[1:]:
+                ref_stages.append(
+                    KSpaceDownsampleBlock(
+                        in_channels=ref_ch * 2,
+                        out_channels=feature * 2,
+                        use_complex_conv=True,
+                        activation="modrelu",
+                        time_embedding_dim=None,  # fully sampled, so timestep-free
+                        attention_type="none",
+                        padding_mode=padding_mode,
+                        feature_domain=self.feature_domain,
+                    )
+                )
+                ref_ch = feature
+            ref_stages.append(
+                ComplexConv2d(ref_ch, bottleneck_out_channels // 2, kernel_size=1, bias=False)
+            )
+            self.ref_encoder = nn.ModuleList(ref_stages)
             self.cc_olmpa = CrossContrastOLMPA(
-                in_channels=target_ch,
-                num_contrasts=1,  # 1:1 source→target at feature level
-                phase_safe_dim=phase_safe_dim,
+                in_channels=bottleneck_out_channels,
+                num_contrasts=1,  # one encoded source, projected to the trunk width
+                phase_safe_dim=kwargs.pop("phase_safe_dim", 128),
             )
         else:
             self.cc_olmpa = None
@@ -386,6 +422,15 @@ class ComplexUNet(nn.Module):
         """
         out = self.norm_ups[level](self.ups[level](trunk, skip, emb, mask))
         return self.radial_band_tokens(out, rung, level=level, full_size=full_size)
+
+    def _encode_reference(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode the leading ``reference_channels`` of ``x`` to the bottleneck grid."""
+        if self.ref_encoder is None:
+            raise RuntimeError("ComplexUNet: no reference encoder; CC-OLMPA was not built.")
+        ref = self.ref_encoder[0](x[:, : self.reference_channels])
+        for stage in self.ref_encoder[1:-1]:
+            ref, _ = stage(ref)
+        return self.ref_encoder[-1](ref)
 
     def _geometry(
         self, features: torch.Tensor, geometry: torch.Tensor | None, stage: int
@@ -564,21 +609,13 @@ class ComplexUNet(nn.Module):
         up_stage = len(self.downs) + 2
         current = self._geometry(current, geometry, up_stage - 1)
 
-        # CC-OLMPA: cross-contrast attention at bottleneck resolution
+        # CC-OLMPA: the trunk (query) attends to the encoded source (key/value).
         if self.cc_olmpa is not None:
             B, C, H, W = current.shape
-            half_c = C // 2
-            # Split source (first half) and target (second half)
-            source_feat = current[:, :half_c]  # [B, C/2, H, W]
-            target_feat = current[:, half_c:]  # [B, C/2, H, W]
-            # Flatten to [B, N, C/2] for CC-OLMPA
-            target_seq = target_feat.reshape(B, half_c, H * W).permute(0, 2, 1)
-            source_seq = source_feat.reshape(B, half_c, H * W).permute(0, 2, 1)
-            # Apply attention: target attends to source
+            target_seq = current.reshape(B, C, H * W).permute(0, 2, 1)
+            source_seq = self._encode_reference(x).reshape(B, C, H * W).permute(0, 2, 1)
             attended = self.cc_olmpa(target_seq, source_seq)
-            # Reshape back and residual
-            target_feat = attended.permute(0, 2, 1).reshape(B, half_c, H, W) + target_feat
-            current = torch.cat([source_feat, target_feat], dim=1)
+            current = attended.permute(0, 2, 1).reshape(B, C, H, W) + current
 
         # Decoder
         if self.radial_band_tokens is not None and timesteps is None:

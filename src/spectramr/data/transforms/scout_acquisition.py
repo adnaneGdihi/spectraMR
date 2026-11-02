@@ -77,7 +77,6 @@ class ScoutAcquisitionTransform(tio.Transform):
                 continue
             image = subject[key]
             data = image.data  # (C, *spatial)
-            # Identify the last two axes as (H, W).
             if data.dim() < 3:
                 continue
             cropped = self._scout_crop(data)
@@ -101,7 +100,18 @@ class ScoutAcquisitionTransform(tio.Transform):
     # ------------------------------------------------------------------
 
     def _scout_crop(self, data: torch.Tensor) -> torch.Tensor:
-        """Apply the central-window crop on the spatial axes (last two dims)."""
+        """Apply the central-window crop on the in-plane axes.
+
+        A TorchIO tensor is ``(C, W, H, D)``: the plane is axes 1 and 2 and the
+        slice axis is last, so it is moved out of the way before cropping. A 3-D
+        ``(C, H, W)`` tensor already has the plane last.
+        """
+        if data.dim() == 4:
+            return self._crop_last_two(data.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        return self._crop_last_two(data)
+
+    def _crop_last_two(self, data: torch.Tensor) -> torch.Tensor:
+        """Crop the central window on the last two axes."""
         H, W = data.shape[-2], data.shape[-1]
         sx, sy = self.scout_resolution
         if sx > H or sy > W:

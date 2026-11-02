@@ -419,6 +419,9 @@ def _range_under_quantile_contract(
     return contract.anchor
 
 
+_SSIM_ROUNDING_TOL = 1e-5
+
+
 def _guard_ssim_codomain(value: Tensor, *, metric_name: str) -> Tensor:
     """Raise if an SSIM lands outside its own codomain ``[-1, 1]``.
 
@@ -434,6 +437,8 @@ def _guard_ssim_codomain(value: Tensor, *, metric_name: str) -> Tensor:
     something upstream is wrong, which is a crash, not an N/A.
     """
     scalar = float(value)  # single sync; the caller is about to convert anyway
+    if math.isfinite(scalar) and 1.0 < abs(scalar) <= 1.0 + _SSIM_ROUNDING_TOL:
+        return value.clamp(-1.0, 1.0)  # float32 rounding of a mean map, not a defect
     if not math.isfinite(scalar) or scalar < -1.0 or scalar > 1.0:
         raise ValueError(
             f"{metric_name} returned {scalar:.6g}, outside its codomain "
@@ -2980,7 +2985,7 @@ class MedFID(BaseMetric):
         import scipy.linalg as linalg
 
         eps = 1e-6
-        covmean, _ = linalg.sqrtm(sigma1_np.dot(sigma2_np), disp=False)
+        covmean = linalg.sqrtm(sigma1_np.dot(sigma2_np))  # SciPy >= 1.18 removed ``disp``
 
         if not np.isfinite(covmean).all():
             offset = np.eye(sigma1_np.shape[0]) * eps

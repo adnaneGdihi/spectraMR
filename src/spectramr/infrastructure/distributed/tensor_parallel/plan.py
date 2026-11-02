@@ -14,6 +14,7 @@ through its load hook, so the checkpoint path is exercised by the same check.
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -32,8 +33,33 @@ from spectramr.models.generators.uvit_backbone import UViTBlock
 MLP_PLANS: dict[type[nn.Module], tuple[str, ...]] = {DiTBlock: ("mlp",), UViTBlock: ("mlp",)}
 
 
+#: Attribute on a split root holding its :class:`TensorParallelPlan`.
+TP_PLAN_ATTR = "_spectramr_tp_plan"
+
+
 class TensorParallelError(RuntimeError):
     """The model cannot be, or was not correctly, split across the tensor group."""
+
+
+@dataclass(frozen=True)
+class TensorParallelPlan:
+    """What :func:`parallelize_tensor` split: read by the grad-norm clip and the EMA shadow."""
+
+    group: Any
+    blocks: tuple[str, ...]
+    #: Dotted names of the parameters each tensor rank holds a slice of. Everything else
+    #: is replicated across the group.
+    sharded: tuple[str, ...]
+
+
+def _record(model: nn.Module, group: Any, targets: list) -> TensorParallelPlan:
+    blocks = tuple(name for name, *_ in targets)
+    sharded = tuple(
+        f"{name}.{key}".lstrip(".") for name, module, _ in targets for key in module.tp_sharded_keys
+    )
+    plan = TensorParallelPlan(group=group, blocks=blocks, sharded=sharded)
+    setattr(model, TP_PLAN_ATTR, plan)
+    return plan
 
 
 def _targets(model: nn.Module) -> list[tuple[str, nn.Module, Any]]:
@@ -48,7 +74,8 @@ def _targets(model: nn.Module) -> list[tuple[str, nn.Module, Any]]:
     return found
 
 
-def _identical_across(module: nn.Module, group: Any) -> bool:
+def identical_across(module: nn.Module, group: Any) -> bool:
+    """True when every floating tensor of ``module`` is equal on every rank of ``group``."""
     same = True
     for tensor in module.state_dict().values():
         if tensor.is_floating_point():
@@ -105,7 +132,7 @@ def parallelize_tensor(model: nn.Module, group: Any) -> list[str]:
         )
     failures = []
     for name, module, adopt in targets:
-        if not _identical_across(module, group):
+        if not identical_across(module, group):
             failures.append(f"{name}: weights differ across tensor ranks")
             continue
         reference = copy.deepcopy(module)
@@ -114,15 +141,48 @@ def parallelize_tensor(model: nn.Module, group: Any) -> list[str]:
         )
         adopt(module, group)
         failures += [f"{name}: {p}" for p in _verify(reference, module, width, group)]
-    # On the model's device: NCCL reduces device tensors only.
+    # On the model's device: NCCL reduces device tensors only. World-wide, so a failure in
+    # one tensor group cannot leave the others waiting in the next collective.
     flag = torch.tensor([float(bool(failures))], device=next(model.parameters()).device)
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
     if flag.item():
         raise TensorParallelError(
             "tensor-parallel split does not reproduce the unsplit blocks: "
             + ("; ".join(failures[:5]) if failures else "on another rank")
         )
-    return [name for name, *_ in targets]
+    return list(_record(model, group, targets).blocks)
 
 
-__all__ = ["MLP_PLANS", "TensorParallelError", "parallelize_tensor"]
+def split_like(target: nn.Module, reference: nn.Module) -> nn.Module:
+    """Split ``target``, a copy of ``reference`` taken before its split, the same way.
+
+    For the EMA shadow: split alike, the blend and the swap stay shard-local. No
+    verification step runs, because the shadow is never trained.
+    """
+    plan = getattr(reference, TP_PLAN_ATTR, None)
+    if plan is None:
+        raise TensorParallelError(
+            f"{type(reference).__name__} was not split by parallelize_tensor; there is no "
+            "tensor-parallel plan to copy onto the EMA shadow."
+        )
+    targets = _targets(target)
+    if tuple(name for name, *_ in targets) != plan.blocks:
+        raise TensorParallelError(
+            "the EMA shadow's blocks differ from the split generator's, so the shadow "
+            "cannot be split like it."
+        )
+    for _, module, adopt in targets:
+        adopt(module, plan.group)
+    _record(target, plan.group, targets)
+    return target
+
+
+__all__ = [
+    "MLP_PLANS",
+    "TP_PLAN_ATTR",
+    "TensorParallelError",
+    "TensorParallelPlan",
+    "identical_across",
+    "parallelize_tensor",
+    "split_like",
+]

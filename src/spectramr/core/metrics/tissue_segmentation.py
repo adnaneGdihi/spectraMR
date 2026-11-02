@@ -43,11 +43,13 @@ whole evaluation.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import torch
 from torch import Tensor
 
 from spectramr.core.metrics.evaluation_metrics import BaseMetric
+from spectramr.core.metrics.monai_compat import call_surface_metric
 from spectramr.core.metrics.registry import register_metric
 
 logger = logging.getLogger(__name__)
@@ -105,10 +107,8 @@ def _otsu_thresholds(values: Tensor, n_classes: int) -> Tensor | None:
     """Otsu thresholds splitting *values* into ``n_classes`` bins.
 
     Range-agnostic: the histogram spans the tensor's own [min, max], so this works
-    on ``[-1, 1]``-normalised MRI as well as ``[0, 1]``. (The pre-existing
-    ``qa_metrics.hd95`` hard-codes a ``[0, 1]`` histogram and drops every negative
-    value, which silently misbehaves on the ``[-1, 1]`` arms — hence a local
-    implementation rather than reuse.)
+    on ``[-1, 1]``-normalised MRI as well as ``[0, 1]``. ``qa_metrics.hd95``
+    binarizes through this function too.
 
     Returns ``None`` when *values* is degenerate (empty or constant).
     """
@@ -373,7 +373,7 @@ class TissueHD95Metric(_SegmentationAgreementMetric):
         super().__init__(device=device)
         self._monai_metric = None
 
-    def _get_monai_metric(self):
+    def _get_monai_metric(self) -> Any:
         if self._monai_metric is None:
             from monai.metrics import HausdorffDistanceMetric
 
@@ -399,7 +399,9 @@ class TissueHD95Metric(_SegmentationAgreementMetric):
         metric = self._get_monai_metric()
         metric.reset()
         # -> [B, n_classes - 1] (include_background=False drops class 0)
-        dist = torch.as_tensor(metric(y_pred=oh_p, y=oh_t), dtype=torch.float32).reshape(
+        dist = torch.as_tensor(
+            call_surface_metric(metric, y_pred=oh_p, y=oh_t), dtype=torch.float32
+        ).reshape(
             seg_p.shape[0], -1
         )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from spectramr.core.metrics.quantitative.segmentation import LabelDiceBackend
 from spectramr.core.metrics.registry import register_metric
 
 _EPS = 1e-10
@@ -72,10 +73,11 @@ class VolumeConsistencyMetric:
     Volumes are voxel counts; the voxel-volume factor cancels in the ratio.
     The final score is the mean over all ``labels`` (default: :data:`DGM_LABELS_14`).
 
-    Segmentation is handled by an injected segmenter backend — SynthSeg 2.0 on
-    the cluster, :class:`~spectramr.core.metrics.quantitative.segmentation.LabelDiceBackend`
-    proxy locally.  The backend's ``segment(image)`` method is called with no
-    ``labels`` argument (the backend decides which label IDs appear in its output).
+    Segmentation needs an injected segmenter that emits FreeSurfer aseg IDs (SynthSeg
+    2.0 on the cluster).  There is no local stand-in: the intensity-quantile
+    ``LabelDiceBackend`` cannot measure DGM volume agreement, so it and a missing
+    segmenter both raise (#169).  The backend's ``segment(image)`` method is called
+    with no ``labels`` argument.
 
     Direction (higher-is-better) is declared centrally in
     ``core/metrics/metric_directions.py::METRIC_HIGHER_IS_BETTER`` and injected
@@ -132,8 +134,8 @@ class VolumeConsistencyMetric:
             labels: label IDs to score.  Defaults to ``self.labels`` (SSOT).
         """
         effective_labels = self.labels if labels is None else labels
-        pred_map = pred_seg.segment(None)  # type: ignore[union-attr]
-        gt_map = gt_seg.segment(None)  # type: ignore[union-attr]
+        pred_map = pred_seg.segment(None)  # type: ignore[attr-defined]
+        gt_map = gt_seg.segment(None)  # type: ignore[attr-defined]
         return self._compute(pred_map, gt_map, effective_labels)
 
     def __call__(
@@ -143,12 +145,14 @@ class VolumeConsistencyMetric:
         **kwargs: object,
     ) -> float:
         seg = kwargs.get("segmenter", self.segmenter)
-        if seg is None:
-            from spectramr.core.metrics.quantitative.segmentation import get_segmenter
-
-            seg = get_segmenter("label_dice", n_classes=max(self.labels) + 1)
-        pred_map = seg.segment(pred)  # type: ignore[union-attr]
-        target_map = seg.segment(target)  # type: ignore[union-attr]
+        if seg is None or isinstance(seg, LabelDiceBackend):
+            raise ValueError(
+                "volume_consistency needs a SynthSeg-style segmenter that emits FreeSurfer "
+                "aseg IDs; none was injected, and the label_dice proxy cannot measure DGM "
+                "volume agreement (#169). Omit the metric or inject a real segmenter."
+            )
+        pred_map = seg.segment(pred)  # type: ignore[attr-defined]
+        target_map = seg.segment(target)  # type: ignore[attr-defined]
         return self._compute(pred_map, target_map, self.labels)
 
 
@@ -182,7 +186,7 @@ class LPIPSAlexMetric:
         for p in self._net.parameters():
             p.requires_grad_(False)
 
-    @torch.no_grad()
+    @torch.no_grad()  # type: ignore[misc]
     def __call__(
         self,
         pred: torch.Tensor,

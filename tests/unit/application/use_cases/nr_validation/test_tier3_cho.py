@@ -145,3 +145,24 @@ def test_score_cho_concordance_empty_inputs_no_crash() -> None:
     out2 = score_cho_concordance(refs, ["psnr"], families=["does_not_exist"])
     assert out2["psnr"].passed is False
     assert math.isnan(out2["psnr"].score)
+
+
+def test_same_prefix_contents_get_different_tier3_seeds(monkeypatch) -> None:
+    """Tier 3 shares the simulator's blake2b content seed, so ``phantom_0`` and
+    ``phantom_1`` (identical first 8 bytes) no longer draw one ensemble."""
+    from spectramr.application.use_cases.nr_validation import tier3_cho
+
+    seen: list[int] = []
+
+    def _record(*_a, base_seed, **_k):
+        seen.append(base_seed)
+        raise RuntimeError("seed captured")
+
+    monkeypatch.setattr(tier3_cho, "_ensemble", _record)
+    monkeypatch.setattr(tier3_cho, "_mean_image", _record)
+    seeds = []
+    for cid in ("phantom_0", "phantom_1"):
+        seen.clear()
+        score_cho_concordance([(cid, _smooth_ref())], ["psnr"], n_severities=1, seed=3)
+        seeds.append(seen[0])
+    assert seeds[0] != seeds[1]

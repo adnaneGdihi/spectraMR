@@ -49,7 +49,8 @@ def _make_config(ham_block=None, image_losses=None):
     # flags fields PRESENT in it; an empty dict is vacuously consistent with the
     # hamiltonian block (a real config carries the matching arch fields here).
     model = SimpleNamespace(model_kwargs={})
-    return SimpleNamespace(training=training, losses=losses, model=model)
+    data = SimpleNamespace(sampling=SimpleNamespace(patch_size=(16, 16, 1)))
+    return SimpleNamespace(training=training, losses=losses, model=model, data=data)
 
 
 def _build_strategy(config, generator):
@@ -168,3 +169,19 @@ def test_deterministic_losses(generator):
     a = strat._compute_losses_impl(target, target, epoch=0)["g_total_loss"]
     b = strat._compute_losses_impl(target, target, epoch=0)["g_total_loss"]
     assert torch.allclose(a, b)
+
+
+def test_hardware_loss_takes_matrix_size_from_the_patch_grid(generator):
+    """#2276: the loss converts cycles/pixel with N read from data.sampling.patch_size."""
+    cfg = _make_config()
+    cfg.data.sampling.patch_size = (256, 256, 1)
+    strat = _build_strategy(cfg, generator)
+    assert strat.loss_hardware.matrix_size == 256
+
+
+@pytest.mark.parametrize("patch", [None, (256, 192, 1), (0, 0, 1)])
+def test_non_square_or_missing_grid_raises(generator, patch):
+    cfg = _make_config()
+    cfg.data.sampling.patch_size = patch
+    with pytest.raises(ValueError, match="matrix size N"):
+        _build_strategy(cfg, generator)

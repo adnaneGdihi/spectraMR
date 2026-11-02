@@ -187,11 +187,13 @@ class DisentanglementAccumulator:
     def n_rows(self) -> int:
         return sum(t.numel() for t in self._labels)
 
-    def probes(self, include_style: bool = True) -> dict[str, float]:
+    def probes(self, include_style: bool = True, label_name: str = "contrast") -> dict[str, float]:
         """``val_style_contrast_acc`` (high is good) and ``val_content_contrast_leak`` (low).
 
         ``include_style=False`` for a model whose render takes no style code (a declared
         protocol owns the contrast): a style reading would then describe the encoder alone.
+        ``label_name`` names what the labels are (``field`` for a field-strength axis) in the
+        emitted keys.
         """
         if not self._labels:
             return {}
@@ -199,14 +201,14 @@ class DisentanglementAccumulator:
         groups = self._groups or None
         content_acc, content_chance = linear_probe(torch.cat(self._content), labels, groups=groups)
         out = {
-            "val_content_contrast_leak": content_acc - content_chance,
+            f"val_content_{label_name}_leak": content_acc - content_chance,
             # Which split produced the numbers: 1 = subject-disjoint, 0 = row halves.
             "val_probe_split_by_subject": float(groups is not None),
         }
         if include_style:
             style_acc, style_chance = linear_probe(torch.cat(self._style), labels, groups=groups)
-            out["val_style_contrast_acc"] = style_acc
-            out["val_style_contrast_chance"] = style_chance
+            out[f"val_style_{label_name}_acc"] = style_acc
+            out[f"val_style_{label_name}_chance"] = style_chance
         return out
 
     def swap_pairs(self, max_pairs: int) -> list[tuple[Any, Any]]:

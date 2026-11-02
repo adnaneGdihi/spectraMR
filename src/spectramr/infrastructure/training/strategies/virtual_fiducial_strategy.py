@@ -27,12 +27,10 @@ import torch
 
 from spectramr.core.metrics.complex_input import PhaseBlindInputError
 from spectramr.core.module_utils import unwrap_model
-from spectramr.infrastructure.physics.spin_history import SpinHistoryStage
-from spectramr.infrastructure.training.strategies.vf_phase_stego import PhaseStegoHook
-from spectramr.infrastructure.training.strategies.vf_null_space import NullSpaceErasureHook
-from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
-from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
+from spectramr.infrastructure.physics.spin_history import SpinHistoryStage
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
+from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.mixins.conditioning_mixin import (
     conditioning_block_of,
     conditioning_enabled,
@@ -41,13 +39,21 @@ from spectramr.infrastructure.training.strategies.ood_acceleration_readout impor
     ood_acceleration_readout,
     ood_accelerations,
 )
+from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
 from spectramr.infrastructure.training.strategies.simulator_builder import (
     build_simulator_from_config,
     require_epi_profile,
     undersampling_mask_kwargs,
 )
+from spectramr.infrastructure.training.strategies.vf_null_space import NullSpaceErasureHook
+from spectramr.infrastructure.training.strategies.vf_phase_stego import PhaseStegoHook
+from spectramr.infrastructure.training.utils.held_out_severity import (
+    held_out_severity_points,
+    held_out_severity_readout,
+)
 from spectramr.infrastructure.training.utils.metric_views import MetricViews
 from spectramr.models.conditioning import AdaptiveConditioner, ConditioningContext
+from spectramr.models.losses.build_set import declared_build_set
 from spectramr.models.losses.registry import create_loss
 
 logger = logging.getLogger(__name__)
@@ -90,6 +96,10 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
     # DDP-wrapped conditioner fails the next step's reduction. Without it VF owns nothing.
     parallel_compat = frozenset({"replicated"})
 
+    #: ``_apply_domain_losses`` fft2c's the prediction before every ``kspace_losses``
+    #: entry, so an image-output arm's k-space losses are bridged here, not by LossBuilder.
+    fft_bridges_kspace_losses = True
+
     @classmethod
     def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
         on = conditioning_enabled(conditioning_block_of(config))
@@ -99,6 +109,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
     synthesises_model_input: ClassVar[bool] = True
 
     _spin_history: SpinHistoryStage | None = None
+    _heldout_severities: tuple[float, ...] = ()
 
     _phase_stego_hook: PhaseStegoHook | None = None
     _null_space_hook: NullSpaceErasureHook | None = None
@@ -143,6 +154,15 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize simulator from config and register losses dynamically."""
+        # ── Held-out severity grid: multipliers of the twin's motion/B0/B1 strengths ──
+        self._heldout_severities = tuple(held_out_severity_points(self.config))
+        bad = [x for x in self._heldout_severities if x <= 1.0]
+        if bad:
+            raise ValueError(
+                f"validation.gates.held_out_severity_grid {bad} is not beyond the training "
+                "severity for virtual_fiducial: values are multipliers and must exceed 1."
+            )
+
         # ── Build simulator from config.physics.digital_twin (SSOT) ──
         self.simulator = build_simulator_from_config(self.config, self.device)
         require_epi_profile(self.simulator)
@@ -184,7 +204,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         # Legacy (non-list) configs: fall back to the flat enabled-loss dict,
         # treating every entry as image-domain (magnitude) as before.
         if not self._loss_specs:
-            for name, weight in self.config.losses.get_enabled_losses().items():
+            for name, weight in declared_build_set(self.config.losses).items():
                 if weight > 0 and name not in seen:
                     self._loss_specs.append(
                         (name, create_loss(name).to(self.device), weight, "image")
@@ -775,8 +795,34 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         g_total_loss = g_total_loss + self._lambda_marker * loss_marker
         loss_dict["loss_marker"] = loss_marker.detach()
         loss_dict["g_total_loss"] = g_total_loss
+        if self.generator_model.training:  # validation_step reuses this impl in eval mode
+            loss_dict.update(self._train_metrics(pred, clean_norm))
 
         return loss_dict
+
+    def _train_metrics(self, pred: torch.Tensor, clean_norm: torch.Tensor) -> dict[str, float]:
+        """``train_*`` metrics on the magnitude pair validation scores (#183)."""
+        step = resolve_loop_iteration(self)
+        if not self._training_metrics_due(self.config, step):
+            return {}
+        domain = getattr(self, "_metric_output_domain", None)
+        if domain is None:
+            from spectramr.infrastructure.training.utils.domain_inference import (
+                infer_output_domain,
+            )
+
+            domain = self._metric_output_domain = infer_output_domain(self.config)
+        pred = self._to_image_domain(pred.detach(), domain, self.device)
+        clean = clean_norm.detach()
+        # The views validation_step scores: magnitudes, plus the complex pair for phase metrics.
+        return self._score_training_views(
+            MetricViews(
+                pred.abs(),
+                clean.abs(),
+                pred if torch.is_complex(pred) else None,
+                clean if torch.is_complex(clean) else None,
+            )
+        )
 
     @staticmethod
     def _to_image_domain(
@@ -913,6 +959,15 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
                 ood_acceleration_readout(
                     self.simulator,
                     ood_accelerations(self.config),
+                    lambda: self._score_at_current_twin(
+                        target_complex, b0_map, cache_visuals=False
+                    ),
+                )
+            )
+            result.update(
+                held_out_severity_readout(
+                    self.simulator,
+                    self._heldout_severities,
                     lambda: self._score_at_current_twin(
                         target_complex, b0_map, cache_visuals=False
                     ),

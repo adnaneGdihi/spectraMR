@@ -108,17 +108,19 @@ class GradientHardwareComplianceLoss(nn.Module):
     r"""Soft hinge penalty on gradient-amplitude and slew-rate violations.
 
     Trajectories live in normalised k-space (:math:`k\in[-0.5, 0.5]`, cycles per
-    FOV). To express the hardware bounds in physical units we convert the
-    normalised gradient velocity :math:`\dot{\mathbf k}` and acceleration
-    :math:`\ddot{\mathbf k}` to physical gradient amplitude / slew via
+    PIXEL, so :math:`k_{\max} = 1/(2\Delta x)`). To express the hardware bounds
+    in physical units we convert the normalised gradient velocity
+    :math:`\dot{\mathbf k}` and acceleration :math:`\ddot{\mathbf k}` to
+    physical gradient amplitude / slew via
 
     .. math::
 
-        \mathbf G_{\text{phys}} = \frac{\dot{\mathbf k}}{\gamma\,\mathrm{FOV}},
+        \mathbf G_{\text{phys}} = \frac{N\,\dot{\mathbf k}}{\gamma\,\mathrm{FOV}},
         \qquad
-        \dot{\mathbf G}_{\text{phys}} = \frac{\ddot{\mathbf k}}{\gamma\,\mathrm{FOV}},
+        \dot{\mathbf G}_{\text{phys}} = \frac{N\,\ddot{\mathbf k}}{\gamma\,\mathrm{FOV}},
 
-    with :math:`\gamma=\gamma_{\text{Hz/T}}` and FOV in metres; the result is in
+    with :math:`N` the matrix size (:math:`\mathrm{FOV}/N = \Delta x`),
+    :math:`\gamma=\gamma_{\text{Hz/T}}` and FOV in metres; the result is in
     T/m and T/m/s, scaled to mT/m and T/m/s for comparison with the bounds. The
     penalty is
 
@@ -137,6 +139,8 @@ class GradientHardwareComplianceLoss(nn.Module):
             provided.
         gamma_hz_per_t: Gyromagnetic ratio :math:`\gamma/2\pi` (Hz/T).
         fov_m: Field of view (m) for the normalised→physical conversion.
+        matrix_size: Matrix size :math:`N` of the reconstructed grid; required,
+            since cycles/pixel → cycles/m needs it (#2276).
     """
 
     def __init__(
@@ -146,10 +150,15 @@ class GradientHardwareComplianceLoss(nn.Module):
         dt_seconds: float = 4e-6,
         gamma_hz_per_t: float = 42.577478e6,
         fov_m: float = 0.22,
+        *,
+        matrix_size: int,
     ) -> None:
         super().__init__()
         if g_max_mT_per_m <= 0 or s_max_T_per_m_per_s <= 0:
             raise ValueError("Hardware bounds must be positive.")
+        if isinstance(matrix_size, bool) or not isinstance(matrix_size, int) or matrix_size <= 0:
+            raise ValueError(f"matrix_size must be a positive int; got {matrix_size!r}.")
+        self.matrix_size = matrix_size
         self.g_max = float(g_max_mT_per_m)
         self.s_max = float(s_max_T_per_m_per_s)
         self.dt = float(dt_seconds)
@@ -214,8 +223,8 @@ class GradientHardwareComplianceLoss(nn.Module):
         g_norm, slew = self._unpack(prediction)
 
         # Convert normalised k-space velocity/acceleration to physical units.
-        # G_phys [T/m] = (dk/dt) / (gamma * FOV); x1e3 -> mT/m.
-        scale = 1.0 / (self.gamma * self.fov)
+        # G_phys [T/m] = N * (dk/dt) / (gamma * FOV); x1e3 -> mT/m.
+        scale = self.matrix_size / (self.gamma * self.fov)
         g_phys_mt = g_norm * scale * 1e3  # mT/m
         slew_phys = slew * scale  # T/m/s
 

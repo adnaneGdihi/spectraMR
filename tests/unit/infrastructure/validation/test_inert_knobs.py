@@ -142,16 +142,17 @@ def test_regression_kspace_cold_diffusion_swallows_four_knobs():
     """The defect that motivated the check, pinned against silent repair.
 
     ``KSpaceColdDiffusionGenerator.__init__`` declares and documents these four
-    and references none: flipping ``activation``/``use_complex_conv`` leaves the
-    module tree and forward output bit-identical. If a fix lands, this test
-    fails loudly and should be updated — that is the point.
+    and references none: flipping ``activation`` leaves the module tree and
+    forward output bit-identical. ``use_complex_conv`` is read now (#1461), so
+    it has left this set. If a fix lands, this test fails loudly and should be
+    updated — that is the point.
     """
     from spectramr.models.generators.kspace_cold_diffusion_generator import (
         KSpaceColdDiffusionGenerator,
     )
 
     assert unread_init_params(KSpaceColdDiffusionGenerator) == frozenset(
-        {"activation", "use_complex_conv", "time_embedding_type", "training_mode"}
+        {"activation", "time_embedding_type", "training_mode"}
     )
 
 

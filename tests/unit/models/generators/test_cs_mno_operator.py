@@ -230,3 +230,15 @@ def test_grad_checkpointing_matches_plain_forward_and_grads() -> None:
     assert torch.allclose(y, y_ref, atol=1e-5)
     assert len(g) == len(g_ref)
     assert all(torch.allclose(a, b, atol=1e-4) for a, b in zip(g, g_ref, strict=True))
+
+
+@pytest.mark.parametrize("arc_step", ["physical", "fixed_resolution"])
+def test_arc_delta_validation_extent_keeps_construction_step(arc_step: str) -> None:
+    """#2365: a 221² slice keeps the 1/128 step of a 128² construction grid in both modes."""
+    from spectramr.models.blocks.topology_linearizer import ImageTopologyLinearizer
+    from spectramr.models.generators.cs_mno_operator import _arc_delta
+
+    lin = ImageTopologyLinearizer((221, 221), mode="hilbert_2d_rect")
+    delta = _arc_delta(lin, (221, 221), arc_step, (128, 128))
+    assert delta.shape == (221 * 221,)
+    assert float(torch.mode(delta[1:]).values) == pytest.approx(1.0 / 128)

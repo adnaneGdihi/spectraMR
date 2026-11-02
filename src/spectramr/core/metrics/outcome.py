@@ -60,6 +60,8 @@ class NotApplicableReason(StrEnum):
     MISSING_MEASUREMENT_CONTEXT = "missing_measurement_context"
     DATA_RANGE_UNRESOLVED = "data_range_unresolved_for_range_sensitive_metric"
     DECLARED_KWARG_UNSUPPORTED = "declared_kwarg_unsupported_by_metric"
+    VELOCITY_DIRECTIONS_BELOW_SPATIAL_RANK = "velocity_directions_below_spatial_rank"
+    DEGENERATE_VELOCITY_FIELD = "velocity_field_has_no_gradient"
 
 
 class MetricNotApplicableError(Exception):

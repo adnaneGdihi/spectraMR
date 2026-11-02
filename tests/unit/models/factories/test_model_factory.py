@@ -738,3 +738,48 @@ def test_pimn_kwargs_are_not_silently_filtered() -> None:
 
     mapped = ParameterMapper().map_generator_params("pimn", hidden_channels=64, num_iterations=3)
     assert mapped["hidden_channels"] == 64
+
+
+def test_symbolic_regression_builds_the_symbolic_head():
+    """``symbolic_regression`` built the U-Net wrapper, dropping exp118's head kwargs (#977)."""
+    import torch
+
+    from spectramr.models.factories.model_factory import ModelFactory
+    from spectramr.models.generators.symbolic_regression import SymbolicRegressionGenerator
+    from spectramr.models.generators.symbolic_regression_wrapper import (
+        SymbolicRegressionWrapper,
+    )
+
+    factory = ModelFactory()
+    registry = factory._registry
+    assert registry.get_generator_class("symbolic_regression") is SymbolicRegressionGenerator
+    assert (
+        registry.get_generator_class("symbolic_regression_wrapper") is SymbolicRegressionWrapper
+    )
+    with torch.device("meta"):
+        model = factory.create_generator(
+            "symbolic_regression",
+            in_channels=1,
+            out_channels=1,
+            feature_dim=8,
+            num_symbolic_terms=3,
+            constraints={
+                "dimensional_consistency": True,
+                "units": {"T2": "time", "TE": "time", "M0": "magnetization"},
+            },
+            allowed_operators=["exp", "add", "mul", "div", "neg"],
+        )
+    assert model.symbolic_head.num_terms == 3
+    assert model.intro.out_channels == 8
+
+
+@pytest.mark.parametrize("model_type", ["score_based_diffusion", "score_based_diffusion_generator"])
+def test_score_sde_knobs_reach_the_score_generator(model_type: str) -> None:
+    from spectramr.models.factories.model_factory import ParameterMapper
+
+    mapped = ParameterMapper().map_generator_params(
+        model_type, sde_type="vesde", sigma_min=0.01, sigma_max=50.0, features=[8]
+    )
+    assert mapped["sde_type"] == "vesde"
+    assert (mapped["sigma_min"], mapped["sigma_max"]) == (0.01, 50.0)
+    assert "features" not in mapped

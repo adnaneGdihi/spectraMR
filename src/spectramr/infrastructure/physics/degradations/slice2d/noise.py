@@ -10,6 +10,7 @@ from spectramr.infrastructure.physics.degradations._common import (
     _isolated_rng,
     _sample_rms,
     _signal_level,
+    reject_override_with_endpoint,
 )
 from spectramr.infrastructure.physics.digital_twin_simulator import simulate_spike_noise
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
@@ -79,12 +80,15 @@ def degrade_rician_noise(
     return torch.sqrt((mag + eta1) ** 2 + eta2**2)
 
 
-def _delegate_spike(x, theta, seed=0, **kw):
+def _delegate_spike(x, theta, seed=0, max_probability=0.05, **kw):
     x = _ensure_complex(x)
+    reject_override_with_endpoint(
+        "spike", "probability", kw.get("probability"), "max_probability", max_probability, 0.05
+    )
     with _isolated_rng(x.device, seed):
         torch.manual_seed(int(seed))
         if x.device.type == "cuda":
             torch.cuda.manual_seed(int(seed))
-        prob = float(kw.get("probability", float(theta) * 0.05))
+        prob = float(kw.get("probability", float(theta) * float(max_probability)))
         out = ifft2c(simulate_spike_noise(fft2c(x), probability=prob))
     return out

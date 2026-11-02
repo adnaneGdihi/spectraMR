@@ -41,10 +41,12 @@ DEFAULT_ESP_MS = 10.0
 MAX_TRAIN_OVER_T2 = 2.0
 
 
-def tse_weights(echo: Tensor, etl: int, esp_ms: float, theta: float) -> Tensor:
+def tse_weights(
+    echo: Tensor, etl: int, esp_ms: float, theta: float, max_train_over_t2: float = MAX_TRAIN_OVER_T2
+) -> Tensor:
     """``exp(-(TE_e - TE_centre) / T2_eff)`` for echo indices ``echo`` ``[D, H]``; ``T2_eff = ETL ESP / (2 theta)``."""
     te = (echo.to(torch.float64) + 1.0) * esp_ms
-    t2_eff = etl * esp_ms / (MAX_TRAIN_OVER_T2 * theta)
+    t2_eff = etl * esp_ms / (max_train_over_t2 * theta)
     centre = te[echo.shape[0] // 2, echo.shape[1] // 2]
     return torch.exp(-(te - centre) / t2_eff).to(torch.float32)
 
@@ -58,6 +60,7 @@ def tse_t2_blur_volume(
     etl: int = DEFAULT_ETL,
     esp_ms: float = DEFAULT_ESP_MS,
     order: str | None = None,
+    max_train_over_t2: float = MAX_TRAIN_OVER_T2,
 ) -> Tensor:
     check_input(x, geometry, "tse_t2_blur")
     if isinstance(etl, bool) or not isinstance(etl, int) or etl < 2:
@@ -71,7 +74,7 @@ def tse_t2_blur_volume(
         return x
     # A train longer than the lines leaves its last echoes unused: each line is then its own echo.
     echo = shot_index(times, min(etl, times.numel())).to(x.device)
-    return apply_line_weights(x, tse_weights(echo, etl, esp_ms, theta), geometry.mode)
+    return apply_line_weights(x, tse_weights(echo, etl, esp_ms, theta, max_train_over_t2), geometry.mode)
 
 
 def degrade_tse_t2_blur(x: Tensor, theta: float, seed: int = 0, **kwargs) -> Tensor:

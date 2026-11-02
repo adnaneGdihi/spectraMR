@@ -10,6 +10,8 @@ Reference:
 
 from __future__ import annotations
 
+import itertools
+import math
 from typing import Any
 
 import torch
@@ -20,41 +22,32 @@ from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 
-class _TaskConditionedEncoder(nn.Module):
-    """Encoder with task-specific conditioning via FiLM."""
+def _stage(in_ch: int, out_ch: int, *, down: bool) -> list[nn.Module]:
+    conv = nn.Conv2d if down else nn.ConvTranspose2d
+    return [
+        conv(in_ch, out_ch, 4, stride=2, padding=1),
+        nn.GroupNorm(math.gcd(32, out_ch), out_ch),
+        nn.SiLU(),
+    ]
 
-    def __init__(self, in_ch: int, feature_dim: int, num_tasks: int) -> None:
+
+class _TaskConditionedEncoder(nn.Module):
+    """Stride-2 encoder over ``features`` with task-specific FiLM conditioning."""
+
+    def __init__(self, in_ch: int, features: list[int], num_tasks: int) -> None:
         super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, feature_dim, 4, stride=2, padding=1),
-            nn.GroupNorm(min(32, feature_dim), feature_dim),
-            nn.SiLU(),
-            nn.Conv2d(feature_dim, feature_dim * 2, 4, stride=2, padding=1),
-            nn.GroupNorm(min(32, feature_dim * 2), feature_dim * 2),
-            nn.SiLU(),
-            nn.Conv2d(feature_dim * 2, feature_dim * 4, 4, stride=2, padding=1),
-            nn.GroupNorm(min(32, feature_dim * 4), feature_dim * 4),
-            nn.SiLU(),
-        )
-        # FiLM conditioning from task ID
-        self.task_embed = nn.Embedding(num_tasks, feature_dim * 4)
-        self.film_gamma = nn.Linear(feature_dim * 4, feature_dim * 4)
-        self.film_beta = nn.Linear(feature_dim * 4, feature_dim * 4)
+        widths = [in_ch, *features]
+        layers: list[nn.Module] = []
+        for a, b in itertools.pairwise(widths):
+            layers += _stage(a, b, down=True)
+        self.conv = nn.Sequential(*layers)
+        out_dim = features[-1]
+        self.task_embed = nn.Embedding(num_tasks, out_dim)
+        self.film_gamma = nn.Linear(out_dim, out_dim)
+        self.film_beta = nn.Linear(out_dim, out_dim)
 
     def forward(self, x: torch.Tensor, task_id: int = 0) -> torch.Tensor:
-        """forward method for _TaskConditionedEncoder.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-            task_id (int): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+        """Encode ``x`` (B, C, H, W) and modulate the last stage by the task embedding."""
         h = self.conv(x)
         B = h.shape[0]
         tid = torch.full((B,), task_id, device=x.device, dtype=torch.long)
@@ -62,6 +55,21 @@ class _TaskConditionedEncoder(nn.Module):
         gamma = self.film_gamma(te)[..., None, None]
         beta = self.film_beta(te)[..., None, None]
         return gamma * h + beta
+
+
+def _check_depth(features: list[int], encoder_blocks: int, decoder_blocks: int) -> None:
+    """Raise unless ``features`` is a stem width plus one width per encoder/decoder stage."""
+    if encoder_blocks < 1 or len(features) != encoder_blocks + 1:
+        raise ValueError(
+            f"conditional_continual_vae: features has {len(features)} widths but "
+            f"encoder_blocks={encoder_blocks}; it needs encoder_blocks + 1 widths "
+            "(features[0] is the first stage's input width after the stem)."
+        )
+    if decoder_blocks != encoder_blocks:
+        raise ValueError(
+            f"conditional_continual_vae: decoder_blocks={decoder_blocks} must equal "
+            f"encoder_blocks={encoder_blocks}; the decoder mirrors the encoder's resolution."
+        )
 
 
 @register_model(name="conditional_continual_vae", training_mode="vae")
@@ -78,30 +86,30 @@ class ConditionalContinualVAEGenerator(IGenerator, nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        features: list[int] = kwargs.get("features", [32, 64, 128, 256])
-        encoder_blocks: int = kwargs.get("encoder_blocks", 4)
-        decoder_blocks: int = kwargs.get("decoder_blocks", 4)
+        features: list[int] = list(kwargs.get("features", [32, 64, 128, 256]))
+        encoder_blocks: int = kwargs.get("encoder_blocks", 3)
+        decoder_blocks: int = kwargs.get("decoder_blocks", 3)
         num_tasks: int = kwargs.get("num_tasks", 5)
-        base_dim = features[0]
+        _check_depth(features, encoder_blocks, decoder_blocks)
+        self.features = features
+        self.encoder_blocks = encoder_blocks
+        self.decoder_blocks = decoder_blocks
 
-        # Encoder
-        self.encoder = _TaskConditionedEncoder(in_channels, base_dim, num_tasks)
-        enc_out_dim = base_dim * 4
+        # Stem at features[0], then encoder_blocks stride-2 stages over features[1:].
+        self.stem = nn.Conv2d(in_channels, features[0], 3, padding=1)
+        self.encoder = _TaskConditionedEncoder(features[0], features[1:], num_tasks)
+        enc_out_dim = features[-1]
 
-        # Latent
         self.fc_mu = nn.Conv2d(enc_out_dim, enc_out_dim, 1)
         self.fc_logvar = nn.Conv2d(enc_out_dim, enc_out_dim, 1)
 
-        # Decoder
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(enc_out_dim, base_dim * 2, 4, stride=2, padding=1),
-            nn.GroupNorm(min(32, base_dim * 2), base_dim * 2),
-            nn.SiLU(),
-            nn.ConvTranspose2d(base_dim * 2, base_dim, 4, stride=2, padding=1),
-            nn.GroupNorm(min(32, base_dim), base_dim),
-            nn.SiLU(),
-            nn.ConvTranspose2d(base_dim, out_channels, 4, stride=2, padding=1),
-        )
+        rev = features[::-1]
+        dec: list[nn.Module] = []
+        for a, b in itertools.pairwise(rev):
+            dec += _stage(a, b, down=False)
+        dec.append(nn.Conv2d(features[0], out_channels, 3, padding=1))
+        self.decoder = nn.Sequential(*dec)
+        self._last_aux: dict[str, torch.Tensor] | None = None
 
         self.num_tasks = num_tasks
 
@@ -128,18 +136,24 @@ class ConditionalContinualVAEGenerator(IGenerator, nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        B, C, H, W = x.shape
+        H, W = x.shape[-2:]
         task_id: int = kwargs.get("task_id", 0)
 
-        h = self.encoder(x, task_id)
+        h = self.encoder(self.stem(x), task_id)
         mu = self.fc_mu(h)
         logvar = self.fc_logvar(h)
         z = self._reparameterize(mu, logvar)
         out = self.decoder(z)
+        # The strategy reads the posterior here, so the KL acts on a bare-tensor forward (#2362).
+        self._last_aux = {"mu": mu, "logvar": logvar, "z": z}
 
         if out.shape[2:] != (H, W):
             out = F.interpolate(out, size=(H, W), mode="bilinear", align_corners=False)
         return out
+
+    def last_aux(self) -> dict[str, torch.Tensor] | None:
+        """The posterior ``(mu, logvar, z)`` of the most recent forward, or None before one."""
+        return self._last_aux
 
     def generate(self, z: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         return self.forward(z, **kwargs)

@@ -6,9 +6,9 @@ Pre-fix bug (2026-05-31 audit): the strategy read ``self.env.teacher`` and
 ``self.env.domain_discriminator`` — neither of which is a field on the frozen
 :class:`TrainingEnvironment`, so the first training step raised
 ``AttributeError`` — and ``_setup_strategy_specific_components`` was a bare
-``return``, so nothing was ever built. The fix builds a frozen teacher copy of
-the student and a :class:`DomainDiscriminator` (stored on ``self`` because env
-is frozen), and adds the discriminator params to ``opt_g``.
+``return``, so nothing was ever built. The fix loads a frozen teacher from the
+stage-1 ``teacher_checkpoint`` and builds a :class:`DomainDiscriminator` (stored
+on ``self`` because env is frozen), and adds the discriminator params to ``opt_g``.
 
 These tests drive the setup hook with a stub env (real ``opt_g`` SGD over a
 dummy param, a tiny ``nn.Module`` student) and assert:
@@ -30,6 +30,9 @@ from spectramr.infrastructure.training.strategies.privileged_learning_strategy i
     DomainDiscriminator,
     PrivilegedLearningStrategy,
 )
+from tests.unit.infrastructure.training.strategies.test_privileged_learning_strategy import (
+    write_teacher_checkpoint,
+)
 
 
 class _TinyStudent(nn.Module):
@@ -47,9 +50,10 @@ def _param_ids(opt: torch.optim.Optimizer) -> set[int]:
     return {id(p) for g in opt.param_groups for p in g["params"]}
 
 
-def _make_strategy() -> PrivilegedLearningStrategy:
+def _make_strategy(ckpt=None) -> PrivilegedLearningStrategy:
     """Build a bare strategy via ``object.__new__`` with only the attributes
-    that ``_setup_strategy_specific_components`` reads."""
+    that ``_setup_strategy_specific_components`` reads. Distillation (beta 0.5)
+    only with a stage-1 ``ckpt``; without one beta is 0 and no teacher is built."""
     s = object.__new__(PrivilegedLearningStrategy)
     s._owned_modules, s._owned_wrappers = {}, {}
     s.device = torch.device("cpu")
@@ -69,14 +73,21 @@ def _make_strategy() -> PrivilegedLearningStrategy:
     s._disc_hidden_dim = 16
     s._teacher = None
     s._domain_discriminator = None
-    s._alpha, s._beta, s._delta = 1.0, 0.5, 0.1
+    s._alpha, s._beta, s._delta = 1.0, (0.5 if ckpt else 0.0), 0.1
     s._tau0, s._n_min, s._n_max = 5.0, 0.0, 1.0
+    s._stage, s._teacher_checkpoint, s._declared_knobs = "student", ckpt, frozenset()
     return s
 
 
+@pytest.fixture
+def teacher_ckpt(tmp_path):
+    torch.manual_seed(3)
+    return str(write_teacher_checkpoint(tmp_path / "best.safetensors", _TinyStudent()))
+
+
 class TestPrivilegedTeacherBuilt:
-    def test_teacher_and_disc_built_and_registered(self):
-        s = _make_strategy()
+    def test_teacher_and_disc_built_and_registered(self, teacher_ckpt):
+        s = _make_strategy(teacher_ckpt)
         before = _param_ids(s.env.opt_g)
 
         s._setup_strategy_specific_components()
@@ -168,10 +179,15 @@ class TestPrivilegedMarkerRequired:
         )
         assert "g_total_loss" in out
 
-    def test_marker_actually_reaches_teacher(self):
+    def test_marker_actually_reaches_teacher(self, tmp_path):
         """The teacher input must differ from the student input when a marker
-        is present (otherwise the privileged path is a no-op)."""
+        is present (otherwise the privileged path is a no-op). The checkpoint
+        holds the student's own weights, so the marker is the only difference."""
         s = _make_strategy()
+        s._teacher_checkpoint = str(
+            write_teacher_checkpoint(tmp_path / "best.safetensors", s.env.generator)
+        )
+        s._beta = 0.5
         s._delta = 0.0  # marker test; the domain term needs its own key (A6)
         s._setup_strategy_specific_components()
 

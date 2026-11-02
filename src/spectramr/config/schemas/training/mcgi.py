@@ -1,40 +1,38 @@
-r"""Schema for MCGI: Monotone-Contrast-Group-Invariant encoder (M2).
+r"""Schema for the ``mcgi_encoder`` ``model_kwargs`` (MCGI, bundle M2).
 
-Defines the ``training.mcgi`` sub-block for arms selecting
-:class:`~spectramr.models.encoders.mcgi_encoder.MCGIEncoder`. MCGI rides the
-existing ``supervised`` paradigm -- there is no bespoke strategy, because the
-invariance is *structural* (it lives in the rank transform in front of the
-backbone), not something the training loop enforces.
+The single owner of the encoder's knobs: ``MCGIEncoder.__init__`` validates what
+the arm declares under ``model.model_kwargs`` through this model, and the
+``mcgi_invariance_declared`` audit check reads the same model, so the defaults and
+the legal values are defined once. MCGI rides the reconstruction strategy; the
+invariance is structural (the rank transform in front of the backbone), not
+something the training loop enforces.
 
-The knobs here are the ones that decide whether the invariance claim is exact:
-
-* ``hard_rank_eval`` -- the exact empirical-CDF rank at inference. Soft-ranking
-  at inference makes the invariance approximate, which the Tier-1
-  ``mcgi_invariance_declared`` check flags as an ERROR (pitfall #16: a facade
-  mechanism that still carries the exactness claim).
-* ``symmetrize_order_reversal`` -- adjoins the involution
-  :math:`\sigma:\mathbf x\mapsto-\mathbf x`, extending invariance from
-  :math:`G_+` to the full :math:`G_+\rtimes\mathbb Z_2` needed for order-reversing
-  contrast pairs (T1w vs T2w). Leaving it off is legitimate for single-polarity
-  cohorts, but then the arm is only :math:`G_+`-invariant.
+* ``rank_transform`` -- the per-image midrank :math:`R` in front of the backbone.
+  ``false`` is the one-knob non-invariant control: the same backbone on raw
+  intensities, so the pair isolates the rank transform.
+* ``symmetrize_order_reversal`` -- adjoins :math:`\sigma:\mathbf x\mapsto-\mathbf x`,
+  extending invariance from :math:`G_+` to :math:`G_+\rtimes\mathbb Z_2`.
+* ``hard_rank_eval`` -- must be ``true``: the exact midrank runs in training and
+  inference (#2409 retired the soft rank).
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class MCGIConfig(BaseModel):
-    """Hyperparameters for the monotone-contrast-group-invariant encoder."""
+    """Validated ``model_kwargs`` of the monotone-contrast-group-invariant encoder."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    soft_rank_temperature: float = Field(
-        default=0.05,
-        gt=0.0,
+    hidden_channels: int = Field(default=16, ge=1, description="Backbone hidden width.")
+    depth: int = Field(default=3, ge=1, description="Conv layers in the backbone.")
+    rank_transform: bool = Field(
+        default=True,
         description=(
-            "Temperature of the differentiable soft rank used during training. "
-            "Smaller is closer to the exact rank but has a sharper gradient."
+            "Apply the per-image midrank before the backbone. False is the "
+            "non-invariant one-knob control."
         ),
     )
     symmetrize_order_reversal: bool = Field(
@@ -46,18 +44,18 @@ class MCGIConfig(BaseModel):
     )
     hard_rank_eval: bool = Field(
         default=True,
-        description=(
-            "Use the exact hard rank at inference. Required for the exactness "
-            "claim (Tier-1 mcgi_invariance_declared)."
-        ),
+        description="Exact midrank in every mode; false is rejected (#2409).",
     )
-    backbone: str = Field(
-        default="conv",
-        description=(
-            "Backbone Psi behind the rank transform. The invariance guarantee is "
-            "independent of this choice -- it sits behind R."
-        ),
-    )
+
+    @field_validator("hard_rank_eval")
+    @classmethod
+    def _exact_rank_only(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError(
+                "mcgi_encoder runs the exact midrank in every mode; hard_rank_eval=false "
+                "is not supported (#2409)."
+            )
+        return value
 
 
 __all__ = ["MCGIConfig"]

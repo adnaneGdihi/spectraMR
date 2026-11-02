@@ -458,6 +458,8 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
     """
 
     __expected_kwargs__ = {f.name for f in fields(UNetConfig)}
+    # forward() accepts `cond` for the diffusion call signature but discards it.
+    consumes_cond: bool = False
 
     def __init__(
         self,
@@ -866,6 +868,11 @@ class UNet(LatentAccessMixin, nn.Module, IGenerator):
             components.append("TransConv")
 
         return "_".join(components)
+
+    @property
+    def consumes_time(self) -> bool:
+        """Whether a timestep changes the output (only when a time embedding is built)."""
+        return self.time_mlp is not None
 
     def forward(
         self,

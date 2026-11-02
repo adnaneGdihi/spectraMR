@@ -215,3 +215,45 @@ def test_input_dependence_healthy_output_not_flagged() -> None:
     metric = InputDependenceSpreadMetric()
     preds = [torch.rand(1, 1, 8, 8) for _ in range(3)]
     assert metric(None, None, cascade_predictions=preds) > 0.1
+
+
+# ---------------------------------------------------------------------------
+# certified_radius: registered, needs the reconstructor, raises without it
+# ---------------------------------------------------------------------------
+
+
+def test_certified_radius_registered_and_needs_reconstructor() -> None:
+    assert MetricsRegistry.is_registered("certified_radius")
+    assert "reconstructor" in MetricsRegistry.needs("certified_radius")
+
+
+def test_certified_radius_raises_without_reconstructor() -> None:
+    with pytest.raises(ValueError):
+        get_metric("certified_radius")(torch.rand(1, 1, 4, 4), None)
+
+
+def test_certified_radius_per_sample_and_mean() -> None:
+    from spectramr.core.metrics.context import MetricContext
+    from spectramr.core.metrics.robustness_metrics import CertifiedRadiusMetric
+
+    torch.manual_seed(0)
+    metric = get_metric("certified_radius", sigma=0.1, n_samples=4)
+    assert isinstance(metric, CertifiedRadiusMetric)
+    x = torch.full((3, 1, 4, 4), 2.0)
+    radii = metric.per_sample(lambda z: z, x)
+    assert radii.shape == (3,)
+    assert bool((radii > 0).all())  # a positive mean response votes for a positive radius
+    mean = metric(context=MetricContext(reconstructor=lambda z: z), model_input=x)
+    assert mean == pytest.approx(float(radii.mean()), rel=0.2)
+
+
+def test_adversarial_psnr_drop_runs_under_no_grad() -> None:
+    torch.manual_seed(0)
+    model = nn.Conv2d(1, 1, 3, padding=1)
+    x = torch.rand(2, 1, 8, 8)
+    target = model(x).detach()
+    with torch.no_grad():  # the validation loop's context
+        drop = get_metric("adversarial_psnr_drop", epsilon=0.05, steps=3)(
+            target, target, model=model, model_input=x
+        )
+    assert drop > 0.0

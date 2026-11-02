@@ -167,6 +167,7 @@ def offres_blur_volume(
     readout_times_s: Tensor | None = None,
     n_spokes: int | None = None,
     samples_per_spoke: int | None = None,
+    max_cycles: float = MAX_CYCLES,
 ) -> Tensor:
     check_input(x, geometry, "offres_blur_noncartesian")
     b, c, d, h, w = x.shape
@@ -179,12 +180,12 @@ def offres_blur_volume(
     dev = x.device
     traj, times = traj.to(dev), times.to(dev)
     dcf = RadialDCF(n_sp, sps)(traj.T)
-    omega = 2 * math.pi * (MAX_CYCLES * theta / t_ro_s) * unit.expand(b, c, d, h, w)
+    omega = 2 * math.pi * (max_cycles * theta / t_ro_s) * unit.expand(b, c, d, h, w)
     img = _ensure_complex(x).to(torch.complex64).reshape(-1, 1, h, w)
     omega = omega.reshape(-1, 1, h, w)
     seg, plain = (
-        TimeSegmentedNUFFT((h, w), n_segments(MAX_CYCLES * theta)),
-        TimeSegmentedNUFFT((h, w), 1),
+        TimeSegmentedNUFFT((h, w), n_segments(max_cycles * theta)).to(dev),
+        TimeSegmentedNUFFT((h, w), 1).to(dev),
     )
 
     def forward(op: TimeSegmentedNUFFT, image: Tensor, field: Tensor) -> Tensor:

@@ -384,3 +384,81 @@ def test_flux_loss_does_not_broadcast_across_the_batch() -> None:
         f"velocity {tuple(v.shape)} x mask {tuple(inlet.shape)} broadcasts to "
         f"{tuple((v * inlet).shape)} — samples are being cross-multiplied"
     )
+
+
+# ---------------------------------------------------------------------------
+# Units guard, rank-generic adapters, setup reads encoding_scheme.
+# ---------------------------------------------------------------------------
+
+
+def test_adapters_work_on_a_volume_with_frames() -> None:
+    """The adapters encode along the channel axis at any rank, not only [B, C, H, W]."""
+    from spectramr.infrastructure.training.strategies.phase_contrast_flow_strategy import (
+        decode_velocity_four_point,
+    )
+
+    v = (torch.rand(2, 3, 4, 5, 6, 7) - 0.5) * 1.8 * _VENC
+    phases = encode_velocity_four_point(v, _VENC)
+    assert phases.shape == (2, 4, 4, 5, 6, 7)
+    assert torch.allclose(decode_velocity_four_point(phases, _VENC), v, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("units", "activation", "tail", "fragment"),
+    [
+        ("Hz", None, None, "output_field_units='Hz'"),
+        (None, "tanh", None, "output_activation='tanh'"),
+        (None, None, torch.nn.Sigmoid(), "last module is Sigmoid"),
+    ],
+)
+def test_bounded_output_is_named(units, activation, tail, fragment) -> None:
+    from spectramr.infrastructure.training.strategies.phase_contrast_flow_strategy import (
+        bounded_velocity_output,
+    )
+
+    net = _VelocityNet() if tail is None else torch.nn.Sequential(_VelocityNet(), tail)
+    reason = bounded_velocity_output(units, activation, net)
+    assert reason is not None and fragment in reason
+
+
+def test_unbounded_undeclared_generator_passes() -> None:
+    from spectramr.infrastructure.training.strategies.phase_contrast_flow_strategy import (
+        bounded_velocity_output,
+    )
+
+    assert bounded_velocity_output(None, None, _VelocityNet()) is None
+    assert bounded_velocity_output("m/s", None, _VelocityNet()) is None
+
+
+def _setup_strategy(generator: torch.nn.Module, **model: object) -> PhaseContrastFlowStrategy:
+    from spectramr.config.schemas.data import PhaseContrastConfigSchema
+
+    strat = object.__new__(PhaseContrastFlowStrategy)
+    strat.env = types.SimpleNamespace(generator=generator, losses={})
+    strat.logging_service = None
+    strat._verify_strategy_config = lambda **_: None
+    strat._get_loss_weight = lambda name: 1.0 if name == "phase_contrast_velocity" else 0.0
+    model_cfg = {"model_type": "not_a_registered_model", "in_channels": 4, "out_channels": 3}
+    model_cfg.update(model)
+    strat.config = types.SimpleNamespace(
+        data=types.SimpleNamespace(phase_contrast=PhaseContrastConfigSchema(enabled=True, venc=1.5)),
+        model=types.SimpleNamespace(output_activation=None, **model_cfg),
+        training=types.SimpleNamespace(phase_contrast=None),
+    )
+    strat._setup_strategy_specific_components()
+    return strat
+
+
+def test_setup_reads_the_encoding_scheme() -> None:
+    strat = _setup_strategy(_VelocityNet())
+    assert strat._encoding_scheme == "four_point_reference"
+
+
+def test_setup_rejects_a_wrong_input_channel_count() -> None:
+    with pytest.raises(ValueError, match="4 encoded phases"):
+        _setup_strategy(_VelocityNet(), in_channels=2)
+
+
+def test_setup_rejects_a_terminal_tanh() -> None:
+    with pytest.raises(ValueError, match="needs velocity in m/s"):
+        _setup_strategy(torch.nn.Sequential(_VelocityNet(), torch.nn.Tanh()))

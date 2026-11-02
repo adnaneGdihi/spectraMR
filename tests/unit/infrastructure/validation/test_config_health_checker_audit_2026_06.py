@@ -216,3 +216,35 @@ def test_varkwargs_model_skips_signature_advisory(monkeypatch):
     cfg = _cfg_with_kwargs("m", {"anything_goes": 1})
     results = checker.check_advertised_options(cfg)
     assert all(r.passed for r in results)
+
+
+def _adaptive_cfg(target_rate, base=8.0, center_fraction=0.08):
+    adaptive = SimpleNamespace(enabled=True, target_rate=target_rate)
+    return SimpleNamespace(
+        undersampling=SimpleNamespace(
+            adaptive=adaptive, base_acceleration=base, center_fraction=center_fraction
+        )
+    )
+
+
+def test_adaptive_target_rate_accepts_the_acs_inclusive_budget():
+    # 0.08 + 0.92/8 = 0.195: the fraction the fixed 8x control realises.
+    checker = ConfigHealthChecker()
+    assert checker.check_acceleration_adaptive_target_rate_consistent(_adaptive_cfg(0.195)).passed
+    assert checker.check_acceleration_adaptive_target_rate_consistent(_adaptive_cfg(0.125)).passed
+
+
+def test_adaptive_target_rate_still_warns_above_and_below_the_budget():
+    checker = ConfigHealthChecker()
+    for rate in (0.5, 0.02):
+        result = checker.check_acceleration_adaptive_target_rate_consistent(_adaptive_cfg(rate))
+        assert result.passed is False and result.severity == "warning", rate
+
+
+def test_adaptive_target_rate_without_acs_expects_the_nominal_rate():
+    checker = ConfigHealthChecker()
+    no_acs = _adaptive_cfg(0.195, center_fraction=0.0)
+    assert checker.check_acceleration_adaptive_target_rate_consistent(no_acs).passed is False
+    assert checker.check_acceleration_adaptive_target_rate_consistent(
+        _adaptive_cfg(0.125, center_fraction=0.0)
+    ).passed

@@ -164,7 +164,7 @@ def test_the_check_is_wired_into_the_audit_run() -> None:
     """An unwired check is the facade this repo polices.
 
     check_workflow_signal_domain existing but never being called would be
-    exactly the "landed but unwired" shape (severity_calibration.py, #279).
+    exactly the "landed but unwired" shape (#279).
     """
     import inspect
 

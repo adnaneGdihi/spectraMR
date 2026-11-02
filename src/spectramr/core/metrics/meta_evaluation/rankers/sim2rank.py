@@ -105,7 +105,7 @@ def _kendall_tau(x: torch.Tensor, y: torch.Tensor) -> float:
     if n_pairs < 1:
         return 0.0
     concordance = (sign_x * sign_y)[tri].sum().item()
-    return concordance / n_pairs
+    return float(concordance) / n_pairs
 
 
 def _midranks(x: torch.Tensor) -> torch.Tensor:
@@ -299,7 +299,7 @@ def _increment_perplexity(grads: torch.Tensor) -> float:
 
             This is deliberately **not** invariant to reparameterising the severity grid.
             Saturation is only meaningful relative to a severity axis that means something;
-            that is what :mod:`scripts.sim2rank.severity_calibration` establishes (#245).
+            damage bands (:mod:`spectramr.core.metrics.meta_evaluation.damage`) give it one (#245).
             On a unitless index, any saturation measure can be reparameterised away —
             which is the real content of critique L1.
     """
@@ -460,7 +460,7 @@ def _dataset_axes(
     stamp = (id(dataset.samples), len(dataset.samples))
     cached = getattr(dataset, "_axes_cache", None)
     if cached is not None and cached[0] == stamp:
-        return cached[1]
+        return tuple(cached[1])
 
     samples = dataset.samples
     thetas = [float(s.severity.get("theta", 0.0)) for s in samples]
@@ -479,7 +479,7 @@ def _dataset_axes(
         flat_index.append(pair * n_sev + sev_index[theta])
 
     payload = (severities, contents, families, flat_index)
-    dataset._axes_cache = (stamp, payload)
+    dataset._axes_cache = (stamp, payload)  # type: ignore[attr-defined]
     return payload
 
 

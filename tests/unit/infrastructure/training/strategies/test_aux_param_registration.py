@@ -33,9 +33,6 @@ from spectramr.infrastructure.training.strategies.girf_aware_strategy import (
 from spectramr.infrastructure.training.strategies.physics_equivariant_ssl_strategy import (
     PhysicsEquivariantSSLStrategy,
 )
-from spectramr.infrastructure.training.strategies.universal_reconstruction_strategy import (
-    UniversalReconstructionStrategy,
-)
 
 
 def _env_with_opt():
@@ -85,16 +82,6 @@ class TestAuxParamRegistration:
         after = _param_ids(s.env.opt_g)
         assert after - before, "ParameterEstimator params were not added to opt_g"
         assert all(id(p) in after for p in est.parameters())
-
-    def test_universal_recon_prompt_embedder_registered(self):
-        s = object.__new__(UniversalReconstructionStrategy)
-        s.env = _env_with_opt()
-        s.device = torch.device("cpu")
-        before = _param_ids(s.env.opt_g)
-        emb = s._get_prompt_embedder(4)
-        after = _param_ids(s.env.opt_g)
-        assert after - before, "PhysicsPromptEmbedding params were not added to opt_g"
-        assert all(id(p) in after for p in emb.parameters())
 
     def test_physics_eq_ssl_lazy_projection_registered(self):
         s = object.__new__(PhysicsEquivariantSSLStrategy)

@@ -18,6 +18,7 @@ shared k-space diffusion machinery. Pure helpers hold the testable math.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 import torch
@@ -66,8 +67,15 @@ def compute_field_guided_diffusion_loss(
     *,
     alphas_cumprod: torch.Tensor,
     guidance_prob: float = 0.1,
+    fold_image_losses: Callable[
+        [torch.Tensor, torch.Tensor, dict[str, torch.Tensor]], torch.Tensor | None
+    ]
+    | None = None,
 ) -> dict[str, torch.Tensor]:
-    """ε-matching loss with per-sample field dropout (the CFG training rule)."""
+    """ε-matching loss with per-sample field dropout (the CFG training rule).
+
+    ``fold_image_losses(x0_hat, x0, components)`` adds declared image losses on the x0 estimate.
+    """
     x0 = batch["target"]
     src = batch["input"]
     b_t = batch["field_strength_target"]
@@ -87,7 +95,16 @@ def compute_field_guided_diffusion_loss(
         contrast_id=batch.get("contrast_id"),
     )
     loss = torch.mean((eps - noise) ** 2)
-    return {"loss_total": loss, "loss_eps": loss}
+    components = {"loss_eps": loss}
+    total = loss
+    if fold_image_losses is not None:
+        # Same x0 estimate (and clamp) as the sampler's per-step update.
+        a_t = alphas_cumprod[t].reshape(-1, 1, 1, 1)
+        x0_hat = ((x_t - (1.0 - a_t).sqrt() * eps) / a_t.sqrt().clamp_min(1e-6)).clamp(-1.0, 2.0)
+        aux = fold_image_losses(x0_hat, x0, components)
+        if aux is not None:
+            total = total + aux
+    return {"loss_total": total, **components}
 
 
 @torch.no_grad()
@@ -161,9 +178,11 @@ def field_guided_sample(
 class FieldGuidedDiffusionStrategy(ReconstructionTrainingStrategy):
     """Train a source-conditioned, continuous-field-guided diffusion model (B-3.5)."""
 
-    #: Loss ownership (mrixfields review 2026-09-03): computes its objective inline and folds NOTHING else: any other declared image loss is a decoy.
+    #: Loss ownership (mrixfields review 2026-09-03): the eps-matching term is computed inline; declared
+    #: ``losses.image_losses`` are folded onto the x0 estimate the sampler also uses (against the target).
     inline_losses: ClassVar[frozenset[str] | None] = frozenset()
-    folds_image_losses: ClassVar[bool | None] = False
+    folds_image_losses: ClassVar[bool | None] = True
+    empty_loss_stack_is_design: ClassVar[bool] = True
 
     def _setup_strategy_specific_components(self) -> None:
         self._verify_strategy_config(expected_modes=("field_guided_diffusion", "reconstruction"))
@@ -206,6 +225,9 @@ class FieldGuidedDiffusionStrategy(ReconstructionTrainingStrategy):
             batch,
             alphas_cumprod=acp,
             guidance_prob=getattr(self, "_fgd_guidance_prob", 0.1),
+            fold_image_losses=lambda pred, target, comps: self._apply_builder_image_losses(
+                pred, target, comps
+            ),
         )
 
     def validation_step(

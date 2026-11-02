@@ -185,9 +185,15 @@ class ModelEma(nn.Module):
 
             effective_decay = min(decay, (1 + num_updates) / (10 + num_updates))
         """
+        from spectramr.infrastructure.distributed.tensor_parallel import (
+            tensor_parallel_local_state,
+        )
+
         self.num_updates += 1
         decay = self._current_decay()
-        with torch.no_grad():
+        # Local state: a tensor-parallel shadow is split like the live model, so the
+        # blend is slice against slice, without gathering every split weight per step.
+        with torch.no_grad(), tensor_parallel_local_state():
             msd = model.state_dict()
             esd = self.module.state_dict()
             # Blend in fused ``_foreach_lerp_`` batches instead of two kernel

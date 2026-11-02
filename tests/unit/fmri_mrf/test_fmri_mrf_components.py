@@ -154,16 +154,13 @@ class _ScoreStub(nn.Module):
 
 
 def test_spatiotemporal_adaptive_sfc_recon_smoke() -> None:
-    from spectramr.infrastructure.physics.manifolds.beltrami_4d import (
-        SeparableBeltrami4DSolver,
-    )
     from spectramr.infrastructure.training.strategies.fmri_kspace_strategies import (
         SpatiotemporalAdaptiveSFCReconStrategy,
     )
     s = _alloc(SpatiotemporalAdaptiveSFCReconStrategy, _Identity())
     s.lambda_mu = 0.01
     s.lambda_T = 0.01
-    s.solver = SeparableBeltrami4DSolver(planar_max_iter=4, tol=1e-2)
+    s.lambda_l1 = 10.0
     x = torch.randn(1, 1, 4, 8, 8)
     out = s._compute_losses_impl(x, x, epoch=0)
     assert torch.isfinite(out["g_total_loss"])
@@ -323,19 +320,26 @@ def test_conformal_mrf_dictless_recon_smoke() -> None:
 
 
 def test_crlb_mrf_pulse_design_smoke() -> None:
+    from spectramr.infrastructure.physics.acquisition.mrf_acquisition_manifold import (
+        AcquisitionBound,
+    )
     from spectramr.infrastructure.training.strategies.mrf_acquisition_strategies import (
         CRLBMRFPulseDesignStrategy,
     )
+    from spectramr.infrastructure.training.strategies.rng_streams import (
+        rank_seeded_generator,
+    )
+    from spectramr.models.generators.mrf_pulse_design import MRFPulseDesign
 
-    class _PulseHead(nn.Module):
-        def forward(self, x, *a, **kw):
-            return torch.randn(x.shape[0], 8, 2, requires_grad=True)
-
-    s = _alloc(CRLBMRFPulseDesignStrategy, _PulseHead())
+    s = _alloc(
+        CRLBMRFPulseDesignStrategy,
+        MRFPulseDesign(n_tr=8, alpha_init_rad=1.0, tr_init_ms=10.0),
+    )
     s.lambda_beltrami = 1e-3
-    x = torch.randn(2, 8, 2)
-    params = torch.tensor([[1.0, 0.1, 1.0, 0.0, 1.0], [2.0, 0.2, 1.0, 0.0, 1.0]])
-    out = s._compute_losses_impl(x, params, epoch=0)
+    s.t1_range_ms, s.t2_range_ms, s.prior_samples, s.te_ms = (100.0, 3000.0), (20.0, 500.0), 8, 2.0
+    s.bound = AcquisitionBound(4.0, 200.0)
+    s._prior_rng = rank_seeded_generator(0)
+    out = s._compute_losses_impl(torch.randn(2, 8), torch.randn(2, 8), epoch=0)
     assert torch.isfinite(out["g_total_loss"])
 
 
@@ -348,6 +352,7 @@ def test_cross_scanner_mrf_harmonisation_smoke() -> None:
     s = _alloc(CrossScannerMRFHarmonisationStrategy, model)
     s.tau_eps = 0.1
     s.lambda_anchor = 1e-3
+    s.requires_scanner_id = False
     observed = torch.randn(2, 32)
     canonical = torch.randn(2, 32)
     out = s._compute_losses_impl(observed, canonical, epoch=0)

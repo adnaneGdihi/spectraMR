@@ -38,10 +38,16 @@ _PROCESS_MEMO: BoundedLRUCache[tuple[Any, ...], Any] = BoundedLRUCache()
 # ---------------------------------------------------------------------------
 # config parsing — shared with scripts/ci/check_acceleration_ladder_realisable.py (the horizon is imported from here)
 # ---------------------------------------------------------------------------
+#: ``cold_diffusion`` is the Gaussian-noise ``ColdDiffusionGenerator``: its forward process is
+#: ``q_sample`` and it builds no mask cascade, so the ladder witnesses have nothing to certify.
+_NO_MASK_LADDER = frozenset({"cold_diffusion"})
+
+
 def _is_cold_diffusion(doc: dict) -> bool:
     model = doc.get("model") or {}
     kwargs = model.get("model_kwargs") or {}
-    return "cold_diffusion" in str(model.get("model_type") or "") or (
+    model_type = str(model.get("model_type") or "")
+    return ("cold_diffusion" in model_type and model_type not in _NO_MASK_LADDER) or (
         "cold_diffusion" in str(kwargs.get("process_type") or "")
     )
 

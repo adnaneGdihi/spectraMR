@@ -514,17 +514,17 @@ def synthesise_pairs(
 
     Each volume is written twice -- the degraded ``primary`` and the clean ``target``
     -- on the SAME grid, because a paired restoration set needs input and target
-    voxel-aligned. Writes go through the data layer's ``write_slice_first_nifti`` and
-    are read back with ``verify_slice_first_nifti``: a silently transposed write would
-    hand the downstream arm a cut through the wrong plane.
+    voxel-aligned. Writes are slice-LAST, the layout the paired-NIfTI loader slices, and
+    are read back with ``verify_slice_last_nifti``: a transposed write would hand the
+    downstream arm a cut through the wrong plane.
 
     Returns the manifest path, which the downstream arm consumes via
     ``data.paired_manifest_path``.
     """
     from spectramr.data.nifti_export import (
         VoxelGeometry,
-        verify_slice_first_nifti,
-        write_slice_first_nifti,
+        verify_slice_last_nifti,
+        write_slice_last_nifti,
     )
     from spectramr.data.reference_volume import load_reference_volume
     from spectramr.infrastructure.physics.quality_descriptors import resample_to_spacing
@@ -569,10 +569,10 @@ def synthesise_pairs(
             slice_gap_assumed_zero=True,
             source="quality_matching_synthesis",
         )
-        lq_path = write_slice_first_nifti(lq_dir / f"{stem}.nii.gz", degraded, geom)
-        hq_path = write_slice_first_nifti(hq_dir / f"{stem}.nii.gz", volume, geom)
-        verify_slice_first_nifti(lq_path, degraded)
-        verify_slice_first_nifti(hq_path, volume)
+        lq_path = write_slice_last_nifti(lq_dir / f"{stem}.nii.gz", degraded, geom)
+        hq_path = write_slice_last_nifti(hq_dir / f"{stem}.nii.gz", volume, geom)
+        verify_slice_last_nifti(lq_path, degraded, geom.zooms())
+        verify_slice_last_nifti(hq_path, volume, geom.zooms())
 
         records.append(
             {

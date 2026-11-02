@@ -148,3 +148,10 @@ class SafetensorsCodec:
                 f"(written before schema 1). Convert the run first: python {CONVERTER} <run_dir>"
             )
         return _decode(json.loads(metadata[STATE_KEY]), tensors)
+
+    def model_state_keys(self, path: Path, model: str) -> list[str]:
+        """``model``'s state-dict keys, from the tensor names alone (no tensor is read)."""
+        prefix = f"models.{model}."
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            wheres = [name.partition(":")[2] for name in handle.keys()]  # noqa: SIM118
+        return [where[len(prefix) :] for where in wheres if where.startswith(prefix)]

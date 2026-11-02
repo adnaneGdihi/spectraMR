@@ -96,16 +96,24 @@ Models with ``training_mode="reconstruction"``. These models typically map an in
 
       def __init__(
           self,
-          in_channels: int = 2,
-          out_channels: int = 2,
+          in_channels: int = 1,
+          out_channels: int = 1,
           img_size: tuple[int, int] = (256, 256),
           num_unrolls: int = 5,
           features: int = 64,
           kernel_size: int = 3,
-          lambda_dc: float = 0.1,
+          lambda_dc: float = 1.0,
           num_coils: int = 1,
           activation: str = "relu",
+          output_activation: str = "tanh",
+          residual: bool = False,
+          learnable_dc: bool = False,
       ):
+
+   ``residual: true`` makes each regulariser refine the estimate (``x + r(x)``, last conv
+   zero-initialised) rather than replace it. ``learnable_dc: true`` trains one soft-DC
+   step per unroll as ``softplus(raw)``, initialised at ``lambda_dc``. Both default off,
+   which is what every existing arm ran.
 
 **VarNet (Variational Network)**
    - **Registry Name:** ``varnet``
@@ -1338,7 +1346,8 @@ Models with ``training_mode="diffusion"``. These are typically denoising network
 **Stable Diffusion Adapter**
    - **Registry Name:** ``stable_diffusion_adapter``
    - **Class:** ``spectramr.models.generators.stable_diffusion_adapter_generator.StableDiffusionAdapterGenerator``
-   - **Description:** Adapter wrapper for leveraging pre-trained Stable Diffusion models.
+   - **Description:** From-scratch SD-style UNet built from torch primitives; it loads no
+     pretrained weights and builds no adapter. Use ``pretrained_sd_adapter`` for those.
 
    .. code-block:: python
 
@@ -1353,12 +1362,39 @@ Models with ``training_mode="diffusion"``. These are typically denoising network
           hidden_dim: int = 320,
       ):
 
+**Pretrained Stable Diffusion Adapter**
+   - **Registry Name:** ``pretrained_sd_adapter``
+   - **Class:** ``spectramr.models.generators.pretrained_sd_adapter.PretrainedSDAdapterGenerator``
+   - **Description:** Loads a Stable Diffusion 1.x/2.x ``UNet2DConditionModel`` with
+     ``diffusers`` ``from_pretrained`` (``base_model_path``: hub id or a local directory
+     holding ``unet/``), freezes it (``freeze_backbone``) and re-sizes ``conv_in``/``conv_out``
+     to the MRI channel count. The measurement arrives through
+     ``training.diffusion.condition_on_input: true``; ``adapter_type: controlnet`` feeds it
+     to a trainable ControlNet copy of the encoder, ``adapter_type: concat`` to ``conv_in``.
+     Requires the ``.[diffusion]`` extra.
+
+   .. code-block:: python
+
+      def __init__(
+          self,
+          in_channels: int = 2,
+          out_channels: int = 1,
+          base_model_path: str = "stabilityai/stable-diffusion-2-1-base",
+          adapter_type: str = "controlnet",
+          freeze_backbone: bool = True,
+          unet: nn.Module | None = None,
+      ):
+
 **Laplace Diffusion**
 
 **Cascaded Diffusion**
    - **Registry Name:** ``cascaded_diffusion``
    - **Class:** ``spectramr.models.generators.cascaded_diffusion_generator.CascadedDiffusionGenerator``
-   - **Description:** Wrapper for standard U-Net to support cascaded diffusion (e.g., low-res conditioning).
+   - **Description:** Two-stage spectral cascade of time-conditioned U-Nets, trained by
+     ``CascadedDiffusionStrategy`` (``training_mode: cascaded_diffusion``). Stage 1 denoises
+     the k-space low-pass circle of the image; stage 2 denoises the high-pass residual,
+     conditioned on the stage-1 output. ``stage_1: {kspace_filter: all_pass}`` with
+     ``stage_2: null`` is the single-stage control.
 
    .. code-block:: python
 
@@ -1366,9 +1402,10 @@ Models with ``training_mode="diffusion"``. These are typically denoising network
           self,
           in_channels: int = 1,
           out_channels: int = 1,
-          features: tuple[int, ...] = (64, 128, 256, 512),
-          low_res_conditioning: bool = False,
-          **kwargs,
+          features: tuple[int, ...] | list[int] = (32, 64, 128, 256),
+          time_dim: int = 256,
+          stage_1: Mapping[str, Any] | None = None,  # kspace_filter: low_pass_circle | all_pass; cutoff_frequency
+          stage_2: Mapping[str, Any] | None = None,  # input_conditioning: stage_1_output; prediction_target: high_pass_residual
       ):
 
 
@@ -2443,6 +2480,11 @@ VAE / VQ family
 
 **MoE VAE** — ``moe_vae`` (``spectramr.models.vae.moe_vae.MoEVAE``) — top-1
    gated expert routing with load-balancing loss (Shazeer et al., 2017).
+
+**Single-decoder VAE** — ``single_decoder_vae``
+   (``spectramr.models.vae.single_decoder_vae.SingleDecoderVAE``) — ``moe_vae``'s
+   trunk with one dense decoder of width ``decoder_hidden``; the width-matched
+   control for ``moe_vae``.
 
 **Hierarchical VQ-VAE (VQ-VAE-2)** — ``hierarchical_vq_vae``
    (``spectramr.models.vq.hierarchical_vq_vae.HierarchicalVQVAE``) — two-level

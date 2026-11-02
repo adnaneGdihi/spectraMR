@@ -71,3 +71,18 @@ def test_strategy_kwarg_detection_sees_named_param() -> None:
     )
 
     assert _callable_accepts_kwarg(_model().forward, "sfc_indices")
+
+
+def test_soft_perm_without_indices_raises() -> None:
+    m = _model().eval()
+    n = m.grid_size**2
+    with pytest.raises(ValueError, match="requires the sfc_indices"):
+        m(torch.randn(2, 1, 32, 32), sfc_soft_perm=torch.eye(n).expand(2, n, n))
+
+
+def test_soft_perm_shape_mismatch_raises() -> None:
+    m = _model().eval()
+    n = m.grid_size**2
+    idx = torch.arange(n).unsqueeze(0).expand(2, n)
+    with pytest.raises(ValueError, match="sfc_soft_perm must have shape"):
+        m(torch.randn(2, 1, 32, 32), sfc_indices=idx, sfc_soft_perm=torch.eye(4).expand(2, 4, 4))

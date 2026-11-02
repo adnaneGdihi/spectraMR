@@ -24,14 +24,26 @@ from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
 
 from ..utils.training_utils import clamp_to_range
 from .equivariant_imaging_ops import aligned_validation_context
+from .generator_artifact_hooks import (
+    auxiliary_loss_keys,
+    corrupted_input_metrics,
+    fold_auxiliary_losses,
+)
 from .loss_folding import (
     declared_inline_losses,
     declared_loss_weights,
     fold_builder_image_losses,
     inline_managed_with,
 )
+from .mixins.contrast_forwarding import (
+    AcquisitionLookup,
+    align_contrast_rows,
+    bloch_loss_context,
+    contrast_inputs,
+    declared_acquisition_lookup,
+)
 from .mixins.reconstruction import AUX_KEY_MAPPING, _as_aux_mapping
-from .mixins.utils import _callable_accepts_kwarg, pick_present
+from .mixins.utils import _callable_accepts_kwarg, _names_parameter, pick_present
 from .tall_locality import add_tall_locality, arm_tall_locality, tall_locality_term
 from .validation_chunking import forward_in_chunks, reconstruction_output
 
@@ -166,6 +178,7 @@ class ReconstructionStepMixin:
         keys = set(parent() if callable(parent) else ())
         if self.config.model.model_type == "evidential_unet":
             keys.add("nig_epistemic_var")
+        keys |= auxiliary_loss_keys(getattr(self.env, "generator", None) if self.env else None)
         return frozenset(keys)
 
     def _setup_strategy_specific_components(self) -> None:
@@ -310,6 +323,7 @@ class ReconstructionStepMixin:
             loss_context["loss_mask"] = batch_context["loss_mask"]
         if nig_params is not None:
             loss_context["nig_params"] = nig_params
+        loss_context.update(bloch_loss_context(unwrap_model(self.env.generator)))
 
         loss_output = self.loss_computer.compute(
             pred=eval_fakes,
@@ -327,9 +341,8 @@ class ReconstructionStepMixin:
 
         # Build result dict from computed losses
         self._loss_dict_reuse.clear()
-        if total_loss is None:
-            total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         total_loss = add_tall_locality(total_loss, self._loss_dict_reuse, locality)
+        total_loss = fold_auxiliary_losses(self.env.generator, total_loss, self._loss_dict_reuse)
         self._loss_dict_reuse["g_total_loss"] = total_loss
         self._loss_dict_reuse.update(components)
         if nig_params is not None:
@@ -881,7 +894,14 @@ class ReconstructionStepMixin:
             # this injection the renderer raised "missing 1 required keyword-only
             # argument: 'field_strength'" -> zero successful validation batches
             # (CLAUDE.md #10).
-            if _callable_accepts_kwarg(generator_forward, "field_strength"):
+            if _names_parameter(generator_forward, "field_strength_target"):
+                # A two-field forward (source ``field_strength`` + ``field_strength_target``)
+                # reads each field under its own name; the target-first rule below would feed
+                # it the target twice (#197).
+                for key in ("field_strength", "field_strength_target"):
+                    if batch_context.get(key) is not None:
+                        forward_kwargs[key] = batch_context[key]
+            elif _callable_accepts_kwarg(generator_forward, "field_strength"):
                 fs = batch_context.get("field_strength_target", batch_context.get("field_strength"))
                 if fs is not None:
                     forward_kwargs["field_strength"] = fs
@@ -889,8 +909,45 @@ class ReconstructionStepMixin:
                 generator_forward, "contrast_id"
             ):
                 forward_kwargs["contrast_id"] = batch_context["contrast_id"]
+            forward_kwargs.update(
+                self._contrast_idx_kwargs(
+                    generator_forward,
+                    pick_present(*(batch_context.get(k) for k in AUX_KEY_MAPPING["contrast_id"])),
+                    lr_image.shape[0],
+                )
+            )
 
         return lr_image, forward_kwargs
+
+    #: Built on first use from ``data.multi_contrast.acquisition_params`` (#2410).
+    _acquisition_lookup: AcquisitionLookup | None = None
+
+    def _contrast_idx_kwargs(
+        self, generator_forward: Any, contrast: torch.Tensor | None, rows: int
+    ) -> dict[str, Any]:
+        """``contrast_idx`` and ``acquisition_params`` for a forward that names them (#2410).
+
+        A bare ``**kwargs`` does not opt in: a backbone alias would pass them on to
+        a network that rejects them. ``data.multi_contrast.enabled`` is the switch, so
+        an arm with it off trains the same network unconditioned.
+        """
+        multi_contrast = self.config.data.multi_contrast
+        takes_idx, takes_acq = contrast_inputs(generator_forward, multi_contrast)
+        if not (takes_idx or takes_acq):
+            return {}
+        if contrast is None:
+            raise ValueError(
+                "data.multi_contrast.enabled is true and the generator takes "
+                "contrast_idx, but the batch carries no contrast id; the model would "
+                "train unconditioned."
+            )
+        contrast = align_contrast_rows(contrast, rows)
+        kwargs: dict[str, Any] = {"contrast_idx": contrast} if takes_idx else {}
+        if takes_acq and multi_contrast.acquisition_params:
+            if self._acquisition_lookup is None:
+                self._acquisition_lookup = declared_acquisition_lookup(multi_contrast)
+            kwargs["acquisition_params"] = self._acquisition_lookup(contrast)
+        return kwargs
 
     def _declared_im_size(self, batch_context: dict[str, Any]) -> Any:
         """Image grid for the NUFFT adjoint: the target's, else the generator's, else 256.
@@ -1189,7 +1246,8 @@ class ReconstructionTrainingStrategy(
 
     # parallel_compat: a permission is never inherited (strategy_compat), so the
     # strategy declares its own; the FSDP arm is workflow_baselines/b2_structural_recon_m4raw_fsdp.yaml.
-    parallel_compat = frozenset({"replicated", "sharded"})
+    # "pipelined": one optimizer over the generator's forward, no discriminator.
+    parallel_compat = frozenset({"replicated", "sharded", "pipelined"})
 
     # Domain axes this paradigm can populate from the batch (via data.expose_*).
     # Widens ConditioningMixin's empty default so model.conditioning passes the
@@ -1261,7 +1319,22 @@ class ReconstructionTrainingStrategy(
                     "measured_kspace": None,
                     "contrast_id": contrast,
                 }
-        return super().validation_step(input_batch, target_batch, batch_data=batch_data, **kwargs)
+        metrics = super().validation_step(input_batch, target_batch, batch_data=batch_data, **kwargs)
+
+        def corrupted_pass() -> dict[str, Any]:
+            # The held-out test writer renders the clean prediction only.
+            writer = getattr(self, "_test_slice_writer", None)
+            self._test_slice_writer = None
+            try:
+                return super(ReconstructionTrainingStrategy, self).validation_step(
+                    input_batch, target_batch, batch_data=batch_data, **kwargs
+                )
+            finally:
+                self._test_slice_writer = writer
+
+        generator = getattr(self.env, "generator", None) if self.env else None
+        metrics.update(corrupted_input_metrics(generator, metrics, corrupted_pass))
+        return metrics
 
     def _validation_loss(
         self,

@@ -341,16 +341,20 @@ def test_spectroscopy_declares_the_spectrum_domain_not_image_or_kspace() -> None
     )
 
 
-def test_flow_is_live_with_a_real_operator_and_strategy() -> None:
-    """mri_flow reached LIVE: `phase_contrast` operator + a FLOW-tagged strategy.
+def test_flow_is_live_on_the_fourier_operator_and_the_pc_signal_model() -> None:
+    """mri_flow is LIVE on a split forward model: linear Fourier + nonlinear encoding.
 
-    Pinned like the structural baseline, so a silent downgrade fails. Both LIVE
-    clauses are satisfied honestly here — pc_adjoint is a TRUE inverse within
-    |v| < venc, not a stand-in for one.
+    Each velocity encoding is a multicoil Fourier acquisition; the encoding
+    ``v -> m exp(i pi v / venc)`` has an inverse within ``|v| < venc`` but no
+    adjoint, so it is a signal model and must not sit in the OperatorRegistry.
     """
     profile = WORKFLOW_PROFILES[Regime.FLOW]
     assert profile.maturity is Maturity.LIVE
-    assert operator_registered(profile.forward_operator)  # "phase_contrast"
+    assert profile.forward_operator == "multi_coil_fft"
+    assert operator_registered(profile.forward_operator)
+    assert profile.signal_model == "phase_contrast"
+    assert signal_model_registered(profile.signal_model)
+    assert not operator_registered("phase_contrast")
     assert strategies_tagged(Regime.FLOW)
     assert losses_tagged(Regime.FLOW)
     assert metrics_tagged(Regime.FLOW)

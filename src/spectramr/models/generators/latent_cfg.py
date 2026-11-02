@@ -22,6 +22,10 @@ but not guided stays on in every term, so a single-axis control keeps its
 contrast conditioning at sampling, as it had in training. The 1+k predictions
 run as one batched U-Net call.
 
+``cfg_schedule`` makes each guided weight time-varying: at reverse progress
+:math:`\tau \in [0, 1]` (0 = highest noise) the weight is :math:`w_i\,s_i(\tau)`,
+with :math:`s_i` built by :func:`~spectramr.models.blocks.cfg_schedule.make_schedule`.
+
 Absent knobs reproduce the generator's historical behaviour exactly: a 10%
 drop of the ULF condition, drawn with the same ``torch.bernoulli`` call, and
 unguided sampling.
@@ -34,6 +38,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from spectramr.models.blocks.cfg_schedule import PerAxisSchedule, make_per_axis_schedule
 from spectramr.models.blocks.multi_axis_cfg import MultiAxisCFGMixin
 
 __all__ = [
@@ -44,6 +49,7 @@ __all__ = [
     "axis_keep_masks",
     "guided_noise",
     "resolve_latent_cfg",
+    "reverse_progress",
 ]
 
 #: Axes the latent ULF->HF path can condition on, in the order masks are drawn.
@@ -64,13 +70,19 @@ class LatentCFGSpec:
 
     drop_probs: Mapping[str, float] = field(default_factory=dict)
     weights: Mapping[str, float] = field(default_factory=dict)
+    schedule: PerAxisSchedule | None = None
+    schedule_spec: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
 
     @property
     def guided(self) -> bool:
         return any(w != 0.0 for w in self.weights.values())
 
     def to_dict(self) -> dict[str, dict[str, float]]:
-        return {"cfg_drop_probs": dict(self.drop_probs), "cfg_weights": dict(self.weights)}
+        return {
+            "cfg_drop_probs": dict(self.drop_probs),
+            "cfg_weights": dict(self.weights),
+            "cfg_schedule": {axis: dict(spec) for axis, spec in self.schedule_spec.items()},
+        }
 
 
 def _check_axes(name: str, mapping: Mapping[str, object], available: set[str]) -> None:
@@ -96,8 +108,9 @@ def resolve_latent_cfg(
     *,
     has_condition: bool,
     has_contrast: bool,
+    schedule: Mapping[str, object] | None = None,
 ) -> LatentCFGSpec:
-    """Validate ``cfg_drop_probs`` / ``cfg_weights``; unknown or unusable axes raise."""
+    """Validate ``cfg_drop_probs`` / ``cfg_weights`` / ``cfg_schedule``; unknown or unusable axes raise."""
     available = {a for a, on in (("condition", has_condition), ("contrast", has_contrast)) if on}
     if drop_probs is None:
         drops = {"condition": LEGACY_CONDITION_DROP} if has_condition else {}
@@ -126,7 +139,32 @@ def resolve_latent_cfg(
                     "training, so its null branch is untrained. Set cfg_drop_probs for it."
                 )
             guide[axis] = w
-    return LatentCFGSpec(drop_probs=drops, weights=guide)
+    sched_spec: dict[str, Mapping[str, object]] = {}
+    if schedule is not None:
+        if not isinstance(schedule, Mapping):
+            raise ValueError(f"cfg_schedule must be a mapping of axis -> spec; got {schedule!r}.")
+        for axis, spec in schedule.items():
+            if guide.get(axis, 0.0) == 0.0:
+                raise ValueError(
+                    f"cfg_schedule[{axis!r}] modulates an axis that cfg_weights does not "
+                    f"guide, so it would never act. Guided axes: {sorted(guide)}."
+                )
+            if not isinstance(spec, Mapping):
+                raise ValueError(f"cfg_schedule[{axis!r}] must be a mapping; got {spec!r}.")
+            sched_spec[axis] = dict(spec)
+    return LatentCFGSpec(
+        drop_probs=drops,
+        weights=guide,
+        schedule=make_per_axis_schedule(sched_spec),
+        schedule_spec=sched_spec,
+    )
+
+
+def reverse_progress(t: int, n_total: int) -> float:
+    """Reverse-chain progress of timestep ``t``: 0 at ``t = n_total - 1``, 1 at ``t = 0``."""
+    if n_total <= 1:
+        return 1.0
+    return (n_total - 1 - int(t)) / (n_total - 1)
 
 
 def axis_keep_masks(
@@ -198,8 +236,12 @@ def guided_noise(
     cond_latent: torch.Tensor | None,
     contrast_available: bool,
     spec: LatentCFGSpec,
+    progress: float = 0.0,
 ) -> torch.Tensor:
-    """The multi-axis CFG noise estimate for one reverse step (2-D latents)."""
+    """The multi-axis CFG noise estimate for one reverse step (2-D latents).
+
+    ``progress`` is :func:`reverse_progress` of this step; only ``spec.schedule`` reads it.
+    """
     conditions: dict[str, torch.Tensor | None] = {}
     if "condition" in spec.weights:
         conditions["condition"] = cond_latent
@@ -208,4 +250,6 @@ def guided_noise(
             torch.ones(z_t.shape[0], device=z_t.device) if contrast_available else None
         )
     guide = LatentCFGGuide(denoise, timesteps, cond_latent, contrast_available)
-    return guide.cfg_sample_step(z_t, conditions, dict(spec.weights))
+    return guide.cfg_sample_step(
+        z_t, conditions, dict(spec.weights), schedule=spec.schedule, t=progress
+    )

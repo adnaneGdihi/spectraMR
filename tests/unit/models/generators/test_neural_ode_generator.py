@@ -114,51 +114,21 @@ def test_forward_attempts_no_module_import() -> None:
     )
 
 
-def test_the_absence_of_torchdiffeq_is_a_named_flag_not_a_silent_branch() -> None:
-    """Absent is a state to report, never a state to infer (non-negotiable 18)."""
-    assert hasattr(mod, "HAVE_TORCHDIFFEQ"), (
-        "no HAVE_TORCHDIFFEQ flag: whether the adjoint/adaptive solvers are "
-        "reachable is then undiscoverable from outside forward()."
-    )
-    assert isinstance(mod.HAVE_TORCHDIFFEQ, bool)
+def test_one_integrator_whatever_extras_are_installed() -> None:
+    """Classical RK4 only (#2397): torchdiffeq's "rk4" is the 3/8 rule and dropped ``t_eval``.
 
-
-def test_both_solvers_walk_the_same_grid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``linspace(0, T, steps)`` is ``steps - 1`` intervals, not ``steps``.
-
-    Substitutes a stand-in solver on the module globals so the torchdiffeq branch
-    runs on a host where the real package is absent, and reads the grid the
-    generator actually hands it. ``importlib.reload`` is deliberately NOT used --
-    it re-fires ``@register_model``, which refuses a duplicate name.
+    The final state of the ``t_eval`` trajectory at ``t = T`` must equal the plain
+    forward, and the module must not hold a solver it could switch to.
     """
-    captured: dict[str, torch.Tensor] = {}
-
-    def fake_odeint(func, y0, t, method=None, **kwargs):
-        captured["t"] = t.detach().clone()
-        return torch.stack([y0, y0])
-
-    monkeypatch.setattr(mod, "HAVE_TORCHDIFFEQ", True)
-    monkeypatch.setattr(mod, "odeint", fake_odeint)
-
-    model = NeuralODEGenerator(in_channels=1, out_channels=1, features=8)
-    model.integration_time = 1.0
-    model(torch.randn(1, 1, 16, 16))
-
-    assert "t" in captured, (
-        "HAVE_TORCHDIFFEQ was True and the stand-in solver was never called -- "
-        "forward() is not branching on the module-level flag."
-    )
-    grid = captured["t"]
-    assert grid.numel() == _STEPS + 1, (
-        f"torchdiffeq is handed {grid.numel()} points, i.e. {grid.numel() - 1} "
-        f"intervals of T/{grid.numel() - 1}, while the built-in solver walks "
-        f"{_STEPS} of T/{_STEPS}. The two branches disagree on the discretisation, "
-        "so a result depends on whether an undeclared package happens to be installed."
-    )
-    step = torch.diff(grid)
-    assert torch.allclose(step, torch.full_like(step, 1.0 / _STEPS)), (
-        f"grid is not uniform at T/{_STEPS}: {grid.tolist()}"
-    )
+    assert not hasattr(mod, "odeint") and not hasattr(mod, "HAVE_TORCHDIFFEQ")
+    torch.manual_seed(0)
+    model = NeuralODEGenerator(in_channels=1, out_channels=1, features=8).double()
+    x = torch.randn(1, 1, 16, 16, dtype=torch.float64)
+    with torch.no_grad():
+        final = model(x)
+        traj = model(x, t_eval=torch.tensor([0.5, 1.0], dtype=torch.float64))
+    assert traj.shape == (1, 2, 1, 16, 16)
+    assert torch.allclose(traj[:, -1], final, atol=1e-10)
 
 
 def test_the_registered_name_still_resolves_to_this_class() -> None:

@@ -19,6 +19,7 @@ from spectramr.config.schemas.base import (
 )
 from spectramr.config.schemas.certification import CertificationConfigSchema
 from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
+from spectramr.config.schemas.compression import CompressionExportConfigSchema
 from spectramr.config.schemas.data import DataConfigSchema
 from spectramr.config.schemas.early_stopping import EarlyStoppingConfigSchema
 from spectramr.config.schemas.ema import EMAConfigSchema
@@ -284,6 +285,13 @@ class TrainingSettings(BaseSettings):  # type: ignore[misc]
         description=(
             "Regulatory certification block (R1 CDFC, R2 CHD, R4 PRC, R5 PAC-Bayes, "
             "V.3 validation badge). See spectramr.config.schemas.certification."
+        ),
+    )
+    compression: CompressionExportConfigSchema | None = Field(
+        default=None,
+        description=(
+            "Post-training network compression export (pruning / weight quantization), "
+            "re-scored on the validation pass. See spectramr.config.schemas.compression."
         ),
     )
     parallel: ParallelismConfigSchema | None = Field(

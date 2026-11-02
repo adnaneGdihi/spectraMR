@@ -126,3 +126,27 @@ def test_max_constants_are_documented_values() -> None:
     assert AcquisitionRegistry.MAX_TE == 200.0
     assert AcquisitionRegistry.MAX_TI == 3000.0
     assert AcquisitionRegistry.MAX_B0 == 3.0
+
+
+# ---------------------------------------------------------------------------
+# Strict per-row lookup
+# ---------------------------------------------------------------------------
+
+
+def test_physics_vectors_for_fields_match_per_row_protocol() -> None:
+    """Each row gets the vector of its own field; no row borrows another's."""
+    rows = AcquisitionRegistry.physics_vectors_for_fields("T1w", torch.tensor([3.0, 0.064, 3.0]))
+    assert rows.shape == (3, 4)
+    assert torch.allclose(rows[0], AcquisitionRegistry.get_physics_vector("T1w", "3T")[0])
+    assert torch.allclose(rows[1], AcquisitionRegistry.get_physics_vector("T1w", "64mT")[0])
+
+
+def test_physics_vectors_for_unregistered_field_raises() -> None:
+    """0.3 T has no protocol; the strict lookup refuses instead of borrowing 64 mT."""
+    with pytest.raises(ValueError, match="no registered protocol"):
+        AcquisitionRegistry.physics_vectors_for_fields("T1w", torch.tensor([0.3]))
+
+
+def test_physics_vectors_for_unregistered_contrast_raises() -> None:
+    with pytest.raises(ValueError, match="no registered protocol for contrast 'ADC'"):
+        AcquisitionRegistry.physics_vectors_for_fields("ADC", torch.tensor([3.0]))

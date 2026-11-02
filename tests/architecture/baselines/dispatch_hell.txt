@@ -119,7 +119,6 @@ src/spectramr/models/losses/latent_losses.py::LatentRegularizationLoss.forward  
 src/spectramr/models/losses/optimal_transport_losses.py::SinkhornDistance.forward  # 3 branches
 src/spectramr/models/mamba/d2_mamba.py::D2MambaBlock.forward  # 3 branches
 src/spectramr/models/model_cards.py::ModelCardGenerator.save_model_card  # 3 branches
-src/spectramr/models/model_compression.py::PruningManager.prune_model  # 4 branches
 src/spectramr/models/pipelines/generation_pipeline.py::create_3d_generation_pipeline  # 3 branches
 src/spectramr/models/specialized/fusion_2d_sr_bundle.py::ConcatFusionBlock._build_norm_layer  # 3 branches
 src/spectramr/models/specialized/fusion_2d_sr_bundle.py::MultiSlice2DSRGenerator._build_fusion_block  # 3 branches

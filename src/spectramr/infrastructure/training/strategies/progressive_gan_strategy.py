@@ -24,9 +24,12 @@ import logging
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.gan import GANTrainingStrategy
+from spectramr.infrastructure.training.utils.metric_views import MetricViews
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +168,28 @@ class ProgressiveGANStrategy(GANTrainingStrategy):
         return phase, alpha
 
     # ------------------------------------------------------------------ #
+    # Phase-resolution targets
+    # ------------------------------------------------------------------ #
+    def _to_phase_resolution(self, target: torch.Tensor) -> torch.Tensor:
+        """Box-downsample ``target`` to the generator's active output resolution.
+
+        At phase ``s`` the generator emits ``4 * 2**s`` pixels, so the real batch
+        the critic scores and the target of the reconstruction losses are reduced
+        to that size (Karras et al.), with the same average pooling the
+        discriminator's fade-in path uses (#2385).
+        """
+        res = self.env.generator.current_resolution()
+        if tuple(target.shape[-2:]) == (res, res):
+            return target
+        if target.shape[-2] % res or target.shape[-1] % res:
+            raise ValueError(
+                f"target spatial size {tuple(target.shape[-2:])} is not a multiple of the "
+                f"active ProgressiveGAN resolution {res}; set the patch size to "
+                "model_kwargs.max_resolution."
+            )
+        return F.adaptive_avg_pool2d(target, res)
+
+    # ------------------------------------------------------------------ #
     # Step override
     # ------------------------------------------------------------------ #
     @accepts_step_io
@@ -179,14 +204,12 @@ class ProgressiveGANStrategy(GANTrainingStrategy):
         scaler: Any = None,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
-        """Advance the growth phase, then delegate to the GAN step."""
-        global_step = int(kwargs.get("iteration", kwargs.get("step", iteration)) or 0)
-        phase, alpha = self._apply_phase(global_step)
-        if not hasattr(self, "_last_step_metrics") or self._last_step_metrics is None:
-            self._last_step_metrics = {}
-        self._last_step_metrics["progan_phase"] = float(phase)
-        self._last_step_metrics["progan_alpha"] = float(alpha)
-        return super().train_step(
+        """Advance the growth phase, resize the target to it, then run the GAN step."""
+        phase, alpha = self._apply_phase(resolve_loop_iteration(self))
+        if input_batch is None or target_batch is None:
+            input_batch, target_batch = self._unpack_batch(batch)
+        target_batch = self._to_phase_resolution(self._to_device(target_batch))
+        steps = super().train_step(
             batch,
             epoch,
             input_batch=input_batch,
@@ -196,3 +219,58 @@ class ProgressiveGANStrategy(GANTrainingStrategy):
             scaler=scaler,
             **kwargs,
         )
+        # The base step resets ``_last_step_metrics``, so the phase is recorded after it.
+        self._last_step_metrics["progan_phase"] = float(phase)
+        self._last_step_metrics["progan_alpha"] = float(alpha)
+        return steps
+
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Run the critic at the active phase; score the image metrics at full resolution.
+
+        The critic and the visual capture see the phase-resolution pair, while the
+        metrics compare the prediction upsampled to the target size with the full
+        target, so ``val_psnr`` stays comparable across phases and with
+        full-resolution baselines. ``progan_phase`` is stamped into the result.
+        """
+        full = target_batch
+        if torch.is_complex(full):
+            full = torch.cat([full.real, full.imag], dim=1)
+        self._val_full_target = full
+        try:
+            results = super().validation_step(
+                input_batch, self._to_phase_resolution(target_batch), **kwargs
+            )
+        finally:
+            self._val_full_target = None
+        results["progan_phase"] = float(self.env.generator.current_phase)
+        return results
+
+    def _metric_transform_views(
+        self, pred: torch.Tensor, target: torch.Tensor, metrics_config: Any, **kwargs: Any
+    ) -> MetricViews:
+        full = getattr(self, "_val_full_target", None)
+        if full is not None:
+            target = full.to(pred.device)
+            if pred.shape[-2:] != target.shape[-2:]:
+                pred = F.interpolate(
+                    pred, size=target.shape[-2:], mode="bilinear", align_corners=False
+                )
+        return super()._metric_transform_views(pred, target, metrics_config, **kwargs)
+
+    def _log_validation_images_to_tensorboard(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor,
+        inputs: torch.Tensor,
+        metrics: dict,
+    ) -> None:
+        # The pipeline's visual capture pairs a fresh forward with the full-size target;
+        # handing it this pass's phase-resolution pair keeps the two shapes equal.
+        self._last_visual_pred = predictions.detach()
+        self._last_visual_target = targets.detach()
+        super()._log_validation_images_to_tensorboard(predictions, targets, inputs, metrics)

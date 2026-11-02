@@ -263,3 +263,40 @@ class TestDistributionMetricShapeGuard:
 
         with pytest.raises(ValueError, match="trailing"):
             Wasserstein1D()(torch.rand(1, 1, 128, 128), torch.rand(1, 1, 64, 64))
+
+
+class TestUnsignedAgreementMetrics:
+    """Darkening and brightening are both disagreement; the score must not see the sign."""
+
+    @staticmethod
+    def _score(key: str, pred: torch.Tensor, target: torch.Tensor) -> float:
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        return float(MetricsRegistry.get(key).compute_metric(pred, target))
+
+    @pytest.fixture
+    def target(self) -> torch.Tensor:
+        torch.manual_seed(0)
+        return torch.rand(1, 1, 32, 32) + 0.5
+
+    @pytest.mark.parametrize("key", ["abs_bland_altman_bias", "limits_of_agreement_halfwidth"])
+    def test_darkening_and_brightening_move_the_score_the_same_way(self, key, target) -> None:
+        clean = self._score(key, target, target)
+        torch.manual_seed(1)
+        noise = 0.05 * torch.randn_like(target)
+        dark = self._score(key, 0.7 * target + noise, target) - clean
+        bright = self._score(key, 1.3 * target + noise, target) - clean
+        assert dark > 0 and bright > 0
+
+    def test_the_signed_bias_is_why(self, target) -> None:
+        dark = self._score("bland_altman_bias", 0.7 * target, target)
+        bright = self._score("bland_altman_bias", 1.3 * target, target)
+        assert dark < 0 and bright > 0
+
+    @pytest.mark.parametrize("key", ["abs_bland_altman_bias", "limits_of_agreement_halfwidth"])
+    def test_registered_lower_is_better(self, key) -> None:
+        from spectramr.core.metrics.metric_directions import METRIC_HIGHER_IS_BETTER
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        assert METRIC_HIGHER_IS_BETTER[key] is False
+        assert MetricsRegistry.get(key).higher_is_better is False

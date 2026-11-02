@@ -8,7 +8,9 @@ from typing import Any
 
 import torch
 
+from spectramr.domain.exceptions import ConfigurationError
 from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
+from spectramr.models.losses.weights import resolve_loss_weight
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +54,13 @@ class UnifiedMAELossComputer(BaseLossComputer):
         **kwargs: Any,
     ) -> LossOutput:
         """Standard compute method required by BaseLossComputer."""
-        return self.compute_forward_loss(pred, target, **kwargs)
+        return self.compute_forward_loss(pred, target, iteration=iteration, **kwargs)
 
     def compute_forward_loss(
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
+        iteration: int = 0,
         **kwargs: Any,
     ) -> LossOutput:
         """Compute MAE reconstruction loss (forward pass only, no backward).
@@ -70,38 +73,29 @@ class UnifiedMAELossComputer(BaseLossComputer):
         Returns:
             LossOutput with total loss and component dict.
         """
-        # Reconstruction loss (primary)
+        # Train exactly what the arm declares: weights come from the SSOT table, and a
+        # term it does not declare contributes nothing (#2280).
+        table = self._weight_table
+        if table.get("l2") is None and table.get("l1") is None:
+            # An empty objective would back-propagate zeros and report success (#177).
+            raise ConfigurationError(
+                "UnifiedMAELossComputer: the arm declares neither an mse nor an l1 term, "
+                "so there is no reconstruction objective. Declare one under "
+                "losses.image_losses."
+            )
+        mse_weight = resolve_loss_weight(table, "l2", iteration=iteration, declared_only=True)
+        l1_weight = resolve_loss_weight(table, "l1", iteration=iteration, declared_only=True)
+
         mse_loss = self.mse_loss(pred, target)
-
-        # Optional L1 regularization
         l1_loss = self.l1_loss(pred, target)
-
-        # Weighted combination - use safe weight lookup
-        mse_weight = 1.0
-        l1_weight = 0.1
-
-        try:
-            if (
-                hasattr(self.config, "losses")
-                and self.config.losses
-                and self.config.losses.reconstruction
-            ):
-                recon = self.config.losses.reconstruction
-                mse_weight = recon.lambda_l2 if hasattr(recon, "lambda_l2") else 1.0
-                l1_weight = recon.lambda_l1 if hasattr(recon, "lambda_l1") else 0.1
-        except Exception as _exc:
-            logger.debug("Suppressed exception: %s", _exc)
 
         weighted_mse = mse_loss * mse_weight
         weighted_l1 = l1_loss * l1_weight
-
         total_loss = weighted_mse + weighted_l1
 
-        # Stack components
-        components = {
-            "reconstruction_loss": weighted_mse,
-            "l1_loss": weighted_l1,
-        }
+        components = {"reconstruction_loss": weighted_mse}
+        if l1_weight > 0:
+            components["l1_loss"] = weighted_l1
 
         # Detached tensors, not ``float()``: two device syncs per step for a dict
         # no training-path caller reads.

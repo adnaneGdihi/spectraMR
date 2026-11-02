@@ -684,7 +684,7 @@ class DataPipelineDirector:
         # dict. Route both through the leaf DataLoaderBuilder (its robust collate handles
         # dict samples, incl. the B-1.1 ``sources`` [B,N,1,H,W] tuple), same as the val
         # loader already does. Without this every mrixfields arm crashes at train start.
-        if data_config.dataset_type in ("npy_slice", "mrixfields"):
+        if data_config.dataset_type in ("npy_slice", "mrixfields", "flow_synthetic"):
             # slice_mode='all_slices' expands each container to one sample per foreground
             # depth slice, which is the right sampling but makes a plain shuffled order
             # pathological: every sample becomes a fresh ~226 MB volume decode because the

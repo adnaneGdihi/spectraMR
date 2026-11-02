@@ -13,16 +13,16 @@ PNAS 2020).
 
 The headline one-knob ablation is ``training.certified_robustness.lambda_lipschitz``
 (``0`` = adversarial-training-only control; ``>0`` = certified-robust treatment).
-Unlike the parent, this strategy reads *all* its knobs (epsilon, attack steps,
-clean/adv weights, …) from the ``certified_robustness`` config block rather than
-the hardcoded class attributes (CLAUDE.md pitfall #15), and stamps the resolved
-values + the live certified bound into run provenance.
+The adversarial knobs (epsilon, attack steps, clean/adv weights, ...) are read from
+the ``certified_robustness`` block by the parent; this class reads the Lipschitz
+knobs and stamps them with the live certified bound into run provenance.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import math
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -30,6 +30,7 @@ from spectramr.core.metrics.lipschitz_bound_metrics import (
     ComposedSpectralNormBound,
     MaxLayerSpectralNorm,
 )
+from spectramr.models.capabilities import StrategyCapabilities
 from spectramr.models.losses.lipschitz_penalty import LipschitzSpectralPenalty
 
 from .adversarial_robustness_strategy import AdversarialRobustnessStrategy
@@ -38,17 +39,17 @@ from .adversarial_robustness_strategy import AdversarialRobustnessStrategy
 class CertifiedRobustnessStrategy(AdversarialRobustnessStrategy):
     """Adversarial training + opt-in certified Lipschitz-bound penalty (A-8.3)."""
 
+    capabilities: ClassVar[StrategyCapabilities] = dataclasses.replace(
+        AdversarialRobustnessStrategy.capabilities,
+        emitted_metrics=AdversarialRobustnessStrategy.capabilities.emitted_metrics
+        | {"val_composed_spectral_norm_bound", "val_max_layer_spectral_norm"},
+    )
+    reads_lipschitz_knobs: ClassVar[bool] = True
+
     def _setup_strategy_specific_components(self) -> None:
         super()._setup_strategy_specific_components()
+        # The parent reads the adversarial knobs of this block; the Lipschitz ones are ours.
         cfg = getattr(self.config.training, "certified_robustness", None)
-
-        # Adversarial knobs: read from config, else keep the parent class defaults.
-        if cfg is not None:
-            self.epsilon = float(cfg.epsilon)
-            self.attack_steps = int(cfg.attack_steps)
-            self.attack_norm = str(cfg.attack_norm)
-            self.clean_weight = float(cfg.clean_weight)
-            self.adv_weight = float(cfg.adv_weight)
 
         # Lipschitz certification knobs (the A-8.3 one-knob).
         self._lambda_lipschitz = float(getattr(cfg, "lambda_lipschitz", 0.0)) if cfg else 0.0

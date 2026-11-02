@@ -205,7 +205,24 @@ class TestRng:
         torch.manual_seed(5)
         expected = torch.rand(2)
         torch.manual_seed(5)
-        with patch.object(resume_mod, "dp_rank", lambda: 1):
+        with (
+            patch.object(resume_mod.RankUtility, "is_main_rank", staticmethod(lambda: False)),
+            patch.object(resume_mod, "dp_rank", lambda: 1),
+        ):
+            _resume(path, fresh)
+        assert torch.equal(torch.rand(2), expected)
+
+    def test_a_model_parallel_peer_of_rank_zero_replays_its_stream(self, tmp_path: Path) -> None:
+        """Context/tensor peers of rank 0 (data-parallel index 0) must draw rank 0's noise."""
+        torch.manual_seed(11)
+        path = _save(tmp_path)
+        expected = torch.rand(2)
+        fresh = make_pipeline()
+        torch.manual_seed(5)
+        with (
+            patch.object(resume_mod.RankUtility, "is_main_rank", staticmethod(lambda: False)),
+            patch.object(resume_mod, "dp_rank", lambda: 0),
+        ):
             _resume(path, fresh)
         assert torch.equal(torch.rand(2), expected)
 

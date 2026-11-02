@@ -10,6 +10,7 @@ from spectramr.models.diffusion.cold_rung import (
     RungStatus,
     acceleration_over_acquired,
     level_is_declared,
+    process_rung_mask,
     rung_for_acceleration,
     rung_mask,
     schedule_accelerator,
@@ -112,3 +113,30 @@ def test_acceleration_over_acquired_counts_only_acquired_lines() -> None:
     sampled = torch.zeros(1, 16, dtype=torch.bool)
     sampled[:, 0:8:2] = True  # lines 0, 2, 4, 6; line 0 was never acquired
     assert float(acceleration_over_acquired(sampled, acquired)[0]) == pytest.approx(4.0)
+
+
+class TestProcessRungMask:
+    """A caller that omits the mask gets the arm's cascade or an error, never a guess (#2555)."""
+
+    def test_a_measurement_degraded_at_the_rung_takes_that_rungs_mask(self) -> None:
+        process = P.process()
+        steps = torch.full((2,), P.HEAD, dtype=torch.long)
+        expected = rung_mask(process, steps, P.kspace(), None)[:, :1]
+        measurement = P.kspace() * expected
+        assert torch.equal(process_rung_mask(process, measurement, None), expected)
+
+    def test_zero_lines_inside_the_mask_stay_sampled(self) -> None:
+        process = P.process()
+        steps = torch.full((2,), 4, dtype=torch.long)
+        expected = rung_mask(process, steps, P.kspace(), None)[:, :1]
+        measurement = P.kspace() * expected
+        measurement[..., 0] = 0  # a structurally zero line the non-zero guess would drop
+        assert torch.equal(process_rung_mask(process, measurement, 4), expected)
+
+    def test_a_fully_sampled_measurement_raises(self) -> None:
+        with pytest.raises(ValueError, match="outside the arm's rung"):
+            process_rung_mask(P.process(), P.kspace(), None)
+
+    def test_a_process_without_a_cascade_raises(self) -> None:
+        with pytest.raises(ValueError, match="no Cartesian cascade"):
+            process_rung_mask(object(), P.kspace(), None)

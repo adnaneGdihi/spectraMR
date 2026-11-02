@@ -66,4 +66,18 @@ class SIRENNetwork(nn.Module):
         return self.net(coords)
 
 
-__all__ = ["SIRENLayer", "SIRENNetwork"]
+def kspace_coordinate_grid(height: int, width: int, device: torch.device) -> torch.Tensor:
+    """``[H*W, 2]`` k-space coordinates ``(k_x, k_y)`` on ``[-1, 1]``, row-major over ``(H, W)``.
+
+    The one convention every SIREN-over-k-space consumer reads, so a field fitted by
+    one strategy indexes the same frequencies as another.
+    """
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, height, device=device),
+        torch.linspace(-1, 1, width, device=device),
+        indexing="ij",
+    )
+    return torch.stack([xx.flatten(), yy.flatten()], dim=-1)
+
+
+__all__ = ["SIRENLayer", "SIRENNetwork", "kspace_coordinate_grid"]

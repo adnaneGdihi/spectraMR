@@ -22,17 +22,16 @@ sparse-coding autoencoder pass: analyse -> soft-threshold (sparsify) -> synthesi
 Two structural penalties, on the atom matrix :math:`W\in\mathbb{R}^{m\times n}`
 (``m`` atoms, each a flattened :math:`n=C\,k^2` filter):
 
-* **Parseval tightness** :math:`\lVert W^\top W - (m/n) I_n\rVert_F^2` — a
-  penalty on the *atom-matrix* Gram. This is a **heuristic proxy** for tightness
-  of the full convolutional frame operator :math:`D D^\top` (the overlapping-patch
-  conv structure adds energy couplings the atom Gram cannot fully control), so it
-  *encourages* but does not *guarantee* an energy-preserving round-trip. The
-  adjoint property of the pair is exact (verified by test); the tight-round-trip is
-  the optimisation target, not a proven invariant.
-* **Mutual coherence** :math:`\lVert \tilde G - I_m\rVert_F^2` with
-  :math:`\tilde G = \hat W\hat W^\top` the Gram of the *unit-normalised* atoms —
-  the off-diagonal Frobenius penalty that drives the atoms apart. The diagnostic
-  :math:`\mu = \max_{i\neq j}|\tilde G_{ij}|` is the classical mutual coherence.
+* **Parseval tightness** :math:`\lVert W^\top W - (1/n) I_n\rVert_F^2`. The frame
+  operator of this stride-1 conv pair is :math:`D^\top D`, the convolution whose lag-0
+  coefficient is :math:`\operatorname{tr}(W^\top W)`, so :math:`W^\top W = c I_n` gives
+  :math:`D^\top D = c\,n\,I` and the zero of this penalty is a Parseval frame
+  (:math:`D^\top D = I`, interior pixels). The condition is sufficient, not necessary:
+  the exact one constrains only the lag sums of :math:`W^\top W`.
+* **Mutual coherence** :math:`\mu = \max_{i\neq j}|\tilde G_{ij}|` with
+  :math:`\tilde G = \hat W\hat W^\top` the Gram of the *unit-normalised* atoms
+  (``mutual_coherence()``). Its penalty is owned by the ``frame_coherence`` loss,
+  which reads ``atoms()``.
 
 Tightness and incoherence are **distinct** objectives (a tight frame can still be
 coherent), which is exactly why the A-6.5 one-knob ablation isolates the coherence
@@ -62,7 +61,7 @@ class TightFrameLearner(nn.Module):
     r"""Learnable convolutional sparsifying frame (A-6.5 SCO-Frame).
 
     A sparse-coding autoencoder over a learned over-complete filter bank, with
-    Parseval-tightness and mutual-coherence penalties on the atoms.
+    Parseval-tightness penalty and mutual-coherence diagnostic on the atoms.
 
     Args:
         in_channels: Image channels (== ``out_channels``; this is an autoencoder).
@@ -124,21 +123,13 @@ class TightFrameLearner(nn.Module):
         return self.synthesize(coeffs)
 
     def parseval_penalty(self) -> torch.Tensor:
-        r"""Frame-tightness penalty :math:`\lVert W^\top W - (m/n) I_n\rVert_F^2`."""
+        r"""Tightness penalty :math:`\lVert W^\top W - I_n/n\rVert_F^2`; zero gives :math:`D^\top D = I`."""
         w = self.atoms()
         n_feat = w.shape[1]
         gram = w.t() @ w  # [n, n]
-        scale = self.num_atoms / n_feat
+        scale = 1.0 / n_feat
         eye = torch.eye(n_feat, device=w.device, dtype=w.dtype)
         return ((gram - scale * eye) ** 2).sum()
-
-    def coherence_penalty(self) -> torch.Tensor:
-        r"""Mutual-coherence penalty :math:`\sum_{i\neq j}\tilde G_{ij}^2` (Gram off-diagonal)."""
-        w = self.atoms()
-        wn = w / (w.norm(dim=1, keepdim=True) + 1e-12)
-        gram = wn @ wn.t()  # [m, m], unit diagonal
-        off = gram - torch.eye(self.num_atoms, device=gram.device, dtype=gram.dtype)
-        return (off**2).sum()
 
     @torch.no_grad()
     def mutual_coherence(self) -> float:

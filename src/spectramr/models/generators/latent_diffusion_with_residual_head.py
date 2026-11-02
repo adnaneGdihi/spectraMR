@@ -12,8 +12,11 @@ the decoded output:
 
 .. math::
 
-    \\hat{x}_{\\text{final}} = D(z_t)
-        + h_\\theta\\bigl(D(z_t), c_{\\text{contrast}}\\bigr)
+    \\hat{x}_0 = D\\bigl((z_t - \\sqrt{1-\\bar\\alpha_t}\\,\\hat\\epsilon)/\\sqrt{\\bar\\alpha_t}\\bigr),
+    \\qquad \\hat{x}_{\\text{final}} = \\hat{x}_0 + h_\\theta(\\hat{x}_0, c_{\\text{contrast}})
+
+The backbone predicts the latent noise :math:`\\hat\\epsilon` from :math:`z_t`; the
+image terms score :math:`\\hat{x}_{\\text{final}}` against the image target.
 
 The head is trained against the high-frequency component of the target
 (``target - lowpass(target)``) via the registered
@@ -210,35 +213,86 @@ class LatentDiffusionWithResidualHead(nn.Module, IGenerator):
         else:
             self.contrast_embedding = None
 
+    # The latent-diffusion protocol the strategy, validation and predict call is the
+    # backbone's; the head only acts on decoded images.
+    @property
+    def config(self) -> Any:
+        return self.backbone.config
+
+    @property
+    def diffusion(self) -> Any:
+        return self.backbone.diffusion
+
+    def set_diffusion_schedule(self, **kwargs: Any) -> None:
+        self.backbone.set_diffusion_schedule(**kwargs)
+
+    def load_autoencoder_state(self, state: Any, *, freeze: bool, source: str) -> None:
+        self.backbone.load_autoencoder_state(state, freeze=freeze, source=source)
+
+    def encode_to_latent(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone.encode_to_latent(x)
+
+    def decode_from_latent(self, z: torch.Tensor) -> torch.Tensor:
+        return self.backbone.decode_from_latent(z)
+
     def forward(
         self,
         x: torch.Tensor,
-        contrast_idx: torch.Tensor | None = None,
-        **kwargs: Any,
+        timesteps: torch.Tensor,
+        context: dict | None = None,
+        condition_image: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compose backbone reconstruction with residual head correction.
+        """Latent noise prediction: ``z_t -> eps_hat``, both ``[B, latent_channels, h, w]``.
 
-        Args:
-            x: Input image batch ``[B, C, H, W]``.
-            contrast_idx: Optional ``[B]`` long tensor of contrast indices.
-            **kwargs: Forwarded to the backbone (timestep, conditioning).
-
-        Returns:
-            ``[B, out_channels, H, W]`` corrected image.
+        The head never sees this tensor. The strategy forms the latent x0 estimate from
+        ``eps_hat`` and calls :meth:`decode_and_refine`.
         """
-        backbone_out = self.backbone(x, **kwargs)
-        if isinstance(backbone_out, tuple):
-            # Some training modes return (image, aux) -- only correct the image.
-            decoded = backbone_out[0]
-        else:
-            decoded = backbone_out
+        return self.backbone(
+            x, timesteps=timesteps, context=context, condition_image=condition_image
+        )
 
+    def refine(self, decoded: torch.Tensor, contrast_idx: torch.Tensor | None) -> torch.Tensor:
+        """``decoded + h(decoded, c)`` in image space."""
         embed = None
-        if self.contrast_embedding is not None and contrast_idx is not None:
-            embed = self.contrast_embedding(contrast_idx)
+        if self.contrast_embedding is not None:
+            if contrast_idx is None:
+                raise ValueError(
+                    "residual_head.contrast_conditioning is true but contrast_idx is None: "
+                    "the head would run contrast-agnostic. Enable data.multi_contrast so the "
+                    "batch carries contrast_idx, or turn contrast_conditioning off."
+                )
+            embed = self.contrast_embedding(contrast_idx.long())
+        if decoded.shape[1] != self.residual_head.encoders[0][0].in_channels:
+            raise ValueError(
+                f"residual head expects an image with "
+                f"{self.residual_head.encoders[0][0].in_channels} channel(s), got "
+                f"{tuple(decoded.shape)}; it must be fed the decoded image, not a latent."
+            )
+        return decoded + self.residual_head(decoded, embed)
 
-        residual = self.residual_head(decoded, embed)
-        return decoded + residual
+    def decode_and_refine(
+        self, latent_x0: torch.Tensor, contrast_idx: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Decode the latent x0 estimate and add the image-space residual (#1066)."""
+        return self.refine(self.decode_from_latent(latent_x0), contrast_idx)
+
+    def sample(
+        self,
+        shape: tuple[int, ...],
+        device: str = "cpu",
+        contrast_idx: torch.Tensor | None = None,
+        condition_image: torch.Tensor | None = None,
+        num_inference_steps: int | None = None,
+    ) -> torch.Tensor:
+        """Reverse-sample with the backbone, then refine the decoded image."""
+        decoded = self.backbone.sample(
+            shape,
+            device=device,
+            contrast_idx=contrast_idx,
+            condition_image=condition_image,
+            num_inference_steps=num_inference_steps,
+        )
+        return self.refine(decoded, contrast_idx)
 
     def residual_head_param_ratio(self) -> float:
         """Return ``|head| / |backbone|``.

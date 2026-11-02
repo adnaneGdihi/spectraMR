@@ -243,7 +243,9 @@ class ScannerTimeReparam(nn.Module):
             idx = scanner_id
             if not torch.is_tensor(idx):
                 idx = torch.as_tensor(idx, device=self.raw.device)
-            idx = idx.to(self.raw.device).long().reshape(-1).clamp_(0, self.num_scanners - 1)
+            # No clamp: an id outside [0, num_scanners) must fail in index_select, not
+            # collapse onto the last row (num_scanners unset would merge every vendor).
+            idx = idx.to(self.raw.device).long().reshape(-1)
             raw_b = self.raw.index_select(0, idx)  # [n_ids, T-1]
             if raw_b.shape[0] == 1 and batch_size > 1:
                 raw_b = raw_b.expand(batch_size, -1)

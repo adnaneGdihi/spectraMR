@@ -26,13 +26,19 @@ import torch.nn.functional as F
 from spectramr.core.module_utils import unwrap_model
 from spectramr.infrastructure.checkpointing.restore import weights
 from spectramr.infrastructure.distributed.owned_modules import sync_frozen_module
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.simulator_builder import (
     build_simulator_from_config,
 )
+from spectramr.infrastructure.training.utils.metric_views import MetricViews
 from spectramr.models.losses.registry import create_loss
 
 logger = logging.getLogger(__name__)
+
+# training.distillation.validation_input: whether validation corrupts the target with the twin
+# or grades the student on the loaded (really corrupted) input against the loaded reference.
+_VALIDATION_INPUTS = frozenset({"digital_twin", "loaded"})
 
 
 def _build_teacher(config: Any) -> torch.nn.Module:
@@ -98,13 +104,33 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
         # Teacher model: loaded from checkpoint
         self._teacher: torch.nn.Module | None = None
         self._load_teacher()
+        self._validation_input = self._resolve_validation_input(self.config)
 
         logger.info(
-            "[DistillationStrategy] λ_distill=%.2f, λ_marker=%.2f, teacher_loaded=%s",
+            "[DistillationStrategy] λ_distill=%.2f, λ_marker=%.2f, teacher_loaded=%s, "
+            "validation_input=%s",
             self._lambda_distill,
             self._lambda_marker,
             self._teacher is not None,
+            self._validation_input,
         )
+
+    @staticmethod
+    def _resolve_validation_input(config: Any) -> str:
+        distillation = config.training.distillation
+        value = distillation.validation_input if distillation is not None else "digital_twin"
+        if value not in _VALIDATION_INPUTS:
+            raise ValueError(
+                f"training.distillation.validation_input={value!r}; expected one of "
+                f"{sorted(_VALIDATION_INPUTS)}."
+            )
+        return value
+
+    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
+        """Stamp what validation feeds the student into the snapshot provenance."""
+        extra = super()._first_steps_extra(epoch, batch=batch)
+        extra["distillation"] = {"validation_input": self._validation_input}
+        return extra
 
     @staticmethod
     def _student_returns_latent(student: torch.nn.Module) -> bool:
@@ -258,7 +284,7 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
             recon_loss + self._lambda_distill * loss_distill + self._lambda_marker * loss_marker
         )
 
-        return {
+        out: dict[str, Any] = {
             "g_total_loss": g_total_loss,
             "loss_l1": loss_l1.detach(),
             "loss_ssim": loss_ssim.detach(),
@@ -266,6 +292,11 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
             "loss_distill": loss_distill.detach(),
             "loss_marker": loss_marker.detach(),
         }
+        step = resolve_loop_iteration(self)
+        if self.generator_model.training and self._training_metrics_due(self.config, step):
+            # #183: the real-stacked pair validation_step scores, untransformed, so units match.
+            out.update(self._score_training_views(MetricViews(student_pred.detach(), clean_target)))
+        return out
 
     def validation_step(
         self,
@@ -284,20 +315,40 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
         via the digital twin, run the student, blind to markers) and computes
         ``val_``-prefixed metrics via the SSOT validation-metrics computer
         (same seam as the VAE strategy), so early stopping resolves the monitor.
+
+        With ``training.distillation.validation_input: loaded`` the twin is skipped: the
+        student reads the loaded input scan and is scored against the loaded target.
         """
         target_batch = self._to_device(target_batch)
+        loaded = self._validation_input == "loaded"
+        if loaded:
+            input_batch = self._to_device(input_batch)
         if target_batch.ndim == 5:  # volumetric -> mid-slice (as in training)
             mid = target_batch.shape[-1] // 2
             target_batch = target_batch[..., mid]
+            if loaded:
+                input_batch = input_batch[..., mid]
 
         with torch.no_grad():
-            # Digital-twin corruption of the clean target (same as _compute_losses_impl)
             target_complex = self._to_complex(target_batch)
             # k-space → image once (see _compute_losses_impl) so the cached visual
             # target and val metrics are image-domain, not |k-space|.
             target_complex = self._ensure_image_domain_target(target_complex)
-            corrupted_image, _marker_prior, _ = self.simulator(target_complex)
-            corrupted_input = torch.cat([corrupted_image.real, corrupted_image.imag], dim=1)
+            if loaded:
+                # Real corruption: the loaded scan reaches the student untouched by the twin.
+                student_image = self._ensure_image_domain_target(self._to_complex(input_batch))
+                if student_image.shape == target_complex.shape and torch.allclose(
+                    student_image, target_complex
+                ):
+                    raise RuntimeError(
+                        "[DistillationStrategy] validation_input='loaded' but the loaded "
+                        "reference equals the loaded input: the loader pairs no clean "
+                        "reference, so the score would grade the student against its own "
+                        "corrupted input."
+                    )
+            else:
+                student_image, _marker_prior, _ = self.simulator(target_complex)
+            corrupted_input = torch.cat([student_image.real, student_image.imag], dim=1)
 
             # Blind student forward (no marker), honouring the return_latent API
             student = self.generator_model

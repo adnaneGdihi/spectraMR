@@ -44,6 +44,8 @@ def _settings(model_type: str, gan: dict | None):
         logging={},
         losses={"gan": gan} if gan is not None else {},
         parallel={"strategy": "ddp"},
+        # privileged_learning: no distillation, so no stage-1 teacher checkpoint is needed.
+        training={"privileged": {"beta": 0.0}} if gan is None else {},
     )
 
 

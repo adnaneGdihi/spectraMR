@@ -47,7 +47,7 @@ __all__ = [
 
 
 #: The metrics that combine with maps rather than grade coil data; the validation
-#: path hands them the scoring maps when the batch carries them (#2664).
+#: path hands them the batch's own coil maps.
 SENSE_METRIC_NAMES: frozenset[str] = frozenset({"sense_psnr", "sense_ssim"})
 
 

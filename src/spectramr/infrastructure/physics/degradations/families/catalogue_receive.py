@@ -91,7 +91,16 @@ ENTRIES = (
             "Needs at least two coils."
         ),
         severity=SeveritySpec(
-            (_P("noise_rms", "x subject k-space RMS", 0.0, 0.3),),
+            (
+                _P(
+                    "noise_rms",
+                    "x subject k-space RMS",
+                    0.0,
+                    0.3,
+                    endpoint_kwargs=(None, "sigma_max"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="noise RMS per complex sample over the whole-subject k-space RMS, as "
             "complex_gaussian; theta = 0 is noise-free.",
         ),
@@ -108,7 +117,14 @@ ENTRIES = (
         description="Broadband interference on a contiguous run of acquired lines, white across kx",
         severity=SeveritySpec(
             (
-                _P("noise_rms", "x subject k-space RMS", 0.0, 0.5),
+                _P(
+                    "noise_rms",
+                    "x subject k-space RMS",
+                    0.0,
+                    0.5,
+                    endpoint_kwargs=(None, "sigma_max"),
+                    valid_min=0.0,
+                ),
                 _P("burst_lines", "fraction of lines", 0.0, 0.2),
             ),
             notes="theta sets both: the noise RMS on the corrupted lines and the run length.",
@@ -127,7 +143,14 @@ ENTRIES = (
         ),
         severity=SeveritySpec(
             (
-                _P("gain_step", "dB of gain step", 0.0, 6.0),
+                _P(
+                    "gain_step",
+                    "dB of gain step",
+                    0.0,
+                    6.0,
+                    endpoint_kwargs=(None, "step_max_db"),
+                    valid_min=0.0,
+                ),
                 _P("gain_drift", "fraction of gain over the scan", 0.0, 0.05),
             ),
             notes="g = (1 + 0.05 theta t/T) 2^(+-theta [t >= t0]) divided by g(centre line): the "
@@ -143,7 +166,12 @@ ENTRIES = (
         adc_clipping,
         description="ADC saturation: Re and Im of k-space clipped below the subject's peak",
         severity=SeveritySpec(
-            (_P("clip_level", "fraction of peak |Re/Im|", 1.0, 0.1),),
+            (_P(
+                "clip_level", "fraction of peak |Re/Im|", 1.0, 0.1,
+                endpoint_kwargs=(None, "min_clip_level"),
+                valid_min=0.01,
+                valid_max=1.0,
+            ),),
             notes="clip level = 1 - 0.9 theta of the per-subject k-space peak; theta = 0 clips "
             "nothing.",
         ),
@@ -160,7 +188,12 @@ ENTRIES = (
             "(ENOB = 16 - 12 theta) over the subject's full scale"
         ),
         severity=SeveritySpec(
-            (_P("enob", "effective bit", 16.0, 4.0),),
+            (_P(
+                "enob", "effective bit", 16.0, 4.0,
+                endpoint_kwargs=(None, "min_enob"),
+                valid_min=1.0,
+                valid_max=16.0,
+            ),),
             notes="ENOB = 16 - 12 theta, real-valued; delta = P / 2^(ENOB - 1) for full scale P; "
             "theta = 0 bypasses the quantiser exactly.",
         ),
@@ -180,7 +213,11 @@ ENTRIES = (
             "identity, and 0.6 at theta = 1"
         ),
         severity=SeveritySpec(
-            (_P("inverse_cutoff", "band edge / cutoff", 0.0, 1.0 / 0.6),),
+            (_P(
+                "inverse_cutoff", "band edge / cutoff", 0.0, 1.0 / 0.6,
+                endpoint_kwargs=(None, "max_inverse_cutoff"),
+                valid_min=0.0,
+            ),),
             notes="cutoff x_c = 0.6 / theta (1 / x_c linear in theta); theta = 0 is no filter. The "
             "magnitude response weights the image along the readout axis.",
         ),
@@ -194,7 +231,17 @@ ENTRIES = (
         coil_dropout,
         description="A seeded subset of coils dead for the scan or from a seeded line on",
         severity=SeveritySpec(
-            (_P("dropped_coils", "fraction of coils", 0.0, 0.5),),
+            (
+                _P(
+                    "dropped_coils",
+                    "fraction of coils",
+                    0.0,
+                    0.5,
+                    endpoint_kwargs=(None, "max_fraction"),
+                    valid_min=0.0,
+                    valid_max=0.5,
+                ),
+            ),
             notes="ceil(theta/2 C) coils, at most C // 2, so the count is integer-valued and plateaus "
             "in theta (C = 4: one coil for every theta in (0, 0.5]); mode full or partial (kwarg).",
         ),

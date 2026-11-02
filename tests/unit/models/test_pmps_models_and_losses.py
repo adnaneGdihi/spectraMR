@@ -190,10 +190,13 @@ class TestPairedSynthesisGenerator:
     def test_forward_dict_shape(self) -> None:
         gen = PairedSynthesisGenerator(in_channels=3, out_channels=1)
         theta = torch.rand(2, 3, 16, 16)
-        out = gen(theta)
+        out = gen(
+            theta,
+            p_ulf={"te": 10.0, "tr": 300.0, "fa_rad": 1.5708},
+            p_hf={"te": 80.0, "tr": 3000.0, "fa_rad": 1.5708},
+        )
         assert set(out.keys()) >= {"ulf", "hf", "theta", "residual", "defensibility_flag"}
         assert out["ulf"].shape == (2, 1, 16, 16)
         assert out["hf"].shape == (2, 1, 16, 16)
         assert out["defensibility_flag"].dtype == torch.bool
         assert out["defensibility_flag"].shape == (2,)
-

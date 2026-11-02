@@ -123,8 +123,10 @@ class PoweredPartialOrder:
 
     Attributes:
         n_samples: the evaluation sample size ``N`` the certification used.
-        alpha: the target misordering probability per pair.
-        gap_threshold: ``delta_min`` — the smallest certifiable gap at ``(N, alpha)``.
+        alpha: the target misordering probability per pair, or over the family of
+            pairs under ``correction="holm"``.
+        gap_threshold: ``delta_min`` — the smallest gap one pair certifies at
+            ``(N, alpha)`` before any multiplicity correction.
         certified: ``(better, worse)`` ordered pairs whose gap clears the threshold.
         ambiguous: unordered ``(a, b)`` pairs whose gap is below the threshold and
             are therefore statistically indistinguishable at this power.
@@ -135,6 +137,7 @@ class PoweredPartialOrder:
     gap_threshold: float
     certified: list[tuple[str, str]]
     ambiguous: list[tuple[str, str]]
+    correction: str = "none"
 
     @property
     def n_certified(self) -> int:
@@ -149,8 +152,27 @@ class PoweredPartialOrder:
         return (better, worse) in self.certified
 
 
+CORRECTIONS = ("none", "holm")
+
+
+def _pair_pvalue(gap: float, n_samples: int) -> float:
+    """Hoeffding p-value of one pair: ``min(1, 2 exp(-m gap^2 / 8))``, ``m = N // 2``.
+
+    ``p <= alpha`` iff ``|gap| >= powered_gap_threshold(N, alpha)``, so the two gates
+    agree on a single pair. A non-finite gap (a crashed metric) has ``p = 1``.
+    """
+    m = n_samples // 2
+    if m < 1 or not math.isfinite(gap):
+        return 1.0
+    return min(1.0, 2.0 * math.exp(-m * gap * gap / 8.0))
+
+
 def certify_partial_order(
-    scores: dict[str, float], n_samples: int, alpha: float = 0.05
+    scores: dict[str, float],
+    n_samples: int,
+    alpha: float = 0.05,
+    *,
+    correction: str = "none",
 ) -> PoweredPartialOrder:
     """Certify only the pairwise orderings whose gap clears the powered threshold.
 
@@ -162,13 +184,21 @@ def certify_partial_order(
 
     Args:
         scores: per-metric scores (higher = better; rank-correlation scale).
-        n_samples: evaluation sample size ``N``.
-        alpha: target misordering probability per pair.
+        n_samples: evaluation sample size ``N`` (independent units, not correlated
+            replicates).
+        alpha: target misordering probability per pair (``"none"``), or the
+            family-wise error rate over all pairs (``"holm"``).
+        correction: ``"none"`` or ``"holm"`` (Holm step-down on the per-pair
+            Hoeffding p-values). Anything else raises.
 
     Returns:
         A :class:`PoweredPartialOrder`.
     """
+    if correction not in CORRECTIONS:
+        raise ValueError(f"correction={correction!r}; expected one of {CORRECTIONS}")
     threshold = powered_gap_threshold(n_samples, alpha)
+    if correction == "holm":
+        return _certify_holm(scores, n_samples, alpha, threshold)
     names = list(scores.keys())
     certified: list[tuple[str, str]] = []
     ambiguous: list[tuple[str, str]] = []
@@ -191,4 +221,34 @@ def certify_partial_order(
         gap_threshold=threshold,
         certified=certified,
         ambiguous=ambiguous,
+    )
+
+
+def _certify_holm(
+    scores: dict[str, float], n_samples: int, alpha: float, threshold: float
+) -> PoweredPartialOrder:
+    """Holm step-down over the pairs: the ``k``-th smallest p-value must clear ``alpha/(K-k)``."""
+    names = list(scores)
+    pairs = [(names[i], names[j]) for i in range(len(names)) for j in range(i + 1, len(names))]
+    pvals = [_pair_pvalue(scores[a] - scores[b], n_samples) for a, b in pairs]
+    order = sorted(range(len(pairs)), key=lambda k: (pvals[k], k))
+    rejected: set[int] = set()
+    for step, k in enumerate(order):
+        if pvals[k] > alpha / (len(pairs) - step):
+            break
+        rejected.add(k)
+    certified: list[tuple[str, str]] = []
+    ambiguous: list[tuple[str, str]] = []
+    for k, (a, b) in enumerate(pairs):
+        if k in rejected:
+            certified.append((a, b) if scores[a] > scores[b] else (b, a))
+        else:
+            ambiguous.append((a, b))
+    return PoweredPartialOrder(
+        n_samples=n_samples,
+        alpha=alpha,
+        gap_threshold=threshold,
+        certified=certified,
+        ambiguous=ambiguous,
+        correction="holm",
     )

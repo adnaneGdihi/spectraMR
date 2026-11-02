@@ -42,6 +42,7 @@ from .normalization import AdaptiveInstanceNorm
 from .radial_linearizer import MorphologicalRadialLinearizer
 from .residual import UnifiedResidualBlock
 from .topology_linearizer import ImageTopologyLinearizer
+from .velocity_field_head import VelocityFieldHead
 
 __all__ = [
     # Registry API (new pattern)
@@ -58,6 +59,7 @@ __all__ = [
     "ReferencePanel",
     "ReferenceTissue",
     "UnifiedResidualBlock",
+    "VelocityFieldHead",
     "AttentionKeys",
     "InstrumentKeyedCrossAttention",
     # Topology / Linearization

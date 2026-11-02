@@ -137,6 +137,18 @@ def test_rss_image_apply_transform_pipeline() -> None:
     )
 
 
+def test_rss_image_combines_the_separate_layout_source_like_the_target() -> None:
+    """Default keys: ``kspace_source`` becomes the same 1-channel image as ``target``."""
+    ksp = _make_asymmetric_coil_kspace()
+    subject = tio.Subject(
+        target=tio.ScalarImage(tensor=ksp, affine=np.eye(4)),
+        kspace_source=tio.ScalarImage(tensor=ksp.clone(), affine=np.eye(4)),
+    )
+    out = CoilCombineTransform(method="rss_image")(subject)
+    assert out["kspace_source"].data.shape[0] == 1
+    assert torch.equal(out["kspace_source"].data, out["target"].data)
+
+
 def test_unknown_method_raises() -> None:
     """Unknown ``method`` raises — keeps CLAUDE.md #9 (no silent fallbacks)."""
     ksp = _make_asymmetric_coil_kspace()
@@ -359,3 +371,26 @@ def test_rss_per_channel_apply_transform_emits_two_real_channels() -> None:
 
     assert out.shape == (2, 16, 16, 2)
     assert not torch.is_complex(out)
+
+
+def test_rss_image_channel_groups_combine_each_contiguous_coil_group() -> None:
+    """Two groups (the stacked M4Raw source and target contrasts) give one RSS each."""
+    g = torch.Generator().manual_seed(0)
+    k = torch.complex(torch.randn(4, 16, 16, 1, generator=g), torch.randn(4, 16, 16, 1, generator=g))
+    grouped = CoilCombineTransform(method="rss_image", channel_groups=2)._rss_image_combine(k)
+    single = CoilCombineTransform(method="rss_image")
+    expected = torch.cat([single._rss_image_combine(k[:2]), single._rss_image_combine(k[2:])])
+    assert grouped.shape == (2, 16, 16, 1)
+    torch.testing.assert_close(grouped, expected)
+
+
+def test_rss_image_channel_groups_refuse_an_uneven_split() -> None:
+    k = torch.complex(torch.randn(3, 8, 8, 1), torch.randn(3, 8, 8, 1))
+    with pytest.raises(ValueError, match="equal groups"):
+        CoilCombineTransform(method="rss_image", channel_groups=2)._rss_image_combine(k)
+
+
+@pytest.mark.parametrize(("method", "groups"), [("rss", 2), ("sense", 2), ("rss_image", 0)])
+def test_channel_groups_outside_rss_image_raise(method: str, groups: int) -> None:
+    with pytest.raises(ValueError, match="channel_groups"):
+        CoilCombineTransform(method=method, channel_groups=groups)

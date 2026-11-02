@@ -435,6 +435,7 @@ class KANVAEGenerator(nn.Module, IGenerator):
 
         # Initialize weights - handled by centralized weight initialization
         # self.apply(self._init_weights)
+        self._last_aux: dict[str, torch.Tensor] | None = None
 
     def _init_weights(self, module: nn.Module):
         """Initialize network weights."""
@@ -491,6 +492,8 @@ class KANVAEGenerator(nn.Module, IGenerator):
 
         # Decode
         reconstruction = self.decoder(z)
+        # The strategy reads the posterior here, so the KL acts on a bare-tensor forward (#2362).
+        self._last_aux = {"mu": mu, "logvar": logvar, "z": z}
 
         # Resize to original input size if mismatched
         if reconstruction.shape[2:] != x.shape[2:]:
@@ -499,6 +502,10 @@ class KANVAEGenerator(nn.Module, IGenerator):
             )
 
         return reconstruction
+
+    def last_aux(self) -> dict[str, torch.Tensor] | None:
+        """The posterior ``(mu, logvar, z)`` of the most recent forward, or None before one."""
+        return self._last_aux
 
     def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode input to latent distribution.

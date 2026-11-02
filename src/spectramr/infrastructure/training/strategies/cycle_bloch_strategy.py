@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -8,10 +8,18 @@ from spectramr.infrastructure.training.contexts import TrainingEnvironment
 from spectramr.infrastructure.training.step_io import accepts_step_io
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.cycle_bloch_critic import resolve_critic
+from spectramr.infrastructure.training.strategies.cycle_bloch_objective import (
+    resolve_segmenter,
+    split_image_losses,
+)
 from spectramr.infrastructure.training.strategies.cycle_bloch_physics import (
     ESTIMATOR_RANGES,
     ParameterEstimator,
     build_backward,
+)
+from spectramr.infrastructure.training.strategies.loss_folding import (
+    declared_loss_weights,
+    fold_builder_image_losses,
 )
 from spectramr.infrastructure.training.strategies.mixins.reconstruction import _as_aux_mapping
 from spectramr.models.losses.gan_loss_library import gradient_penalty_loss
@@ -148,6 +156,12 @@ class CycleBlochStrategy(BaseTrainingStrategy):
     # step from the generator's output channels, DDP-wrapped and run via call_owned.
     parallel_compat = frozenset({"replicated"})
 
+    #: The cycle criterion is ``training.cycle_bloch.cycle_criterion``, not an image-loss
+    #: entry, so every declared ``losses.image_losses`` term folds onto the generator.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = True
+    empty_loss_stack_is_design: ClassVar[bool] = True
+
     @classmethod
     def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
         return (*super().owned_module_declarations(config), ("estimator", OWNED_MODULE))
@@ -196,8 +210,15 @@ class CycleBlochStrategy(BaseTrainingStrategy):
         self.lambda_cycle = _gan_cfg.lambda_cycle_bloch if _gan_cfg else 10.0
         self.lambda_adv = _gan_cfg.lambda_cycle_adv if _gan_cfg else 1.0
 
-        # SSOT: Use registry-based loss creation instead of hardcoded nn modules
-        self.criterion_cycle = create_loss("l1")
+        cycle_criterion = cb_cfg.cycle_criterion if cb_cfg is not None else "l1"
+        self.criterion_cycle = create_loss(cycle_criterion)
+        segmenter_backend = cb_cfg.segmenter_backend if cb_cfg is not None else "none"
+        self._segmenter = resolve_segmenter(segmenter_backend, self.device)
+        self._image_loss_weights = declared_loss_weights(self.config)
+        self._image_losses: tuple[dict[str, nn.Module], dict[str, nn.Module]] | None = None
+        self.cycle_bloch_provenance.update(
+            cycle_criterion=cycle_criterion, segmenter_backend=segmenter_backend
+        )
         self._configure_critic(_gan_cfg)
 
     def _configure_critic(self, gan_cfg: Any) -> None:
@@ -232,6 +253,12 @@ class CycleBlochStrategy(BaseTrainingStrategy):
         """Stamp the resolved backward operator and its sequence into the snapshot."""
         extra = super()._first_steps_extra(epoch, batch=batch)
         extra["cycle_bloch"] = dict(self.cycle_bloch_provenance)
+        generator = self.env.generator
+        if isinstance(getattr(generator, "module", None), nn.Module):  # DDP-wrapped
+            generator = generator.module
+        sequence = getattr(generator, "sequence_provenance", None)
+        if isinstance(sequence, dict):
+            extra["cycle_bloch"]["generator_sequence"] = dict(sequence)
         return extra
 
     @staticmethod
@@ -318,52 +345,73 @@ class CycleBlochStrategy(BaseTrainingStrategy):
                 - 'gan': Adversarial loss
                 - 'cycle': Cycle-physics loss
         """
-        real_ulf = input_batch
-
-        generator = self.env.generator
         discriminator = self.env.discriminator
-
         if discriminator is None:
-            raise ValueError(
-                "CycleBlochStrategy requires a discriminator. Either "
-                "(a) add a ``discriminator:`` section to the experiment "
-                "YAML under ``model:`` (e.g. ``model.discriminator: "
-                "{discriminator_type: patch_gan_2d, ...}``), or "
-                "(b) switch to a non-adversarial cycle strategy such as "
-                "``CycleConsistencyStrategy`` that does not depend on a "
-                "discriminator."
-            )
+            raise ValueError("CycleBlochStrategy requires a discriminator.")
+        total, components = self._generator_objective(
+            input_batch, target_batch, discriminator, kwargs.get("contrast_id")
+        )
+        return {"g_total_loss": total, **components}
 
-        # --- 1. Forward: ULF -> HF (Hallucination) ---
-        fake_hf = generator(real_ulf)
+    def _cycle_pair(
+        self, rec_ulf: torch.Tensor, real_ulf: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The simulated and measured ULF as the magnitude images the cycle compares.
 
-        # --- 2. Physics Inversion: HF -> Tissue Maps ---
-        # Estimate T1/T2/PD maps from the generated HF image
-        # --- 3. Backward: Tissue Maps -> ULF (Simulation) ---
-        rec_ulf, loss_b1_tv = self._physics_cycle(fake_hf, kwargs.get("contrast_id"))
+        The render is already a magnitude image, so the declared ``pre_loss_target``
+        chain (which starts from k-space) applies to the measured input only.
+        """
+        if self.adapter_chains.get("pre_loss_target"):
+            return rec_ulf, self.apply_adapters("pre_loss_target", real_ulf)
+        return self._to_magnitude_image(rec_ulf), self._to_magnitude_image(real_ulf)
 
-        # --- GAN Loss ---
+    def _generator_objective(
+        self,
+        real_ulf: torch.Tensor,
+        target_hf: torch.Tensor | None,
+        discriminator: nn.Module,
+        contrast_id: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Adversarial + cycle-physics + B1+ TV + the declared image losses."""
+        fake_hf = self.env.generator(real_ulf)
+        rec_ulf, loss_b1_tv = self._physics_cycle(fake_hf, contrast_id)
         loss_gan = self.critic.compute_generator_loss(discriminator(fake_hf))
-
-        # --- Cycle-Bloch Loss ---
-        loss_cycle = self.criterion_cycle(rec_ulf, real_ulf)
-
-        # --- Total Generator Loss ---
-        total_loss_g = (
+        rec_ulf_target, real_ulf_target = self._cycle_pair(rec_ulf, real_ulf)
+        loss_cycle = self.criterion_cycle(rec_ulf_target, real_ulf_target)
+        total = (
             (self.lambda_adv * loss_gan)
             + (self.lambda_cycle * loss_cycle)
             + (self._b1_tv_weight * loss_b1_tv)
         )
-
-        # Canonical key is ``g_total_loss``; the orchestrator at
-        # base.py:845 accepts ``total`` as a synonym but the on-disk
-        # convention should be the canonical handle. See
-        # TODO/audit/07_strategies_v6_2_v6_3_exotic.md F18.
-        return {
-            "g_total_loss": total_loss_g,
+        components: dict[str, torch.Tensor] = {
             "gan": loss_gan,
             "cycle": loss_cycle,
+            "loss_b1_tv": loss_b1_tv,
         }
+        if self._image_losses is None:
+            self._image_losses = split_image_losses(
+                getattr(self.env, "losses", None), self._image_loss_weights, self._segmenter
+            )
+        paired, anchored = self._image_losses
+        sched = getattr(getattr(self, "loop_state", None), "loss_weight_overrides", None) or {}
+        if paired and target_hf is None:
+            raise ValueError(
+                f"losses.image_losses {sorted(paired)} compare against the HF target, "
+                "but this batch has none."
+            )
+        for losses, anchor in ((paired, target_hf), (anchored, real_ulf_target)):
+            aux = fold_builder_image_losses(
+                losses,
+                self._image_loss_weights,
+                sched,
+                fake_hf,
+                anchor,
+                components,
+                inline_managed=self.inline_losses,
+            )
+            if aux is not None:
+                total = total + aux
+        return total, components
 
     @accepts_step_io
     def train_step(
@@ -469,40 +517,15 @@ class CycleBlochStrategy(BaseTrainingStrategy):
             Returns:
                 Any: Description.
             """
-            fake_hf = self.env.generator(real_ulf)
-
-            rec_ulf, loss_b1_tv = self._physics_cycle(fake_hf, contrast_id)
-
-            # Adversarial Loss
-            loss_gan = self.critic.compute_generator_loss(discriminator(fake_hf))
-
-            # Cycle-Physics Loss.
-            # rec_ulf is 1-ch magnitude (from BlochSimulator); real_ulf may
-            # be multi-channel (virtual coils, real/imag interleaved). When
-            # the YAML declares `adapters.pre_loss_target: [{name:
-            # rss_coils_to_magnitude}]`, apply_adapters runs it (visible to
-            # the audit). Otherwise fall back to the inline helper for
-            # legacy YAMLs (which delegates to the same registered
-            # adapter — see _to_magnitude_image).
-            if self.adapter_chains.get("pre_loss_target"):
-                rec_ulf_target = self.apply_adapters("pre_loss_target", rec_ulf)
-                real_ulf_target = self.apply_adapters("pre_loss_target", real_ulf)
-            else:
-                rec_ulf_target = self._to_magnitude_image(rec_ulf)
-                real_ulf_target = self._to_magnitude_image(real_ulf)
-            loss_cycle = self.criterion_cycle(rec_ulf_target, real_ulf_target)
-
-            total_loss_g = (
-                (self.lambda_adv * loss_gan)
-                + (self.lambda_cycle * loss_cycle)
-                + (self._b1_tv_weight * loss_b1_tv)
+            total_loss_g, components = self._generator_objective(
+                real_ulf, target_hf, discriminator, contrast_id
             )
 
             losses_dict.update(
                 {
                     "loss_g": total_loss_g,
-                    "loss_cycle": loss_cycle,
-                    "loss_b1_tv": loss_b1_tv,
+                    "loss_cycle": components["cycle"],
+                    **{k: v for k, v in components.items() if k.startswith("loss_")},
                 }
             )
             self._last_step_metrics = {k: v.detach() for k, v in losses_dict.items()}

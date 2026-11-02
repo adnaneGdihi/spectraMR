@@ -46,6 +46,8 @@ DEFAULT_T1_MS = 1000.0
 DEFAULT_TI_MS = 900.0
 DEFAULT_FA_DEG = 5.0
 DEFAULT_TR_RO_MS = 7.0
+#: Readout-train length over T1 at theta = 1.
+MAX_TRAIN_OVER_T1 = 1.0
 
 
 def _steady_state(t1_ms: float, fa_deg: float, tr_ro_ms: float) -> float:
@@ -62,10 +64,17 @@ def mz_recursion(p: Tensor, t1_ms: float, ti_ms: float, fa_deg: float, tr_ro_ms:
 
 
 def t1_weights(
-    j: Tensor, inner: int, theta: float, t1_ms: float, ti_ms: float, fa_deg: float, tr_ro_ms: float
+    j: Tensor,
+    inner: int,
+    theta: float,
+    t1_ms: float,
+    ti_ms: float,
+    fa_deg: float,
+    tr_ro_ms: float,
+    max_train_over_t1: float = MAX_TRAIN_OVER_T1,
 ) -> Tensor:
     """``1 + (M_p - M_centre) / M_ss`` for inner-loop positions ``j`` ``[D, H]``, ``p = j N_train / inner``."""
-    n_train = theta * t1_ms / tr_ro_ms
+    n_train = theta * max_train_over_t1 * t1_ms / tr_ro_ms
     m = mz_recursion(j * (n_train / inner), t1_ms, ti_ms, fa_deg, tr_ro_ms)
     centre = m[j.shape[0] // 2, j.shape[1] // 2]
     return (1.0 + (m - centre) / _steady_state(t1_ms, fa_deg, tr_ro_ms)).to(torch.float32)
@@ -83,6 +92,7 @@ def t1_shot_blur_volume(
     tr_ro_ms: float = DEFAULT_TR_RO_MS,
     order: str | None = None,
     profile_ti_fa_ignored: str | None = None,
+    max_train_over_t1: float = MAX_TRAIN_OVER_T1,
 ) -> Tensor:
     # ``profile_ti_fa_ignored`` only records, in the realised kwargs, that the profile's sequence has no
     # inversion / gradient-echo readout, so its TI and flip angle were not used (the defaults were).
@@ -103,7 +113,7 @@ def t1_shot_blur_volume(
         return x
     # Weights depend on geometry only: built on the CPU, moved to the device once by apply_line_weights.
     j = shot_index(times, times.numel()) % inner
-    w = t1_weights(j, inner, theta, t1_ms, ti_ms, fa_deg, tr_ro_ms)
+    w = t1_weights(j, inner, theta, t1_ms, ti_ms, fa_deg, tr_ro_ms, max_train_over_t1)
     return apply_line_weights(x, w, geometry.mode)
 
 

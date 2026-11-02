@@ -14,6 +14,8 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 
+from spectramr.core.module_utils import unwrap_model
+
 from .reconstruction import ReconstructionTrainingStrategy
 
 
@@ -34,6 +36,19 @@ def field_strength_for(
     return torch.full((x.shape[0],), float(source_field), device=x.device)
 
 
+def target_field_kwargs(model: Any, batch_field_target: Any, x: torch.Tensor) -> dict[str, Any]:
+    """``field_strength_target`` for the net: None unless it is target-conditioned (#196)."""
+    if not getattr(model, "use_target_field", False):
+        return {"field_strength_target": None}
+    if batch_field_target is None:
+        raise ValueError(
+            "FieldWienerNet(use_target_field=True) needs batch['field_strength_target'] "
+            "(set data.expose.field_strength_target)."
+        )
+    b_t = torch.as_tensor(batch_field_target, device=x.device).reshape(-1).float()
+    return {"field_strength_target": b_t}
+
+
 def compute_field_wiener_loss(
     model: Any,
     batch: dict[str, Any],
@@ -45,7 +60,11 @@ def compute_field_wiener_loss(
     x = batch["input"]
     y = batch["target"]
     b_s = field_strength_for(x, batch.get("field_strength"), source_field)
-    pred = model(x, field_strength=b_s)
+    pred = model(
+        x,
+        field_strength=b_s,
+        **target_field_kwargs(unwrap_model(model), batch.get("field_strength_target"), x),
+    )
     loss_l1 = F.l1_loss(pred, y)
     return {
         "loss_total": lambda_l1 * loss_l1,
@@ -111,11 +130,18 @@ class FieldWienerStrategy(ReconstructionTrainingStrategy):
         return out
 
     def validation_step(
-        self, input_batch: Any, target_batch: Any, field_strength: Any = None, **kwargs: Any
+        self,
+        input_batch: Any,
+        target_batch: Any,
+        field_strength: Any = None,
+        field_strength_target: Any = None,
+        **kwargs: Any,
     ) -> Any:
         bc = kwargs.pop("batch_context", None) or {}
         if field_strength is not None:
             bc["field_strength"] = field_strength
+        if field_strength_target is not None:
+            bc["field_strength_target"] = field_strength_target
         metrics = super().validation_step(input_batch, target_batch, batch_context=bc, **kwargs)
         if isinstance(metrics, dict):
             metrics.update(self._score_wiener(input_batch, bc))
@@ -156,4 +182,8 @@ class FieldWienerStrategy(ReconstructionTrainingStrategy):
             batch_context.get("field_strength", kwargs.get("field_strength")),
             getattr(self, "_fw_source_field", None),
         )
-        return self.env.generator(x0, field_strength=b_s).clamp(0.0, 1.0)
+        b_t = batch_context.get("field_strength_target", kwargs.get("field_strength_target"))
+        gen = self.env.generator
+        return gen(
+            x0, field_strength=b_s, **target_field_kwargs(unwrap_model(gen), b_t, x0)
+        ).clamp(0.0, 1.0)

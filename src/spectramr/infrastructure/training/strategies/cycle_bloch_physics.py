@@ -22,10 +22,8 @@ from spectramr.infrastructure.physics.ulf_forward_operator import (
     DifferentiableULFForwardOperator,
     power_law_dispersion,
 )
+from spectramr.models.generators.bloch_cycle_maps import T1_RANGE_MS, T2_RANGE_MS
 
-#: Physiological bounds of the estimated maps, in the ms every backward model reads.
-T1_RANGE_MS = (100.0, 4000.0)
-T2_RANGE_MS = (10.0, 300.0)
 ESTIMATOR_RANGES = {"t1_range_ms": T1_RANGE_MS, "t2_range_ms": T2_RANGE_MS}
 
 

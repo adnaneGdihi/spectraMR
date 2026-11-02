@@ -12,6 +12,12 @@ import inspect
 
 import pytest
 
+from spectramr.models.losses.weights import (
+    ENABLE_FLAG_LAMBDAS,
+    build_loss_weight_table,
+    canonical_loss_name,
+)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -214,12 +220,12 @@ class TestSymmetricEnableLambdaPairs:
 
 
 # ---------------------------------------------------------------------------
-# 3. get_enabled_losses() covers all enable_* flags
+# 3. enable_* flags are declared by the weight table
 # ---------------------------------------------------------------------------
 
 
 class TestGetEnabledLossesCoverage:
-    """LossConfigSchema.get_enabled_losses() must be reachable for each enable_* flag.
+    """The weight table must declare each enable_* flag's term (#1966: the table is the owner).
 
     We enable each flag one at a time (with weight > 0) and verify the returned dict
     contains the expected key.
@@ -298,15 +304,18 @@ class TestGetEnabledLossesCoverage:
     ):
         """Enabling a flag + non-zero lambda must produce the key in get_enabled_losses()."""
 
-        lambda_key = f"lambda_{enable_flag[len('enable_'):]}"
+        lambda_key = ENABLE_FLAG_LAMBDAS.get(enable_flag, f"lambda_{enable_flag[len('enable_'):]}")
         loss_config = self._make_loss_config(paradigm, enable_flag, lambda_key)
-        enabled = loss_config.get_enabled_losses()
-        assert expected_key in enabled, (
-            f"LossConfigSchema.get_enabled_losses() did not return '{expected_key}' "
-            f"when {paradigm}.{enable_flag}=True and {lambda_key} > 0.\n"
-            f"Actual keys returned: {sorted(enabled.keys())}\n"
-            "This likely means the get_enabled_losses() method has a mapping gap "
-            "or the enable/lambda naming convention is inconsistent."
+        declared = {
+            k: spec.weight
+            for k, spec in build_loss_weight_table(loss_config).items()
+            if spec.enabled and spec.weight > 0
+        }
+        assert canonical_loss_name(expected_key) in declared, (
+            f"the weight table did not declare '{expected_key}' when "
+            f"{paradigm}.{enable_flag}=True and {lambda_key} > 0.\n"
+            f"Declared keys: {sorted(declared)}\n"
+            "The enable/lambda naming convention is inconsistent (see ENABLE_FLAG_LAMBDAS)."
         )
 
 

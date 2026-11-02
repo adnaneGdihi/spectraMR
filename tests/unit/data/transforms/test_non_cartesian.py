@@ -62,3 +62,13 @@ def test_output_deterministic_across_cached_calls():
     o1 = t(tio.Subject(input=tio.ScalarImage(tensor=base.clone())))["input"].data
     o2 = t(tio.Subject(input=tio.ScalarImage(tensor=base.clone())))["input"].data
     assert torch.allclose(o1, o2)
+
+
+@pytest.mark.unit
+def test_simulated_samples_survive_patch_sampling():
+    """Keys the transform adds reach a training patch, and the copied target is an Image."""
+    t = NonCartesianSimulationTransform(pattern="spiral", im_size=(32, 32))
+    out = t(tio.Subject(input=tio.ScalarImage(tensor=torch.rand(1, 32, 32, 2))))
+    patch = next(iter(tio.data.UniformSampler((32, 32, 1))(out)))
+    assert {"measured_kspace", "trajectory", "dcf", "target"} <= set(patch.keys())
+    assert isinstance(patch["target"], tio.Image)

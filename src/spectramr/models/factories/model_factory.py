@@ -197,17 +197,11 @@ class ParameterMapper:
                 "acceleration_config",
                 "features",
                 "score_matching",
-                "sde_type",
-                "sigma_min",
-                "sigma_max",
             },
             "score_based_diffusion_generator": {
                 "acceleration_config",
                 "features",
                 "score_matching",
-                "sde_type",
-                "sigma_min",
-                "sigma_max",
             },
             "neural_ode": {
                 "acceleration_config",
@@ -1741,7 +1735,10 @@ class ModelFactory:
             ("reflexion_reconstruction", "..generators", "ReflexionReconstruction"),
             ("continual_learning_unet", "..generators", "ContinualLearningUNet"),
             ("spiking_unet", "..generators", "SpikingUNet"),
-            ("symbolic_regression", "..generators", "SymbolicRegressionWrapper"),
+            # The name builds the symbolic head exp118 declares; the wrapper (a
+            # plain base generator plus offline residual analysis) keeps its own (#977).
+            ("symbolic_regression", "..generators", "SymbolicRegressionGenerator"),
+            ("symbolic_regression_wrapper", "..generators", "SymbolicRegressionWrapper"),
             (
                 "uncertainty_wrapper",
                 "spectramr.models.generators.uncertainty_wrappers",
@@ -1826,6 +1823,12 @@ class ModelFactory:
             )
         except ImportError as e:
             self._logger.debug(f"Skipping StableDiffusionAdapter: {e}")
+
+        from spectramr.models.generators.pretrained_sd_adapter import (
+            PretrainedSDAdapterGenerator,
+        )
+
+        self._registry.register_generator("pretrained_sd_adapter", PretrainedSDAdapterGenerator)
 
         try:
             from spectramr.models.generators.x_diffusion_generator import (

@@ -11,8 +11,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
-
 try:
     from spectramr.infrastructure.physics.m4_operator import Operator_A_m4
 
@@ -120,10 +118,9 @@ class Complex3DRegularizer(nn.Module):
 class PMAVarNet(nn.Module):
     """Physics-Driven Marker-Anchored Variational Network.
 
-    Implements a K-cascade unrolled optimization using the exact mathematical
-    forward operator (A_m4). The CNN regularizer acts purely as a prior,
-    computationally blind to trajectory delays, motion, and B0 artifacts because
-    the A_m4 and A_m4^H operators mathematically resolve them.
+    Implements a K-cascade unrolled optimization ``x <- R_k(x - eta_k A^H(Ax - y))`` with
+    the forward operator A_m4 built from ``maps_dict``. The operator models only the maps it
+    is given; any corruption it is not given (motion, B0) is left to the regularizers.
 
     Args:
         in_channels: Number of input contrasts (N_con).
@@ -169,7 +166,7 @@ class PMAVarNet(nn.Module):
                For this implementation, we expect y in kwargs['y_meas'] if x is zero-filled.
                Or x is `y_meas` [B, N_con, Nc, N_k].
             kwargs: Must contain 'maps_dict' holding physics parameters.
-                    Optionally 'marker_mask', 'marker_prior', 'y_meas'.
+                    Optionally 'y_meas'.
 
         Returns:
             Reconstructed image [B, N_con, H, W].
@@ -189,8 +186,6 @@ class PMAVarNet(nn.Module):
         # Parse inputs
         y_meas = kwargs.get("y_meas", x)  # [B, N_con, Nc, N_k]
         maps_dict = kwargs.get("maps_dict", {})
-        marker_mask = kwargs.get("marker_mask")  # k-space mask [1, 1, N_k] or image mask
-        marker_prior = kwargs.get("marker_prior")  # k-space prior
 
         if self.operator is None:
             raise RuntimeError("Operator_A_m4 is required for PMAVarNet.")
@@ -224,19 +219,6 @@ class PMAVarNet(nn.Module):
             # x_cnn = Regularizer( x_n - eta * g_n )
             x_update = x_n - self.eta[k] * g_n
             x_cnn = self.regularizers[k](x_update)
-
-            # 3. Hard Marker Projection (Task 4.4 / Deep DC Forcing)
-            if marker_mask is not None and marker_prior is not None:
-                # Assuming marker constraint is applied in image or k-space according to mask
-                # If marker_mask is image space [B, 1, H, W]:
-                if marker_mask.shape[-1] == x_cnn.shape[-1]:
-                    x_cnn = x_cnn * (1 - marker_mask) + marker_prior * marker_mask
-                else:
-                    # K-space projection
-                    for c in range(N_con):
-                        X_k = fft2c(x_cnn[:, c])
-                        X_k = X_k * (1 - marker_mask) + marker_prior * marker_mask
-                        x_cnn[:, c] = ifft2c(X_k)
 
             x_n = x_cnn
 

@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,10 @@ class HybridQMapGenerator(nn.Module, IGeneratorProtocol):
     3. Decoder MLP: Maps sampled features + coordinates to physical parameters (T1, T2, PD, B0, B1).
     """
 
+    #: No test-time optimisation runs here (#2307): the audit rejects ``enable_tto: true`` at
+    #: load; the build-time raise below also catches ``tto_*`` keys without ``enable_tto``.
+    OPTION_SCHEMA: ClassVar[dict[str, list[Any]]] = {"enable_tto": [False]}
+
     def __init__(self, input_dim: int = 1, feature_dim: int = 64, **kwargs: Any):
         """
         Args:
@@ -30,6 +34,13 @@ class HybridQMapGenerator(nn.Module, IGeneratorProtocol):
             **kwargs: Absorbed for factory compatibility. Recognised aliases:
                 ``in_channels`` (canonical v6.0 name) overrides ``input_dim``.
         """
+        tto = sorted(k for k in kwargs if k == "enable_tto" or k.startswith("tto_"))
+        if tto:
+            # Nothing in this model or its strategy runs test-time optimisation (#2307).
+            raise ValueError(
+                f"hybrid_qmap_generator does not run test-time optimisation, so {tto} "
+                "would be dropped; remove them or use a model that wires TTO."
+            )
         super().__init__()
         # Accept the canonical v6.0 `in_channels` kwarg as alias for input_dim
         # so model_factory wiring honours the YAML's declared channel count

@@ -162,6 +162,7 @@ def antialias_rolloff(
     dims: tuple[int, ...],
     *,
     noise_sigma: float = 0.0,
+    max_inverse_cutoff: float = 1.0 / _CUTOFF_MIN,
 ) -> Tensor:
     """Receiver anti-alias filter: Butterworth (n = 4) magnitude over the readout band.
 
@@ -185,7 +186,7 @@ def antialias_rolloff(
     if theta <= 0.0:
         return x
     nu = 2.0 * centred_freqs(x.shape[-1], x.device)
-    gain = butterworth_response(nu, _CUTOFF_MIN / theta)
+    gain = butterworth_response(nu, 1.0 / (max_inverse_cutoff * theta))
     return x * gain.to(x.real.dtype)
 
 

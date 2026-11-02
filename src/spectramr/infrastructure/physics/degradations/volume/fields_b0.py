@@ -17,6 +17,7 @@ from spectramr.infrastructure.physics.degradations._common import (
     _ensure_complex,
     _generator,
     readout_offset_px,
+    reject_override_with_endpoint,
 )
 from spectramr.infrastructure.physics.degradations.blocks.volume_fields import (
     upsampled_noise_field,
@@ -86,6 +87,7 @@ def b0_volume(
     seed: int,
     geometry: AcquisitionGeometry,
     strength: float | None = None,
+    max_strength: float = 1.0,
 ) -> Tensor:
     """D10: phase ``exp(i pi f)`` of a random quadratic field plus gradient dropout.
 
@@ -94,7 +96,8 @@ def b0_volume(
     (plus the through-slice factor) and the 3-D gradient in a volume.
     """
     check_volume(x, geometry, "b0")
-    s = float(theta) if strength is None else float(strength)
+    reject_override_with_endpoint("b0", "strength", strength, "max_strength", max_strength, 1.0)
+    s = float(theta) * float(max_strength) if strength is None else float(strength)
     if s == 0.0:
         return x
     x = _ensure_complex(x)
@@ -164,6 +167,7 @@ def b0_geometric_volume(
     b0_strength: float | None = None,
     dwell_time: float = 5e-5,
     sequence: str = "spin_warp",
+    max_b0_strength: float = 1.0,
 ) -> Tensor:
     """D10b: spin-warp voxel shift ``dB0 / BW_px`` along readout only, ``BW_px = 1 / (W dwell)``."""
     check_volume(x, geometry, "b0_geometric_distortion")
@@ -173,7 +177,11 @@ def b0_geometric_volume(
         )
     if dwell_time <= 0:
         raise ValueError(f"dwell_time must be > 0 s; got {dwell_time}")
-    s = float(theta) if b0_strength is None else float(b0_strength)
+    reject_override_with_endpoint(
+        "b0_geometric_distortion", "b0_strength", b0_strength,
+        "max_b0_strength", max_b0_strength, 1.0,
+    )
+    s = float(theta) * float(max_b0_strength) if b0_strength is None else float(b0_strength)
     if s == 0.0:
         return x
     x = _ensure_complex(x)

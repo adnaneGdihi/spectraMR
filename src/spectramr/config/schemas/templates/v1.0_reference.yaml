@@ -210,8 +210,8 @@ data:
   #                                       # 'ordered' pairs the two halves of a split target_mode
   #
   # SSOT: data/datasets/m4raw_dataset.py::_average_reps · rules: .claude/rules/data.md
-  # Audit: `m4raw_nex_target_mode_declared` (advisory) flags an m4raw arm that
-  # declares neither.
+  # Audit: `m4raw_nex_target_mode_declared` refuses an m4raw arm that does not
+  # declare target_mode (the complex_mean default cancels signal on M4Raw).
 
   # WHERE the bytes come from (phase 9g). `data_root`/`data_layout` drop the
   # `data_` prefix -- the outer block supplies it. The `_path` leaves keep their
@@ -282,6 +282,7 @@ data:
     # M4Raw cross-contrast route only (dataset_type: m4raw, single_contrast: false); live, they are refused otherwise:
     # cross_contrast_source: 'T1'                # options: 'T1', 'T2', 'FLAIR'
     # source_layout: 'stacked'                   # options: 'stacked', 'separate', 'target_only'
+    # stacked_combine: 'joint'                   # options: 'joint', 'per_contrast' (stacked + rss_image only)
     contrasts: null                 # e.g. ['T1w', 'FLAIR']
     sessions: null                  # e.g. ['01', '02']
     # target side; each null = mirror its input counterpart above
@@ -622,6 +623,8 @@ training:
 #   cycle_bloch:
 #     b1_plus: 'off'                             # options: 'off', 'estimated'
 #     backward_model: 'bloch_fixed'              # options: 'bloch_fixed', 'ulf_forward', 'epg_tse'
+#     cycle_criterion: 'l1'                      # options: 'l1', 'mse'
+#     segmenter_backend: 'none'                  # options: 'none', 'label_dice'
 #   diffusion:
 #     # Which generative paradigm trains this arm. `null` is the transitional
 #     # "unspecified" tag -- equivalent to omitting the key, and it is what the
@@ -1188,7 +1191,8 @@ loss_logging:
 undersampling:
   base_acceleration: 4.0
   max_acceleration: 8.0
-  # options: 'linear', 'polynomial', 'exponential', 'step', 'power_law'
+  # options: 'linear', 'polynomial', 'exponential', 'step', 'power_law', 'log'
+  # ('log' is accepted by the enum but refused here: only severity_axes.<name>.schedule takes it.)
   acceleration_schedule: 'linear'
   schedule_steps: 10000
   schedule_power: 2.0
@@ -1202,6 +1206,8 @@ undersampling:
   #   ('cartesian_lines', 'cartesian_peripheral', 'sle_kappa', ...) are not
   #   accelerators. The two vocabularies overlap but are not the same set.
   acceleration_type: 'variable_density'
+  # Outer-sample pattern of the loader's Cartesian masking; null = uniform random lines.
+  sampling_pattern: null                         # options: null, 'random_cartesian', 'variable_density_1d', 'sle_kappa'
   center_fraction: 0.08
   density_power: 2.0
   sigma_scaling: 0.25
@@ -1230,7 +1236,7 @@ undersampling:
 # to; uncomment the lines you need. Generated from the schema -- see
 # tests/unit/config/test_reference_template_options.py, which fails if any
 # list here stops matching its Enum/Literal.
-#   schedule_type: null                          # options: null, 'linear', 'polynomial', 'exponential', 'step', 'power_law'
+#   schedule_type: null                          # options: null, 'linear', 'polynomial', 'exponential', 'step', 'power_law', 'log'
 
 # ============================================================================
 # PHYSICS  (PhysicsConfigSchema)
@@ -1405,7 +1411,8 @@ physics:
     # 'step' differs from undersampling's: there it indexes an explicit
     # acceleration_range LIST, and severity has only the (vmin, vmax) pair, so here
     # it is binary at the midpoint — vmin below, vmax above.
-    # options: 'linear', 'polynomial', 'power_law', 'exponential', 'step'
+    # options: 'linear', 'polynomial', 'power_law', 'exponential', 'step', 'log'
+    # ('log' is refused here: only severity_axes.<name>.schedule takes it.)
     degradation_schedule: 'linear'      # applies to every axis...
     degradation_schedules: {}           # ...unless overridden per axis, e.g.
                                         #   {motion: step, noise: power_law}
@@ -1414,6 +1421,16 @@ physics:
                                         # from a non-empty list is held STATIC at
                                         # full strength, so its ramp never fires.
     degradation_schedule_power: 2.0     # read only by power_law / polynomial
+    # Physical-unit range + schedule for DEGRADATION_REGISTRY axes listed in
+    # progressive_degradations, resolved exactly as Sim2Rank's --severity-axes.
+    # A native axis, or one also keyed in degradation_ranges/_schedules, raises.
+    # Keyed by axis name, e.g. {cartesian_undersamp: {start: 2, end: 16, schedule: log}}:
+    severity_axes: {}
+    #   start: 2.0                      # physical value at theta = 0
+    #   end: 16.0                       # physical value at theta = 1
+    #   n_steps: null                   # Sim2Rank grid size; the twin raises if set
+    #   schedule: 'linear'  # options: 'linear', 'polynomial', 'power_law', 'exponential', 'step', 'log'
+    #   power: 2.0                      # read only by power_law / polynomial
 
     # Apply the twin as a transversal data-pipeline transform (DigitalTwinDegradation)
     # instead of inside a VF strategy: corrupts the acquisition into `input` and keeps
@@ -1587,7 +1604,8 @@ parallel:
     tensor: 1
     context: 1
     spatial: 1
-    pipeline: 1
+    pipeline: 1                     # >1: unrolled cascades split into stages (pipeline_stages)
+    pipeline_microbatches: 1        # GPipe microbatches; bubble (pp-1)/(m+pp-1)
   # [S0, S1, S2] (data.sampling.patch_size order) of the synthetic volume the spatial
   # equivalence gate runs on when mesh.spatial > 1; the split runs along S0. null
   # derives it from data.sampling.patch_size.

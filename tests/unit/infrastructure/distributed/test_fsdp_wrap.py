@@ -179,3 +179,17 @@ def test_unknown_sharding_strategy_raises() -> None:
     # The strategy is checked before the mesh is indexed, so no mesh is needed.
     with pytest.raises(ValueError, match="Unknown FSDP sharding_strategy"):
         fsdp_shard_mesh(object(), "zero3")
+
+
+def test_no_shard_refuses_spatial_peers() -> None:
+    from types import SimpleNamespace
+
+    from spectramr.infrastructure.distributed.fsdp_wrap import fsdp_shard_mesh
+
+    class _SpatialMesh:
+        def __getitem__(self, name):
+            return SimpleNamespace(size=lambda: 2)
+
+    # Replicating over dp alone would leave the sp peers out of the gradient average.
+    with pytest.raises(ValueError, match="no_shard"):
+        fsdp_shard_mesh(_SpatialMesh(), "no_shard")

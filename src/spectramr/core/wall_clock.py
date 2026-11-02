@@ -1,6 +1,6 @@
 """Wall-clock budget SSOT — yielding before the allocation ends.
 
-A production arm is allowed 120 h per job and needs far more, so the run has to
+A production arm is allowed 96 h per job and needs far more, so the run has to
 survive being cut in half. The half that was missing is not *resume* — the
 checkpoint carries model, optimizer, scheduler, scaler, EMA, RNG and counter
 state already — it is **stopping in time to write one**. A job killed at the

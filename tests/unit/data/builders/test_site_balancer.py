@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections import Counter
 
 import pytest
+import torch
 
 from spectramr.data.builders.site_balancer import (
     RoundRobinBalancer,
@@ -103,3 +104,76 @@ def test_module_imports_and_exposes_balancers():
     assert hasattr(sb, "build_balancer")
     assert hasattr(sb, "RoundRobinBalancer")
     assert hasattr(sb, "Balancer")
+
+
+# ── DomainLabelledBalancer: one flat batch + per-sample domain_label ──────────
+
+
+class _DictLoader:
+    """Yields ``n`` collated dict batches of ``bs`` samples filled with ``value``."""
+
+    def __init__(self, value: float, n: int, bs: int = 2, extra: str | None = None) -> None:
+        self._value, self._n, self._bs, self._extra = value, n, bs, extra
+
+    def __iter__(self):
+        for i in range(self._n):
+            batch = {
+                "input": torch.full((self._bs, 1, 4, 4), self._value),
+                "meta": {"step": torch.full((self._bs,), float(i)), "path": ["p"] * self._bs},
+            }
+            if self._extra:
+                batch[self._extra] = torch.zeros(self._bs)
+            yield batch
+
+    def __len__(self) -> int:
+        return self._n
+
+
+def test_domain_labelled_concatenates_and_labels_per_sample() -> None:
+    balancer = build_balancer(
+        {"synthetic": _DictLoader(1.0, 2, bs=2), "real": _DictLoader(-1.0, 2, bs=3)},
+        strategy="domain_labelled",
+    )
+    batch = next(iter(balancer))
+    assert batch["input"].shape == (5, 1, 4, 4)
+    assert batch["domain_label"].tolist() == [1.0, 1.0, 0.0, 0.0, 0.0]
+    # Labels line up with the domain each sample came from.
+    assert batch["input"][:2].eq(1.0).all() and batch["input"][2:].eq(-1.0).all()
+    assert batch["meta"]["step"].shape == (5,) and len(batch["meta"]["path"]) == 5
+
+
+def test_domain_labelled_epoch_follows_the_source_and_cycles_the_target() -> None:
+    balancer = build_balancer(
+        {"synthetic": _DictLoader(1.0, 3), "real": _DictLoader(-1.0, 1)},
+        strategy="domain_labelled",
+    )
+    assert len(balancer) == 3
+    assert len(list(balancer)) == 3
+
+
+def test_domain_labelled_refuses_mismatched_keys() -> None:
+    balancer = build_balancer(
+        {"synthetic": _DictLoader(1.0, 1, extra="marker"), "real": _DictLoader(-1.0, 1)},
+        strategy="domain_labelled",
+    )
+    with pytest.raises(ValueError, match="disagree"):
+        next(iter(balancer))
+
+
+def test_domain_labelled_needs_exactly_two_uniformly_weighted_domains() -> None:
+    three = {k: _DictLoader(0.0, 1) for k in ("a", "b", "c")}
+    with pytest.raises(ValueError, match="exactly 2"):
+        build_balancer(three, strategy="domain_labelled")
+    two = {k: _DictLoader(0.0, 1) for k in ("a", "b")}
+    with pytest.raises(NotImplementedError, match="non-uniform"):
+        build_balancer(two, strategy="domain_labelled", weights={"a": 1.0, "b": 3.0})
+
+
+def test_schema_rejects_domain_labelled_with_three_domains() -> None:
+    from spectramr.config.schemas.data import MultiDomainConfigSchema
+
+    domains = [{"name": n} for n in ("a", "b", "c")]
+    with pytest.raises(ValueError, match="exactly 2"):
+        MultiDomainConfigSchema(enabled=True, balancing="domain_labelled", domains=domains)
+    ok = MultiDomainConfigSchema(enabled=True, balancing="domain_labelled", domains=domains[:2])
+    assert ok.balancing == "domain_labelled"

@@ -38,6 +38,16 @@ class MotionConfig(BaseModel):
         default="smooth",
         description=f"Type of motion trajectory. One of: {VALID_MOTION_TYPES}",
     )
+    fixed_trajectory_seed: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Single-task control: draw one motion trajectory from this seed and reuse it "
+            "for every training batch. None draws a new random trajectory per batch "
+            "(meta-training). Validation always draws random motion, so both arms are "
+            "scored on the same distribution."
+        ),
+    )
 
     @field_validator("motion_type")
     @classmethod

@@ -274,14 +274,16 @@ class QualityMatchingConfig(StrictSchema):
         ),
     )
     max_residual: float | None = Field(
-        default=None,
+        default=0.1,
         gt=0.0,
         description=(
             "Absolute ceiling on the weighted residual, beside min_gap_closed. The weights "
             "are 1/target^2, so the residual is a relative error norm: 0.1 means the "
-            "achieved attributes lie within about 10% of target. None disables the "
-            "ceiling. A fit above it RAISES, because min_gap_closed alone passes any "
-            "fit that halves a large gap."
+            "achieved attributes lie within about 10% of target. On by default, because "
+            "min_gap_closed alone passes any fit that halves a large gap (#2411); a fit "
+            "above it RAISES. On synthetic phantoms a correctly normalised fit lands near "
+            "1e-3 and an intensity-unit mismatch near 1, so 0.1 separates them; it is not "
+            "yet calibrated on the real cohorts. An explicit null disables the ceiling."
         ),
     )
     held_out_fraction: float = Field(

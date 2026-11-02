@@ -92,7 +92,7 @@ LOSS_LISTS: tuple[str, ...] = tuple(LOSS_LIST_DOMAINS)
 
 #: Spellings of a loss that the registry does not know, because the schema field and the
 #: component the computers stack are named differently. Mirrors the remap
-#: ``LossConfigSchema.get_enabled_losses()`` already applies when deciding what to BUILD;
+#: ``models/losses/build_set.py`` applies this table when deciding what to BUILD;
 #: without it the same knob is invisible when deciding what to WEIGH.
 #:
 #: This is not cosmetic. Every legacy resolver looked up ``lambda_adversarial``, but the
@@ -376,6 +376,58 @@ def _written_lambda_fields(section: Any) -> list[str]:
     return []
 
 
+#: ``enable_<x>`` flags whose term is weighted by a differently named ``lambda_<y>``.
+#: Same-name pairs (``enable_l1`` / ``lambda_l1``) need no entry. Mirrors the walker that
+#: this table replaces (#1966), so an ``enable_*`` flag keeps its meaning.
+ENABLE_FLAG_LAMBDAS: dict[str, str] = {
+    "enable_adversarial": "lambda_adv",
+    "enable_gradient_penalty": "lambda_gp",
+    "enable_r1": "lambda_r1",
+    "enable_diffusion": "lambda_mse",
+    "enable_recon": "lambda_recon",
+    "enable_marker_loss": "lambda_marker",
+    "enable_prior_loss": "lambda_prior",
+    "enable_lncc": "lambda_sim",
+    "enable_smoothness": "lambda_smooth",
+}
+
+
+def _enable_flag_declarations(
+    loss_config: Any,
+) -> tuple[dict[str, str], dict[str, list[tuple[str, float]]]]:
+    """Terms switched off by ``enable_<x>: false``, and terms enabled by ``enable_<x>: true``.
+
+    ``enable_<x>: false`` on a term the author weighted on the lambda surface disables it
+    (weight 0.0, the source named). ``enable_<x>: true`` with no written lambda declares the
+    term at the schema default, which is what the walker this table replaces did. The second
+    mapping is only consulted when no other surface declares the term.
+    """
+    disabled: dict[str, str] = {}
+    found: dict[str, list[tuple[str, float]]] = {}
+    for section_name in LAMBDA_SECTIONS:
+        section = getattr(loss_config, section_name, None)
+        if section is None:
+            continue
+        written = set(getattr(section, "model_fields_set", ()) or ())
+        for flag in sorted(f for f in written if f.startswith("enable_")):
+            lam = ENABLE_FLAG_LAMBDAS.get(flag, "lambda_" + flag[len("enable_") :])
+            if lam not in type(section).model_fields:
+                continue
+            # The source names the lambda the weight lives in, so a strategy-resolved term
+            # (``losses.reconstruction.lambda_l1``) is classified the same whichever flag
+            # declared it.
+            source = f"losses.{section_name}.{lam}"
+            if getattr(section, flag) is False:
+                if lam in written:
+                    disabled[_loss_name_for_field(lam)] = source
+            elif getattr(section, flag) is True and lam not in written:
+                default = type(section).model_fields[lam].default
+                if isinstance(default, (int, float)) and not isinstance(default, bool):
+                    name = _loss_name_for_field(lam)
+                    found.setdefault(name, []).append((source, float(default)))
+    return disabled, found
+
+
 def _declared_list_entries(
     loss_config: Any,
 ) -> dict[str, list[tuple[str, float, bool]]]:
@@ -401,6 +453,16 @@ def _declared_list_entries(
             found.setdefault(name, []).append(
                 (source, 1.0 if weight is None else float(weight), bool(enabled))
             )
+    # ``composed.components`` is a list of the same component type; it is a declaration
+    # surface too, so the build set (#1966) reads it from here like any other list.
+    composed = getattr(loss_config, "composed", None)
+    for component in getattr(composed, "components", None) or []:
+        raw = getattr(component, "name", None)
+        if raw is None:
+            continue
+        name = canonical_loss_name(str(raw))
+        source = f"losses.composed.components[{raw}].weight"
+        found.setdefault(name, []).append((source, float(component.weight), bool(component.enabled)))
     return found
 
 
@@ -470,6 +532,10 @@ def build_loss_weight_table(
 
     lambdas = _declared_lambdas(loss_config)
     entries = _declared_list_entries(loss_config)
+    disabled, enabled_by_flag = _enable_flag_declarations(loss_config)
+    for name, flagged in enabled_by_flag.items():
+        if name not in lambdas and name not in entries:
+            lambdas.setdefault(name, []).extend(flagged)
 
     recon = getattr(loss_config, "reconstruction", None)
     raw_warmup = getattr(recon, "warmup_iterations", None) if recon is not None else None
@@ -521,6 +587,17 @@ def build_loss_weight_table(
             source=source,
             warmup_gated=name in warmup_losses,
         )
+
+    for name in disabled:
+        spec = specs.get(name)
+        if spec is not None:
+            specs[name] = LossWeightSpec(
+                name=name,
+                weight=0.0,
+                enabled=False,
+                source=spec.source,
+                warmup_gated=spec.warmup_gated,
+            )
 
     if conflicts:
         raise ConfigurationError(
@@ -590,6 +667,7 @@ def resolve_loss_weight(
     *,
     scheduled: Mapping[str, float] | None = None,
     iteration: int = 0,
+    declared_only: bool = False,
 ) -> float:
     """The hot path: a pure lookup. No config walk, no ``model_dump``, no allocation.
 
@@ -600,6 +678,9 @@ def resolve_loss_weight(
       2. ``enabled: false`` -> 0.0
       3. the warm-up gate -> 0.0 while ``iteration < warmup_iterations``
       4. the declared static weight
+
+    ``declared_only`` makes an undeclared term weigh 0.0 instead of its schema default
+    (#2280: a computer asking for a term the arm does not declare must not train it).
 
     Raises:
         ConfigurationError: ``name`` is declared nowhere. Never silently 1.0.
@@ -613,6 +694,8 @@ def resolve_loss_weight(
 
     spec = table.get(canonical)
     if spec is None:
+        if declared_only:
+            return 0.0
         # Undeclared. Fall back to the `lambda_<n>` SCHEMA default if one exists — that
         # is a single, visible, auditable value (almost always 0.0 = "not requested"),
         # and callers legitimately probe a term's weight before deciding to compute it.

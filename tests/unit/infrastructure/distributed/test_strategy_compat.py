@@ -308,3 +308,47 @@ class TestGeneratorMethodCallers:
 
     def test_single_process_is_not_gated(self, module, name) -> None:
         assert not evaluate_parallel_compat(self._cls(module, name), "none").refused
+
+
+class _Pipelined(_NoOwned):
+    parallel_compat = frozenset({REPLICATED, SHARDED, "pipelined"})
+
+
+class _ChildOfPipelined(_Pipelined):
+    """Inherits the backends' permission check path but not the pipeline permission."""
+
+
+class TestPipelineDeclaration:
+    """``parallel.mesh.pipeline > 1`` needs the class's OWN 'pipelined' token."""
+
+    @pytest.mark.parametrize("backend", ["ddp", "fsdp"])
+    def test_a_declared_strategy_may_pipeline(self, backend) -> None:
+        assert not evaluate_parallel_compat(_Pipelined, backend, pipeline=2).refused
+
+    @pytest.mark.parametrize("cls", [_Both, _Undeclared, _ChildOfPipelined])
+    def test_planted_an_undeclared_strategy_is_refused(self, cls) -> None:
+        verdict = evaluate_parallel_compat(cls, "ddp", pipeline=2)
+        assert verdict.refused and "pipelined" in verdict.message
+
+    def test_pipeline_one_is_not_gated(self) -> None:
+        assert not evaluate_parallel_compat(_Both, "ddp", pipeline=1).refused
+
+    def test_the_config_reader_passes_the_mesh_pipeline(self) -> None:
+        config = SimpleNamespace(
+            parallel=SimpleNamespace(
+                strategy="ddp", deepspeed=None, mesh=SimpleNamespace(pipeline=2)
+            )
+        )
+        assert check_strategy_for_parallel(config, _Both).refused
+        assert not check_strategy_for_parallel(config, _Pipelined).refused
+
+    def test_reconstruction_declares_it_and_gan_does_not(self) -> None:
+        from spectramr.infrastructure.training.strategies.gan import GANTrainingStrategy
+        from spectramr.infrastructure.training.strategies.reconstruction import (
+            ReconstructionTrainingStrategy,
+        )
+
+        assert not evaluate_parallel_compat(
+            ReconstructionTrainingStrategy, "ddp", pipeline=2
+        ).refused
+        assert evaluate_parallel_compat(GANTrainingStrategy, "ddp", pipeline=2).refused

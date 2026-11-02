@@ -56,6 +56,8 @@ def _write(
         f["ismrmrd_header"] = np.bytes_(_header(proto).encode())
         if nex is not None:
             f.attrs["nex_average_count"] = nex
+        if nex is not None:
+            f.attrs["nex_average_mode"] = "phase_aligned_mean"
         if registered:
             f.attrs["registration_valid_slices"] = np.array([True, True, False])
         if source is not None:
@@ -170,3 +172,12 @@ def test_a_series_without_its_averaging_count_excludes_the_subject(tmp_path: Pat
     (tmp_path / "y" / "A" / "split").mkdir(parents=True)
     with pytest.raises(FileNotFoundError, match="no registered triplet"):
         M4RawTripletDataset(*trees, split="split")
+
+
+def test_an_average_not_phase_aligned_excludes_the_subject(tmp_path: Path) -> None:
+    trees = _tree(tmp_path, s2_flair_registered=True)
+    with h5py.File(trees[0] / "split" / "s1_T100.h5", "a") as f:
+        f.attrs["nex_average_mode"] = "complex_mean"
+    ds = M4RawTripletDataset(*trees, split="split")
+    assert "averages not phase_aligned_mean" in ds.excluded["s1"]
+    assert {s for s, _ in ds.records} == {"s2"}

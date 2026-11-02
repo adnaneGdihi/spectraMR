@@ -348,6 +348,25 @@ RESOLUTION_AGNOSTIC_SCAN: dict[str, str] = {
 }
 
 
+def arc_length_steps(
+    order: np.ndarray, shape: tuple[int, ...], reference_shape: tuple[int, ...]
+) -> torch.Tensor:
+    """Euclidean step between consecutive voxels of ``order`` (flat indices into ``shape``).
+
+    Coordinates are divided per axis by ``reference_shape``, so the unit is one
+    reference-grid extent; ``Δ_0 = 0``. Returns a float32 tensor of ``len(order)``.
+    """
+    if len(reference_shape) != len(shape):
+        raise ValueError(
+            f"reference_shape {tuple(reference_shape)} has rank {len(reference_shape)}, "
+            f"shape {tuple(shape)} has rank {len(shape)}"
+        )
+    coords = np.array(np.unravel_index(order, shape), dtype=np.float64).T
+    coords /= np.asarray(reference_shape, dtype=np.float64)[None, :]
+    steps = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+    return torch.from_numpy(np.concatenate([[0.0], steps]).astype(np.float32))
+
+
 def resolution_agnostic_mode(mode: str) -> str:
     """Map a strict Hilbert scan mode to its resolution-agnostic ``*_rect``
     sibling; every other mode (already shape-agnostic — morton/snake/raster/
@@ -439,40 +458,20 @@ class ImageTopologyLinearizer(nn.Module):
         x_restored = sequence[:, :, self.inverse_idx]
         return x_restored.reshape(B, C, *self.shape)
 
-    def physical_arc_delta(self) -> torch.Tensor:
-        """Per-token arc-length step ``Δ_t = ‖H(s_t) − H(s_{t-1})‖_Ω``.
+    def physical_arc_delta(self, reference_shape: tuple[int, ...] | None = None) -> torch.Tensor:
+        """Per-token arc-length step ``Δ_t = ‖p_t - p_{t-1}‖`` in reference-grid units.
 
-        Used by ``ContinuousSFCMamba`` to scale the per-token timestep
-        in the selective SSM update so the discrete scan is a
-        consistent quadrature of the continuous-time SSM along the
-        space-filling curve. This is the mechanism behind Theorem A
-        (resolution invariance) of ``TODO/Mamba_NO.md``.
-
-        Coordinates are normalised to the unit cube ``[0, 1]^d`` so
-        the absolute scale is independent of grid resolution. The
-        returned tensor has shape ``(seq_len,)`` with ``Δ_0 = 0`` (no
-        previous token).
-
-        Bound (from the Hilbert Hölder property, eq. (1) of
-        ``TODO/Mamba_NO.md``)::
-
-            Δ_t ≤ c_d · N^{-1/d}     where c_d = 2·sqrt(d+3)
+        ``ContinuousSFCMamba`` scales its per-token timestep by this step. Each axis
+        is divided by ``reference_shape`` (default: this linearizer's own shape), so a
+        model built on one grid keeps the same per-voxel step on any other extent at
+        the same voxel spacing. On a power-of-two Hilbert grid every step after the
+        first is ``1/n``; ``Δ_0 = 0``. The step scales as ``N^{-1/d}``, not as the
+        ``1/N`` cell measure the resolution-invariance argument of
+        ``TODO/Mamba_NO.md`` assumes (#2365).
         """
-        # Reconstruct (h, w) or (d, h, w) coordinates from the flat
-        # forward_idx, then take the L2 step between consecutive
-        # tokens. Normalise by the largest spatial dim so the
-        # canonical curve lives in [0, 1]^d.
-        coords = np.array(
-            np.unravel_index(self.forward_idx.cpu().numpy(), self.shape), dtype=np.float64
-        ).T  # (seq_len, d)
-
-        # Normalise to the unit cube — divide each axis by its size.
-        scales = np.asarray(self.shape, dtype=np.float64)
-        coords_unit = coords / scales[None, :]
-
-        steps = np.linalg.norm(np.diff(coords_unit, axis=0), axis=1)
-        delta = np.concatenate([[0.0], steps]).astype(np.float32)
-        return torch.from_numpy(delta)
+        return arc_length_steps(
+            self.forward_idx.cpu().numpy(), self.shape, reference_shape or self.shape
+        )
 
     def extra_repr(self) -> str:
         return f"mode={self.mode}, shape={self.shape}, seq_len={len(self.forward_idx)}"

@@ -41,7 +41,7 @@ from torch import Tensor
 from spectramr.core.metrics.evaluation_metrics import BaseMetric
 from spectramr.core.metrics.registry import register_metric
 
-Image = torch.Tensor
+type Image = torch.Tensor
 
 
 def _to_numpy(t: Tensor) -> np.ndarray:
@@ -88,7 +88,7 @@ class DISTSMetric(BaseMetric):
         for p in self._impl.parameters():
             p.requires_grad_(False)
 
-    @torch.inference_mode()
+    @torch.inference_mode()  # type: ignore[misc, unused-ignore]
     def compute_metric(self, preds: Image, target: Image, **_: Any) -> Tensor:
         # Ensure inputs live on the same device + dtype (fp32) as the
         # metric's internal VGG19. The precompute loop calls this
@@ -137,7 +137,7 @@ class FocalFrequencyMetric(BaseMetric):
         self._impl.to(self._device)
         self._impl.eval()
 
-    @torch.inference_mode()
+    @torch.inference_mode()  # type: ignore[misc, unused-ignore]
     def compute_metric(self, preds: Image, target: Image, **_: Any) -> Tensor:
         preds = preds.to(self._device).float()
         target = target.to(self._device).float()
@@ -429,6 +429,26 @@ class LimitsOfAgreementLower(BaseMetric):
         return torch.tensor(
             float(diff.mean() - 1.96 * diff.std(ddof=1) if diff.size > 1 else 0.0),
             device=self.device,
+        )
+
+
+@register_metric("abs_bland_altman_bias", aliases=["abs_ba_bias"])
+class AbsBlandAltmanBias(BaseMetric):
+    r"""Size of the Bland-Altman bias, :math:`|\bar d|`: darkening and brightening both raise it."""
+
+    def compute_metric(self, preds: Image, target: Image, **_: Any) -> Tensor:
+        diff = _to_numpy(preds) - _to_numpy(target)
+        return torch.tensor(abs(float(diff.mean())), device=self.device)
+
+
+@register_metric("limits_of_agreement_halfwidth", aliases=["loa_halfwidth"])
+class LimitsOfAgreementHalfwidth(BaseMetric):
+    r"""Half-width of the Bland-Altman limits of agreement, :math:`1.96 s_d`."""
+
+    def compute_metric(self, preds: Image, target: Image, **_: Any) -> Tensor:
+        diff = _to_numpy(preds) - _to_numpy(target)
+        return torch.tensor(
+            float(1.96 * diff.std(ddof=1) if diff.size > 1 else 0.0), device=self.device
         )
 
 

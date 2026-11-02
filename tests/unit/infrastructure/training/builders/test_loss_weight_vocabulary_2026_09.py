@@ -98,7 +98,7 @@ class TestTheVocabularyIsClosed:
     def test_the_ast_scan_finds_the_read_sites(self):
         """A scan that found nothing would make every assertion below vacuous."""
         literals = _weight_name_literals()
-        assert {"l1", "l2", "kl", "perceptual", "adversarial"} <= set(literals), literals
+        assert {"l2", "kl", "perceptual", "adversarial"} <= set(literals), literals
 
     def test_every_declarable_source_is_classified(self):
         from spectramr.infrastructure.training.builders.loss_builder import (
@@ -258,7 +258,7 @@ class TestModuleBackedLambdasAreRefused:
         runs and the adversarial module is absent — the weight buys nothing."""
         from spectramr.domain.exceptions import ConfigurationError
 
-        with pytest.raises(ConfigurationError, match=r"not in the v6\.0"):
+        with pytest.raises(ConfigurationError, match=r"enable_adversarial is\s+false"):
             _build(_armed("gan", "lambda_adv", 1.0))
 
     def test_the_same_adversarial_weight_builds_once_the_flag_is_on(self):

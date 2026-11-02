@@ -265,26 +265,23 @@ def test_param_grad_norms_returns_one_value_per_parameter() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_apply_dp_clips_large_gradient_and_adds_noise() -> None:
+def test_apply_dp_adds_calibrated_noise_without_reclipping() -> None:
     s = _bare_strategy()
     s.env = _loader_env(num_samples=400)
     s.config = _real_config(noise_multiplier=0.5, max_grad_norm=1.0)
     s._configure_from_settings()
+    s._dp_step_examples = 2
     assert s._dp_enabled and s._max_grad_norm == 1.0
 
-    model = torch.nn.Linear(4, 1, bias=False)
-    big = torch.zeros_like(model.weight)
-    big[0, 0] = 100.0
-    model.weight.grad = big.clone()
+    model = torch.nn.Linear(4096, 1, bias=False)
+    model.weight.grad = torch.zeros_like(model.weight)
 
     torch.manual_seed(0)
     s._apply_dp_to_grads(model)
 
-    g = model.weight.grad
-    norm = float(g.norm())
-    assert torch.isfinite(g).all()
-    assert 0.5 < norm < 2.0
-    assert g[0, 1] != 0.0  # noise injected into a previously-zero entry
+    # Per-sample clipping happens upstream; the hook only adds N(0, (sigma*C/B)^2).
+    std = float(model.weight.grad.std())
+    assert abs(std - 0.5 * 1.0 / 2) < 0.02
 
 
 def test_apply_dp_noop_when_disabled() -> None:
@@ -337,13 +334,18 @@ def test_clip_and_log_hook_applies_dp_and_records_step() -> None:
     gen.weight.grad = big.clone()
 
     steps_before = s.accountant.steps
+    with pytest.raises(RuntimeError, match="per-sample clipping path"):
+        s._clip_and_log_gradients(gen, epoch=0, step=0, model_name="generator")
+    assert s.accountant.steps == steps_before
+
+    s._dp_per_sample_clipped = True
     torch.manual_seed(1)
     total_norm = s._clip_and_log_gradients(gen, epoch=0, step=0, model_name="generator")
 
     assert s.accountant.steps == steps_before + 1
+    assert not s._dp_per_sample_clipped  # consumed: the next step must clip again
     g = gen.weight.grad
     assert torch.isfinite(g).all()
-    assert float(g.norm()) < 5.0
     assert g[0, 1] != 0.0
     assert isinstance(total_norm, float)
 

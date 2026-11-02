@@ -323,6 +323,68 @@ def test_a_repetition_split_batch_adds_the_reference_free_risk() -> None:
     assert {"val_rep_split_risk", "val_rep_split_bias"} <= set(metrics)
 
 
+def test_a_repetition_split_batch_trains_the_power_domain_loss() -> None:
+    """#2976: with noise_power on the batch the loss is the power residual, input-masked."""
+    from spectramr.infrastructure.training.strategies.qmap_rep_split import repetition_loss
+
+    s, batch = _strategy("projected"), _batch()
+    batch["noise_power"] = torch.full((2, 3), 4.0)
+    y = batch["target"] * 1.1
+    torch.manual_seed(1)
+    out = s._compute_losses_impl(batch["input"], y, epoch=0, batch=batch)
+    torch.manual_seed(1)
+    _, renders = s._render(s._rows(batch["input"]), batch, None)
+    x = batch["input"]
+    expected = sum(
+        repetition_loss(r, x[:, k : k + 1], y[:, k : k + 1], batch["noise_power"][:, k])
+        for k, r in enumerate(renders)
+    )
+    assert torch.allclose(out["g_total_loss"], expected)
+    y2 = y.clone()
+    y2[:, :, :20, :] = 40.0  # bright in the target where the input is air
+    torch.manual_seed(1)
+    again = s._compute_losses_impl(batch["input"], y2, epoch=0, batch=batch)
+    assert torch.allclose(out["g_total_loss"], again["g_total_loss"])
+
+
+def test_the_repetition_split_gauge_prior_never_reads_the_target() -> None:
+    """On a repetition split the prior's gains come from the input fit, not from y."""
+    from spectramr.infrastructure.training.strategies.qmap_gauge_prior import (
+        gain_ratio_penalty,
+        gain_ratio_penalty_from_gains,
+    )
+    from spectramr.infrastructure.training.strategies.qmap_rep_split import (
+        power_projected_gains,
+        repetition_loss,
+    )
+
+    s, batch = _strategy("projected", gain_ratio_prior=_PRIOR), _batch()
+    batch["noise_power"] = torch.full((2, 3), 4.0)
+    x = s._rows(batch["input"])
+    torch.manual_seed(1)
+    _, renders = s._render(x, batch, None)
+    y = s._rows(batch["target"])
+    y2 = y * torch.tensor([1.0, 3.0, 0.2]).view(1, 3, 1, 1)  # moves magnitude-fit ratios only
+    ys = [y[:, k : k + 1] for k in range(3)]
+    ys2 = [y2[:, k : k + 1] for k in range(3)]
+    masks = s._signal_masks(x)
+    assert not torch.allclose(
+        gain_ratio_penalty(renders, ys, masks, s._gauge_prior),
+        gain_ratio_penalty(renders, ys2, masks, s._gauge_prior),
+    )
+    prior = gain_ratio_penalty_from_gains(
+        power_projected_gains(renders, x, batch["noise_power"]), s._gauge_prior
+    )
+    for target in (y, y2):
+        torch.manual_seed(1)
+        out = s._compute_losses_impl(batch["input"], target, epoch=0, batch=batch)
+        data = sum(
+            repetition_loss(r, x[:, k : k + 1], target[:, k : k + 1], batch["noise_power"][:, k])
+            for k, r in enumerate(renders)
+        )
+        assert torch.allclose(out["g_total_loss"], data + prior)
+
+
 def test_the_physics_free_control_trains_and_validates_without_maps() -> None:
     from spectramr.models.generators.masked_contrast_unet import MaskedContrastUNet
 

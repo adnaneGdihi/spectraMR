@@ -122,14 +122,10 @@ class CoordKSpaceGenStrategy(DiffusionTrainingStrategy):
         coords = batch.get("coords")
         contrast_id = batch.get("contrast_id")
         if coords is None:
+            from spectramr.models.blocks.siren_inr import kspace_coordinate_grid
+
             B, C, H, W = real_k.shape
-            yy, xx = torch.meshgrid(
-                torch.linspace(-1, 1, H, device=real_k.device),
-                torch.linspace(-1, 1, W, device=real_k.device),
-                indexing="ij",
-            )
-            coords = torch.stack([xx.flatten(), yy.flatten()], dim=-1)
-            coords = coords.unsqueeze(0).expand(B, -1, -1)
+            coords = kspace_coordinate_grid(H, W, real_k.device).unsqueeze(0).expand(B, -1, -1)
 
         in_features = coords.shape[-1] + (1 if contrast_id is not None else 0)
         if contrast_id is not None:

@@ -91,7 +91,16 @@ ENTRIES = (
         gfactor_noise_volume,
         description="SENSE g-factor noise amplification at the scanner's acceleration",
         severity=SeveritySpec(
-            (_P("noise_rms", "x p99 signal", 0.0, 0.1),),
+            (
+                _P(
+                    "noise_rms",
+                    "x p99 signal",
+                    0.0,
+                    0.1,
+                    endpoint_kwargs=(None, "sigma_max"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="complex noise of std sigma_0 g(r) sqrt(R) added to the image, sigma_0 = 0.1 theta x "
             "p99(|x|); g = sqrt([(S^H Psi^-1 S)^-1]_rr [S^H Psi^-1 S]_rr) over the aliased voxel set "
             "(Pruessmann 1999); R = 1 gives g = 1." + _SENSE_NOTE,
@@ -106,7 +115,16 @@ ENTRIES = (
         pi_residual_volume,
         description="Residual aliasing of SENSE unfolded with miscalibrated coil maps",
         severity=SeveritySpec(
-            (_P("coil_map_error", "max |eps| of S' = S (1 + eps)", 0.0, 0.2),),
+            (
+                _P(
+                    "coil_map_error",
+                    "max |eps| of S' = S (1 + eps)",
+                    0.0,
+                    0.2,
+                    endpoint_kwargs=(None, "eps_max"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="the coil images plus S (m' - m): the exact unfolding m of the data aliased with the "
             "true maps S, subtracted from the unfolding m' with S' = S (1 + eps); eps a smooth seeded "
             "real field per coil with max |eps| = 0.2 theta."
@@ -126,7 +144,7 @@ ENTRIES = (
         cs_recon_volume,
         description="Compressed-sensing reconstruction artefacts (ISTA, Haar wavelet prior)",
         severity=SeveritySpec(
-            (_P("acceleration", "x", 1.0, 6.0),),
+            (_P("acceleration", "x", 1.0, 6.0, endpoint_kwargs=(None, "r_max"), valid_min=1.0),),
             notes="theta sets R = 1 + 5 theta on nested variable-density masks ((ky) or (kz, ky), alpha 3, "
             "8 % calibration). The Haar soft threshold (coarse band excepted) is 0.01 p99(|x|) times "
             "min(1, theta / 0.05): fixed above a short ramp, so theta -> 0+ is continuous and only R "
@@ -146,7 +164,12 @@ ENTRIES = (
         apodization_volume,
         description="Reconstruction k-space apodisation filter (low-pass)",
         severity=SeveritySpec(
-            (_P("window_strength", "fraction of the window applied", 0.0, 1.0),),
+            (_P(
+                "window_strength", "fraction of the window applied", 0.0, 1.0,
+                endpoint_kwargs=(None, "max_strength"),
+                valid_min=0.0,
+                valid_max=1.0,
+            ),),
             notes="k-space multiplied by w_theta = 1 - theta (1 - w), w the window kwarg in {hamming, "
             "hann, fermi} (default hamming), separable over the encoded axes (ky, kx; kz, ky, kx in 3-D).",
         ),
@@ -159,7 +182,17 @@ ENTRIES = (
         zero_fill_volume,
         description="Reduced-matrix acquisition zero-filled to the full matrix",
         severity=SeveritySpec(
-            (_P("truncated_fraction", "fraction of each encoded axis", 0.0, 0.5),),
+            (
+                _P(
+                    "truncated_fraction",
+                    "fraction of each encoded axis",
+                    0.0,
+                    0.5,
+                    endpoint_kwargs=(None, "max_fraction"),
+                    valid_min=0.0,
+                    valid_max=0.99,  # the kernel needs max_fraction < 1
+                ),
+            ),
             notes="the central 1 - f of every encoded axis is acquired (round(n (1 - f)) samples about DC), "
             "the rest zero-filled; f = 0.5 theta. Encoded axes are (ky, kx), or (kz, ky, kx) in 3-D.",
         ),
@@ -178,6 +211,8 @@ ENTRIES = (
                     "fraction of the gradient-nonlinearity coefficients",
                     0.0,
                     0.5,
+                    endpoint_kwargs=(None, "eps_max"),
+                    valid_min=0.0,
                 ),
             ),
             notes="net displacement -eps d_c(r) in one resampling, d_c the order 2..3 polynomial "

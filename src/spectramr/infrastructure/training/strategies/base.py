@@ -32,6 +32,7 @@ from spectramr.infrastructure.training.metrics.metrics_reporter import MetricsRe
 from spectramr.infrastructure.training.mixed_precision import (
     MixedPrecisionConfig,
     MixedPrecisionIntegrationHelper,
+    needs_cross_rank_inf_flag,
     resolve_amp_precision,
 )
 from spectramr.infrastructure.training.optimizers.amp_policy import AMPPolicy
@@ -352,6 +353,12 @@ class BaseTrainingStrategy(
     #: matches a route marker textually.
     folds_image_losses: ClassVar[bool | None] = None
 
+    #: True when an EMPTY ``LossBuilder`` stack is this strategy's design even though it folds
+    #: image losses: the objective is computed inline and a declared image term, if any, is
+    #: folded on top. ``loss_folding.declares_inline_objective`` reads it; it is set only on
+    #: strategies that compute their whole objective themselves.
+    empty_loss_stack_is_design: ClassVar[bool] = False
+
     #: Which parallel backends this strategy declares it can run under -- a subset
     #: of ``{"replicated", "sharded"}`` (see
     #: :mod:`spectramr.infrastructure.distributed.strategy_compat`). ``None`` is
@@ -392,6 +399,11 @@ class BaseTrainingStrategy(
     #: computer's ``stamped_component_keys``, which no config traversal can name
     #: (e.g. ``loss_nonfinite_substitutions``, #2546).
     forwards_loss_components: ClassVar[bool] = False
+
+    #: False on a strategy whose training step never calls ``_compute_training_metrics``
+    #: (or ``_score_training_views``); the CSV header then omits ``train_*`` columns
+    #: rather than promise columns that stay empty (#183).
+    reports_train_metrics: ClassVar[bool] = True
 
     #: Names of the ``torch.Generator`` attributes that drive training-step
     #: randomness (a k-space split, a group or operator draw). The base
@@ -584,10 +596,11 @@ class BaseTrainingStrategy(
             opt_config.precision.enabled, opt_config.precision.dtype
         )
         # Under FSDP the shards run in the FSDP-resolved precision; fp16 there needs the
-        # scaler (and the cross-rank non-finite flag) even when optimization.precision is off.
+        # scaler even when optimization.precision is off. Model-parallel peers hold
+        # different grads, so their non-finite flag is all-reduced too.
         parallel = getattr(self.config, "parallel", None)
-        sharded_grads = getattr(parallel, "strategy", None) == "fsdp"
-        if sharded_grads:
+        sharded_grads = needs_cross_rank_inf_flag(parallel)
+        if getattr(parallel, "strategy", None) == "fsdp":
             from spectramr.infrastructure.distributed.fsdp_wrap import resolve_fsdp_precision
 
             if resolve_fsdp_precision(parallel.fsdp, opt_config.precision) == "fp16":
@@ -597,7 +610,8 @@ class BaseTrainingStrategy(
             f"[Mixed Precision] enabled={amp_enabled} precision={amp_precision} "
             f"(precision.dtype={opt_config.precision.dtype}, "
             f"precision.enabled={opt_config.precision.enabled}) | enable_complex_support={is_complex} "
-            f"(domain={model_domain}, kspace_recon={physics_kspace})"
+            f"(domain={model_domain}, kspace_recon={physics_kspace}) | "
+            f"inf_flag={'world' if sharded_grads else 'local'}"
         )
 
         amp_config = MixedPrecisionConfig(
@@ -2634,11 +2648,10 @@ class BaseTrainingStrategy(
         Returns:
             Total gradient norm, on the parameters' device.
         """
+        from spectramr.infrastructure.distributed.grad_norm import clip_grad_norm_global_
+
         max_norm = clip_value if enable_clip else float("inf")
-        # Over FSDP2's DTensor gradients this is already the global norm; it comes
-        # back replicated, and the local copy keeps callers on plain tensors.
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-        return norm.full_tensor() if hasattr(norm, "full_tensor") else norm
+        return clip_grad_norm_global_(model, max_norm)
 
     def _check_and_log_gradient_anomalies(
         self,

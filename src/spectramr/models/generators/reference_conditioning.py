@@ -2,7 +2,8 @@
 
 A cross-contrast arm (``data.pairing.source_layout: separate``) reconstructs one
 target contrast and receives a second, fully sampled contrast as a reference.
-The reference is concatenated onto the backbone input and nothing else: it never
+The reference is concatenated onto the backbone input (``complex_unet`` with
+CC-OLMPA also encodes those leading channels for its bottleneck attention): it never
 enters the diffusion state, so the forward degradation, data consistency, the
 reverse loop, the losses and the metrics all see the target alone (#2452).
 """

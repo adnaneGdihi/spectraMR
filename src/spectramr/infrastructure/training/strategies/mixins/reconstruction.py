@@ -35,6 +35,8 @@ AUX_KEY_MAPPING: dict[str, tuple[str, ...]] = {
     "measured_kspace": ("measured_kspace", "kspace"),
     "mask": ("mask",),
     "trajectory": ("trajectory",),
+    # Patch origin (i0, j0, k0, i1, j1, k1): picks a volume's simulated samples for its slice.
+    "location": ("location",),
     "slice_indices": ("slice_indices",),
     "dcf": ("dcf", "sampling_density"),
     "field_strength": ("field_strength", "b0", "field"),

@@ -142,6 +142,7 @@ def test_to_summary_includes_betting(metric_set, clean_volumes) -> None:
     summary = out.to_summary()
     assert "betting" in summary
     assert "aggregate" in summary["betting"]
+    assert set(summary["final_mid_ranks"]) == set(summary["final_ranks"])
 
 
 def test_betting_increments_are_per_sample_not_per_method(
@@ -152,7 +153,7 @@ def test_betting_increments_are_per_sample_not_per_method(
     metrics (identical length), which the paired confidence sequence relies on."""
     pipe = _pipeline(use_betting=True)
     out = pipe.run(metric_set, clean_volumes)
-    inc = pipe._severity_concordance_increments(out.dataset)
+    inc = pipe._severity_concordance_increments(out.dataset, metric_set.higher_is_better)
     # One adjacent-pair increment per (content, family) sub-sweep, summed.
     groups = {(s.content_id, s.degradation_family) for s in out.dataset.samples}
     expected_len = out.dataset.n_samples - len(groups)
@@ -181,7 +182,7 @@ def test_compute_betting_shared_helper(metric_set, clean_volumes) -> None:
     assert off.compute_betting(out.dataset) == {}
     on = _pipeline(use_betting=True)
     out2 = on.run(metric_set, clean_volumes)
-    assert "aggregate" in on.compute_betting(out2.dataset)
+    assert "aggregate" in on.compute_betting(out2.dataset, metric_set.higher_is_better)
 
 
 # ---------------------------------------------------------------------------

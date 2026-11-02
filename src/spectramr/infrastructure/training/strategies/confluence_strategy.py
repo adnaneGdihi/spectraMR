@@ -3,7 +3,7 @@
 The travelling-volunteer tuple images the SAME subject at every source field
 ``{0.1,1.5,3,5}`` T with a single 7T target. A source-conditioned renderer
 (:class:`~spectramr.models.generators.cross_field_renderer.AnatomyFieldRenderer`, reused
-unchanged from B-3.8/B-1.9) produces a per-source 7T prediction ``x_hat_b = G(x_b)``; the
+from B-3.8/B-1.9; its encoder reads each source's field) produces a per-source 7T prediction ``x_hat_b = G(x_b)``; the
 loss combines per-source FIDELITY to the shared target with a CONSENSUS (Fréchet-mean)
 regulariser pulling the per-source predictions together::
 
@@ -18,7 +18,8 @@ ONE-KNOB ABLATION: ``lambda_consensus`` (a config knob, sampler-and-loss). ``lam
 NOT degenerate — it trains the SAME renderer on all source->7T pairs (a valid multi-source
 fidelity translator), so the delta vs ``lambda>0`` isolates exactly the consensus
 regulariser's contribution (#17). The multi-source TUPLE is supplied by the dataset's
-``multi_source`` pairing policy (``batch['sources']`` ``[B,N,1,H,W]``).
+``multi_source`` pairing policy (``batch['sources']`` ``[B,N,1,H,W]`` and
+``batch['source_field_strengths']`` ``[B,N]``).
 """
 
 from __future__ import annotations
@@ -34,16 +35,28 @@ from .reconstruction import ReconstructionTrainingStrategy
 def _render_each_source(
     model: Any,
     sources: torch.Tensor,
+    source_fields: torch.Tensor,
     field_target: torch.Tensor,
     contrast_id: torch.Tensor | None,
 ) -> list[torch.Tensor]:
-    """Render every source ``[B,N,1,H,W]`` to the target field -> list of N ``[B,1,H,W]``."""
+    """Render every source ``[B,N,1,H,W]`` (fields ``[B,N]``) to the target field -> N ``[B,1,H,W]``."""
     n = sources.shape[1]
     preds = []
     for i in range(n):
-        q = model.encode(sources[:, i])
+        q = model.encode(sources[:, i], source_fields[:, i])
         preds.append(model.render(q, field_target, contrast_id))
     return preds
+
+
+def _source_fields(source_fields: Any, sources: torch.Tensor) -> torch.Tensor:
+    """Per-source fields ``[B, N]`` for the tuple ``sources``; absent raises (no inert encoder)."""
+    if source_fields is None:
+        raise ValueError(
+            "ConfluenceStrategy requires 'source_field_strengths' alongside 'sources' "
+            "(emitted by the mrixfields multi_source policy). Got None."
+        )
+    b_s = torch.as_tensor(source_fields, device=sources.device).float()
+    return b_s.reshape(sources.shape[0], sources.shape[1])
 
 
 def compute_confluence_losses(
@@ -56,9 +69,10 @@ def compute_confluence_losses(
     """Per-source 7T fidelity + Fréchet-mean consensus over the travelling-volunteer tuple."""
     sources = batch["sources"]  # [B, N, 1, H, W]
     target = batch["target"]  # [B, 1, H, W]
+    b_s = _source_fields(batch.get("source_field_strengths"), sources)
     b_t = batch["field_strength_target"].reshape(-1).float()
     cid = batch.get("contrast_id") if contrast_conditioning else None
-    preds = _render_each_source(model, sources, b_t, cid)  # N x [B,1,H,W]
+    preds = _render_each_source(model, sources, b_s, b_t, cid)  # N x [B,1,H,W]
     n = len(preds)
 
     loss_fidelity = sum(F.l1_loss(p, target) for p in preds) / n
@@ -142,14 +156,20 @@ class ConfluenceStrategy(ReconstructionTrainingStrategy):
         input_batch: Any,
         target_batch: Any,
         sources: Any = None,
+        source_field_strengths: Any = None,
+        field_strength: Any = None,
         field_strength_target: Any = None,
         contrast_id: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """Fold the tuple + target field into batch_context (gated seam) for the consensus eval."""
+        """Fold the tuple + fields into batch_context (gated seam) for the consensus eval."""
         bc = kwargs.pop("batch_context", None) or {}
         if sources is not None:
             bc["sources"] = sources
+        if source_field_strengths is not None:
+            bc["source_field_strengths"] = source_field_strengths
+        if field_strength is not None:
+            bc["field_strength"] = field_strength
         if field_strength_target is not None:
             bc["field_strength_target"] = field_strength_target
         if contrast_id is not None:
@@ -175,13 +195,21 @@ class ConfluenceStrategy(ReconstructionTrainingStrategy):
         sources = batch_context.get("sources")
         if sources is None:
             x0 = batch_context.get("input", input_batch)
+            b_s = batch_context.get("field_strength", kwargs.get("field_strength"))
+            if b_s is None:
+                raise ValueError(
+                    "ConfluenceStrategy single-input validation requires the source "
+                    "'field_strength'. Got None."
+                )
+            b_s = torch.as_tensor(b_s, device=x0.device).reshape(-1).float()
             b_t = torch.as_tensor(b_t, device=x0.device).reshape(-1).float()
-            out = gen.render(gen.encode(x0), b_t, cid).clamp(0.0, 1.0)
+            out = gen.render(gen.encode(x0, b_s), b_t, cid).clamp(0.0, 1.0)
             self._last_visual_pred = out.detach()
             return out
         sources = torch.as_tensor(sources, device=input_batch.device)
+        b_s = _source_fields(batch_context.get("source_field_strengths"), sources)
         b_t = torch.as_tensor(b_t, device=sources.device).reshape(-1).float()
-        preds = _render_each_source(gen, sources, b_t, cid)
+        preds = _render_each_source(gen, sources, b_s, b_t, cid)
         stacked = torch.stack(preds, dim=0)
         consensus = stacked.mean(dim=0).clamp(0.0, 1.0)  # variance-reduced estimate
         # Inter-source dispersion: a collapse to ~0 (encoder driven source-invariant, rho->1)

@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from spectramr.models.blocks.field_film_modulation import FieldFiLMBlock
 from spectramr.models.registry import register_model
 
 
@@ -52,6 +53,7 @@ class FieldWienerNet(nn.Module):
         n_blocks: int = 3,
         kernel_size: int = 3,
         use_field_noise: bool = True,
+        use_target_field: bool = False,
     ) -> None:
         super().__init__()
         if in_channels != 1 or out_channels != 1:
@@ -64,9 +66,19 @@ class FieldWienerNet(nn.Module):
             raise ValueError(
                 f"use_field_noise must be a bool; got {type(use_field_noise).__name__}."
             )
+        if not isinstance(use_target_field, bool):
+            raise ValueError(
+                f"use_target_field must be a bool; got {type(use_target_field).__name__}."
+            )
         self.width = int(width)
         self.n_blocks = int(n_blocks)
         self.use_field_noise = bool(use_field_noise)
+        # Any-to-any (Task 3) maps one input to several target fields; without the target field
+        # the estimate regresses to their conditional mean (#196). Identity-init FiLM.
+        self.use_target_field = bool(use_target_field)
+        self.target_film = (
+            FieldFiLMBlock(num_channels=width, sequence_dim=1) if self.use_target_field else None
+        )
         pad = kernel_size // 2
         layers: list[nn.Module] = [nn.Conv2d(1, width, kernel_size, padding=pad), nn.SiLU()]
         for _ in range(n_blocks):
@@ -108,7 +120,16 @@ class FieldWienerNet(nn.Module):
         n = self.noise_level(field_strength).reshape(-1, 1, 1, 1) * s_mean  # relative noise floor
         return s / (s + n + 1e-8)
 
-    def forward(self, x: torch.Tensor, *, field_strength: torch.Tensor, **_: Any) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        field_strength: torch.Tensor,
+        field_strength_target: torch.Tensor | None,
+        **_: Any,
+    ) -> torch.Tensor:
+        # field_strength_target is required-by-keyword (may be None when use_target_field is
+        # off) so the Tier-2 probe injects it like the source field.
         if torch.is_complex(x):
             raise ValueError("FieldWienerNet expects magnitude (real) input.")
         if field_strength.reshape(-1).shape[0] != x.shape[0]:
@@ -116,7 +137,15 @@ class FieldWienerNet(nn.Module):
                 f"field_strength batch {field_strength.reshape(-1).shape[0]} != input batch "
                 f"{x.shape[0]}; pass one source field per sample."
             )
-        x0 = self.unet(x)
+        if self.target_film is None:
+            x0 = self.unet(x)
+        else:
+            if field_strength_target is None:
+                raise ValueError("FieldWienerNet(use_target_field=True) requires field_strength_target.")
+            h = self.unet[:2](x)  # stem conv + SiLU
+            b_t = field_strength_target.reshape(-1, 1).to(device=h.device, dtype=h.dtype)
+            h = self.target_film.apply_to(h, b_t, b_t.new_zeros(b_t.shape[0], 1))
+            x0 = self.unet[2:](h)
         x0f = torch.fft.rfft2(x0, norm="ortho")
         gain = self.wiener_gain(x0, field_strength)
         return torch.fft.irfft2(gain * x0f, s=x.shape[-2:], norm="ortho")

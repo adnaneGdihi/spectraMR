@@ -96,6 +96,7 @@ VALID_TRAINING_MODES = [
     "frontdoor_federated",
     "hodge_motion",
     "levy_diffusion",
+    "cascaded_diffusion",  # two-stage spectral cascade (CascadedDiffusionStrategy)
     "koopman_fmri",
     "sheaf_multi_contrast",
     "hjb_waveform",
@@ -435,6 +436,7 @@ VALID_MODEL_TYPES = [
     "efficient_transformer",
     "stable_vit",
     "stable_diffusion_adapter",
+    "pretrained_sd_adapter",
     "score_based_unet",
     "refined_kan_unet",
     "diffdeur",
@@ -694,6 +696,7 @@ VALID_MODEL_TYPES = [
     "hierarchical_vq_vae",
     "hyperspherical_vae",
     "moe_vae",
+    "single_decoder_vae",
     "beta_vae_gan",
     "progressive_gan",
     "octave_conv",

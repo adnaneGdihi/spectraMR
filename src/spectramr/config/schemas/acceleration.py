@@ -7,11 +7,11 @@ This schema is imported and embedded in training/base.py::BaseTrainingConfigSche
 as the "acceleration" field, making it part of the unified training configuration.
 """
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .enums import AccelerationSchedule
+from .enums import AccelerationSchedule, reject_log_schedule
 
 
 class AdaptiveAccelerationConfig(BaseModel):
@@ -155,6 +155,11 @@ class AccelerationConfigSchema(BaseModel):
         default=None,
         description="Alias for acceleration_schedule or specific schedule type",
     )
+
+    @field_validator("acceleration_schedule", "schedule_type")
+    @classmethod
+    def _no_log_schedule(cls, v: Any) -> Any:
+        return reject_log_schedule(v)
 
     # ============================================================
     # K-SPACE UNDERSAMPLING PATTERN SPECIFICATION
@@ -379,9 +384,14 @@ class AccelerationConfigSchema(BaseModel):
     sampling_pattern: str | None = Field(
         default=None,
         description=(
-            "Alias / override for the dominant Cartesian sampling pattern. "
-            "Examples: 'uniform_random', 'equispaced', 'variable_density'. "
-            "Takes precedence over ``acceleration_type`` when set."
+            "Outer-sample pattern of the LOADER's Cartesian masking "
+            "(PhysicsInformedMasking), distinct from the strategy-side "
+            "acceleration_type / mask_types. None or 'random_cartesian' draws uniform "
+            "random lines, 'variable_density_1d' (alias 'cartesian_vd') draws lines from "
+            "a centre-weighted PDF, 'sle_kappa' spends the same budget on multi-shot SLE "
+            "curves; the ACS band is the same for all. Requires the loader to mask "
+            "(data.trajectory: cartesian, base_acceleration != 1); the transform "
+            "builder raises otherwise, and on any other pattern."
         ),
     )
     rate: float | None = Field(

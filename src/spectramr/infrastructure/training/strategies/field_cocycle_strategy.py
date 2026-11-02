@@ -210,13 +210,13 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Resolve (source field, target field, contrast id) from the stashed batch."""
         batch = self._current_batch or {}
-        b_t = batch.get("field_strength_target", batch.get("field_strength"))
-        b_s = batch.get("field_strength", b_t)
-        if b_t is None:
+        b_t = batch.get("field_strength_target")
+        b_s = batch.get("field_strength")
+        if b_t is None or b_s is None:
             raise ValueError(
-                "FieldCocycleTranslationStrategy needs 'field_strength_target' in the "
-                "batch (set data.expose_field_strength_target on the mrixfields "
-                "dataset)."
+                "FieldCocycleTranslationStrategy needs 'field_strength' (source) and "
+                "'field_strength_target' in the batch (set "
+                "data.expose_field_strength_target on the mrixfields dataset)."
             )
         b_t = b_t.to(device)
         b_s = b_s.to(device)
@@ -260,13 +260,13 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
         losses_dict: dict[str, Any] | None = None,
     ) -> Any:
         gen = self.env.generator
-        _b_s, b_t, cid = self._batch_fields(target_batch.device)
+        b_s, b_t, cid = self._batch_fields(target_batch.device)
 
         def d_closure() -> torch.Tensor:
             if isinstance(discriminator, nn.Module):
                 discriminator.requires_grad_(True)
             with torch.no_grad():
-                x_hat = gen.render(gen.encode(input_batch), b_t, cid)
+                x_hat = gen.render(gen.encode(input_batch, b_s), b_t, cid)
             cond_t = self._field_contrast_cond(target_batch, b_t, cid)
             real_logits = discriminator(torch.cat([target_batch, cond_t], dim=1))
             fake_logits = discriminator(torch.cat([x_hat, cond_t], dim=1))
@@ -294,7 +294,7 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
                 discriminator.requires_grad_(False)
             components: dict[str, torch.Tensor] = {}
 
-            q = gen.encode(input_batch)  # Phi(x)
+            q = gen.encode(input_batch, b_s)  # Phi(x; b_s)
             x_hat = gen.render(q, b_t, cid)  # G(x; s, t) direct
             if getattr(self.config.training, "enforce_output_range", False):
                 x_hat = clamp_to_range(x_hat, enable=True, telemetry=False)
@@ -302,7 +302,7 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
             # Paired fidelity (always on — pins away from G=Id collapse).
             loss_fid = F.l1_loss(x_hat, target_batch)
             # Latent-cycle (coboundary consistency of the encode-once architecture).
-            loss_latent = self._latent_cycle_loss(gen.encode(x_hat), q)
+            loss_latent = self._latent_cycle_loss(gen.encode(x_hat, b_t), q)
             # Field-identity: render back at the source field reproduces the source.
             x_id = gen.render(q, b_s, cid)  # G(x; s, s)
             loss_identity = self._identity_loss(x_id, input_batch)
@@ -312,7 +312,7 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
             b_m = self._sample_intermediate_field(b_t)
             x_m = gen.render(q, b_m, cid)
             inner = x_m.detach() if self._detach_inner else x_m
-            x_mt = gen.render(gen.encode(inner), b_t, cid)
+            x_mt = gen.render(gen.encode(inner, b_m), b_t, cid)
             loss_cocycle = self._cocycle_loss(x_mt, x_hat.detach())
             # Adversarial (hinge/lsgan/vanilla against the field-conditioned D).
             cond_t = self._field_contrast_cond(x_hat, b_t, cid)
@@ -416,12 +416,14 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
         image must show the actually-translated output, not a fieldless call).
         """
         x0 = batch_context.get("input", input_batch)
+        b_s = batch_context.get("field_strength", kwargs.get("field_strength"))
         b_t = batch_context.get("field_strength_target", kwargs.get("field_strength_target"))
-        if b_t is None:
+        if b_t is None or b_s is None:
             raise ValueError(
                 "FieldCocycleTranslationStrategy validation requires per-sample "
-                "'field_strength_target'. Set data.expose_field_strength_target on "
-                "the mrixfields dataset. Got field_strength_target=None."
+                "'field_strength' (source) and 'field_strength_target'. Set "
+                "data.expose_field_strength_target on the mrixfields dataset. Got "
+                f"field_strength={b_s!r}, field_strength_target={b_t!r}."
             )
         cid = (
             batch_context.get("contrast_id", kwargs.get("contrast_id"))
@@ -429,7 +431,8 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
             else None
         )
         gen = self.env.generator
-        out = gen.render(gen.encode(x0), b_t, cid)
+        b_s = torch.as_tensor(b_s, device=x0.device).reshape(-1).float()
+        out = gen.render(gen.encode(x0, b_s), b_t, cid)
         if getattr(self.config.training, "enforce_output_range", False):
             out = clamp_to_range(out, enable=True, telemetry=False)
         return out
@@ -461,13 +464,14 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
             return {}
         input_batch = self._to_device(input_batch)
         target_batch = self._to_device(target_batch)
-        if field_strength_target is None:
+        if field_strength_target is None or field_strength is None:
             raise ValueError(
                 "FieldCocycleTranslationStrategy validation requires per-sample "
-                "'field_strength_target'. Set data.expose_field_strength_target on "
-                "the mrixfields dataset."
+                "'field_strength' (source) and 'field_strength_target'. Set "
+                "data.expose_field_strength_target on the mrixfields dataset."
             )
         b_t = field_strength_target.to(input_batch.device)
+        b_s = field_strength.to(input_batch.device)
         cid = (
             contrast_id.to(input_batch.device)
             if (contrast_id is not None and self._contrast_conditioning)
@@ -476,7 +480,8 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
 
         self.generator_model.eval()
         gen = self.env.generator
-        hr_fakes = gen.render(gen.encode(input_batch), b_t, cid)
+        q = gen.encode(input_batch, b_s)
+        hr_fakes = gen.render(q, b_t, cid)
         if getattr(self.config.training, "enforce_output_range", False):
             hr_fakes = clamp_to_range(hr_fakes, enable=True, telemetry=False)
 
@@ -504,15 +509,13 @@ class FieldCocycleTranslationStrategy(GANTrainingStrategy):
         # (`fieldSensitivity_ge_of_fidelity`). A run reporting field_sensitivity ~ 0
         # against a large field_gap_delta has collapsed, whatever its cocycle_residual
         # says.
-        if field_strength is not None:
-            b_s = field_strength.to(input_batch.device)
-            x_id = gen.render(gen.encode(input_batch), b_s, cid)
-            eps_fid = torch.mean(torch.abs(hr_fakes - target_batch))
-            eps_id = torch.mean(torch.abs(x_id - input_batch))
-            delta = torch.mean(torch.abs(target_batch - input_batch))
-            metrics["field_sensitivity"] = float(torch.mean(torch.abs(hr_fakes - x_id)).item())
-            metrics["field_gap_delta"] = float(delta.item())
-            metrics["field_sensitivity_floor"] = float((delta - eps_fid - eps_id).item())
+        x_id = gen.render(q, b_s, cid)
+        eps_fid = torch.mean(torch.abs(hr_fakes - target_batch))
+        eps_id = torch.mean(torch.abs(x_id - input_batch))
+        delta = torch.mean(torch.abs(target_batch - input_batch))
+        metrics["field_sensitivity"] = float(torch.mean(torch.abs(hr_fakes - x_id)).item())
+        metrics["field_gap_delta"] = float(delta.item())
+        metrics["field_sensitivity_floor"] = float((delta - eps_fid - eps_id).item())
 
         disc_scores: dict[str, float] = {}
         if self.env.discriminator is not None:

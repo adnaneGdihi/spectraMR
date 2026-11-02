@@ -343,3 +343,7 @@ class TestOptimizerTypeVocabulary:
         from spectramr.config.schemas.enums import OPTIMIZER_NAMES
 
         assert {"lbfgs", "sparseadam"} <= OPTIMIZER_NAMES
+
+
+def test_acceleration_schedule_has_log() -> None:
+    assert AccelerationSchedule("log") is AccelerationSchedule.LOG

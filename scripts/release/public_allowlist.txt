@@ -129,7 +129,9 @@ conftest.py
 !tests/unit/test_sim2rank_canonical_counts.py
 !tests/unit/test_sim2rank_cd_diagram.py
 !tests/unit/test_sim2rank_consensus_figures.py
+!tests/unit/test_sim2rank_coverage_preview.py
 !tests/unit/test_sim2rank_cpge_complex_context.py
+!tests/unit/test_sim2rank_damage_cli.py
 !tests/unit/test_sim2rank_dataset_kind.py
 !tests/unit/test_sim2rank_degradation_complex.py
 !tests/unit/test_sim2rank_degradation_report.py
@@ -138,6 +140,7 @@ conftest.py
 !tests/unit/test_sim2rank_distributional_eval.py
 !tests/unit/test_sim2rank_engine_outcomes.py
 !tests/unit/test_sim2rank_engine_zero_metrics.py
+!tests/unit/test_sim2rank_example_ranges.py
 !tests/unit/test_sim2rank_exclude_radiomics_provenance.py
 !tests/unit/test_sim2rank_export_per_axis_tables.py
 !tests/unit/test_sim2rank_figure_tree.py
@@ -148,12 +151,14 @@ conftest.py
 !tests/unit/test_sim2rank_identity_anchor_floor.py
 !tests/unit/test_sim2rank_inter_metric_correlation.py
 !tests/unit/test_sim2rank_interactive_report.py
+!tests/unit/test_sim2rank_local_theta_sweep.py
 !tests/unit/test_sim2rank_log_triage.py
 !tests/unit/test_sim2rank_measured_noise.py
 !tests/unit/test_sim2rank_measurement_noise.py
 !tests/unit/test_sim2rank_meta_eval.py
 !tests/unit/test_sim2rank_method_robustness.py
 !tests/unit/test_sim2rank_metric_health.py
+!tests/unit/test_sim2rank_metric_scales.py
 !tests/unit/test_sim2rank_mosaics.py
 !tests/unit/test_sim2rank_odm_correctness.py
 !tests/unit/test_sim2rank_odm_invariants.py
@@ -166,9 +171,9 @@ conftest.py
 !tests/unit/test_sim2rank_region_sweep.py
 !tests/unit/test_sim2rank_registry_parity.py
 !tests/unit/test_sim2rank_response_clustering.py
+!tests/unit/test_sim2rank_response_floor.py
 !tests/unit/test_sim2rank_scanner_conditioning.py
 !tests/unit/test_sim2rank_scoring_repairs.py
-!tests/unit/test_sim2rank_severity_calibration.py
 !tests/unit/test_sim2rank_simulator_calibration.py
 !tests/unit/test_sim2rank_synthetic.py
 !tests/unit/test_sim2rank_tidy_export.py
@@ -686,6 +691,23 @@ experiments/inprogress/diffusion/experiment_96_sde_diffusion.yaml
 !tests/unit/scripts/test_ssdu_loader_starvation.py
 !tests/unit/test_sim2rank_3d_mode.py
 !tests/unit/test_sim2rank_volume_mode_axes.py
+!tests/unit/test_sim2rank_board_scoring.py
+!tests/unit/test_sim2rank_content_seed.py
+!tests/unit/test_sim2rank_content_shards.py
+!tests/unit/test_sim2rank_content_sweeps.py
+!tests/unit/test_sim2rank_contrast_strata.py
+!tests/unit/test_sim2rank_full_ranges.py
+!tests/unit/test_sim2rank_pool_eval.py
+!tests/unit/test_sim2rank_rank_bootstrap.py
+!tests/unit/test_sim2rank_reference_range.py
+!tests/unit/test_sim2rank_volume_board.py
+!tests/unit/test_sim2rank_volume_contiguity.py
+!tests/unit/test_sim2rank_volume_damage.py
+!tests/unit/test_sim2rank_volume_guard.py
+!tests/unit/test_sim2rank_volume_layout.py
+!tests/unit/test_sim2rank_volume_local_theta.py
+!tests/unit/test_sim2rank_volume_metrics_slices.py
+!tests/unit/test_sim2rank_volume_real_data.py
 
 # ---- CI workflows ----------------------------------------------------------
 # Workstream F's condition is met: the two Claude workflows are denied below, so

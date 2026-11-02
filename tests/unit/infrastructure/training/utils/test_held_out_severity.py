@@ -11,7 +11,11 @@ import torch
 from spectramr.infrastructure.training.strategies.motion_meta_strategy import (
     ConcreteMotionMetaTrainingStrategy,
 )
-from spectramr.infrastructure.training.utils.held_out_severity import held_out_severity_points
+from spectramr.infrastructure.training.utils.held_out_severity import (
+    HELD_OUT_COUNT_KEY,
+    held_out_severity_points,
+    held_out_severity_readout,
+)
 
 
 def _cfg(*, enabled=True, grid=None, legacy=None):
@@ -81,3 +85,36 @@ def test_validation_scores_at_each_held_out_magnitude(monkeypatch) -> None:
 def test_a_grid_inside_the_training_range_is_rejected(monkeypatch) -> None:
     with pytest.raises(ValueError, match="must exceed 1"):
         _bare_strategy([0.5], monkeypatch)._heldout_motion_scales()
+
+
+class _ScaledTwin:
+    def __init__(self) -> None:
+        self.scale = 1.0
+
+    @contextlib.contextmanager
+    def at_severity(self, scale):
+        self.scale = scale
+        try:
+            yield
+        finally:
+            self.scale = 1.0
+
+
+def test_readout_scores_inside_each_multiplier_and_rekeys() -> None:
+    twin = _ScaledTwin()
+    out = held_out_severity_readout(
+        twin, [1.5, 2.0], lambda: {"val_hfen": twin.scale, "val_psnr": -twin.scale}
+    )
+    assert out == {
+        "val_hfen_heldout_x1.5": 1.5,
+        "val_psnr_heldout_x1.5": -1.5,
+        "val_hfen_heldout_x2": 2.0,
+        "val_psnr_heldout_x2": -2.0,
+        HELD_OUT_COUNT_KEY: 2.0,
+    }
+    assert twin.scale == 1.0
+
+
+def test_no_grid_gives_a_zero_count_and_no_extra_pass() -> None:
+    out = held_out_severity_readout(_ScaledTwin(), [], lambda: pytest.fail("no rung, no pass"))
+    assert out == {HELD_OUT_COUNT_KEY: 0.0}

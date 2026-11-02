@@ -535,7 +535,7 @@ class SLURMBackend:
             # cluster has no dedicated "gpu" partition. Pass partition=<name> in
             # slurm_params only if a specific cluster requires one.
             "partition": None,
-            "time": "120:00:00",
+            "time": "96:00:00",
             "mem": "64GB",
             "cpus_per_task": 8,
             "gpus": 1,
@@ -890,7 +890,7 @@ exit ${{TRAIN_EXIT_CODE}}
             # is the second-submitter half of #1146.
             "account": None,
             "partition": None,
-            "time": "120:00:00",
+            "time": "96:00:00",
             "mem": "64GB",
             "cpus_per_task": 8,
             "gpus": 1,

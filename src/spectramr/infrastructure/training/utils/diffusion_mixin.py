@@ -5,6 +5,7 @@ across different diffusion-based training strategies.
 """
 
 from abc import ABC
+from typing import Any
 
 import torch
 from torch import nn
@@ -54,8 +55,7 @@ class DiffusionStrategyMixin(ABC):
         self.beta_schedule = beta_schedule
         self.device = device or torch.device("cpu")
 
-        # Setup scheduler
-        self.scheduler = DiffusionScheduler(
+        self.scheduler = build_training_scheduler(
             num_timesteps=num_timesteps,
             beta_schedule=beta_schedule,
             device=self.device,
@@ -170,3 +170,49 @@ class DiffusionStrategyMixin(ABC):
 
         """
         return self.scheduler.denoise_step(x_t, predicted_noise, timesteps)
+
+
+def build_training_scheduler(
+    num_timesteps: int,
+    beta_schedule: str,
+    device: torch.device,
+    beta_start: float,
+    beta_end: float,
+) -> DiffusionScheduler:
+    """The one constructor for the training forward-process scheduler (#204).
+
+    Training and the latent predict path both build through here, so the
+    betas an inference run inverts are the betas training ran.
+    """
+    return DiffusionScheduler(
+        num_timesteps=num_timesteps,
+        beta_schedule=beta_schedule,
+        device=device,
+        beta_start=beta_start,
+        beta_end=beta_end,
+    )
+
+
+def bind_latent_reverse_schedule(generator: Any, scheduler: DiffusionScheduler) -> bool:
+    """Hand the training scheduler's betas to a generator's private reverse schedule (#204).
+
+    Returns False when the generator owns no internal schedule. Raises when it
+    owns one but cannot be rebound: sampling would then invert a different
+    forward process than training ran (#9).
+    """
+    if not hasattr(generator, "diffusion"):
+        return False
+    if not hasattr(generator, "set_diffusion_schedule"):
+        raise RuntimeError(
+            f"{type(generator).__name__} owns an internal reverse-diffusion schedule but "
+            "exposes no set_diffusion_schedule(); its sampler would invert the forward "
+            "process with a different schedule than training.diffusion declares. Add the "
+            "method or drop the private schedule."
+        )
+    generator.set_diffusion_schedule(
+        timesteps=scheduler.num_timesteps,
+        beta_schedule=scheduler.beta_schedule,
+        device=str(scheduler.device),
+        betas=scheduler.betas,
+    )
+    return True

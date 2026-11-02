@@ -166,6 +166,48 @@ class TestTheUnrolledModelCanRunDataConsistency:
             UnrolledReconstructionGenerator(num_unrolls=1, output_activation="softplus")
 
 
+class TestResidualAndLearnableDC:
+    """``residual`` refines instead of replacing; ``learnable_dc`` trains one step per unroll."""
+
+    @staticmethod
+    def _model(**kwargs):
+        return UnrolledReconstructionGenerator(
+            in_channels=2, out_channels=2, img_size=(16, 16), num_unrolls=2,
+            features=8, num_coils=4, output_activation="none", **kwargs,
+        )
+
+    def test_the_defaults_keep_what_every_existing_arm_ran(self) -> None:
+        model = self._model()
+        assert model.residual is False
+        assert not any("lambda_raw" in name for name, _ in model.named_parameters())
+
+    def test_a_residual_cascade_starts_as_plain_dc_iterations(self) -> None:
+        import torch
+
+        model = self._model(residual=True).eval()
+        x, kspace, mask, maps = TestTheUnrolledModelCanRunDataConsistency._inputs()
+        out = model(x, kspace_measured=kspace, mask=mask, sensitivity_maps=maps)
+        expected = model.initial_recon(x)
+        for dc in model.dc_layers:
+            dc.A.set_coil_sensitivities(maps)
+            dc.A.set_mask(mask)
+            expected = dc(expected, kspace)
+        assert torch.allclose(out, expected, atol=1e-5)
+
+    def test_learnable_dc_trains_one_step_per_unroll(self) -> None:
+        model = self._model(learnable_dc=True)
+        x, kspace, mask, maps = TestTheUnrolledModelCanRunDataConsistency._inputs()
+        model(x, kspace_measured=kspace, mask=mask, sensitivity_maps=maps).pow(2).sum().backward()
+        steps = [dc.lambda_raw for dc in model.dc_layers]
+        assert len(steps) == 2 and all(p.grad is not None for p in steps)
+
+    def test_pipeline_stages_own_the_learned_steps_and_keep_the_residual(self) -> None:
+        stages = self._model(residual=True, learnable_dc=True).pipeline_stages(2)
+        assert all(stage.residual for stage in stages)
+        owned = [name for stage in stages for name, _ in stage.named_parameters()]
+        assert sum("lambda_raw" in name for name in owned) == 2
+
+
 def test_varnet_does_not_turn_a_nan_input_into_zeros() -> None:
     import torch
 

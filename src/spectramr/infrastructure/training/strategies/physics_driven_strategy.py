@@ -23,6 +23,7 @@ from spectramr.domain.interfaces.service_interfaces import ILoggingService
 from spectramr.infrastructure.physics.coordinate_utils import CoordinateSampler
 
 from .loss_folding import declared_loss_weights
+from .offgrid_graph_path import OffGridGraphPath
 from .reconstruction import ReconstructionTrainingStrategy
 
 # Hoisted to module scope (NN#9): ``_generate_predictions`` runs every training
@@ -164,9 +165,18 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
                     "import failed; cannot honor the requested B0 simulation."
                 ) from exc
 
-        # Ensure K-Space loss is enabled for Physics Driven strategy if not explicitly set
-        # SSOT: check config.losses.reconstruction.enable_kspace_loss
-        pass
+        # A generator that declares trajectory nodes is run on the acquired off-grid samples.
+        self._offgrid_path = None
+        if getattr(unwrap_model(self.env.generator), "node_source", None) == "trajectory":
+            self._offgrid_path = OffGridGraphPath(self.config)
+            # The forward reads y, the trajectory and the DCF from the batch context.
+            self.validation_reads_context_measurement = True
+            import logging
+
+            logging.getLogger(__name__).info(
+                "[OFFGRID] graph nodes from the acquired trajectory: %s",
+                self._offgrid_path.provenance(),
+            )
 
     def _get_field_strength(self) -> float:
         """Extract field strength from physics config."""
@@ -223,6 +233,10 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
         # [FIX 21] Enforce FP32 for Physics-Driven models (FFT/Complex support)
         # We disable AMP for the forward pass of the generator
         with torch.amp.autocast("cuda", enabled=False):
+            if getattr(self, "_offgrid_path", None) is not None:
+                hr = batch_context["hr"]
+                b0_map = self.synthesize_b0_map(hr.shape[0], tuple(hr.shape[-2:]), hr.device)
+                return self._offgrid_path(self.env.generator, batch_context, b0_map), None
             # Ensure inputs are FP32/Complex
             if lr_image.is_floating_point():
                 lr_image = lr_image.float()
@@ -319,6 +333,49 @@ class PhysicsDrivenTrainingStrategy(ReconstructionTrainingStrategy):
             pass
 
         return hr_fakes, intermediate_outputs
+
+    def validation_batch_context(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        batch_data: Any,
+    ) -> dict[str, Any] | None:
+        """The batch's off-grid samples for the off-grid path; the parent's context otherwise.
+
+        The samples are ``[.., 1, N]``, not image-shaped, so they skip the image alignment.
+        """
+        if getattr(self, "_offgrid_path", None) is None:
+            return super().validation_batch_context(input_batch, target_batch, batch_data)
+        if batch_data is None:
+            return None
+        return self._prepare_batch_context(input_batch, target_batch, batch=batch_data)
+
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        *,
+        batch_data: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Validate the off-grid path on the batch's own samples."""
+        if getattr(self, "_offgrid_path", None) is not None and kwargs.get("batch_context") is None:
+            kwargs["batch_context"] = self.validation_batch_context(
+                input_batch, target_batch, batch_data
+            )
+        return super().validation_step(input_batch, target_batch, batch_data=batch_data, **kwargs)
+
+    def _validation_forward(
+        self,
+        input_batch: torch.Tensor,
+        batch_context: dict[str, Any],
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Validate the off-grid path on the clean measurement (B0 is a training augmentation)."""
+        if getattr(self, "_offgrid_path", None) is None:
+            return super()._validation_forward(input_batch, batch_context, **kwargs)
+        with torch.amp.autocast("cuda", enabled=False):
+            return self._offgrid_path(self.env.generator, batch_context, None)
 
     def _physics_forward_fp32(
         self, forward_op, image: torch.Tensor, sensitivity_maps: torch.Tensor = None

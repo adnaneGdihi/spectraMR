@@ -112,18 +112,6 @@ def _write_map_store(config: Any, root: Path, files: list[Path]) -> Any:
     return config.model_copy(update={"data": data})
 
 
-def _write_scoring_store(config: Any, root: Path, files: list[Path]) -> Any:
-    """The all-repetitions store ``coil_maps_reference_root`` names, under ``root``."""
-    scoring = config.data.model_copy(
-        update={"coil_maps_recipe": "all_reps_mean", "coil_maps_acs_size": None}
-    )
-    written = _write_map_store(config.model_copy(update={"data": scoring}), root, files)
-    data = config.data.model_copy(
-        update={"coil_maps_reference_root": written.data.coil_maps_root}
-    )
-    return config.model_copy(update={"data": data})
-
-
 def real_batches(
     config: Any,
     *,
@@ -190,10 +178,6 @@ def real_batches_with_reps(
             if config.data.coil_maps_root is not None:
                 files = [Path(r["primary_path"]) for r in index]
                 config = _write_map_store(config, Path(tmp) / "maps", files)
-            if config.data.coil_maps_reference_root is not None:
-                # The scoring store (#2664): all-repetitions recipe, default calibration.
-                files = [Path(r["primary_path"]) for r in index]
-                config = _write_scoring_store(config, Path(tmp) / "scoring_maps", files)
         tcfg = TorchIOTransformConfig.from_training_config(
             _UndersamplingProxy(config.data, config.undersampling)
         )

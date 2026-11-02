@@ -32,8 +32,8 @@ from spectramr.infrastructure.physics.multicoil_ei_operator import (
     interleaved_to_complex,
 )
 from spectramr.infrastructure.training.strategies.mixins.validation_context import (
+    coil_maps,
     flatten_like,
-    scoring_maps,
 )
 from spectramr.infrastructure.training.utils.metric_transform import (
     image_magnitude,
@@ -189,7 +189,7 @@ def zero_filled_metrics(
     batch_data: Any = None,
 ) -> dict[str, float]:
     """``val_zf_<name>``: :func:`zero_filled_image` against the target, combined as the
-    prediction is: under ``sense_magnitude`` both through the scoring maps, else the RSS image.
+    prediction is: under ``sense_magnitude`` both through the batch's maps, else the RSS image.
 
     Raises:
         ValueError: ``sense_magnitude`` without the multi-coil operator, whose
@@ -203,7 +203,7 @@ def zero_filled_metrics(
             if operator is None:
                 raise ValueError("sense_magnitude grades A^H y and this arm has no multi-coil operator.")
             image = operator.model_input(measured)
-            maps = scoring_maps(batch_data, image)[0] if batch_data is not None else None
+            maps = coil_maps(batch_data, image)[0] if batch_data is not None else None
             zero_filled, reference = (
                 t.abs() for t in sense_scoring_pair(image, target.to(image.device), maps)
             )
@@ -225,7 +225,7 @@ def zero_filled_context_metrics(
 
     The RSS ``val_zf_*`` cannot be read against ``sense_psnr`` or the corrected MSE.
     Here :math:`A^Hy` is graded as the network's image is: the SENSE columns on the
-    combined image with the scoring maps, the corrected MSE on :math:`FS\,A^Hy`.
+    combined image with the batch's maps, the corrected MSE on :math:`FS\,A^Hy`.
     Only the names the arm configures are computed.
     """
     measured = context.get("measured_kspace")
@@ -236,11 +236,11 @@ def zero_filled_context_metrics(
         image = operator.model_input(measured)
         target = target.to(image.device)
         sense = tuple(n for n in ZF_CONTEXT_METRICS if n in SENSE_METRIC_NAMES)
-        maps = scoring_maps(batch_data, image)[0]
+        maps = coil_maps(batch_data, image)[0]
         ctx = MetricContext(coil_maps=maps, signal_domain="image")
         scored.update(computer.compute(image, target, only=sense, context=ctx))
         kspace = network_kspace(image, operator, emits_kspace=False)
-        ctx = MetricContext(coil_maps=scoring_maps(batch_data, kspace)[0], signal_domain="kspace")
+        ctx = MetricContext(coil_maps=coil_maps(batch_data, kspace)[0], signal_domain="kspace")
         rnc = ("reference_noise_corrected_mse",)
         scored.update(computer.compute(kspace, target, only=rnc, context=ctx))
     return {f"val_zf_{name}": value for name, value in scored.items()}

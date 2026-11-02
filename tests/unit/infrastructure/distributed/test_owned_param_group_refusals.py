@@ -23,7 +23,6 @@ _PKG = "spectramr.infrastructure.training.strategies"
 _CASES = [
     ("girf_aware_strategy", "GIRFAwareStrategy", "_girf"),
     ("field_probe_coupled_strategy", "FieldProbeCoupledStrategy", "_demod"),
-    ("universal_reconstruction_strategy", "UniversalReconstructionStrategy", "_prompt_embedder"),
     ("physics_equivariant_ssl_strategy", "PhysicsEquivariantSSLStrategy", "latent_ops"),
     ("xfield_fm_strategy", "XFieldFMStrategy", "_hypernet"),
     ("coord_kspace_gen_strategy", "CoordKSpaceGenStrategy", "_siren"),

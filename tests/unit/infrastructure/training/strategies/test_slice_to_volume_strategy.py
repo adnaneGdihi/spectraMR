@@ -63,15 +63,19 @@ def _s2v(iteration: int) -> tuple[Any, _SpyComputer]:
     return s, spy
 
 
-#: (B, C, D, H, W) -- both helpers this hook calls reject anything but 5-D.
+#: (B, C, X, Y, Z) -- both helpers this hook calls reject anything but 5-D.
 def _vol() -> torch.Tensor:
     return torch.rand(1, 1, 4, 8, 8)
+
+
+#: A replicated stack needs the slice_profile stamp (ratio 2 along TorchIO z).
+_STAMP = {"slice_profile_ratio": [2], "slice_profile_z_axis": [3]}
 
 
 @pytest.mark.unit
 def test_loss_computer_receives_the_live_iteration_not_a_frozen_zero() -> None:
     strategy, spy = _s2v(_LIVE_ITERATION)
-    strategy._compute_losses_impl(input_batch=_vol(), target_batch=_vol(), epoch=3)
+    strategy._compute_losses_impl(input_batch=_vol(), target_batch=_vol(), epoch=3, batch=_STAMP)
     assert len(spy.calls) == 1
     assert spy.calls[0]["iteration"] == _LIVE_ITERATION, (
         "the loss computer must receive the live loop iteration; frozen at 0 the "
@@ -88,7 +92,9 @@ def test_a_stale_step_kwarg_does_not_win_over_the_loop_state() -> None:
     supplying ``step=0`` would still freeze the schedule.
     """
     strategy, spy = _s2v(_LIVE_ITERATION)
-    strategy._compute_losses_impl(input_batch=_vol(), target_batch=_vol(), epoch=3, step=0)
+    strategy._compute_losses_impl(
+        input_batch=_vol(), target_batch=_vol(), epoch=3, step=0, batch=_STAMP
+    )
     assert spy.calls[0]["iteration"] == _LIVE_ITERATION
 
 
@@ -96,9 +102,9 @@ def test_a_stale_step_kwarg_does_not_win_over_the_loop_state() -> None:
 def test_the_iteration_advances_with_the_loop() -> None:
     """Two steps, two values -- a constant would satisfy a single-point assertion."""
     strategy, spy = _s2v(0)
-    strategy._compute_losses_impl(input_batch=_vol(), target_batch=_vol(), epoch=0)
+    strategy._compute_losses_impl(input_batch=_vol(), target_batch=_vol(), epoch=0, batch=_STAMP)
     strategy.loop_state.iteration = _LIVE_ITERATION
-    strategy._compute_losses_impl(input_batch=_vol(), target_batch=_vol(), epoch=0)
+    strategy._compute_losses_impl(input_batch=_vol(), target_batch=_vol(), epoch=0, batch=_STAMP)
     assert [c["iteration"] for c in spy.calls] == [0, _LIVE_ITERATION]
 
 
@@ -106,5 +112,114 @@ def test_the_iteration_advances_with_the_loop() -> None:
 def test_the_hook_still_returns_its_own_anchor_terms() -> None:
     """Guard the edit's blast radius: the two bespoke terms survive the change."""
     strategy, _ = _s2v(_LIVE_ITERATION)
-    out = strategy._compute_losses_impl(input_batch=_vol(), target_batch=_vol(), epoch=3)
+    out = strategy._compute_losses_impl(
+        input_batch=_vol(), target_batch=_vol(), epoch=3, batch=_STAMP
+    )
     assert {"g_total_loss", "g_through_plane_consistency", "g_isotropy_consistency"} <= set(out)
+
+
+# --- the thick-slice anchor, driven through the production path ------------------
+
+_ARM = "experiments/inprogress/spec_tasks/task_2_7_slice_to_volume_oasis.yaml"
+
+
+def _arm_patches() -> tuple[Any, list[Any]]:
+    """Arm config -> the real train chain -> torchio patches at two different z phases."""
+    from pathlib import Path
+
+    import torchio as tio
+
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.data.builders.torchio_transform_builder import (
+        TorchIOTransformBuilder,
+        TorchIOTransformConfig,
+    )
+
+    settings = TrainingSettings.from_yaml(str(Path(__file__).resolve().parents[5] / _ARM))
+    chain = TorchIOTransformBuilder.build_train_transforms(
+        TorchIOTransformConfig.from_settings(settings)
+    )
+    # Full patch_size in-plane, so _EnsureMinimumSpatialSize pads nothing.
+    vol = 100 * torch.rand(1, 128, 128, 32, generator=torch.Generator().manual_seed(0))
+    subject = chain(
+        tio.Subject(input=tio.ScalarImage(tensor=vol), target=tio.ScalarImage(tensor=vol.clone()))
+    )
+    torch.manual_seed(0)
+    by_phase: dict[int, Any] = {}
+    for patch in tio.UniformSampler((16, 16, 16))(subject, num_patches=64):
+        by_phase.setdefault(int(patch["location"][2]) % 4, patch)
+    return settings, [by_phase[p] for p in sorted(by_phase)[:2]]
+
+
+def _collate(settings: Any, patches: list[Any]) -> Any:
+    """The collate strategy the train queue selects for this arm, then the loop's adapter."""
+    from spectramr.data.batch_types import BatchAdapter
+    from spectramr.data.collation.strategies import CollateStrategyFactory
+    from spectramr.data.collation.strategy_selector import CollationStrategySelector
+
+    name, kwargs = CollationStrategySelector.select_strategy(
+        config=settings.data.collation,
+        dataset_type=settings.data.dataset_type,
+        enable_slab_mode=False,
+        patch_size=tuple(settings.data.sampling.patch_size),
+    )
+    collated = CollateStrategyFactory.create(name, **kwargs).collate(patches)
+    return BatchAdapter.from_dict(collated)
+
+
+@pytest.mark.unit
+def test_the_arm_anchor_pools_each_patch_back_onto_its_own_thick_slices() -> None:
+    """Identity on a replicated stack matches every thick slice exactly -- at any phase.
+
+    A pool that ignored the patch z-start (or pooled along X, dim 2) would see the
+    staircase straddle its windows and report a non-zero anchor.
+    """
+    from spectramr.infrastructure.training.strategies.slice_to_volume_strategy import (
+        read_slice_profile_stamp,
+        replicated_stack_anchor,
+    )
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+    settings, patches = _arm_patches()
+    assert TrainingStrategyFactory().get_strategy_class(settings) is SliceToVolumeStrategy
+    batch = _collate(settings, patches)
+    assert batch.metadata["slice_profile_ratio"] == [4, 4]  # host-side ints, no sync
+    assert len({int(k) % 4 for k in batch.metadata["location"][:, 2]}) == 2  # two phases
+    assert not torch.equal(batch.input, batch.target)  # only the input was degraded
+
+    strategy, _ = _s2v(_LIVE_ITERATION)
+    out = strategy._compute_losses_impl(
+        input_batch=batch.input, target_batch=batch.target, epoch=0, batch=batch
+    )
+    assert out["g_through_plane_consistency"].item() == pytest.approx(0.0, abs=1e-12)
+
+    stamp = read_slice_profile_stamp(batch)
+    assert (stamp.ratio, stamp.batch_dim) == (4, 4)
+    # Control: the same pool with the patch z-start ignored straddles the blocks.
+    unaligned = type(stamp)(ratio=4, batch_dim=4, z_start=torch.zeros_like(stamp.z_start))
+    assert replicated_stack_anchor(batch.input, batch.input, unaligned).item() > 1e-4
+    toward_target = strategy._through_plane_consistency(batch.target, batch.input, stamp)
+    assert toward_target.item() > 1e-4  # the isotropic volume is not its own thick slices
+
+
+@pytest.mark.unit
+def test_a_ratio_of_one_is_refused() -> None:
+    from spectramr.infrastructure.training.strategies.slice_to_volume_strategy import (
+        SliceProfileStamp,
+        replicated_stack_anchor,
+    )
+
+    x = torch.rand(1, 1, 4, 4, 8)
+    with pytest.raises(ValueError, match="identity MSE"):
+        replicated_stack_anchor(x, x, SliceProfileStamp(ratio=1, batch_dim=4, z_start=None))
+
+
+@pytest.mark.unit
+def test_the_isotropy_prior_follows_the_stamped_axis() -> None:
+    """Blur along Z (dim 4) is penalised only when the prior looks along Z."""
+    x = torch.rand(1, 1, 8, 8, 8)
+    blurred = x.mean(dim=-1, keepdim=True).expand_as(x).contiguous()
+    strategy, _ = _s2v(0)
+    along_z = strategy._isotropy_consistency(blurred, tp_dim=4)
+    along_x = strategy._isotropy_consistency(blurred, tp_dim=2)
+    assert along_z.item() > along_x.item()

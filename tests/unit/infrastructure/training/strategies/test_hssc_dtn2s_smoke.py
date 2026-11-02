@@ -16,6 +16,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+from spectramr.infrastructure.physics.hermitian import is_hermitian
 from spectramr.infrastructure.training.strategies.dtn2s_strategy import DTN2SStrategy
 from spectramr.infrastructure.training.strategies.hssc_strategy import HSSCStrategy
 from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
@@ -50,9 +52,18 @@ class TestHSSCHelpers:
         torch.manual_seed(0)
         x = torch.complex(torch.randn(1, 1, 16, 16), torch.randn(1, 1, 16, 16))
         x_h = s._hermitian_project(x)
-        # Hermitian symmetry: k = conj(flip(k))  (within numeric precision)
-        diff = (x_h - torch.conj(torch.flip(x_h, dims=[-2, -1]))).abs().max()
-        assert float(diff) < 1e-5
+        assert is_hermitian(x_h)
+        assert torch.allclose(s._hermitian_project(x_h), x_h, atol=1e-6)
+
+    @pytest.mark.parametrize("size", [(16, 16), (15, 16), (15, 15)])
+    def test_hermitian_projection_takes_real_part(self, size: tuple[int, int]) -> None:
+        # #2408: with the (N - j) mod N partner the projection is x -> Re x, so a
+        # real image passes unchanged (the flip pairing zeroed r1 + r2 = N/2).
+        s = HSSCStrategy.__new__(HSSCStrategy)
+        torch.manual_seed(2)
+        x = torch.complex(torch.randn(1, 1, *size), torch.randn(1, 1, *size))
+        x_proj = ifft2c(s._hermitian_project(fft2c(x)))
+        assert torch.allclose(x_proj, x.real.to(x.dtype), atol=1e-5)
 
     def test_data_consistency_inside_mask_exact(self) -> None:
         s = HSSCStrategy.__new__(HSSCStrategy)

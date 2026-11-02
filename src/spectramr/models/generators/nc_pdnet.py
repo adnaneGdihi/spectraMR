@@ -37,6 +37,12 @@ from spectramr.models.blocks.attention_domains import (
     interleaved_to_complex,
 )
 from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.pipeline_stages import (
+    CascadeStage,
+    Payload,
+    build_cascade_stages,
+    cascade_at,
+)
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
@@ -139,25 +145,21 @@ class NCPDNet(GradCheckpointingMixin, nn.Module, IGenerator):
         run without its measurement is a plain CNN wearing the name of one, and
         the DC layer raises rather than letting that happen quietly.
         """
-        if measured_kspace is None:
-            measured_kspace = kwargs.get("measured_samples")
-        current = x
-        ckpt = self._checkpointing_active()
-        for regulariser, dc in zip(self.regularisers, self.dc_steps, strict=True):
-            current = (
-                torch.utils.checkpoint.checkpoint(regulariser, current, use_reentrant=False)
-                if ckpt
-                else regulariser(current)
-            )
-            complex_view = dc(
-                interleaved_to_complex(current),
-                measured_kspace,
-                trajectory,
-                sample_mask=sample_mask,
-                dcf=dcf,
-            )
-            current = complex_to_interleaved(complex_view)
-        return current
+        payload = _payload(x, measured_kspace, trajectory, sample_mask, dcf, kwargs)
+        everything = range(len(self.regularisers))
+        return _cascade(self, everything, payload, self._checkpointing_active())[0]
+
+    def pipeline_stages(self, n: int) -> list[CascadeStage]:
+        """``n`` contiguous, balanced runs of regulariser/DC pairs (pipeline parallelism)."""
+        return build_cascade_stages(
+            self,
+            n,
+            len(self.regularisers),
+            _NCPDNetStage,
+            lambda cascades, _first, _last: [
+                f"{group}.{i}" for i in cascades for group in ("regularisers", "dc_steps")
+            ],
+        )
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         return input_shape
@@ -172,6 +174,69 @@ class NCPDNet(GradCheckpointingMixin, nn.Module, IGenerator):
     def generate(self, z: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Generation wrapper to satisfy IGenerator."""
         return self.forward(z, **kwargs)
+
+
+def _payload(
+    x: torch.Tensor,
+    measured_kspace: torch.Tensor | None,
+    trajectory: torch.Tensor | None,
+    sample_mask: torch.Tensor | None,
+    dcf: torch.Tensor | None,
+    kwargs: dict[str, Any],
+) -> Payload:
+    if measured_kspace is None:
+        measured_kspace = kwargs.get("measured_samples")
+    return (x, measured_kspace, trajectory, sample_mask, dcf)
+
+
+def _cascade(owner: nn.Module, cascades: range, payload: Payload, ckpt: bool) -> Payload:
+    """Regulariser then sample-domain DC for each cascade in ``cascades``."""
+    current, measured_kspace, trajectory, sample_mask, dcf = payload
+    for i in cascades:
+        regulariser, dc = cascade_at(owner.regularisers, i), cascade_at(owner.dc_steps, i)
+        current = (
+            torch.utils.checkpoint.checkpoint(regulariser, current, use_reentrant=False)
+            if ckpt
+            else regulariser(current)
+        )
+        complex_view = dc(
+            interleaved_to_complex(current),
+            measured_kspace,
+            trajectory,
+            sample_mask=sample_mask,
+            dcf=dcf,
+        )
+        current = complex_to_interleaved(complex_view)
+    return (current, *payload[1:])
+
+
+class _NCPDNetStage(CascadeStage):
+    """Payload: ``(estimate, measured_kspace, trajectory, sample_mask, dcf)``."""
+
+    def _enter(
+        self,
+        x: torch.Tensor,
+        measured_kspace: torch.Tensor | None = None,
+        trajectory: torch.Tensor | None = None,
+        sample_mask: torch.Tensor | None = None,
+        dcf: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> Payload:
+        return _payload(x, measured_kspace, trajectory, sample_mask, dcf, kwargs)
+
+    def _cascade(self, payload: Payload) -> Payload:
+        return _cascade(self, self.cascades, payload, self._checkpointing_active())
+
+    def batched_entries(self, payload: Payload, batch: int) -> tuple[bool, ...]:
+        # trajectory [2, N] / dcf [N] are shared; [B, 2, N] / [B, 1, N] are per sample.
+        _, kspace, trajectory, sample_mask, dcf = payload
+        return (
+            True,
+            kspace is not None,
+            trajectory is not None and trajectory.ndim == 3,
+            sample_mask is not None and sample_mask.ndim >= 2 and sample_mask.shape[0] == batch,
+            dcf is not None and dcf.ndim == 3,
+        )
 
 
 __all__ = ["NCPDNet", "ResidualRegulariser"]

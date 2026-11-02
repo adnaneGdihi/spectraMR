@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from spectramr.infrastructure.physics.fft_ops import ifft2c, sense_adjoint
+from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.models.blocks.fno_block import FNOBlock
 from spectramr.models.registry import register_model
 
@@ -9,9 +9,8 @@ from spectramr.models.registry import register_model
 @register_model(
     name="fno",
     training_mode="reconstruction",
-    # k-space input ([Re,Im]); applies IFFT at output so output_domain is image
-    # by default (configurable to kspace). Declaring both output domains keeps
-    # either config audit-clean.
+    # k-space input ([Re,Im]); the spectral blocks run on its IFFT (image domain).
+    # output_domain selects image (default) or a FFT back to k-space.
     spatial_dims=(2,),
     input_domain="kspace",
     output_domain=("image", "kspace"),
@@ -19,10 +18,8 @@ from spectramr.models.registry import register_model
 class FNOGenerator(nn.Module):
     """Fourier Neural Operator Generator for MRI Reconstruction.
 
-    [ARCHITECTURE FIX] This version:
-    - Uses frequency-domain grid encoding [-π, π] instead of spatial [0, 1]
-    - Applies IFFT at output to convert k-space refinement to image domain
-    - Suitable for k-space input with image-domain loss (SSIM, L1, etc.)
+    Takes centred k-space, runs its FNO blocks on the image (ifft2c in,
+    fft2c out only when output_domain='kspace'), and uses a [-π, π] coordinate grid.
     """
 
     def __init__(
@@ -57,6 +54,10 @@ class FNOGenerator(nn.Module):
             if isinstance(modes, (list, tuple)) and len(modes) >= 2:
                 modes1, modes2 = modes[0], modes[1]
 
+        if output_domain not in ("image", "kspace"):
+            raise ValueError(
+                f"FNOGenerator output_domain must be 'image' or 'kspace'; got {output_domain!r}."
+            )
         self.output_domain = output_domain
         if output_form not in ("complex", "magnitude"):
             raise ValueError(
@@ -138,73 +139,51 @@ class FNOGenerator(nn.Module):
 
     def forward(self, x, sensitivity_maps=None, **kwargs):
         """Forward pass; applies the declared ``output_form`` head."""
-        out = self._forward_complex(x, sensitivity_maps=sensitivity_maps, **kwargs)
+        out = self._forward_complex(x, **kwargs)
         if self.output_form == "magnitude":
             return torch.sqrt(out[:, 0:1] ** 2 + out[:, 1:2] ** 2)
         return out
 
-    def _forward_complex(self, x, sensitivity_maps=None, **kwargs):
-        """Forward pass with optional IFFT output.
+    def _forward_complex(self, x, **kwargs):
+        """Image-domain FNO: k-space in, spectral blocks on the image, optional FFT out.
+
+        The centred k-space input is inverted with ``ifft2c`` first, so the
+        spectral layers truncate low modes of the *image* (the standard FNO).
+        Channels stay interleaved ``[Re0, Im0, Re1, Im1, ...]``.
 
         Args:
-            x: K-space input (B, 2, H, W) with [Re, Im] channels
+            x: K-space input (B, C, H, W), C even, real/imag interleaved.
 
         Returns:
-            If output_domain='image': Image-domain output (B, 2, H, W)
-            If output_domain='kspace': K-space refined output (B, 2, H, W)
+            Image-domain ``[Re, Im]`` (B, 2, H, W) when ``output_domain='image'``;
+            centred k-space ``[Re, Im]`` (B, 2, H, W) via ``fft2c`` when ``'kspace'``.
         """
-        # x: (B, C, H, W)
         if x.ndim == 3:
             x = x.unsqueeze(0)
 
-        grid = self.get_grid(x.shape, x.device)
-        x = torch.cat((x, grid), dim=1)
+        img = ifft2c(x)  # (B, C/2, H, W) complex, image centre at N // 2
+        feat = torch.view_as_real(img).movedim(-1, 2).flatten(1, 2)  # (B, C, H, W) interleaved
 
-        x = x.permute(0, 2, 3, 1)  # (B, H, W, C)
-        x = self.fc0(x)
-        x = x.permute(0, 3, 1, 2)  # (B, C, H, W)
+        grid = self.get_grid(feat.shape, feat.device)
+        h = torch.cat((feat, grid), dim=1)
+
+        h = h.permute(0, 2, 3, 1)  # (B, H, W, C)
+        h = self.fc0(h)
+        h = h.permute(0, 3, 1, 2)  # (B, C, H, W)
 
         for layer in self.layers:
-            x = layer(x)
+            h = layer(h)
 
-        x = x.permute(0, 2, 3, 1)
-        x = self.fc1(x)
-        x = torch.nn.functional.gelu(x)
-        x = self.fc2(x)
-        kspace_pred = x.permute(0, 3, 1, 2)  # (B, 2, H, W) k-space refined
+        h = h.permute(0, 2, 3, 1)
+        h = self.fc1(h)
+        h = torch.nn.functional.gelu(h)
+        h = self.fc2(h)
+        img_pred = h.permute(0, 3, 1, 2)  # (B, 2, H, W) image-domain [Re, Im]
 
-        # [FIX] Physics Projection for Loss Calculation
-        # Always preserve 2-channel [Re, Im] output for proper loss computation
-        if self.training and kwargs.get("project_to_image", True):
-            # Check for Multi-Coil SENSE
-            sensitivity_maps = (
-                kwargs.get("sensitivity_maps") if sensitivity_maps is None else sensitivity_maps
-            )
-
-            if sensitivity_maps is not None:
-                # Multi-coil case
-                if kspace_pred.shape[1] > 2 and kspace_pred.shape[1] % 2 == 0:
-                    coils = kspace_pred.shape[1] // 2
-                    k_complex = torch.complex(kspace_pred[:, :coils], kspace_pred[:, coils:])
-                    img_complex = sense_adjoint(k_complex, sensitivity_maps)
-                    # [FIX] Return [Re, Im] instead of magnitude
-                    return torch.stack([img_complex.real, img_complex.imag], dim=1)
-
-            # Single Coil - convert k-space to image domain
-            if kspace_pred.shape[1] == 2:
-                k_complex = torch.complex(kspace_pred[:, 0], kspace_pred[:, 1])
-                img = ifft2c(k_complex)
-                # [FIX] Return [B, 2, H, W] with [Re, Im], NOT magnitude!
-                return torch.stack([img.real, img.imag], dim=1)
-
-        # Convert to image domain for inference/validation if requested
-        if self.output_domain == "image":
-            x_complex = torch.complex(kspace_pred[:, 0], kspace_pred[:, 1])
-            # Use canonical centered IFFT
-            x_image = ifft2c(x_complex)
-            return torch.stack([x_image.real, x_image.imag], dim=1)
-
-        return kspace_pred
+        if self.output_domain == "kspace":
+            k = fft2c(torch.complex(img_pred[:, 0], img_pred[:, 1]))
+            return torch.stack([k.real, k.imag], dim=1)
+        return img_pred
 
 
 @register_model(

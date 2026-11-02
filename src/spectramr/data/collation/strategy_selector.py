@@ -132,6 +132,7 @@ class CollationStrategySelector:
         "quantitative": "image",  # qMRI parameter-map regression (Phase 4b)
         "cine": "image",  # Cine 4D (Phase 4c)
         "pde_synthetic": "image",  # PDE operator benchmarks (Burgers/Darcy)
+        "flow_synthetic": "flow",  # complex k-space slice dicts, stacked as-is
         "graph": "graph",  # Graph data
         "graph_mri": "graph",  # Graph-based MRI
         "sequence": "sequence",  # Sequential data
@@ -164,6 +165,7 @@ class CollationStrategySelector:
             "pde_synthetic",
         },
         "slab": {"nifti", "kspace", "image", "nifti_paired"},  # 3D data only
+        "flow": {"flow_synthetic"},
         "graph": {"graph", "graph_mri"},
         "sequence": {"sequence"},
         "physics": {"kspace", "fastmri", "m4raw"},  # Non-Cartesian physics

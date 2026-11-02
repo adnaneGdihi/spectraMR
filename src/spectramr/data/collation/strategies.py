@@ -867,6 +867,27 @@ class RobustCollateStrategy(CollateStrategy):
         return default_collate(clean_batch)
 
 
+class FlowCollateStrategy(CollateStrategy):
+    """Strict default collation for phase-contrast slice dicts.
+
+    Complex ``[C, E, T, H, W]`` k-space stacks to 6-D and string ids become lists.
+    Unlike ``robust`` it drops nothing: a ``None`` sample or a key missing from one
+    item is a broken dataset, and raises here instead of shrinking the batch.
+    """
+
+    def collate(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        self.validate_batch(batch)
+        keys = set(batch[0])
+        for item in batch[1:]:
+            if set(item) != keys:
+                raise ValueError(
+                    f"flow items disagree on keys: {sorted(keys ^ set(item))} present in only some"
+                )
+        from torch.utils.data._utils.collate import default_collate
+
+        return default_collate(batch)
+
+
 class PhysicsCollateStrategy(CollateStrategy):
     """Collation for MRI physics objects.
 
@@ -976,6 +997,7 @@ class CollateStrategyFactory:
         "robust": RobustCollateStrategy,
         "physics": PhysicsCollateStrategy,
         "slab": SlabCollateStrategy,
+        "flow": FlowCollateStrategy,
     }
 
     @classmethod

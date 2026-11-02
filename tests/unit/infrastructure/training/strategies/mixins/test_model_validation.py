@@ -457,6 +457,21 @@ class TestTheContextPass:
                 batch.input, batch.target, batch_data=batch
             )
 
+    def test_the_held_out_line_error_reads_the_batch_mask(self) -> None:
+        """The loader's mask, a TrainingBatch field, reaches unacquired_bin_nrmse."""
+        from spectramr.core.metrics.acquired_bin_error import bin_errors
+        from spectramr.data.batch_types import BatchAdapter
+
+        batch, _ = _coil_batch(with_maps=False)
+        mask = torch.zeros(2, 1, _N, _N, 1)
+        mask[:, :, ::2] = 1.0
+        batch = BatchAdapter.from_dict({"input": batch.input, "target": batch.target, "mask": mask})
+        out = _CoilStub(["unacquired_bin_nrmse", "mse"]).validation_step(
+            batch.input, batch.target, batch_data=batch
+        )
+        expected = bin_errors(0.5 * batch.input, batch.target, mask[..., 0])[1]
+        assert out["val_unacquired_bin_nrmse"] == pytest_approx(expected)
+
     def test_pred_alt_is_the_model_run_on_input_alt(self) -> None:
         from spectramr.core.metrics.context import MetricContext
         from spectramr.core.metrics.registry import MetricsRegistry

@@ -63,6 +63,31 @@ def test_style_vector_of_unknown_width_raises() -> None:
         _disentangled()(torch.randn(1, 1, 32, 32), torch.rand(1, 5))
 
 
+def test_vae_physics_posterior_has_a_learned_variance_head() -> None:
+    """use_vae learns logvar for the physics style code; zero-init starts at unit variance."""
+    from spectramr.models.generators.disentangled_mri import DisentangledMRI
+
+    det = _disentangled()
+    assert det.phys_to_style_logvar is None
+    model = DisentangledMRI(in_channels=1, style_dim=8, n_downsample=2, use_vae=True)
+    assert "phys_to_style_logvar.weight" in model.state_dict()
+    phys = torch.rand(2, 4)
+    _, mu, logvar = model(torch.randn(2, 1, 32, 32), phys)
+    assert torch.allclose(mu, model.phys_to_style_proj(phys))
+    assert torch.equal(logvar, torch.zeros_like(logvar))
+    torch.nn.init.normal_(model.phys_to_style_logvar.weight)
+    _, _, logvar = model(torch.randn(2, 1, 32, 32), phys)
+    assert torch.allclose(logvar, model.phys_to_style_logvar(phys).clamp(-10.0, 10.0))
+
+
+def test_vae_rejects_a_ready_style_code_as_style_source() -> None:
+    from spectramr.models.generators.disentangled_mri import DisentangledMRI
+
+    model = DisentangledMRI(in_channels=1, style_dim=8, n_downsample=2, use_vae=True)
+    with pytest.raises(ValueError, match="carries no posterior"):
+        model(torch.randn(1, 1, 32, 32), torch.rand(1, 8))
+
+
 def _tissue_model():
     from spectramr.models.generators.disentangled_mri import DisentangledMRI
 

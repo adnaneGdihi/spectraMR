@@ -7,12 +7,13 @@ calibration/certification primitive (``ConformalCalibrator``,
 calibration split, and writes the resulting JSON artefact to
 ``certification.<name>.output_artefact``.
 
-The model to certify is the generator wired onto ``self.env``. For the
-``dice_risk`` certificate this MUST be a trained network: the branch loads
-``certification.dice_risk.checkpoint_path`` into the generator and RAISES if
-it is unset — certifying a randomly-initialised model is scientifically
-meaningless (pitfall #20). The other certificate branches assume the operator
-restored weights via the trainer's ``--resume`` path.
+The model to certify is the generator wired onto ``self.env``, and it MUST be a
+trained network: certifying a randomly-initialised model is scientifically
+meaningless (pitfall #20). ``dice_risk`` and ``pac_bayes`` load
+``certification.<name>.checkpoint_path``; ``conformal`` and ``chd`` reload
+``model.checkpoint_path`` exactly, because the build-time warm start uses the
+``overlap`` policy and would leave unmatched layers at random init. All RAISE when
+the path is unset or absent.
 
 The strategy is dispatched by the ``training.strategy_class`` field
 (directly importable path) rather than by ``training_mode``; it
@@ -26,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -130,14 +132,6 @@ def _lesion_recall_inputs(model: Any, batches: list[Any], classes: list[str]) ->
     )
 
 
-def _pac_bayes_inputs(model: Any, batches: list[Any]) -> tuple[float, float, int]:
-    """``(empirical_risk, KL(Q||P), n)``. No KL(Q||P) estimator exists (#3041)."""
-    raise NotImplementedError(
-        "pac_bayes needs a KL(Q||P) estimator for the posterior; none is implemented, so the "
-        "certificate is not computable (#3041)."
-    )
-
-
 class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
     """Calibration-only strategy. Does not perform gradient updates.
 
@@ -172,11 +166,12 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
         self,
         input_batch: Any,
         target_batch: Any,
+        field_strength: Any = None,
         field_strength_target: Any = None,
         contrast_id: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """Fold the per-sample target field + contrast into ``batch_context``.
+        """Fold the per-sample source/target fields + contrast into ``batch_context``.
 
         The pipeline's gated validation seam forwards a batch key ONLY when its name
         literally appears in this signature (``_VALIDATION_FORWARD_FIELDS`` in
@@ -190,6 +185,8 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
         CrossFieldTranslationStrategy sibling already carries.
         """
         bc = kwargs.pop("batch_context", None) or {}
+        if field_strength is not None:
+            bc["field_strength"] = field_strength
         if field_strength_target is not None:
             bc["field_strength_target"] = field_strength_target
         if contrast_id is not None:
@@ -238,7 +235,6 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
             CalibratedHallucinationDetector,
             ConformalCalibrationRunner,
             ConformalCalibrator,
-            PACBayesCertificate,
             PathologyRecallCertificate,
             resolve_calibration_score,
         )
@@ -249,6 +245,9 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
         if model is None:
             logger.warning("No generator on context — cannot run calibration.")
             return reports
+        certified_ckpt: str | None = None
+        if {"conformal", "chd"} & set(self._enabled_certs):
+            certified_ckpt = self._load_model_under_certification(model)
 
         # Materialise the cohort once: every certificate re-iterates it. Calibration
         # and test are split by subject (no subject on both sides), seeded from run.seed.
@@ -294,6 +293,7 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
                 "n_calibration_images": n_calib_images,
                 "n_calibration_pixels": report.n_calibration,
                 "n_test_images": _count_images(test_all),
+                "checkpoint_path": certified_ckpt,
                 **split_info,
             }
             reports["r1_cdfc"] = payload
@@ -323,6 +323,7 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
                 "n_calibration_images": n_calib_images,
                 "n_calibration_pixels": detector.n_calibration,
                 "n_test_images": _count_images(test_all),
+                "checkpoint_path": certified_ckpt,
                 **split_info,
             }
             reports["r2_chd"] = payload
@@ -348,17 +349,11 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
             reports["r4_prc"] = payload
             self._write_artefact(prc.output_artefact, payload)
 
-        # PAC-Bayes / R5 — McAllester bound. KL(Q||P) has no estimator; the config schema
-        # rejects enabled=true, and the input helper refuses if reached anyway.
+        # PAC-Bayes / R5 — McAllester bound with Gaussian Q around the certified checkpoint
+        # and Gaussian P around the prior checkpoint.
         if "pac_bayes" in self._enabled_certs:
             pac = cert_cfg.pac_bayes
-            risk, kl, n = _pac_bayes_inputs(model, batches)
-            cert = PACBayesCertificate(
-                delta=pac.delta,
-                loss_bound_M=pac.loss_bound_M,
-                tv_tolerance=pac.tv_tolerance_tau,
-            )
-            payload = cert.certify(risk, kl, n).to_dict()
+            payload = self._pac_bayes_payload(pac, model, batches)
             reports["r5_pac_bayes"] = payload
             self._write_artefact(pac.output_artefact, payload)
 
@@ -444,6 +439,79 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
 
         return reports
 
+    def _pac_bayes_payload(self, pac: Any, model: Any, batches: list[Any]) -> dict[str, Any]:
+        """Load Q's mean, estimate KL(Q||P) and the Gibbs risk, and certify; every knob stamped."""
+        from spectramr.infrastructure.calibration import PACBayesCertificate
+        from spectramr.infrastructure.calibration.pac_bayes_kl import (
+            gibbs_per_image_loss,
+            group_draws,
+            resolve_kl_estimator,
+        )
+        from spectramr.infrastructure.checkpointing.restore import read_part
+
+        self._load_generator_checkpoint(model, pac.checkpoint_path)
+        prior = read_part(Path(pac.prior_checkpoint_path), "generator")
+        posterior = dict(unwrap_model(model).named_parameters())
+        kl, n_params, distance = resolve_kl_estimator(pac.kl_estimator)(
+            posterior, prior, posterior_sigma=pac.posterior_sigma, prior_sigma=pac.prior_sigma
+        )
+        seed = int(self.config.run.seed)
+
+        def predict(batch: Any, net: Any) -> tuple[Any, Any]:
+            pred, target = self._unpack_calibration_pair(_batch_to_device(batch, self.device), net)
+            if pred is None:
+                raise ValueError("pac_bayes calibration batch carries no input/target pair.")
+            return pred, target
+
+        gibbs = gibbs_per_image_loss(
+            model,
+            batches,
+            predict,
+            risk_loss=pac.risk_loss,
+            posterior_sigma=pac.posterior_sigma,
+            n_mc_samples=pac.n_mc_samples,
+            seed=seed,
+            loss_bound=pac.loss_bound_M,
+            out_of_range=pac.loss_out_of_range,
+        )
+        ids = None
+        if pac.independence_unit == "subject":
+            ids = [sid for b in batches for sid in self._subject_ids(b, _batch_size(b))]
+        draws = group_draws(gibbs.per_image, ids)
+        # The bound needs E_Q[L_hat]; the MC mean gets a Hoeffding term at mc_delta.
+        mc_mean = sum(draws) / len(draws)
+        mc_term = pac.loss_bound_M * math.sqrt(
+            math.log(1.0 / pac.mc_delta) / (2 * pac.n_mc_samples)
+        )
+        cert = PACBayesCertificate(
+            delta=pac.delta - pac.mc_delta,
+            loss_bound_M=pac.loss_bound_M,
+            tv_tolerance=pac.tv_tolerance_tau,
+        )
+        payload = cert.certify(mc_mean + mc_term, kl, len(draws)).to_dict()
+        payload.update(
+            delta_total=pac.delta,
+            mc_delta=pac.mc_delta,
+            mc_risk_mean=mc_mean,
+            mc_hoeffding_term=mc_term,
+            kl_estimator=pac.kl_estimator,
+            posterior_sigma=pac.posterior_sigma,
+            prior_sigma=pac.prior_sigma,
+            n_parameters=n_params,
+            weight_distance_l2=distance,
+            n_mc_samples=pac.n_mc_samples,
+            mc_seed=seed,
+            mc_standard_error=gibbs.mc_standard_error,
+            risk_loss=pac.risk_loss,
+            loss_out_of_range=pac.loss_out_of_range,
+            n_losses_truncated=gibbs.n_truncated,
+            independence_unit=pac.independence_unit,
+            n_samples_scored=len(gibbs.per_image),
+            checkpoint_path=str(pac.checkpoint_path),
+            prior_checkpoint_path=str(pac.prior_checkpoint_path),
+        )
+        return payload
+
     def _subject_split(self, batches: list[Any], seed: int) -> tuple[list[Any], list[Any], dict]:
         """Split the cohort into disjoint calibration and test halves by subject.
 
@@ -516,7 +584,7 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
         ids = read_batch_field(batch, "subject_id")
         if ids is None:
             raise ValueError(
-                "certification.dice_risk.independence_unit='subject' needs batch['subject_id'] "
+                "certification.<dice_risk|pac_bayes>.independence_unit='subject' needs batch['subject_id'] "
                 "(the mrixfields and nifti_paired datasets emit it). Declare independence_unit: "
                 "'sample' only for a cohort whose scored images are independent draws."
             )
@@ -546,9 +614,10 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
             return None, None
         if x is None or target is None:
             return None, None
-        # Field-conditioned generators (AnatomyFieldRenderer) REQUIRE a field_strength
-        # kwarg; detect it by signature (no except-TypeError retry, which would mask a
-        # real error) and pass the batch's target field (or source as fallback).
+        # Field-conditioned generators REQUIRE their field kwargs; detect them by signature
+        # (no except-TypeError retry, which would mask a real error). A two-field forward
+        # (AnatomyFieldRenderer) gets source and target under their own names and the
+        # contrast it trained with, so the certificate is measured in distribution (#197).
         import inspect
 
         fwd = getattr(unwrap_model(model), "forward", model)
@@ -557,12 +626,17 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
             params = inspect.signature(fwd).parameters
         except (TypeError, ValueError):
             params = {}
-        if "field_strength" in params:
-            fs = None
-            if isinstance(batch, dict):
-                fs = batch.get("field_strength_target", batch.get("field_strength"))
+        get = batch.get if isinstance(batch, dict) else (lambda _k, _d=None: _d)
+        if "field_strength_target" in params:
+            for key in ("field_strength", "field_strength_target"):
+                if get(key) is not None:
+                    fwd_kwargs[key] = get(key)
+        elif "field_strength" in params:
+            fs = get("field_strength_target", get("field_strength"))
             if fs is not None:
                 fwd_kwargs["field_strength"] = fs
+        if "contrast_id" in params and get("contrast_id") is not None:
+            fwd_kwargs["contrast_id"] = get("contrast_id")
         # A geometry-plane generator raises without ``mask=``; the batch holds only the
         # zero-filled measurement, whose non-zero support is the observation mask.
         if isinstance(x, torch.Tensor):
@@ -573,6 +647,25 @@ class ConformalCalibrationStrategy(ReconstructionTrainingStrategy):
         if isinstance(pred, dict):
             pred = pred.get("reconstruction", next(iter(pred.values())))
         return pred, target
+
+    def _load_model_under_certification(self, model: Any) -> str:
+        """Load ``model.checkpoint_path`` (the producer arm's weights) strictly into ``model``."""
+        path = getattr(getattr(self.config, "model", None), "checkpoint_path", None)
+        if not path:
+            raise ValueError(
+                "model.checkpoint_path is required: the conformal and CHD certificates "
+                "certify a trained reconstructor, and without its checkpoint they would "
+                "certify random weights (pitfall #20). Point it at the producer arm's "
+                "<output_dir>/checkpoints/best.<format> (checkpoint.produced_by_arm)."
+            )
+        if not Path(path).exists():
+            produced_by = getattr(getattr(self.config, "checkpoint", None), "produced_by_arm", None)
+            raise FileNotFoundError(
+                f"model.checkpoint_path not found: {path}. Run the producer arm "
+                f"(checkpoint.produced_by_arm={produced_by!r}) before calibrating."
+            )
+        self._load_generator_checkpoint(model, path)
+        return str(path)
 
     @staticmethod
     def _load_generator_checkpoint(model: Any, path: str) -> None:

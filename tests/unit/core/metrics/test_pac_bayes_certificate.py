@@ -83,3 +83,27 @@ def test_invalid_inputs_raise() -> None:
         PACBayesCertificate(kl_divergence=-1.0)
     with pytest.raises(ValueError):
         PACBayesCertificate(delta=1.5)
+
+
+def test_certificate_raises_when_a_loss_leaves_the_bounded_range() -> None:
+    """#2377: unbounded MSE fed to a [0, 1] bound missed the true risk in 36% of batches."""
+    metric = PACBayesCertificate(delta=0.05)
+    pred = torch.full((4, 1, 8, 8), 10.0)
+    with pytest.raises(ValueError, match="loss_bound"):
+        metric(pred, torch.zeros_like(pred))
+
+
+def test_certificate_is_computed_in_normalised_units() -> None:
+    pred = torch.randn(8, 1, 8, 8)
+    target = torch.zeros_like(pred)
+    losses = pred.pow(2).flatten(1).mean(-1)
+    bound_b = 4.0 * float(losses.max())
+    expected = bound_b * pac_bayes_bernstein_bound(
+        empirical_risk=(losses / bound_b).mean().item(),
+        empirical_variance=(losses / bound_b).var(unbiased=False).item(),
+        kl_divergence=0.0,
+        n_calibration=8,
+    )
+    assert PACBayesCertificate(loss_bound=bound_b)(pred, target) == pytest.approx(expected)
+    with pytest.raises(ValueError):
+        PACBayesCertificate(loss_bound=0.0)

@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+
 try:
     import torchkbnufft as tkbn
 
@@ -92,6 +94,12 @@ def pre_whiten(
     return whitened
 
 
+def _reject_mask_off_grid(maps_dict: dict) -> None:
+    """A Cartesian line mask has no meaning on a NUFFT trajectory; raise rather than drop it."""
+    if maps_dict.get("mask") is not None:
+        raise ValueError("maps_dict['mask'] applies to the Cartesian grid only (dK=None).")
+
+
 class Operator_A_m4(nn.Module):
     """The Complete Forward Physics Simulator for the m4raw anatomy space.
 
@@ -136,7 +144,11 @@ class Operator_A_m4(nn.Module):
                 - B0: [B, 1, H, W] in Tesla
                 - S_map: [B, Nc, H, W]
                 - Psi: [B, Nc, Nc]
-                - dK: [B, 2, N_k] trajectory (nominal + tracking adjustment)
+                - dK: [B, 2, N_k] trajectory (nominal + tracking adjustment), or
+                  None for the Cartesian grid of ``fft2c`` (required key)
+                - mask: binary sampling mask broadcastable to [B, Nc, H, W]
+                  (Cartesian only, optional)
+                - im_size: (H, W) of the Cartesian grid (optional, else self.im_size)
                 - dcf: [B, 1, N_k] density compensation (optional)
 
         Returns:
@@ -174,9 +186,15 @@ class Operator_A_m4(nn.Module):
         if "S_map" in maps_dict and maps_dict["S_map"] is not None:
             x = x * maps_dict["S_map"]  # [B, Nc, H, W]
 
-        # 5. Trajectory-Corrected NUFFT (Task 4.3)
+        # 5. Trajectory-Corrected NUFFT (Task 4.3), or the Cartesian fft2c grid
         ktraj = maps_dict["dK"]  # [B, 2, N_k]
+        if ktraj is None:
+            kx = self._cartesian_forward(x, maps_dict)
+            if "Psi" in maps_dict and maps_dict["Psi"] is not None:
+                kx = pre_whiten(kx, maps_dict["Psi"])
+            return kx
 
+        _reject_mask_off_grid(maps_dict)
         if not TORCHKBNUFFT_AVAILABLE:
             raise RuntimeError("TorchKbNufft required for NUFFT.")
 
@@ -214,11 +232,15 @@ class Operator_A_m4(nn.Module):
             L = torch.linalg.cholesky(maps_dict["Psi"])
             kx = torch.linalg.solve_triangular(L.mH, kx, upper=True)
 
-        # 2. NUFFT Adjoint
+        # 2. NUFFT Adjoint, or the Cartesian ifft2c grid
         ktraj = maps_dict["dK"]
-        if not TORCHKBNUFFT_AVAILABLE:
-            raise RuntimeError("TorchKbNufft required for NUFFT.")
-        x = self.adjnufft(kx, ktraj, norm=self._nufft_norm)  # [B, Nc, H, W]
+        if ktraj is None:
+            x = self._cartesian_adjoint(kx, maps_dict)
+        else:
+            _reject_mask_off_grid(maps_dict)
+            if not TORCHKBNUFFT_AVAILABLE:
+                raise RuntimeError("TorchKbNufft required for NUFFT.")
+            x = self.adjnufft(kx, ktraj, norm=self._nufft_norm)  # [B, Nc, H, W]
 
         # 3. Adjoint Coil Sensitivities (Coil Combination)
         if "S_map" in maps_dict and maps_dict["S_map"] is not None:
@@ -244,6 +266,28 @@ class Operator_A_m4(nn.Module):
             x = x * torch.sin(maps_dict["alpha"])  # sin is real, self-adjoint
 
         return x
+
+    def _cartesian_forward(self, x: torch.Tensor, maps_dict: dict) -> torch.Tensor:
+        """``mask * fft2c(x)`` flattened row-major to ``[B, Nc, H*W]``."""
+        k = fft2c(x)
+        mask = maps_dict.get("mask")
+        if mask is not None:
+            k = k * mask
+        return k.flatten(-2)
+
+    def _cartesian_adjoint(self, y: torch.Tensor, maps_dict: dict) -> torch.Tensor:
+        """``ifft2c(mask * y)`` on the declared ``(H, W)`` grid; the mask is diagonal."""
+        H, W = maps_dict.get("im_size") or self.im_size
+        if y.shape[-1] != H * W:
+            raise ValueError(
+                f"Cartesian adjoint: N_k={y.shape[-1]} does not match the grid {H}x{W}; "
+                "pass maps_dict['im_size'] for a grid other than the operator's im_size."
+            )
+        k = y.reshape(*y.shape[:-1], H, W)
+        mask = maps_dict.get("mask")
+        if mask is not None:
+            k = k * mask
+        return ifft2c(k)
 
 
 __all__ = ["Operator_A_m4", "apply_rigid_transform", "pre_whiten"]

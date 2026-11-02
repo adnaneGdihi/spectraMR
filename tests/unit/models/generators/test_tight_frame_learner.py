@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from spectramr.models.generators.tight_frame_learner import TightFrameLearner
+from spectramr.models.losses.frame_coherence_loss import gram_offdiagonal_penalty
 
 
 def test_forward_preserves_shape() -> None:
@@ -32,7 +33,7 @@ def test_coherence_penalty_zero_for_orthonormal_atoms() -> None:
     q = torch.linalg.qr(torch.randn(feat, 4))[0].t()  # [4, feat] orthonormal rows
     with torch.no_grad():
         m.analysis.weight.copy_(q.reshape(4, 1, 3, 3))
-    assert float(m.coherence_penalty()) == pytest.approx(0.0, abs=1e-5)
+    assert float(gram_offdiagonal_penalty(m.atoms().detach())) == pytest.approx(0.0, abs=1e-5)
     assert m.mutual_coherence() == pytest.approx(0.0, abs=1e-5)
 
 
@@ -41,7 +42,7 @@ def test_coherence_penalty_positive_for_identical_atoms() -> None:
     m = TightFrameLearner(num_atoms=4, kernel_size=3)
     with torch.no_grad():
         m.analysis.weight.copy_(torch.ones_like(m.analysis.weight))
-    assert float(m.coherence_penalty()) > 1.0
+    assert float(gram_offdiagonal_penalty(m.atoms().detach())) > 1.0
     assert m.mutual_coherence() == pytest.approx(1.0, abs=1e-4)
 
 
@@ -63,6 +64,24 @@ def test_parseval_penalty_nonnegative_and_finite() -> None:
     m = TightFrameLearner(num_atoms=16, kernel_size=3)
     p = m.parseval_penalty()
     assert torch.isfinite(p) and float(p) >= 0.0
+
+
+def test_parseval_penalty_zero_is_a_conv_parseval_frame() -> None:
+    # #2368: W^T W = I/n makes D^T D = I; the old (m/n) target made D^T D = m I.
+    torch.manual_seed(0)
+    m_atoms, k = 64, 7
+    n = k * k
+    model = TightFrameLearner(num_atoms=m_atoms, kernel_size=k, sparsity_threshold=0.05).double()
+    q, _ = torch.linalg.qr(torch.randn(m_atoms, n, dtype=torch.float64))
+    x = torch.randn(1, 1, 48, 48, dtype=torch.float64)
+    with torch.no_grad():
+        model.analysis.weight.copy_((q / n**0.5).reshape(m_atoms, 1, k, k))
+        dtdx = model.synthesize(model.analyze(x))
+    assert float(model.parseval_penalty()) < 1e-20
+    assert torch.allclose(dtdx[..., 8:-8, 8:-8], x[..., 8:-8, 8:-8], atol=1e-10)
+    with torch.no_grad():
+        model.analysis.weight.copy_(((m_atoms / n) ** 0.5 * q).reshape(m_atoms, 1, k, k))
+    assert float(model.parseval_penalty()) > 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -87,7 +106,7 @@ def _train_frame(use_coherence: bool, steps: int = 150) -> tuple[float, float]:
         recon = mse(m(noisy), clean)
         loss = recon + 0.01 * m.parseval_penalty()
         if use_coherence:
-            loss = loss + 0.05 * m.coherence_penalty()
+            loss = loss + 0.05 * gram_offdiagonal_penalty(m.atoms())
         loss.backward()
         opt.step()
         last_recon = float(recon.detach())

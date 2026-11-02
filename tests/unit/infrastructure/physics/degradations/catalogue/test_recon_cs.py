@@ -184,3 +184,28 @@ def test_severity_is_monotone_in_theta_for_every_seed(name, x, grid, seed):
     """Nested masks plus a lambda that does not change with theta: only R grows (checked at 8 seeds x 2 phantoms)."""
     c = [float((apply_degradation(NAME, x, t, seed=seed).abs() - x.abs()).norm()) for t in grid]
     assert all(b > a for a, b in pairwise(c)), (name, seed, c)
+
+
+@pytest.mark.parametrize("r_max", [12.0, 16.0])
+def test_2d_mask_realises_r_past_the_acs_cap(r_max, monkeypatch):
+    # An 8 % ACS alone caps R at 12.5; past it the ACS must take the whole line budget.
+    from spectramr.infrastructure.physics.degradations.catalogue import recon_cs
+
+    masks = []
+    draw = recon_cs.cartesian_mask_3d
+
+    def spy(*args, **kwargs):
+        masks.append(draw(*args, **kwargs))
+        return masks[-1]
+
+    monkeypatch.setattr(recon_cs, "cartesian_mask_3d", spy)
+    apply_degradation("cs_recon_artifacts", _cplx(1, 1, 64, 64), theta=1.0, seed=0, r_max=r_max)
+    assert masks[-1].numel() / float(masks[-1].sum()) == pytest.approx(r_max, rel=0.12)
+
+
+def test_2d_acs_cap_is_inactive_at_the_declared_r_max():
+    # round(h/R) >= floor(0.08 h) for R <= 12.5, so the declared r_max = 6 path is unchanged.
+    for h in range(4, 1025):
+        for step in range(21):
+            r = 1.0 + 5.0 * step / 20
+            assert max(1, round(h / r)) >= max(1, int(0.08 * h)), (h, r)

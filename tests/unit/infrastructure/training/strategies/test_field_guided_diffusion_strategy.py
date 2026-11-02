@@ -322,3 +322,36 @@ def test_cfg_sampling_output_stays_in_data_range() -> None:
         f"[{float(out.min()):.3f}, {float(out.max()):.3f}] — images are [0,1], so an "
         "out-of-range return is what produced negative PSNR / ~0 SSIM in the b35 run"
     )
+
+
+def test_declared_image_loss_is_folded_onto_the_x0_estimate() -> None:
+    """A declared image loss reaches the objective on the x0 estimate the sampler uses."""
+    acp = make_alphas_cumprod(50, "cosine")
+    batch = _batch()
+    model = FieldGuidedScoreUNet(width=16, time_dim=16)
+
+    torch.manual_seed(7)
+    off = compute_field_guided_diffusion_loss(model, batch, alphas_cumprod=acp)
+
+    seen: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def fold(x0_hat, x0, components):
+        seen.append((x0_hat, x0))
+        return 0.5 * (x0_hat - x0).abs().mean()
+
+    torch.manual_seed(7)
+    on = compute_field_guided_diffusion_loss(
+        model, batch, alphas_cumprod=acp, fold_image_losses=fold
+    )
+
+    ((x0_hat, x0),) = seen
+    assert torch.equal(x0, batch["target"])
+    assert torch.isfinite(x0_hat).all()
+    assert torch.allclose(on["loss_total"] - off["loss_total"], 0.5 * (x0_hat - x0).abs().mean())
+    assert "loss_eps" in on
+
+
+def test_it_declares_folded_image_losses_with_an_empty_stack_as_design() -> None:
+    assert FieldGuidedDiffusionStrategy.__dict__["folds_image_losses"] is True
+    assert FieldGuidedDiffusionStrategy.__dict__["empty_loss_stack_is_design"] is True
+    assert FieldGuidedDiffusionStrategy.__dict__["inline_losses"] == frozenset()

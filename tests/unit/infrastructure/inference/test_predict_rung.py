@@ -139,7 +139,14 @@ def _predict(tmp_path, monkeypatch, tensor, acceleration, mask=None):
         strategy.model,
         strategy,
         torch.device("cpu"),
-        SimpleNamespace(data=SimpleNamespace(dataset_type="kspace", slice_level_records=False)),
+        SimpleNamespace(
+            data=SimpleNamespace(
+                dataset_type="kspace",
+                slice_level_records=False,
+                multi_contrast=SimpleNamespace(enabled=False, contrast_map={}),
+            ),
+            model=SimpleNamespace(model_type="kspace_cold_diffusion", model_kwargs={}),
+        ),
         2,
         results,
         acceleration=acceleration,

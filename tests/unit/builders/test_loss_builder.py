@@ -8,6 +8,20 @@ from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.training.builders.loss_builder import LossBuilder
 
 
+@pytest.fixture
+def declare_build_set(monkeypatch):
+    """Stand in for the owner of the build set (models/losses/build_set.py)."""
+
+    def _declare(value):
+        monkeypatch.setattr(
+            "spectramr.infrastructure.training.builders.loss_builder.declared_build_set",
+            lambda _losses: dict(value),
+        )
+
+    return _declare
+
+
+
 class TestLossBuilder:
     @pytest.fixture
     def mock_config(self):
@@ -101,10 +115,10 @@ class TestLossBuilder:
         losses = builder.build_reconstruction_losses().build()
         assert len(losses) == 0
 
-    def test_build_l1_loss(self, mock_config):
+    def test_build_l1_loss(self, mock_config, declare_build_set):
         mock_config.losses.reconstruction.enable_l1 = True
         mock_config.losses.reconstruction.lambda_l1 = 1.0
-        mock_config.losses.get_enabled_losses.return_value = {"l1": 1.0}
+        declare_build_set({"l1": 1.0})
 
         builder = LossBuilder(mock_config, "cpu")
         losses = builder.build_reconstruction_losses().build()
@@ -112,10 +126,10 @@ class TestLossBuilder:
         assert "l1" in losses
         assert isinstance(losses["l1"], nn.L1Loss)
 
-    def test_build_l2_loss(self, mock_config):
+    def test_build_l2_loss(self, mock_config, declare_build_set):
         mock_config.losses.reconstruction.enable_l2 = True
         mock_config.losses.reconstruction.lambda_l2 = 1.0
-        mock_config.losses.get_enabled_losses.return_value = {"l2": 1.0}
+        declare_build_set({"l2": 1.0})
 
         builder = LossBuilder(mock_config, "cpu")
         losses = builder.build_reconstruction_losses().build()
@@ -124,10 +138,10 @@ class TestLossBuilder:
         # Note: LossBuilder creates "mse" (from registry) for l2
         assert isinstance(losses["l2"], nn.MSELoss)
 
-    def test_build_ssim_loss(self, mock_config):
+    def test_build_ssim_loss(self, mock_config, declare_build_set):
         mock_config.losses.reconstruction.enable_ssim = True
         mock_config.losses.reconstruction.lambda_ssim = 1.0
-        mock_config.losses.get_enabled_losses.return_value = {"ssim": 1.0}
+        declare_build_set({"ssim": 1.0})
 
         builder = LossBuilder(mock_config, "cpu")
         losses = builder.build_reconstruction_losses().build()
@@ -136,12 +150,14 @@ class TestLossBuilder:
         # Checking type might be tricky if it's from registry, but check it exists
 
     @patch("spectramr.infrastructure.training.builders.loss_builder.create_loss")
-    def test_build_gan_loss(self, mock_create_loss, mock_config):
+    def test_build_gan_loss(self, mock_create_loss, mock_config, declare_build_set):
         mock_config.losses.gan.enable_adversarial = True
         mock_config.losses.gan.gan_loss_type = "vanilla"
         mock_config.losses.gan.lambda_adv = 1.0
+        mock_config.losses.gan.enable_gradient_penalty = False
+        mock_config.losses.gan.enable_feature_matching = False
         mock_config.training.strategy_class = "gan_training"
-        mock_config.losses.get_enabled_losses.return_value = {"adversarial": 1.0}
+        declare_build_set({"adversarial": 1.0})
 
         builder = LossBuilder(mock_config, "cpu")
         losses = builder.build_adversarial_losses().build()
@@ -153,8 +169,8 @@ class TestLossBuilder:
         calls = [args[0] for args, kwargs in mock_create_loss.call_args_list]
         assert "gan_composite" in calls
 
-    def test_introspection(self, mock_config):
-        mock_config.losses.get_enabled_losses.return_value = {"l1": 1.0}
+    def test_introspection(self, mock_config, declare_build_set):
+        declare_build_set({"l1": 1.0})
 
         builder = LossBuilder(mock_config, "cpu")
         enabled = builder.get_enabled_losses()
@@ -215,7 +231,7 @@ class TestLossBuilder:
         builder._build_list_based_losses = lambda: None
         return builder
 
-    def test_recon_managed_loss_not_flagged_as_unmigrated(self, mock_config):
+    def test_recon_managed_loss_not_flagged_as_unmigrated(self, mock_config, declare_build_set):
         """direct_ulf_to_hf_sr pattern: a loss wired via reconstruction.enable_<x>
         (consumed by the reconstruction computer) and deliberately kept OUT of
         image_losses. The unmigrated-key guard must NOT reject it.
@@ -227,18 +243,18 @@ class TestLossBuilder:
         mock_config.losses.reconstruction.enable_hfen = True
         mock_config.losses.reconstruction.lambda_hfen = 1.0
         # get_enabled_losses reports both the recon hfen and the list ssim.
-        mock_config.losses.get_enabled_losses.return_value = {"hfen": 1.0, "ssim": 0.5}
+        declare_build_set({"hfen": 1.0, "ssim": 0.5})
         mock_config.losses.reconstruction_managed_losses.return_value = {"hfen", "ssim"}
 
         builder = self._list_based(mock_config)
         builder._build_all_dynamic()  # must NOT raise ConfigurationError
 
-    def test_genuinely_unmigrated_key_still_raises(self, mock_config):
+    def test_genuinely_unmigrated_key_still_raises(self, mock_config, declare_build_set):
         """A key that is in NO computer path (not recon-managed, not in the
         declarative lists) must still be rejected — the guard's real purpose."""
         from spectramr.domain.exceptions import ConfigurationError
 
-        mock_config.losses.get_enabled_losses.return_value = {"bogus_loss": 1.0}
+        declare_build_set({"bogus_loss": 1.0})
         mock_config.losses.reconstruction_managed_losses.return_value = set()
 
         builder = self._list_based(mock_config)

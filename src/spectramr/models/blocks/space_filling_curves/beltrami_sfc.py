@@ -14,16 +14,14 @@ fixed Hilbert curve — so the strategy strictly generalises a
 fixed-Hilbert HSSC scan (pinned by
 ``test_beltrami_sfc_block_zero_mu_is_hilbert``).
 
-Honest status (pitfall #16). The permutation is produced by an
-``argsort`` and is therefore **not differentiable**: the reconstruction
-loss cannot shape the curve, and the only gradient reaching ``μ_θ`` is
-the strategy's ``|μ|²`` and trajectory regularisers — which *shrink*
-the warp back toward the fixed Hilbert baseline. No fixed-Hilbert
-control arm exists in the cohort, so "adaptive beats fixed" is not yet
-attributable. A differentiable Gumbel-Sinkhorn alternative
-(:class:`~spectramr.models.blocks.sinkhorn_sfc.SinkhornSFCLinearizer`) is
-backlogged — see
-``TODO/backlog_sfc_topology_inert_mechanisms_2026_07.md``.
+Gradient path (#2360). The hard permutation comes from an ``argsort`` and
+carries no gradient, so the block also returns ``soft_perm``: a row-softmax
+assignment of each scan slot to the cells whose continuous warped Hilbert
+rank lies nearest that slot's rank. The rank is read off the Hilbert-rank
+map by bilinear sampling at ``φ(z)``, so it is differentiable in ``μ_θ``.
+A consumer gathers with the hard indices and adds the straight-through
+term ``soft - soft.detach()`` (QuadMamba-style [9]), which leaves the
+forward values unchanged and lets the reconstruction loss reach ``μ_θ``.
 
 Earlier this block sorted cells by ``φ.angle()`` — a single global
 scalar that collapses 2-D locality (max L1 step ≈ 13 vs the Hilbert
@@ -35,12 +33,15 @@ References:
         AMS, 2006.
     [8] L. M. Lui et al., "Teichmüller mapping (T-map)", *SIAM J.
         Imag. Sci.*, 7(1), 2014.
+    [9] F. Xie et al., "QuadMamba: Learning quadtree-based selective
+        scan for visual state space model", *NeurIPS*, 2024.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from spectramr.infrastructure.physics.conformal_geometry import (
     LinearBeltramiSolver,
@@ -64,6 +65,8 @@ class BeltramiSFCBlock(nn.Module):
             maximal warping (and risks numerical instability).
         solver: Optional pre-built solver; defaults to a fresh
             :class:`LinearBeltramiSolver`.
+        soft_temperature: Temperature, in Hilbert-rank units, of the
+            soft assignment behind ``soft_perm``.
     """
 
     def __init__(
@@ -74,10 +77,14 @@ class BeltramiSFCBlock(nn.Module):
         hidden: int = 32,
         k_max: float = 0.9,
         solver: LinearBeltramiSolver | None = None,
+        soft_temperature: float = 1.0,
     ) -> None:
         super().__init__()
         if grid_size & (grid_size - 1):
             raise ValueError(f"grid_size must be a power of two, got {grid_size}")
+        if not soft_temperature > 0.0:
+            raise ValueError(f"soft_temperature must be > 0, got {soft_temperature}")
+        self.soft_temperature = float(soft_temperature)
         self.grid_size = grid_size
         self.k_max = k_max
         self.solver = solver or LinearBeltramiSolver(max_iter=20, tol=1e-3)
@@ -96,6 +103,8 @@ class BeltramiSFCBlock(nn.Module):
         # visited along the Hilbert curve. Used to order cells by the rank of
         # their warped position (see forward).
         self.register_buffer("hilbert_rank", idx.argsort(), persistent=False)
+        rank_map = self.hilbert_rank.to(torch.float32).view(1, 1, grid_size, grid_size)
+        self.register_buffer("hilbert_rank_map", rank_map, persistent=False)
 
     def _mu_from_features(self, x: torch.Tensor) -> torch.Tensor:
         """Compute the constrained Beltrami coefficient from features."""
@@ -103,19 +112,23 @@ class BeltramiSFCBlock(nn.Module):
         mu = enforce_beltrami_constraint(torch.complex(out[:, 0], out[:, 1]), k_max=self.k_max)
         return mu
 
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, features: torch.Tensor, *, soft: bool = True) -> dict[str, torch.Tensor]:
         """Return the adaptive SFC indices plus the underlying μ / φ fields.
 
         Args:
             features: ``[B, C, H, W]`` content tensor. ``H = W =
                 grid_size`` is enforced.
+            soft: Also build ``soft_perm``; an evaluation-only caller that
+                needs no gradient passes False and the key is absent.
 
         Returns:
-            Dict with ``{"indices": [B, H*W] int64, "mu": [B, H, W],
-            "phi": [B, H, W]}``. ``indices[b, k]`` is the flat grid
+            Dict with ``{"indices": [B, H*W] int64, "soft_perm":
+            [B, H*W, H*W], "mu": [B, H, W], "phi": [B, H, W]}``. ``indices[b, k]`` is the flat grid
             index of the cell visited k-th in the adaptive scan
             (consumed by downstream Mamba scans); it is
-            **non-differentiable** (produced by ``argsort``). ``mu`` and
+            non-differentiable (produced by ``argsort``). ``soft_perm[b, k]``
+            is a differentiable relaxation of the one-hot row of
+            ``indices[b, k]`` for the straight-through gradient. ``mu`` and
             ``phi`` carry gradient and are exposed for the Beltrami /
             trajectory regularisers and diagnostics.
         """
@@ -145,7 +158,24 @@ class BeltramiSFCBlock(nn.Module):
         warped_rank = rank[warped_flat]  # [B, N]
         composite = warped_rank * n + rank.unsqueeze(0)
         indices = composite.argsort(dim=-1, stable=True)  # [B, N] int64
-        return {"indices": indices, "mu": mu, "phi": phi}
+        out = {"indices": indices, "mu": mu, "phi": phi}
+        if soft:
+            out["soft_perm"] = self._soft_permutation(phi, indices)
+        return out
+
+    def _soft_permutation(self, phi: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        """Relax the hard order into a ``[B, N, N]`` row-stochastic assignment."""
+        b = phi.shape[0]
+        # grid_sample's (x, y) on [-1, 1] with align_corners=True is exactly the
+        # φ.real / φ.imag cell-centre convention used for the hard order above.
+        grid = torch.stack((phi.real, phi.imag), dim=-1).to(self.hilbert_rank_map.dtype)
+        rank_map = self.hilbert_rank_map.expand(b, -1, -1, -1)
+        score = F.grid_sample(
+            rank_map, grid, mode="bilinear", padding_mode="border", align_corners=True
+        ).view(b, -1)  # [B, N] continuous warped Hilbert rank
+        slot_score = score.gather(1, indices)  # [B, N]: rank of the cell in slot k
+        dist = (slot_score.unsqueeze(-1) - score.unsqueeze(1)).pow(2)
+        return torch.softmax(-dist / self.soft_temperature, dim=-1)
 
 
 __all__ = ["BeltramiSFCBlock"]

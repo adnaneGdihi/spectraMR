@@ -67,27 +67,36 @@ def apodization_window(
     return out
 
 
-def _apodize(x: Tensor, theta: float, window: str, dims: tuple[int, ...]) -> Tensor:
+def _apodize(
+    x: Tensor, theta: float, window: str, dims: tuple[int, ...], max_strength: float = 1.0
+) -> Tensor:
     # The window is built once: an unknown name raises here, at theta = 0 too.
     w = apodization_window(tuple(x.shape), dims, window, x.device, x.real.dtype)
     if float(theta) <= 0.0:
         return x
-    return ifftnc(fftnc(x, dims) * (1.0 - float(theta) * (1.0 - w)), dims)
+    return ifftnc(fftnc(x, dims) * (1.0 - float(theta) * max_strength * (1.0 - w)), dims)
 
 
-def apodization_2d(x: Tensor, theta: float, seed: int = 0, window: str = "hamming") -> Tensor:
+def apodization_2d(
+    x: Tensor, theta: float, seed: int = 0, window: str = "hamming", max_strength: float = 1.0
+) -> Tensor:
     """recon_apodization on a ``(B, C, H, W)`` slice: in-plane (ky, kx) window."""
     x = _ensure_complex(x)
-    return _apodize(x, theta, window, (-2, -1))
+    return _apodize(x, theta, window, (-2, -1), max_strength)
 
 
 def apodization_volume(
-    x: Tensor, theta: float, seed: int, geometry: AcquisitionGeometry, window: str = "hamming"
+    x: Tensor,
+    theta: float,
+    seed: int,
+    geometry: AcquisitionGeometry,
+    window: str = "hamming",
+    max_strength: float = 1.0,
 ) -> Tensor:
     """recon_apodization on a 3-D volume: the product of three 1-D windows over (kz, ky, kx)."""
     check_input(x, geometry, "recon_apodization")
     x = _ensure_complex(x)
-    return _apodize(x, theta, window, (-3, -2, -1))
+    return _apodize(x, theta, window, (-3, -2, -1), max_strength)
 
 
 def truncation_mask(

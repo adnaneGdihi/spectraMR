@@ -5,6 +5,7 @@ based on training paradigm and configuration.
 """
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -54,7 +55,12 @@ class ModelBuilder(Builder):
     """
 
     def __init__(
-        self, config: TrainingSettings, device: torch.device, *, warm_start: bool = False
+        self,
+        config: TrainingSettings,
+        device: torch.device,
+        *,
+        warm_start: bool = False,
+        checkpoint_layout: Mapping[str, Any] | None = None,
     ):
         """Initialize ModelBuilder.
 
@@ -63,10 +69,13 @@ class ModelBuilder(Builder):
             device: Device where models will be placed
             warm_start: Load the stage-1 VAE and ``model.checkpoint_path`` into the
                 generator. Only the training environment director sets it.
+            checkpoint_layout: Generator kwargs that rebuild the module layout of the
+                checkpoint a resume will load (``checkpointing.legacy_layout``).
         """
         self._config = config
         self._device = device
         self._warm_start_enabled = warm_start
+        self._checkpoint_layout = dict(checkpoint_layout or {})
         self._models: dict[str, nn.Module] = {}
         self._ema: ModelEma | None = None
 
@@ -95,7 +104,10 @@ class ModelBuilder(Builder):
             ValueError: If model creation fails
         """
         try:
-            gen_kwargs = resolve_generator_kwargs(self._config, device=self._device)
+            gen_kwargs = {
+                **resolve_generator_kwargs(self._config, device=self._device),
+                **self._checkpoint_layout,
+            }
 
             generator_builder = (
                 GeneratorBuilder(self._config, self._device)

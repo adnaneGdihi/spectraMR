@@ -37,6 +37,7 @@ from spectramr.infrastructure.training.strategies.diffusion import (
 )
 from spectramr.infrastructure.training.utils.kspace_view import decompress_for_view
 from spectramr.infrastructure.training.utils.metric_views import MetricViews
+from spectramr.models.losses.build_set import declared_build_set
 
 
 def _gen(conditional: bool):
@@ -165,6 +166,27 @@ def test_forward_through_model_latent_forwards_condition_and_context() -> None:
     )
     assert torch.equal(received["condition_image"], cond)
     assert received["context"] == {"contrast_idx": cidx}
+
+
+def test_forward_through_model_binds_a_named_t_not_the_kwargs_catch_all() -> None:
+    """#2086: `timesteps=` landed in `**kwargs` and `t` ran at its None default."""
+
+    class _NamedT:
+        def forward(self, x, t=None, **kwargs):
+            return t, kwargs
+
+        __call__ = forward
+
+    mock = MagicMock()
+    mock.generator_model = _NamedT()
+    t, rest = DiffusionTrainingStrategy._forward_through_model(
+        mock,
+        model_input=torch.randn(1, 2, 8, 8),
+        timesteps=torch.tensor([5]),
+        is_latent_diffusion=False,
+        gen_kwargs={},
+    )
+    assert int(t[0]) == 5 and "timesteps" not in rest
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +690,10 @@ def _strategy_declaring(prediction_type: str, model_type: str):
     mock._effective_prediction_type = lambda: DiffusionTrainingStrategy._effective_prediction_type(
         mock
     )
+    mock._declared_prediction_type = lambda: DiffusionTrainingStrategy._declared_prediction_type(
+        mock
+    )
+    mock._is_cold_diffusion = lambda: DiffusionTrainingStrategy._is_cold_diffusion(mock)
     return mock
 
 
@@ -698,18 +724,52 @@ def test_agreeing_declaration_is_accepted(model_type, declared) -> None:
     DiffusionTrainingStrategy._validate_prediction_type(mock)  # must not raise
 
 
-@pytest.mark.parametrize("declared", ["epsilon", "sample", "v_prediction"])
-def test_pixel_space_path_defers_rather_than_crashing(declared) -> None:
-    """Scoped to latent diffusion on purpose.
-
-    9 arms on this strategy declare `epsilon` on the pixel path, whose target is
-    target_batch (x0). That is a real defect (issue #641), but whether the YAML
-    or the path is wrong is those cohorts' decision -- the check must not turn it
-    into a startup crash as a side effect of an LDM review. When #641 is settled,
-    this test should be inverted to expect a raise.
-    """
+@pytest.mark.parametrize("declared", ["epsilon", "sample"])
+def test_pixel_space_declaration_is_accepted(declared) -> None:
+    """Pixel arms now have a real objective per declaration (issue #641)."""
     mock = _strategy_declaring(declared, "enhanced_deep_unet")
     DiffusionTrainingStrategy._validate_prediction_type(mock)  # must not raise
+    assert mock._pixel_epsilon is (declared == "epsilon")
+
+
+def test_pixel_epsilon_is_reported_as_the_effective_objective() -> None:
+    mock = _strategy_declaring("epsilon", "enhanced_deep_unet")
+    DiffusionTrainingStrategy._validate_prediction_type(mock)
+    assert DiffusionTrainingStrategy._effective_prediction_type(mock) == "epsilon"
+
+
+def test_undeclared_pixel_arm_keeps_the_x0_objective() -> None:
+    """The schema default is epsilon; an arm that never wrote the knob must not inherit it."""
+    mock = MagicMock()
+    mock.config = SimpleNamespace(
+        model=SimpleNamespace(model_type="enhanced_deep_unet"),
+        training=SimpleNamespace(
+            diffusion=SimpleNamespace(
+                prediction_type=PredictionType.EPSILON, model_fields_set=set()
+            )
+        ),
+    )
+    mock._is_latent_diffusion = lambda: False
+    mock._is_cold_diffusion = lambda: False
+    mock._declared_prediction_type = lambda: DiffusionTrainingStrategy._declared_prediction_type(
+        mock
+    )
+    DiffusionTrainingStrategy._validate_prediction_type(mock)
+    assert mock._pixel_epsilon is False
+
+
+@pytest.mark.parametrize("model_type", ["kspace_cold_diffusion", "cold_diffusion"])
+def test_epsilon_on_a_masking_forward_process_raises(model_type) -> None:
+    mock = _strategy_declaring("epsilon", model_type)
+    mock._is_cold_diffusion = lambda: True
+    with pytest.raises(ConfigurationError, match="epsilon"):
+        DiffusionTrainingStrategy._validate_prediction_type(mock)
+
+
+def test_v_prediction_raises_on_the_pixel_path() -> None:
+    mock = _strategy_declaring("v_prediction", "enhanced_deep_unet")
+    with pytest.raises(ConfigurationError, match="v_prediction"):
+        DiffusionTrainingStrategy._validate_prediction_type(mock)
 
 
 @pytest.mark.parametrize(
@@ -821,10 +881,7 @@ def test_reverse_schedule_binding_hands_over_betas_not_just_the_name() -> None:
     """
     mock = MagicMock()
     mock._is_latent_diffusion.return_value = True
-    mock.num_timesteps = 200
-    mock.beta_schedule = "cosine"
-    mock.device = torch.device("cpu")
-    mock.scheduler = SimpleNamespace(betas=torch.linspace(0.01, 0.2, 200))
+    mock.scheduler = DiffusionScheduler(num_timesteps=200, beta_schedule="cosine")
 
     gen = MagicMock()
     mock.generator_model = gen
@@ -2693,8 +2750,8 @@ class TestMeasurementAwareMetricsReachTheProductionPath:
     """
 
     @staticmethod
-    def _mock(names: list[str], mask: torch.Tensor | None):
-        measurement = torch.rand(2, 2, 8, 8)
+    def _mock(names: list[str], mask: torch.Tensor | None, size: int = 8):
+        measurement = torch.rand(2, 2, size, size)
         mock = _zf_mock(measurement=measurement, metrics=names)
         # The real seam, bound to the mock host: a MagicMock would stub it out
         # and the test would observe nothing while claiming to observe firing.
@@ -2711,12 +2768,13 @@ class TestMeasurementAwareMetricsReachTheProductionPath:
     def test_the_columns_are_finite_when_the_arm_asks_for_them(self) -> None:
         torch.manual_seed(0)
         wanted = list(DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS)
-        mask = torch.zeros(2, 1, 8, 8)
-        mask[..., 2:6, :] = 1.0
-        mock = self._mock(["psnr", *wanted], mask)
+        # 16x16, not 8x8: the innermost ring (|k| in [N/16, N/8)) holds no bin on an 8x8 grid.
+        mask = torch.zeros(2, 1, 16, 16)
+        mask[..., 4:12, :] = 1.0
+        mock = self._mock(["psnr", *wanted], mask, size=16)
 
         out = _run_validation_metrics(
-            mock, torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8)
+            mock, torch.rand(2, 2, 16, 16), torch.rand(2, 2, 16, 16), torch.rand(2, 2, 16, 16)
         )
 
         for name in wanted:
@@ -3926,7 +3984,7 @@ class TestFillSetMatchesTheCsvHeader:
         # The CSV header's own owner: `training_loop` builds it from this call.
         header = {
             canonical_loss_name(name)
-            for name, weight in strategy.config.losses.get_enabled_losses().items()
+            for name, weight in declared_build_set(strategy.config.losses).items()
             if weight > 0
         } - STRATEGY_MANAGED_LOSSES
 
@@ -4665,6 +4723,36 @@ def test_training_metrics_score_decompressed_denormalised_kspace(monkeypatch) ->
     s = scale.view(-1, 1, 1, 1)
     torch.testing.assert_close(got_target, target * s, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(got_pred, pred * s, rtol=1e-4, atol=1e-4)
+
+
+def test_latent_training_metrics_score_the_decoded_image_not_latent_noise() -> None:
+    """#186: train_psnr on a latent arm graded eps_hat vs eps; it must grade decoded x0 vs target."""
+    torch.manual_seed(0)
+    scheduler = DiffusionScheduler(num_timesteps=50, beta_schedule="cosine")
+    z0 = torch.randn(2, 4, 8, 8)
+    eps = torch.randn_like(z0)
+    t = torch.tensor([3, 40])
+    noisy = scheduler.q_sample(z0, t, eps)
+
+    class _Decoder(torch.nn.Module):
+        def decode_from_latent(self, z: torch.Tensor) -> torch.Tensor:
+            return torch.nn.functional.interpolate(z[:, :1], scale_factor=8.0)
+
+    gen = _Decoder()
+    image_target = gen.decode_from_latent(z0)
+    stub = SimpleNamespace(
+        _train_metric_latent=(noisy, t, image_target),
+        _is_cold_diffusion=lambda: False,
+        generator_model=gen,
+        scheduler=scheduler,
+    )
+    stub._decode_latent_metric_pair = MethodType(
+        DiffusionTrainingStrategy._decode_latent_metric_pair, stub
+    )
+    got_pred, got_target = DiffusionTrainingStrategy._training_metric_inputs(stub, eps, eps)
+    assert got_pred.shape == (2, 1, 64, 64)
+    torch.testing.assert_close(got_target, image_target)
+    torch.testing.assert_close(got_pred, image_target, rtol=1e-4, atol=1e-4)
 
 
 # ── PR4: rung and timestep provenance on the output snapshots ─────────────────

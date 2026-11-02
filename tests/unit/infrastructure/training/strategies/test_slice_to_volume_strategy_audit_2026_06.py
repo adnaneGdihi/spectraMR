@@ -62,13 +62,13 @@ def test_integer_ratio_uses_avg_pool_only() -> None:
     assert loss.item() == pytest.approx(expected, rel=1e-5)
 
 
-def test_equal_depth_short_circuits_to_direct_mse() -> None:
-    """When D_hi == D_lo the method short-circuits to a direct MSE (unchanged)."""
+def test_equal_depth_without_a_decimation_stamp_raises() -> None:
+    """D_hi == D_lo with no slice_profile stamp would be an identity MSE onto the input."""
     strat = _bare_strategy()
     x_hi = torch.ones(1, 1, 4, 4, 4)
     x_lo = torch.zeros(1, 1, 4, 4, 4)
-    loss = strat._through_plane_consistency(x_hi, x_lo)
-    assert loss.item() == pytest.approx(1.0, rel=1e-6)
+    with pytest.raises(ValueError, match="no slice_profile decimation stamp"):
+        strat._through_plane_consistency(x_hi, x_lo)
 
 
 def test_non_5d_inputs_still_raise() -> None:

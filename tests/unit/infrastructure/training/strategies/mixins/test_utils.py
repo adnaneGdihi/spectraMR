@@ -14,12 +14,14 @@ Covers two audit findings (2026-05-31 strategy audit):
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from spectramr.infrastructure.training.strategies.mixins import utils as u
 from spectramr.infrastructure.training.strategies.mixins.utils import (
     _callable_accepts_kwarg,
     pick_present,
+    timestep_kwarg_for,
 )
 
 
@@ -194,3 +196,60 @@ class TestReduceOnDevice:
 
         with pytest.raises(TypeError, match="Cannot convert metric 's'"):
             u.reduce_on_device("s", "text")
+
+
+def test_names_parameter_ignores_var_keyword():
+    # #197: the two-field forward seam must not treat a ``**kwargs`` catch-all as a declared
+    # ``field_strength_target`` (``_callable_accepts_kwarg`` does, by design).
+    def two_field(x, *, field_strength, field_strength_target, **_):
+        return x
+
+    def one_field(x, *, field_strength, **_):
+        return x
+
+    assert u._names_parameter(two_field, "field_strength_target")
+    assert not u._names_parameter(one_field, "field_strength_target")
+    assert _callable_accepts_kwarg(one_field, "field_strength_target")
+
+
+class TestTimestepKwargFor:
+    """#2086: the timestep binds to a NAMED parameter before a ``**kwargs`` catch-all."""
+
+    def test_a_named_t_beats_the_catch_all(self):
+        """The planted red: `_callable_accepts_kwarg` sent this one `timesteps=`."""
+
+        def f(x, t=None, **kwargs):
+            return t
+
+        assert _callable_accepts_kwarg(f, "timesteps") is True
+        assert timestep_kwarg_for(f) == "t"
+        assert f(1, **{timestep_kwarg_for(f): 7}) == 7
+
+    def test_named_timesteps_and_time_are_kept(self):
+        def f(x, timesteps=None, **kwargs):
+            return timesteps
+
+        def g(x, *, time=None):
+            return time
+
+        assert timestep_kwarg_for(f) == "timesteps"
+        assert timestep_kwarg_for(g) == "time"
+
+    def test_a_pure_catch_all_still_receives_timesteps(self):
+        def f(x, **kwargs):
+            return kwargs
+
+        assert timestep_kwarg_for(f) == "timesteps"
+
+    def test_no_time_parameter_gets_none(self):
+        def f(x, mask=None):
+            return x
+
+        assert timestep_kwarg_for(f) is None
+
+    def test_a_sigma_only_forward_raises(self):
+        def f(x, sigma=None, **kwargs):
+            return x
+
+        with pytest.raises(TypeError, match="sigma"):
+            timestep_kwarg_for(f)

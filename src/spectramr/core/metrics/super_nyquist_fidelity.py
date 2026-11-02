@@ -43,13 +43,14 @@ References
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
 
 from spectramr.core.metrics.registry import register_metric
 from spectramr.infrastructure.physics.band_partition import (
+    PASSBAND_GEOMETRIES,
     acquisition_rho,
     band_edges,
     band_masks,
@@ -88,6 +89,7 @@ class SuperNyquistFidelity:
         n_super_bands: int = 2,
         rho_max: float = 2.0,
         min_bins: int = 16,
+        geometry: Literal["cartesian", "radial"] = "cartesian",
         **kwargs: Any,  # absorb device= etc. from InfrastructureBuilder
     ) -> None:
         """Initialise the partition.
@@ -101,6 +103,8 @@ class SuperNyquistFidelity:
             rho_max: Outer edge in units of the acquisition Nyquist.
             min_bins: Smallest admissible band population; see
                 :func:`~spectramr.infrastructure.physics.band_partition.band_masks`.
+            geometry: Passband shape, ``"cartesian"`` (box) or ``"radial"``;
+                see :func:`~spectramr.infrastructure.physics.band_partition.acquisition_rho`.
         """
         if sr_scale is None and effective_voxel_mm is None:
             raise ValueError(
@@ -108,13 +112,16 @@ class SuperNyquistFidelity:
                 "voxel_mm + effective_voxel_mm. Without one there is no "
                 "Nyquist boundary and 'super-Nyquist' is undefined."
             )
+        if geometry not in PASSBAND_GEOMETRIES:
+            raise ValueError(f"geometry must be one of {PASSBAND_GEOMETRIES}, got {geometry!r}")
         self._sr_scale = sr_scale
         self._voxel_mm = voxel_mm
         self._effective_voxel_mm = effective_voxel_mm
         self._edges = band_edges(n_sub_bands, n_super_bands, rho_max)
         self._super = super_nyquist_band_indices(self._edges)
         self._min_bins = min_bins
-        self._cache: dict[tuple, Tensor] = {}
+        self._geometry = geometry
+        self._cache: dict[tuple[Any, ...], Tensor] = {}
 
     @property
     def name(self) -> str:
@@ -144,6 +151,7 @@ class SuperNyquistFidelity:
                 sr_scale=self._sr_scale,
                 voxel_mm=self._voxel_mm,
                 effective_voxel_mm=self._effective_voxel_mm,
+                geometry=self._geometry,
             )
             cached = band_masks(rho, self._edges, min_bins=self._min_bins)
             self._cache[key] = cached
@@ -187,7 +195,7 @@ class SuperNyquistFidelity:
         out[f"{prefix}_super_nyquist"] = float(rho[list(self._super)].mean())
         return out
 
-    @torch.no_grad()
+    @torch.no_grad()  # type: ignore[misc]
     def __call__(
         self,
         prediction: Tensor,

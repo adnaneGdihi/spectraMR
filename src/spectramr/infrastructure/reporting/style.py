@@ -135,6 +135,7 @@ METHOD_COLOURS: dict[str, str] = {
     "qspace_diffusion": "#56B4E9",
     "noise_adaptive_score": "#0072B2",
     "cross_contrast_kspace_diffusion": "#009E73",
+    "complex_kspace_diffusion": "#0072B2",
     # ----- Disentangled / multi-task -----
     "disentangled": "#CC79A7",
     "disentangled_vae": "#0072B2",
@@ -233,6 +234,7 @@ METHOD_COLOURS: dict[str, str] = {
     "ambient_diffusion": "#0072B2",
     "cross_modal_diffusion": "#56B4E9",
     "levy_diffusion": "#009E73",
+    "cascaded_diffusion": "#E69F00",
     "resetting_diffusion": "#0072B2",
     "x_diffusion": "#56B4E9",
     "tissue_diffusion_pretrain": "#009E73",
@@ -335,6 +337,7 @@ METHOD_COLOURS: dict[str, str] = {
     "mrs_quantification": "#0072B2",
     "perfusion_kinetic": "#D55E00",
     "phase_contrast_flow": "#CC79A7",
+    "phase_contrast_recon": "#AA4499",
     # ----- Acquisition-side -----
     "quality_matching": "#999999",
 }

@@ -79,6 +79,9 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
     light spatial-smoothness term (fields are smooth).
     """
 
+    # #183: the training step never scores train_* metrics; declare none.
+    reports_train_metrics = False
+
     # Computes its own objective and reads no `losses:` block, so an empty builder stack
     # is the design (LossBuilder.validate) and any declared image loss is a decoy.
     inline_losses: ClassVar[frozenset[str] | None] = frozenset()
@@ -193,6 +196,9 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
                 n_super_bands=probe_cfg.n_super_bands,
                 rho_max=probe_cfg.rho_max,
                 min_bins=probe_cfg.min_bins,
+                # Pooled frames measure a box passband, so the radial corners
+                # of the square are not super-Nyquist.
+                geometry="cartesian",
             )
             if self._band_probe_enabled
             else None
@@ -568,7 +574,8 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         which is what makes the construction usable at inference; the anatomy's
         exists here only because the digital twin supplies its target, and it is
         used ONLY to check the assumption, never to calibrate. Calibrating on it
-        would be assuming what the arm is meant to test.
+        would be assuming what the arm is meant to test. Strata are scored on the
+        PREDICTION on both sides, the only score an inference-time interval has.
         """
         if (
             self._conformal is None
@@ -591,16 +598,16 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
             )[:, :1]
             support = (marker_hr > 0.05 * marker_hr.amax()).to(marker_hr.dtype)
             try:
-                self._conformal.fit(marker_pred - marker_hr, local_detail_score(marker_hr), support)
+                self._conformal.fit(marker_pred - marker_hr, local_detail_score(marker_pred), support)
             except ValueError as exc:  # too few points for the declared strata
                 logger.warning("[MultiAcq] conformal calibration skipped: %s", exc)
                 return {}
-            report = self._conformal.coverage(pred_field - res.field, local_detail_score(res.field))
+            report = self._conformal.coverage(pred_field - res.field, local_detail_score(pred_field))
         out = report.as_dict()
         # Interval width matters as much as coverage: an infinitely wide band
         # covers everything and says nothing.
         out["conformal_mean_half_width"] = float(
-            self._conformal.half_width(local_detail_score(res.field)).mean()
+            self._conformal.half_width(local_detail_score(pred_field)).mean()
         )
         return out
 
@@ -775,11 +782,11 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
         # It is not zero, and it is arm-dependent. Boxcar pooling is not an
         # ideal anti-aliasing filter, so a single LR frame retains folded-back
         # super-Nyquist energy that bilinear interpolation partially unfolds by
-        # accident -- measured at rho_super = 0.53 on the synthetic marker at
-        # sr_scale=2, against 1.00 for an exact multi-frame inversion and -0.09
-        # for a plausible-but-wrong marker. An absolute rho quoted without this
-        # reference would read as recovery when it is interpolation, so both
-        # numbers are reported and neither is silently folded into the other.
+        # accident -- measured at rho_super = 0.24-0.33 on the synthetic marker
+        # at sr_scale=2 (Cartesian bands), against 1.00 for an exact multi-frame
+        # inversion and -0.13 for a plausible-but-wrong marker. An absolute rho
+        # quoted without this reference would read as recovery when it is
+        # interpolation, so both numbers are reported and neither is folded in.
         floor = interpolate(marker_lr[:, :1], size=hr_size, mode="bilinear", align_corners=False)
         spectrum["snf_floor_super_nyquist"] = self._snf(floor, target)
         spectrum["snf_gain_over_floor"] = (
@@ -1136,7 +1143,7 @@ class ConcreteMultiAcquisitionStrategy(BaseTrainingStrategy):
             self._subject_bank.add(
                 self._batch_subjects(batch_data, int(pred_field.shape[0])),
                 pred_field - field,
-                local_detail_score(field),
+                local_detail_score(pred_field),
             )
         # Coverage is GATED, not asserted: val_conformal_guaranteed is 0.0 when
         # any stratum missed its level, and that is a reportable result rather

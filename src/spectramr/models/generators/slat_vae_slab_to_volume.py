@@ -134,7 +134,6 @@ class SLATVAESlabToVolumeConfig:
     occupancy_threshold: float = 0.05
     occupancy_lambda: float = 1.0
     sparsity_lambda: float = 0.001
-    beta_kl: float = 1.0e-4
 
     def to_slat_config(self) -> SLATConfig:
         """Adapt to the shape-domain :class:`SLATConfig` for downstream
@@ -337,8 +336,9 @@ class SLATVAESlabToVolumeGenerator(nn.Module, IGenerator):
         occupancy_threshold: Foreground threshold (fraction of per-sample
             max intensity) used to derive the coarse active set in the
             encoder. Applied to the magnitude-of-channel-mean.
-        occupancy_lambda / sparsity_lambda / beta_kl: regularization
-            weights consumed by the strategy via the helper hooks below.
+        occupancy_lambda / sparsity_lambda: weights of the structural prior
+            (:meth:`structural_prior_loss`) the VAE strategy adds to its total.
+        beta_kl: refused; the KL weight is owned by ``training.latent``.
     """
 
     def __init__(
@@ -354,10 +354,15 @@ class SLATVAESlabToVolumeGenerator(nn.Module, IGenerator):
         occupancy_threshold: float = 0.05,
         occupancy_lambda: float = 1.0,
         sparsity_lambda: float = 0.001,
-        beta_kl: float = 1.0e-4,
+        beta_kl: float | None = None,
         **_: Any,
     ) -> None:
         super().__init__()
+        if beta_kl is not None:
+            raise ValueError(
+                "slat_vae_slab_to_volume does not read beta_kl; declare the KL weight "
+                "as training.latent.kl_beta_end (the VAE loss computer owns it)."
+            )
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.d_in = d_in
@@ -367,7 +372,6 @@ class SLATVAESlabToVolumeGenerator(nn.Module, IGenerator):
         self.occupancy_threshold = occupancy_threshold
         self.occupancy_lambda = occupancy_lambda
         self.sparsity_lambda = sparsity_lambda
-        self.beta_kl = beta_kl
 
         self.encoder = SLATEncoder(
             in_channels=in_channels,
@@ -534,6 +538,14 @@ class SLATVAESlabToVolumeGenerator(nn.Module, IGenerator):
             if target.shape != logits.shape:
                 target = F.interpolate(target, size=logits.shape[2:], mode="nearest")
         return F.binary_cross_entropy_with_logits(logits, target)
+
+    def structural_prior_loss(self, target: torch.Tensor) -> torch.Tensor:
+        """Weighted TRELLIS prior: occupancy BCE against the target's foreground + sparsity."""
+        vol = target.unsqueeze(-1) if target.dim() == 4 else target
+        mask = SLATEncoder._foreground_mask(vol.detach(), self.occupancy_threshold)
+        return self.occupancy_lambda * self.occupancy_loss(
+            mask
+        ) + self.sparsity_lambda * self.sparsity_loss()
 
     def last_aux(self) -> dict[str, torch.Tensor | None]:
         """Expose the cached (mu, logvar, occupancy, s_coarse) for the

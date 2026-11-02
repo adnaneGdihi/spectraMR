@@ -441,3 +441,43 @@ def test_an_undeclared_unwarp_block_defaults_to_every_term_off() -> None:
 
     unwarp = GeoMambaULFTrainingConfigSchema().unwarp
     assert not (unwarp.enable_b0 or unwarp.enable_grad_nonlinearity or unwarp.enable_maxwell)
+
+
+def test_the_p3_arm_scores_topology_w2_through_validation(monkeypatch) -> None:
+    """Reachability: the P3 arm's ``validation.scoring.compute`` resolves the registered
+    ``cubical_ph_w2_distance`` and the strategy's own ``validation_step`` reports it."""
+    pytest.importorskip("gudhi")
+    pytest.importorskip("ot")
+    from pathlib import Path
+
+    from spectramr.config.settings import TrainingSettings
+
+    arm = (
+        Path(__file__).resolve().parents[5]
+        / "experiments/inprogress/geomamba_ulf/geomamba_ulf_v1_p3.yaml"
+    )
+    settings = TrainingSettings.from_yaml(str(arm))
+    assert "cubical_ph_w2_distance" in settings.validation.scoring.compute
+    # LPIPS needs downloaded weights; the topology metric and one pixel metric suffice here.
+    scoring = settings.validation.scoring.model_copy(
+        update={"compute": ["psnr", "cubical_ph_w2_distance"]}
+    )
+    validation = settings.validation.model_copy(update={"scoring": scoring})
+    s, gen, _ = _validation_strategy(monkeypatch, n_contrasts=3)
+    monkeypatch.undo()  # keep the bare instance, restore the real computer and scorer
+    s.config = settings.model_copy(update={"validation": validation})
+    s._validation_computer = None
+    gen.forward = lambda x, mask=None, contrast_id=None: x
+
+    # A second blob in the prediction is a topological error (one extra H0 component).
+    target = torch.zeros(1, 1, 16, 16)
+    target[..., 2:6, 2:6] = 1.0
+    wrong = target.clone()
+    wrong[..., 10:14, 10:14] = 1.0
+    batch = {"contrast_idx": torch.tensor([0])}
+    metrics = s.validation_step(wrong, target, batch_data=batch)
+    key = next(k for k in metrics if k.endswith("cubical_ph_w2_distance"))
+    assert metrics[key] > 0.0
+    assert s.validation_step(target.clone(), target, batch_data=batch)[key] == pytest.approx(
+        0.0, abs=1e-6
+    )

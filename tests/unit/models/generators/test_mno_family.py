@@ -248,3 +248,14 @@ def test_me_mno_forwards_grad_checkpointing_to_backbone() -> None:
     )
     m.set_grad_checkpointing(True)
     assert m.backbone.grad_checkpointing is True
+
+
+def test_g_mno_metric_sfc_step_uses_construction_grid() -> None:
+    """#2365: the geodesic arc step on a 6³ volume is measured in 4³ construction units."""
+    from types import SimpleNamespace
+
+    owner = SimpleNamespace(beta=10.0, spatial_shape=(4, 4, 4))
+    _, _, delta = GMNOOperator._build_metric_sfc(owner, (6, 6, 6))  # type: ignore[arg-type]
+    assert delta.shape == (216,)
+    assert float(delta[0]) == 0.0
+    assert float(delta[1:].min()) == pytest.approx(0.25)

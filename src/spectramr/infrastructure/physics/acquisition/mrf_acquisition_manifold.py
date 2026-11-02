@@ -110,6 +110,33 @@ def sar_estimate(pulse: torch.Tensor, *, scale: float = 1.0) -> torch.Tensor:
     return scale * pulse[..., 0].pow(2).mean()
 
 
+def slew_estimate(pulse: torch.Tensor, *, scale: float = 1.0) -> torch.Tensor:
+    """Slew proxy matching :meth:`AcquisitionBound.passes`: ``scale * max |ΔTR|`` (0 for T=1)."""
+    if pulse.shape[-2] < 2:
+        return pulse.new_zeros(())
+    return scale * pulse[..., 1].diff(dim=-1).abs().amax()
+
+
+def project_pulse_to_bound(pulse: torch.Tensor, bound: AcquisitionBound) -> torch.Tensor:
+    """Differentiably project a ``[T, 2]`` design onto the SAR and slew proxies of ``bound``.
+
+    Flip angles scale uniformly so :func:`sar_estimate` meets the SAR ceiling, and the TR
+    increments scale uniformly about the first TR so :func:`slew_estimate` meets the slew
+    ceiling. A design already inside both bounds is returned unchanged; no host sync is made.
+    """
+    if pulse.dim() != 2 or pulse.shape[-1] != 2:
+        raise ValueError(f"pulse must be [T, 2]; got {tuple(pulse.shape)}")
+    sar = sar_estimate(pulse).clamp_min(1e-12)
+    alpha = pulse[:, 0] * torch.sqrt((bound.sar_max_w_per_kg / sar).clamp(max=1.0))
+    tr = pulse[:, 1]
+    if tr.shape[0] > 1:
+        slew = slew_estimate(pulse).clamp_min(1e-12)
+        factor = (bound.gradient_slew_rate_t_per_m_per_s / slew).clamp(max=1.0)
+        steps = torch.cat([tr[:1], tr.diff() * factor])
+        tr = steps.cumsum(0)
+    return torch.stack([alpha, tr], dim=-1)
+
+
 class MRFAcquisitionManifold(torch.nn.Module):
     """Acquisition manifold + bound checker.
 
@@ -159,5 +186,7 @@ __all__ = [
     "AcquisitionBound",
     "MRFAcquisitionManifold",
     "beltrami_pulse_curve",
+    "project_pulse_to_bound",
     "sar_estimate",
+    "slew_estimate",
 ]

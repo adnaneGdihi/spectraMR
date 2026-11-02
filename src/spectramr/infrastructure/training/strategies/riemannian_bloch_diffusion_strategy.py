@@ -11,13 +11,19 @@ heat-kernel approximation for the conditional score:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
+from spectramr.core.metrics.registry import MetricsRegistry
 from spectramr.infrastructure.physics.manifolds import BlochRelaxationManifold
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.training.strategies.riemannian_bloch_heldout import (
+    HeldoutProtocol,
+    heldout_prediction,
+)
+from spectramr.models.capabilities import StrategyCapabilities
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,11 @@ class RiemannianBlochDiffusionStrategy(BaseTrainingStrategy):
     snapshot_prepared_is_model_input: bool = False
     snapshot_model_input_tag: str | None = "diffusion_step"
 
+    #: Written by :meth:`validation_step`, which grades the held-out pass itself.
+    capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
+        emitted_metrics=frozenset({"val_geodesic_qmap_error", "val_geodesic_qmap_error_noised"})
+    )
+
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         rbd = getattr(self.config.training, "riemannian_bloch_diffusion", None)
@@ -59,6 +70,15 @@ class RiemannianBlochDiffusionStrategy(BaseTrainingStrategy):
         )
         self._last_refresh_epoch = -1
         self._logged_point_count = -1
+        self._heldout = HeldoutProtocol.from_knobs(
+            getattr(rbd, "heldout_eval_t", None) if rbd else None,
+            t_min=self.t_min,
+            t_max=self.t_max,
+            step_size=self.step_size_init,
+        )
+        if self._heldout is not None:
+            logger.info("[RIEMANNIAN-BLOCH] held-out q-map pass: %s", self._heldout.describe())
+        self._qmap_metric: Any = None
 
     def _to_manifold_points(self, target_batch: torch.Tensor) -> torch.Tensor:
         """Reduce the target to ``[N, 3]`` points on M = {(M0, T1, T2)}.
@@ -193,6 +213,48 @@ class RiemannianBlochDiffusionStrategy(BaseTrainingStrategy):
             "g_total_loss": loss,
             "rdsm_quadratic_residual": loss.detach(),
             "rdsm_mean_t": t.mean().detach(),
+        }
+
+    @torch.no_grad()
+    def validation_step(
+        self, input_batch: torch.Tensor, target_batch: torch.Tensor, **kwargs: Any
+    ) -> dict[str, float]:
+        """Noise each held-out map, denoise it with the learned field, grade both.
+
+        ``val_geodesic_qmap_error`` scores the denoised map and
+        ``val_geodesic_qmap_error_noised`` the denoiser's input, so a field that
+        does not beat its own input is visible. Both are means over foreground
+        voxels only (M0, T1, T2 all > 0). The noise draw is seeded from
+        ``run.seed`` and the batch index, so every pass scores the same draws.
+        """
+        del input_batch  # unconditional model: the held-out target is theta_0
+        if self._heldout is None:
+            raise ValueError(
+                "validation is enabled but training.riemannian_bloch_diffusion."
+                "heldout_eval_t is unset: the held-out q-map pass needs a declared "
+                "noise level."
+            )
+        if self._qmap_metric is None:
+            # The strategy's cached manifold: graded in the geometry trained in.
+            self._qmap_metric = MetricsRegistry.get("geodesic_qmap_error", manifold=self.manifold)
+        maps = target_batch.to(self.device, non_blocking=True)
+        self._to_manifold_points(maps)  # shape contract + uncached-metric guard
+        gen = torch.Generator(device=maps.device)
+        gen.manual_seed(int(self.config.run.seed) * 100003 + int(kwargs.get("batch_idx", 0)))
+        model = self.generator_model
+        was_training = model.training
+        model.eval()
+        try:
+            pred, noised, fg = heldout_prediction(
+                self.manifold, lambda th, t: model(th, t, None), maps, self._heldout, gen
+            )
+        finally:
+            model.train(was_training)
+        self._last_visual_pred = pred.detach()
+        self._last_visual_target = maps.detach()
+        return {
+            "val_geodesic_qmap_error": self._qmap_metric(pred, maps, foreground=fg),
+            "val_geodesic_qmap_error_noised": self._qmap_metric(noised, maps, foreground=fg),
         }
 
 

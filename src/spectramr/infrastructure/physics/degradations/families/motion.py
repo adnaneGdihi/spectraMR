@@ -93,7 +93,11 @@ ENTRIES = (
         description="Rigid motion (delegated)",
         severity=SeveritySpec(
             (
-                _P("max_translation", "px", 0.0, 10.0),
+                _P(
+                    "max_translation", "px", 0.0, 10.0,
+                    endpoint_kwargs=(None, "max_translation_px"),
+                    valid_min=0.0,
+                ),
                 _P("max_rotation", "rad", 0.0, 0.1),
             ),
             notes="per-PE-line SE(2) pose; translation and rotation ramp together. Volume "
@@ -116,7 +120,16 @@ ENTRIES = (
         fn=degrade_pulsatile_motion,
         description="Pulsatile non-rigid deformation",
         severity=SeveritySpec(
-            (_P("peak_displacement", "px", 0.0, 9.0),),
+            (
+                _P(
+                    "peak_displacement",
+                    "px",
+                    0.0,
+                    9.0,
+                    endpoint_kwargs=(None, "max_amplitude_px"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="radial non-rigid pulsation at 1.2 Hz, TR = 0.5 s; each PE line sees the "
             "cardiac phase at its own acquisition time (aliased at the TR, as in an ungated "
             "scan), quantised into 16 rendered poses. Volume modes time each (slice or kz, "
@@ -137,7 +150,16 @@ ENTRIES = (
         fn=degrade_translation_drift,
         description="Coherent translational drift",
         severity=SeveritySpec(
-            (_P("max_drift", "px", 0.0, 10.0),),
+            (
+                _P(
+                    "max_drift",
+                    "px",
+                    0.0,
+                    10.0,
+                    endpoint_kwargs=(None, "max_drift_px"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="coherent linear bulk drift along readout across the acquisition: a "
             "single low-order k_y phase gradient -> directional smear, distinct from the "
             "broadband jitter of rigid_motion."
@@ -154,7 +176,7 @@ ENTRIES = (
         fn=degrade_sudden_motion,
         description="Single abrupt bulk shift",
         severity=SeveritySpec(
-            (_P("shift", "px", 0.0, 12.0),),
+            (_P("shift", "px", 0.0, 12.0, endpoint_kwargs=(None, "max_shift_px"), valid_min=0.0),),
             notes="single abrupt bulk shift at the k-space centre (a mid-scan jerk); the "
             "step in k_y yields a discrete double-image ghost."
             + _SCHEDULE_NOTE
@@ -171,7 +193,16 @@ ENTRIES = (
         fn=degrade_random_motion,
         description="Random per-PE-line jitter",
         severity=SeveritySpec(
-            (_P("max_shift", "px", 0.0, 3.0),),
+            (
+                _P(
+                    "max_shift",
+                    "px",
+                    0.0,
+                    3.0,
+                    endpoint_kwargs=(None, "max_shift_px"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="i.i.d. per-PE-line random translational jitter -> broadband ghosting; "
             "the pure-translation sibling of rigid_motion (no rotation)."
             + _SCHEDULE_NOTE,
@@ -188,7 +219,14 @@ ENTRIES = (
         description="Free-breathing respiratory motion",
         severity=SeveritySpec(
             (
-                _P("peak_si_translation", "mm", 0.0, 20.0),
+                _P(
+                    "peak_si_translation",
+                    "mm",
+                    0.0,
+                    20.0,
+                    endpoint_kwargs=(None, "peak_si_mm"),
+                    valid_min=0.0,
+                ),
                 _P("peak_ap_scale", "fraction", 0.0, 0.04),
             ),
             notes="per acquired line, an SI translation of 20 mm x theta x (u(t) - u_ref) and "
@@ -219,7 +257,14 @@ ENTRIES = (
         description="Intermittent regional (swallowing) motion",
         severity=SeveritySpec(
             (
-                _P("peak_regional_displacement", "mm", 0.0, 10.0),
+                _P(
+                    "peak_regional_displacement",
+                    "mm",
+                    0.0,
+                    10.0,
+                    endpoint_kwargs=(None, "peak_mm"),
+                    valid_min=0.0,
+                ),
                 _P("motion_block_fraction", "fraction", 0.0, 0.3),
             ),
             notes="a compact-support smooth warp inside one seeded ellipsoidal region (peak "

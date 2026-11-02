@@ -30,7 +30,12 @@ ENTRIES = (
         family="field",
         description="Tissue contrast re-evaluated at a lower field strength from q-maps",
         severity=SeveritySpec(
-            (PhysicalParam("target_field", "T", 3.0, 0.05),),
+            (PhysicalParam(
+                "target_field", "T", 3.0, 0.05, curve="geometric",
+                # The theta=0 end is the input's own field (b0_T, also set by the profile), not extendable.
+                endpoint_kwargs=(None, "floor_field_T"),
+                valid_min=0.001,
+            ),),
             notes="B0_target = B0_src x (0.05 / B0_src) ** theta, log-linear, B0_src = b0_T "
             "(default 3 T; the endpoint 3 T is that default). The output is x x S(B0_target) / "
             "S(B0_src) voxel-wise, S the stage-1 signal of DifferentiableULFForwardOperator "

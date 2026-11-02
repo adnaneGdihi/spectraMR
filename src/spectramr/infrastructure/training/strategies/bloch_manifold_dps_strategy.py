@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from spectramr.core.module_utils import unwrap_model
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.mixins.kspace import KspaceMixin
-from spectramr.infrastructure.training.strategies.mixins.utils import _callable_accepts_kwarg
+from spectramr.infrastructure.training.strategies.mixins.utils import timestep_kwarg_for
 from spectramr.models.diffusion.bloch_manifold_dps_sampler import (
     check_reverse_stride,
     rescaled_linear_betas,
@@ -56,6 +56,9 @@ def _cfg_get(block: Any, key: str, default: Any = None) -> Any:
 
 
 class BlochManifoldDPSStrategy(BaseTrainingStrategy, KspaceMixin):
+    # #183: the training step never scores train_* metrics; declare none.
+    reports_train_metrics = False
+
     # parallel_compat: Runs the score network only through its wrapped forward and builds no parameters.
     parallel_compat = frozenset({"replicated"})
 
@@ -162,19 +165,20 @@ class BlochManifoldDPSStrategy(BaseTrainingStrategy, KspaceMixin):
 
     @staticmethod
     def _forward_score(model: Any, x_t: torch.Tensor, t: torch.Tensor) -> Any:
-        """Run the score network, passing ``timesteps`` only when it accepts it.
+        """Run the score network, passing the timestep under the name it binds.
 
         Dispatch on introspection, never on ``except TypeError`` (SAQ-001). The
         exception cannot distinguish "this backbone has no ``timesteps`` kwarg"
         from "the forward raised a TypeError several frames down"; retrying the
         second as ``model(x_t)`` hid the traceback *and* trained the score
         network unconditioned on t, which still converges to something and so
-        never announced itself. ``_callable_accepts_kwarg`` honours ``**kwargs``
-        and caches per underlying function, so this costs one signature lookup
-        per model, not one per step.
+        never announced itself. ``timestep_kwarg_for`` binds a named ``t`` before
+        a ``**kwargs`` catch-all (#2086) and caches per underlying function, so
+        this costs one signature lookup per model, not one per step.
         """
-        if _callable_accepts_kwarg(getattr(unwrap_model(model), "forward", model), "timesteps"):
-            return model(x_t, timesteps=t)
+        time_kwarg = timestep_kwarg_for(getattr(unwrap_model(model), "forward", model))
+        if time_kwarg is not None:
+            return model(x_t, **{time_kwarg: t})
         return model(x_t)
 
     def _compute_losses_impl(

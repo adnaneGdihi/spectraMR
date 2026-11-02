@@ -68,3 +68,52 @@ def test_invalid_input_shape() -> None:
     block = MatrixProductStateAttention(embed_dim=4, n_log_tokens=3, bond_dim=2)
     with pytest.raises(ValueError):
         block(torch.randn(2, 8))  # missing token axis
+
+
+def _identity_projections(block: MatrixProductStateAttention) -> None:
+    with torch.no_grad():
+        block.in_proj.weight.copy_(torch.eye(block.embed_dim))
+        block.in_proj.bias.zero_()
+        block.out_proj.weight.copy_(torch.eye(block.embed_dim))
+        block.out_proj.bias.zero_()
+
+
+def _dense_operator(block: MatrixProductStateAttention) -> torch.Tensor:
+    """A[i, j] = prod_l M^(l)[a_{l-1}, i_l, j_l, a_l], summed over bonds; bit 1 most significant."""
+    n_bits, n = block.n_log_tokens, block.token_len
+    a = torch.zeros(n, n, dtype=torch.float64)
+    for i in range(n):
+        for j in range(n):
+            vec = torch.ones(1, dtype=torch.float64)
+            for level, core in enumerate(block.cores):
+                shift = n_bits - 1 - level
+                vec = vec @ core.detach().double()[:, (i >> shift) & 1, (j >> shift) & 1, :]
+            a[i, j] = vec.sum()
+    return a
+
+
+def _applied_operator(block: MatrixProductStateAttention) -> torch.Tensor:
+    n = block.token_len
+    eye = torch.eye(n, dtype=torch.float64)
+    with torch.no_grad():
+        return torch.stack([block(eye[j].view(1, n, 1))[0, :, 0] for j in range(n)], 1)
+
+
+@pytest.mark.parametrize("n_log_tokens,bond_dim", [(3, 1), (3, 4), (4, 2)])
+def test_operator_equals_the_dense_mps_contraction(n_log_tokens: int, bond_dim: int) -> None:
+    """#588: the sweep contracted bit 1 at every level, giving kron(M_2x2, I)."""
+    torch.manual_seed(1)
+    block = MatrixProductStateAttention(1, n_log_tokens=n_log_tokens, bond_dim=bond_dim).double()
+    _identity_projections(block)
+    assert torch.allclose(_applied_operator(block), _dense_operator(block), atol=1e-12)
+
+
+def test_operator_is_not_a_leading_bit_kron() -> None:
+    torch.manual_seed(1)
+    block = MatrixProductStateAttention(1, n_log_tokens=3, bond_dim=4).double()
+    _identity_projections(block)
+    a = _applied_operator(block)
+    m = a[::4, ::4]
+    assert not torch.allclose(a, torch.kron(m, torch.eye(4, dtype=torch.float64)), atol=1e-6)
+    # Tokens 0 and 1 differ only in the least-significant bit and must interact.
+    assert a[0, 1].abs() > 1e-6

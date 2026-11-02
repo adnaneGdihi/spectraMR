@@ -163,3 +163,35 @@ class TestAntiDiagonalSweepEquivalence:
         loss.backward()
         assert pred.grad is not None
         assert torch.isfinite(pred.grad).all()
+
+
+class TestSequenceOrder:
+    """``order`` decides how a slice is linearized before windowing (#2412)."""
+
+    def test_unknown_order_raises(self) -> None:
+        with pytest.raises(ValueError, match="order"):
+            SoftDTWLoss(order="snake_2d")
+
+    def test_hilbert_windows_follow_the_hilbert_permutation(self) -> None:
+        from spectramr.models.blocks.topology_linearizer import ImageTopologyLinearizer
+
+        y = torch.rand(1, 1, 16, 16, dtype=torch.float64)
+        x = torch.roll(y, 1, dims=-2)
+        perm = ImageTopologyLinearizer((16, 16), "hilbert_2d").forward_idx
+
+        def win(t: torch.Tensor) -> torch.Tensor:
+            return t.reshape(-1, 16, 1)
+
+        ours = SoftDTWLoss(gamma=0.1, window_size=16, order="hilbert_2d")(x, y)
+        ref = _soft_dtw_distance(win(x.flatten()[perm]), win(y.flatten()[perm]), 0.1).mean()
+        torch.testing.assert_close(ours, ref)
+        raster = SoftDTWLoss(gamma=0.1, window_size=16)(x, y)
+        assert not torch.allclose(ours, raster)
+
+    def test_hilbert_order_accepts_a_non_power_of_two_slice(self) -> None:
+        pred = torch.rand(2, 1, 12, 20, 3, requires_grad=True)
+        loss = SoftDTWLoss(gamma=0.1, window_size=16, order="hilbert_2d")(
+            pred, torch.rand(2, 1, 12, 20, 3)
+        )
+        loss.backward()
+        assert torch.isfinite(pred.grad).all()

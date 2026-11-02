@@ -210,6 +210,12 @@ class TestAccumulator:
         out = self._fill(content_leaks=False).probes(include_style=False)
         assert set(out) == {"val_content_contrast_leak", "val_probe_split_by_subject"}
 
+    def test_a_field_axis_names_its_keys_by_the_label(self) -> None:
+        """The field-strength axis reports ``val_content_field_leak``, not a contrast key."""
+        out = self._fill(content_leaks=True).probes(include_style=False, label_name="field")
+        assert set(out) == {"val_content_field_leak", "val_probe_split_by_subject"}
+        assert out["val_content_field_leak"] > 0.4
+
     def test_a_capped_swap_covers_every_ordered_pair_of_contrasts(self) -> None:
         """Truncating the sorted list kept only content rows of the first labels: with three
         contrasts and two rows each, FLAIR (label 2) was never a content source at 12 pairs."""

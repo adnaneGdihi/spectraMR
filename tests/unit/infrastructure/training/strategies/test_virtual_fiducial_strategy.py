@@ -11,6 +11,9 @@ as ``tests/unit/infrastructure/training/test_vf_strategy_val_metrics.py``).
 
 from __future__ import annotations
 
+import contextlib
+import pathlib
+
 import torch
 import torch.nn as nn
 
@@ -993,3 +996,102 @@ def test_the_conditioner_is_declared_exactly_when_it_is_built():
     off = SimpleNamespace(model=SimpleNamespace(conditioning=ConditioningConfig()))
     assert ("_conditioner", "param_group") in _VF.owned_module_declarations(on)
     assert _VF.owned_module_declarations(off) == ()
+
+
+# ── #183: train-side metrics on the views validation scores ────────────────────
+
+
+def test_train_metrics_score_phase_metrics_on_the_complex_pair_at_the_live_step() -> None:
+    """A real computer with phase metrics: magnitudes alone raised PhaseBlindInputError."""
+    from types import SimpleNamespace
+
+    from spectramr.core.metrics.computer import create_validation_metrics_computer
+
+    strategy = object.__new__(_VF)
+    strategy.config = SimpleNamespace()
+    strategy.device = torch.device("cpu")
+    strategy.loop_state = SimpleNamespace(iteration=1)  # the first step always scores
+    strategy._metric_output_domain = "kspace"
+    strategy._training_computer = create_validation_metrics_computer(
+        ["psnr", "complex_hfen", "phase_mse"], device="cpu"
+    )
+    image = torch.zeros(1, 1, 32, 32, dtype=torch.complex64)
+    image[0, 0, 8:24, 8:24] = 0.5 + 0.5j
+    ksp = FFTTransformer(device=torch.device("cpu")).fft2c(image)
+
+    out = strategy._train_metrics(ksp, image)
+    assert set(out) == {"train_psnr", "train_complex_hfen", "train_phase_mse"}
+    assert out["train_complex_hfen"] < 1e-4 and out["train_phase_mse"] < 1e-4
+
+    strategy.loop_state.iteration = 101  # off the default cadence of 100
+    assert strategy._train_metrics(ksp, image) == {}
+
+
+# ── Held-out severity (validation.gates.held_out_severity_grid) ──────────────
+# The severity-prompt pair's primary endpoint: the twin's motion/B0/B1 strengths are
+# scaled by each multiplier, the prompt is rebuilt from the scaled twin, and the scores
+# come back as val_<metric>_heldout_x<k>. Driven from the real arm through the factory.
+
+_VF_ARMS = pathlib.Path(__file__).resolve().parents[5] / "experiments/inprogress/vf"
+
+
+def _vfs_from_arm(name: str, monkeypatch) -> ConcreteVirtualFiducialStrategy:
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+    config = TrainingSettings.from_yaml(str(_VF_ARMS / f"{name}.yaml"))
+    cls = TrainingStrategyFactory().get_strategy_class(config)
+    assert issubclass(cls, ConcreteVirtualFiducialStrategy)
+    monkeypatch.setattr(cls, "validation_metrics_computer", None, raising=False)
+    s = cls.__new__(cls)
+    s.config = config
+    s.device = torch.device("cpu")
+    s._setup_strategy_specific_components()
+    s.env = SimpleNamespace(generator=_PlainModel())
+    s._ensure_conditioner = lambda n: None
+    s.snapshot_source = lambda *_: contextlib.nullcontext()
+    s._capture_model_output = lambda **_: contextlib.nullcontext()
+    s._compute_losses_impl = lambda *a, **k: {}
+    s._score_field = lambda **_: {}
+    return s
+
+
+def test_validation_scores_the_severity_arm_at_every_held_out_multiplier(monkeypatch) -> None:
+    s = _vfs_from_arm("exp_vf_severity_prompt_conditioning_v1", monkeypatch)
+    assert s._heldout_severities == (1.5, 2.0, 3.0)
+    sim = s.simulator
+    base = (sim._motion_severity, sim.b0_strength, sim.b1_strength)
+
+    prompts: list[torch.Tensor] = []
+    real = ConcreteVirtualFiducialStrategy._severity_vector
+
+    def spy(simulator, batch_size, device):
+        vec = real(simulator, batch_size, device)
+        prompts.append(vec[0, :3].clone())
+        return vec
+
+    monkeypatch.setattr(type(s), "_severity_vector", staticmethod(spy))
+    target = torch.randn(1, 8, *sim.im_size)
+    with torch.no_grad():
+        out = s.validation_step(target, target)
+
+    for k in ("1.5", "2", "3"):
+        assert f"val_psnr_heldout_x{k}" in out
+    assert out["val_heldout_severities"] == 3.0
+    # In-distribution prompt first, then one per multiplier: the conditioned model is shown
+    # the held-out severity it is scored at.
+    expected = torch.tensor(base)
+    expected[1:] *= torch.tensor([float(sim.enable_b0), float(sim.enable_b1)])
+    assert len(prompts) == 4
+    for got, scale in zip(prompts, (1.0, 1.5, 2.0, 3.0), strict=True):
+        assert torch.allclose(got, expected * scale)
+    assert (sim._motion_severity, sim.b0_strength, sim.b1_strength) == base
+
+
+def test_a_held_out_multiplier_inside_the_training_range_is_rejected() -> None:
+    s = _VFS.__new__(_VFS)
+    gates = SimpleNamespace(held_out_severity_eval=True, held_out_severity_grid=[0.5])
+    s.config = SimpleNamespace(validation=SimpleNamespace(gates=gates))
+    s.device = torch.device("cpu")
+    with pytest.raises(ValueError, match="must exceed 1"):
+        s._setup_strategy_specific_components()

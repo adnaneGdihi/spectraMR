@@ -2407,6 +2407,53 @@ class TestSeparateSourceLayout:
             )
 
 
+class TestStackedCombinePerContrast:
+    """``stacked_combine: per_contrast``: the transform combines each contrast to one channel."""
+
+    def test_target_contrast_starts_at_channel_one(self, tmp_path) -> None:
+        kw = {"single_contrast": False, "coil_processing_mode": "none"}
+        files = _federated_files(tmp_path)
+        joint = M4RawRepetitionDataset(files, **kw)[0]
+        grouped = M4RawRepetitionDataset(files, stacked_combine="per_contrast", **kw)[0]
+        assert int(grouped["federated_target_channel_start"]) == 1
+        assert int(joint["federated_target_channel_start"]) == joint["target"].data.shape[0] // 2
+        # The dataset serves the same coils; only the combine downstream differs.
+        assert torch.equal(grouped["target"].data, joint["target"].data)
+
+    def test_grouped_rss_gives_one_channel_per_contrast(self, tmp_path) -> None:
+        from spectramr.data.transforms.kspace_coil_transforms import CoilCombineTransform
+
+        kw = {"single_contrast": False, "coil_processing_mode": "none"}
+        ds = M4RawRepetitionDataset(
+            _federated_files(tmp_path),
+            stacked_combine="per_contrast",
+            transform=CoilCombineTransform(method="rss_image", channel_groups=2),
+            **kw,
+        )
+        raw = M4RawRepetitionDataset(_federated_files(tmp_path), **kw)[0]
+        source, target = _cross_contrast_halves(raw)  # (S, C, H, W) complex each
+        single = CoilCombineTransform(method="rss_image")
+        expected = torch.cat(
+            [single._rss_image_combine(h.permute(1, 2, 3, 0)) for h in (source, target)]
+        )
+        torch.testing.assert_close(ds[0]["target"].data, expected)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"stacked_combine": "mean"}, "Unknown stacked_combine"),
+            ({"stacked_combine": "per_contrast", "source_layout": "separate"}, "per_contrast"),
+            ({"stacked_combine": "per_contrast", "single_contrast": True}, "per_contrast"),
+        ],
+    )
+    def test_off_route_or_unknown_raises(self, tmp_path, kwargs, match) -> None:
+        kwargs = {"single_contrast": False, **kwargs}
+        with pytest.raises(ValueError, match=match):
+            M4RawRepetitionDataset(
+                _federated_files(tmp_path), coil_processing_mode="none", **kwargs
+            )
+
+
 class TestFederatedContrastChoice:
     """The cross-contrast source and targets are declared, not fixed to T1 -> all."""
 
@@ -2469,44 +2516,6 @@ class TestFederatedContrastChoice:
                 coil_processing_mode="none",
                 source_contrast="T2",
             )
-
-
-class TestScoringMapsStore:
-    """``coil_maps_reference_root`` (#2664): published under a key nothing trains on."""
-
-    def _val(self, files, **kw):
-        return _maps_ds(
-            files,
-            target_mode="phase_aligned_mean",
-            nex_target_exclude_input=True,
-            emit_alternate_input=True,
-            **kw,
-        )
-
-    def test_the_validation_subject_carries_the_scoring_maps(self, tmp_path) -> None:
-        from spectramr.core.coil_map_names import REFERENCE_MAPS_KEY
-
-        files = _coil_scan_files(tmp_path)
-        root, maps = _precompute(tmp_path, files)
-        subject = self._val(files, coil_maps_reference_root=root)[0]
-        torch.testing.assert_close(subject[REFERENCE_MAPS_KEY].data, maps.permute(1, 2, 3, 0))
-        # Only the scoring key: the training-map keys stay absent without coil_maps_root.
-        assert "sensitivity_complex" not in subject and "sensitivity" not in subject
-
-    def test_the_scoring_key_is_no_coil_map_alias(self) -> None:
-        """Planted shape: an alias would let operators, losses and inputs resolve it."""
-        from spectramr.core.coil_map_names import COIL_MAP_ALIASES, REFERENCE_MAPS_KEY
-        from spectramr.infrastructure.training.strategies.mixins.validation_context import (
-            _COIL_MAP_KEYS,
-        )
-
-        assert REFERENCE_MAPS_KEY not in COIL_MAP_ALIASES
-        assert REFERENCE_MAPS_KEY not in _COIL_MAP_KEYS
-
-    def test_an_absent_scoring_file_fails_the_construction(self, tmp_path) -> None:
-        files = _coil_scan_files(tmp_path)
-        with pytest.raises(FileNotFoundError, match=r"1 coil-map file\(s\) missing"):
-            self._val(files, coil_maps_reference_root=tmp_path / "empty")
 
 
 class TestMeasuredKspaceIsTheInput:
@@ -2675,3 +2684,65 @@ def test_contrast_index_for_filename_returns_none_without_a_keyword() -> None:
 
     assert contrast_index_for_filename("m4raw_FLAIR_rep1.h5") == 2
     assert contrast_index_for_filename("volume_0001.h5") is None
+
+
+# ── #2193: the LCAH acquisition vector reaches the batch from the file's header ──
+
+
+def _write_header_h5(path, *, tr: float, te: float, ti: float, fa: float) -> None:
+    _write_structured_kspace_h5(path)
+    xml = (
+        '<?xml version="1.0"?><ns0:ismrmrdHeader xmlns:ns0="http://www.ismrm.org/ISMRMRD">'
+        "<ns0:acquisitionSystemInformation><ns0:systemFieldStrength_T>0.3"
+        "</ns0:systemFieldStrength_T></ns0:acquisitionSystemInformation>"
+        f"<ns0:sequenceParameters><ns0:TR>{tr}</ns0:TR><ns0:TE>{te}</ns0:TE>"
+        f"<ns0:TI>{ti}</ns0:TI><ns0:flipAngle_deg>{fa}</ns0:flipAngle_deg>"
+        "</ns0:sequenceParameters></ns0:ismrmrdHeader>"
+    )
+    with h5py.File(str(path), "a") as f:
+        f["ismrmrd_header"] = xml.encode()
+
+
+@pytest.mark.parametrize("single_contrast", [True, False])
+def test_header_acquisition_vector_reaches_the_collated_batch(tmp_path, single_contrast) -> None:
+    """Subject -> LoadAcquisitionMetadata -> production collate -> finite ``[B, 5]`` phi."""
+    from spectramr.config.schemas.data import (
+        AcquisitionMetadataConfigSchema,
+        CollationConfigSchema,
+    )
+    from spectramr.data.collation.strategies import CollateStrategyFactory
+    from spectramr.data.collation.strategy_selector import CollationStrategySelector
+    from spectramr.data.transforms.acquisition_metadata import LoadAcquisitionMetadata
+    from spectramr.infrastructure.training.strategies.hypernetwork_strategy import (
+        acquisition_vector,
+    )
+
+    files = []
+    for name, proto in (("T101", (500, 18.4, 0, 180)), ("T102", (500, 18.4, 0, 180)),
+                        ("T201", (5500, 128, 0, 160)), ("T202", (5500, 128, 0, 160))):
+        p = tmp_path / f"2022_{name}.h5"
+        _write_header_h5(p, tr=proto[0], te=proto[1], ti=proto[2], fa=proto[3])
+        files.append(p)
+    cfg = AcquisitionMetadataConfigSchema(
+        enabled=True, source="ismrmrd_header", fields=["TE", "TR", "TI", "FA", "B0"], strict=True
+    )
+    ds = M4RawRepetitionDataset(
+        h5_files=files,
+        single_contrast=single_contrast,
+        coil_processing_mode="none",
+        transform=LoadAcquisitionMetadata(cfg),
+    )
+    subjects = [ds[i] for i in range(len(ds))][:2]
+    assert all(s["source_path"].endswith(".h5") for s in subjects)
+    name, kw = CollationStrategySelector.select_strategy(
+        config=CollationConfigSchema(), dataset_type="m4raw",
+        enable_slab_mode=False, patch_size=(16, 16, 1),
+    )
+    batch = CollateStrategyFactory.create(name, **kw).collate(subjects)
+    phi = acquisition_vector(batch)
+    assert phi.shape == (len(subjects), 5)
+    assert torch.isfinite(phi).all()
+    assert torch.allclose(phi[:, 4], torch.tensor(0.3))
+    # Each row is its own file's protocol: TR 500 on T1, 5500 on T2.
+    expected_tr = [500.0 if "_T1" in s["source_path"] else 5500.0 for s in subjects]
+    assert phi[:, 1].tolist() == expected_tr

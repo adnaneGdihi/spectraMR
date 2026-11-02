@@ -468,13 +468,39 @@ class _DataWithRunBlocks:
     data config, which has neither.
     """
 
-    def __init__(self, data: Any, *, undersampling: Any, physics: Any) -> None:
+    def __init__(
+        self, data: Any, *, undersampling: Any, physics: Any, mrf: Any = None, run: Any = None
+    ) -> None:
         self._data = data
         self.undersampling = undersampling
         self.physics = physics
+        # Read only by transforms that declare RUN_BLOCK_KWARGS (mrf_spiral_trajectory_sim).
+        self.mrf = mrf
+        self.run = run
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._data, name)
+
+
+def _inject_run_block_kwargs(name: str, cls: type, kwargs: dict, config: Any) -> dict:
+    """Fill the kwargs a transform takes from run-level blocks (its ``RUN_BLOCK_KWARGS``).
+
+    The run block is the one owner, so a YAML entry restating such a kwarg raises.
+    """
+    owned = getattr(cls, "RUN_BLOCK_KWARGS", None) or {}
+    out = dict(kwargs)
+    for kwarg, (block, field_name) in owned.items():
+        if kwarg in out:
+            raise ValueError(
+                f"Transform {name!r} takes {kwarg!r} from `{block}.{field_name}`; remove it from "
+                "data.processing.transforms so the run block stays its one owner."
+            )
+        block_cfg = getattr(config, block, None) if isinstance(config, _DataWithRunBlocks) else None
+        value = getattr(block_cfg, field_name, None) if block_cfg is not None else None
+        if value is None:
+            raise ValueError(f"Transform {name!r} requires `{block}.{field_name}` to be set.")
+        out[kwarg] = value
+    return out
 
 
 @dataclass
@@ -517,6 +543,9 @@ class TorchIOTransformConfig:
     # through `data.acquisition.phase_encode_axis` (#2160).
     mask_direction: str | None = None
     phase_encode_axis: int | None = None
+    # `undersampling.sampling_pattern`: how the loader mask draws its outer samples
+    # (None = uniform random lines). Read only when the loader masks (acceleration != 1).
+    sampling_pattern: str | None = None
 
     # Image→k-space bridge (opt-in via data.image_undersampling). When True, a
     # RetrospectiveImageUndersampling transform synthesises an aliased ``input``
@@ -573,6 +602,9 @@ class TorchIOTransformConfig:
     # Coil Processing (for multi-coil k-space)
     # Options: "none", "flatten" (Option B), "rss" (pre-combined, no-op), "svd" (Option A), "sense" (Option A)
     coil_processing_mode: str = "none"
+    # `rss_image` groups: 2 RSS-combines the stacked M4Raw source and target
+    # contrasts separately (`data.pairing.stacked_combine: per_contrast`).
+    coil_channel_groups: int = 1
     preserve_complex: bool = False
     num_virtual_coils: int = 4
     # `None` is a MEANING here, not "unset": it selects the full FoV for SVD
@@ -709,6 +741,8 @@ class TorchIOTransformConfig:
             data,
             undersampling=getattr(config, "undersampling", None),
             physics=getattr(config, "physics", None),
+            mrf=getattr(config, "mrf", None),
+            run=getattr(config, "run", None),
         )
         return TorchIOTransformConfig.from_training_config(view)
 
@@ -797,7 +831,8 @@ class TorchIOTransformConfig:
                     )
                 # Membership is the validator: raises KeyError listing the
                 # registered names, mirroring metrics.compute.
-                get_transform(t_name)
+                entry = get_transform(t_name)
+                t_kwargs = _inject_run_block_kwargs(t_name, entry.cls, t_kwargs, config)
 
                 if t_name == "graph_encoding":
                     enable_graph_encoding = True
@@ -834,6 +869,12 @@ class TorchIOTransformConfig:
             acceleration = accel_config.base_acceleration
             center_fraction = accel_config.center_fraction
             mask_direction = getattr(accel_config, "mask_direction", None)
+            sampling_pattern = getattr(accel_config, "sampling_pattern", None)
+            if sampling_pattern is not None and not loader_masks_lines(acceleration):
+                raise ValueError(
+                    f"undersampling.sampling_pattern={sampling_pattern!r} is read only by "
+                    f"the loader mask, which base_acceleration={acceleration} disables."
+                )
             logger.info(
                 f"[SSOT-ACCELERATION] Dataloader will use: "
                 f"acceleration={acceleration:.1f}x, center_fraction={center_fraction:.2f} "
@@ -846,6 +887,7 @@ class TorchIOTransformConfig:
             # intended path for fully-sampled / non-k-space experiments
             # (image-domain reconstruction, latent diffusion, etc.).
             mask_direction = None
+            sampling_pattern = None
             logger.info(
                 "[SSOT-ACCELERATION] No top-level 'acceleration' config — "
                 "using acceleration=1 (no undersampling). If this is a "
@@ -916,6 +958,7 @@ class TorchIOTransformConfig:
             center_fraction=center_fraction,
             mask_direction=mask_direction,
             phase_encode_axis=_phase_encode_axis_of(config),
+            sampling_pattern=sampling_pattern,
             image_undersampling=bool(getattr(config, "image_undersampling", False)),
             digital_twin_config=dt_cfg,
             digital_twin_apply=dt_apply,
@@ -935,6 +978,7 @@ class TorchIOTransformConfig:
             graph_config=graph_config,
             dataset_type=getattr(config, "dataset_type", "image"),
             coil_processing_mode=config.coils.processing_mode,
+            coil_channel_groups=2 if config.pairing.stacked_combine == "per_contrast" else 1,
             rescale_images=rescale_images,
             # Declared field with a schema default -- read it directly. The old
             # `if hasattr(config, "rescale_percentiles") else (0.0, 100.0)`
@@ -1146,7 +1190,9 @@ class TorchIOTransformBuilder:
             # image-domain reconstruction networks that want
             # pre-combined input without the centro-symmetric
             # phase-strip artefact.
-            transforms.append(CoilCombineTransform(method="rss_image"))
+            transforms.append(
+                CoilCombineTransform(method="rss_image", channel_groups=config.coil_channel_groups)
+            )
             logger.debug(
                 "[COIL] CoilCombineTransform (rss_image): (C,H,W,D) complex -> (1,H,W,D) real image"
             )
@@ -1474,7 +1520,9 @@ class TorchIOTransformBuilder:
         ):
             logger.debug("[COIL] rss_image deferred until after the physics masking")
         elif config.coil_processing_mode == "rss_image":
-            transforms.append(CoilCombineTransform(method="rss_image"))
+            transforms.append(
+                CoilCombineTransform(method="rss_image", channel_groups=config.coil_channel_groups)
+            )
             logger.debug(
                 "[COIL] CoilCombineTransform (rss_image): (C,H,W,D) complex -> (1,H,W,D) real image"
             )
@@ -1642,7 +1690,11 @@ class TorchIOTransformBuilder:
         from spectramr.data.transforms.tio_physics import MEASURED_KSPACE_KEY
 
         keys = sorted(CoilCombineTransform.KSPACE_KEYS - {MEASURED_KSPACE_KEY})
-        transforms.append(CoilCombineTransform(method="rss_image", keys=keys))
+        transforms.append(
+            CoilCombineTransform(
+                method="rss_image", keys=keys, channel_groups=config.coil_channel_groups
+            )
+        )
         logger.debug("[COIL] CoilCombineTransform (rss_image) after masking, keys=%s", keys)
 
     @staticmethod
@@ -1651,6 +1703,17 @@ class TorchIOTransformBuilder:
 
         Dispatches to Non-Cartesian simulation if trajectory is spiral/radial.
         """
+        twin_on = getattr(config, "digital_twin_apply", False) and config.digital_twin_config is not None
+        if config.sampling_pattern is not None and (
+            twin_on
+            or config.trajectory_type != "cartesian"
+            or not loader_masks_lines(config.acceleration)
+        ):
+            raise ValueError(
+                f"undersampling.sampling_pattern={config.sampling_pattern!r} is read only by the "
+                f"Cartesian loader mask, which this route (trajectory={config.trajectory_type!r}, "
+                f"acceleration={config.acceleration}, digital_twin={bool(twin_on)}) does not build."
+            )
         # Transversal Digital-Twin degradation takes the physics slot when
         # opted in (produces input=corrupted, target=clean), independent of
         # trajectory. VF strategies leave this off (they corrupt internally).
@@ -1747,6 +1810,7 @@ class TorchIOTransformBuilder:
                 validate_shapes=True,
                 mask_direction=config.mask_direction,
                 phase_encode_axis=config.phase_encode_axis,
+                sampling_pattern=config.sampling_pattern,
             )
 
     @staticmethod

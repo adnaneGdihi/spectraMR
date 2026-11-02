@@ -80,7 +80,7 @@ def test_unknown_latent_loss_raises() -> None:
 def test_schema_accepts_supported_latent_loss_types() -> None:
     from spectramr.config.schemas.loss import LatentLossesConfig
 
-    for v in ("kl_divergence", "latent_regularization", "mmd", "vq_kl"):
+    for v in ("kl_divergence", "latent_regularization", "mmd"):
         assert LatentLossesConfig(latent_loss_type=v).latent_loss_type == v
 
 
@@ -91,3 +91,15 @@ def test_schema_rejects_unsupported_latent_loss_type() -> None:
 
     with pytest.raises(ValidationError):
         LatentLossesConfig(latent_loss_type="not_a_loss")
+
+
+@pytest.mark.parametrize("name", ["vq_kl", "beta_tc_vae"])
+def test_schema_refuses_latent_types_the_continuous_path_cannot_run(name: str) -> None:
+    """vq_kl needs quantised latents and beta_tc_vae owns its KL in the losses dict, so the
+    schema refuses both at load time instead of the first step (#2280)."""
+    from pydantic import ValidationError
+
+    from spectramr.config.schemas.loss import LatentLossesConfig
+
+    with pytest.raises(ValidationError):
+        LatentLossesConfig(latent_loss_type=name)

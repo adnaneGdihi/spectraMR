@@ -47,6 +47,7 @@ def mock_env():
     # schema defaults; bare MagicMock fails StandardOptimizerStepper's raise-on-unknown
     env.config.optimization.gradient.clip.method = "norm"
     env.config.optimization.gradient.clip.value = 1.0
+    env.config.optimization.gradient.activation_offload = "none"
     # metrics_mixin.py:988 compares these against ints; a bare MagicMock raises
     # TypeError before _compute_losses_impl ever reaches the Bloch branch, which
     # is what made test_compute_losses_impl_structure red without ever exercising
@@ -257,3 +258,9 @@ def test_bloch_runs_when_the_lambda_surface_declares_it(strategy, mock_env):
     ran, value = _bloch_ran(strategy, mock_env)
     assert ran
     assert value == pytest.approx(0.5)
+
+
+def test_a_lattice_generator_keeps_the_grid_path(strategy):
+    """Only a generator declaring node_source='trajectory' gets the off-grid path."""
+    assert strategy._offgrid_path is None
+    assert strategy.validation_batch_context(torch.zeros(1), torch.zeros(1), None) is None

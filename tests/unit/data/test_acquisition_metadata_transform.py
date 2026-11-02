@@ -179,3 +179,49 @@ def test_works_inside_torchio_compose() -> None:
     subj = tio.Subject(input=tio.ScalarImage(tensor=torch.zeros(1, 2, 2, 2)))
     out = transform(subj)
     assert out["acquisition_metadata"]["TE"] == 5.0
+
+
+# ── ismrmrd_header (M4Raw) ───────────────────────────────────────────────────
+
+
+def _write_ismrmrd_h5(path: Path, *, ti: str | None = "0") -> Path:
+    """An h5 whose header carries M4Raw's ``ns0:``-prefixed sequence parameters."""
+    import h5py
+
+    ti_tag = f"<ns0:TI>{ti}</ns0:TI>" if ti is not None else ""
+    xml = (
+        '<?xml version="1.0"?><ns0:ismrmrdHeader xmlns:ns0="http://www.ismrm.org/ISMRMRD">'
+        "<ns0:acquisitionSystemInformation><ns0:systemFieldStrength_T>0.3"
+        "</ns0:systemFieldStrength_T></ns0:acquisitionSystemInformation>"
+        f"<ns0:sequenceParameters><ns0:TR>500</ns0:TR><ns0:TE>18.4</ns0:TE>{ti_tag}"
+        "<ns0:flipAngle_deg>180</ns0:flipAngle_deg></ns0:sequenceParameters>"
+        "</ns0:ismrmrdHeader>"
+    )
+    with h5py.File(str(path), "w") as f:
+        f["ismrmrd_header"] = xml.encode()
+    return path
+
+
+def _header_cfg(**kw) -> AcquisitionMetadataConfigSchema:
+    return AcquisitionMetadataConfigSchema(
+        enabled=True, source="ismrmrd_header", fields=["TE", "TR", "TI", "FA", "B0"], **kw
+    )
+
+
+def test_ismrmrd_header_reads_all_five_fields_via_source_path(tmp_path: Path) -> None:
+    """An in-memory subject names its file under ``source_path``; the header fills phi."""
+    path = _write_ismrmrd_h5(tmp_path / "2022_T101.h5")
+    subj = tio.Subject(
+        input=tio.ScalarImage(tensor=torch.zeros(1, 2, 2, 1)), source_path=str(path)
+    )
+    md = LoadAcquisitionMetadata(_header_cfg(strict=True))(subj)["acquisition_metadata"]
+    assert md == {"TE": 18.4, "TR": 500.0, "TI": 0.0, "FA": 180.0, "B0": 0.3}
+
+
+def test_ismrmrd_header_absent_tag_raises_in_strict_mode(tmp_path: Path) -> None:
+    path = _write_ismrmrd_h5(tmp_path / "2022_T201.h5", ti=None)
+    subj = tio.Subject(
+        input=tio.ScalarImage(tensor=torch.zeros(1, 2, 2, 1)), source_path=str(path)
+    )
+    with pytest.raises(MissingAcquisitionMetadata, match="TI"):
+        LoadAcquisitionMetadata(_header_cfg(strict=True))(subj)

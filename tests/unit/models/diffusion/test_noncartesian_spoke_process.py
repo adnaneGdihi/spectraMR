@@ -203,6 +203,20 @@ def test_multi_coil_input_degrades_per_channel() -> None:
     )
 
 
+def test_real_stacked_input_keeps_its_interleaved_layout() -> None:
+    """The cohort feeds interleaved [Re0, Im0, ...] k-space; returning complex C // 2
+    coils killed experiment_43_nc_control_gridded at its first step (job 8961744)."""
+    from spectramr.core.metrics.coil_manifold import as_interleaved
+
+    process = _process()
+    k = fft2c(_phantom(batch=2, channels=4))
+    t = torch.tensor([0, TIMESTEPS - 1])
+    x_complex, _ = process.q_sample(k, t)
+    x_real, _ = process.q_sample(as_interleaved(k), t)
+    assert x_real.shape == (2, 8, *IM) and not x_real.is_complex()
+    torch.testing.assert_close(x_real, as_interleaved(x_complex))
+
+
 def test_the_ladder_report_describes_spokes_not_cartesian_bins() -> None:
     """The inherited reporter would certify a bin ladder this arm never runs.
 

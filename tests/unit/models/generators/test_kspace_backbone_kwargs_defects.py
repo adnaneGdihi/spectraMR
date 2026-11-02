@@ -163,3 +163,25 @@ def test_other_backbones_knob_is_flagged_as_inert(backbone_type, knob):
 def test_declared_transformer_knobs_are_clean(backbone_type):
     kw = {"backbone_type": backbone_type, "depth": 6, "heads": 6, "timesteps": 29}
     assert backbone_kwargs_defects(kw) == []
+
+
+@pytest.mark.parametrize("backbone_type", ["dit", "u_vit", "diffit", "hat"])
+def test_resolver_supplied_kwargs_are_not_misspellings(backbone_type):
+    """``resolve_generator_kwargs`` adds ``dc_weight``; it is within hat's ``cab_weight``
+    cutoff, and refusing it killed sota_hat at build (job 8961744, task 93)."""
+    kw = {"backbone_type": backbone_type, "depth": 6, "heads": 6, "dc_weight": 1.0, "use_dc": True}
+    assert backbone_kwargs_defects(kw) == []
+
+
+def test_the_resolved_hat_arm_builds_past_the_knob_check():
+    """Every key the resolver adds for the real arm is known, so the set cannot drift."""
+    import torch
+
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.builders.generator_kwargs import resolve_generator_kwargs
+
+    config = TrainingSettings.from_yaml(
+        "experiments/inprogress/kspace_filling/sota_backbones/experiment_11_sota_hat.yaml"
+    )
+    kw = resolve_generator_kwargs(config, device=torch.device("cpu"))
+    assert backbone_kwargs_defects(kw) == []

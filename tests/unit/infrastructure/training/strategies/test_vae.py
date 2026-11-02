@@ -145,6 +145,62 @@ class TestBareTensorPosteriorRecovery:
         assert torch.count_nonzero(got_mu) == 0
         assert torch.count_nonzero(got_logvar) == 0
 
+    def test_validation_reads_the_cached_posterior(self) -> None:
+        """Validation KL is non-zero for a bare-tensor VAE that caches its posterior (#2362)."""
+        recon = torch.randn(1, 1, 32, 32)
+        mu = torch.full((1, 8, 4, 4), 0.5)
+        logvar = torch.full((1, 8, 4, 4), -0.25)
+        mock = self._mock_with_last_aux(recon, mu, logvar)
+        mock._get_validation_metrics_computer = MagicMock(side_effect=RuntimeError("not graded"))
+        mock._orthogonality_loss = MagicMock(return_value=None)
+        mock._convert_metrics_to_floats = lambda m: m
+
+        metrics = VAETrainingStrategy.validation_step(
+            mock, None, input_batch=torch.randn(1, 1, 32, 32), target_batch=recon.clone()
+        )
+        assert metrics["kl_divergence"] > 0
+
+
+class TestKLTelemetryAndStructuralPrior:
+    """#642: g_loss_kl read a key the computer never writes; the SLAT prior never trained."""
+
+    def test_g_loss_kl_reports_the_computer_kl_term(self) -> None:
+        recon = torch.randn(1, 1, 8, 8)
+        mock = TestBareTensorPosteriorRecovery._mock_with_last_aux(
+            recon, torch.zeros(1, 2, 2, 2), torch.zeros(1, 2, 2, 2)
+        )
+        kl = torch.tensor(0.75)
+        mock.loss_computer.compute = MagicMock(
+            return_value=SimpleNamespace(total=torch.tensor(1.0), components={"kl": kl}, metrics={})
+        )
+        VAETrainingStrategy._compute_losses_impl(mock, recon, recon.clone(), epoch=0, iteration=0)
+        assert mock._loss_dict_reuse.update.call_args_list[1].args[0]["g_loss_kl"] is kl
+
+    def test_structural_prior_reaches_the_total(self) -> None:
+        class _PriorVAE(torch.nn.Module):
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x
+
+            def last_aux(self) -> dict:
+                return {"mu": torch.ones(1, 2), "logvar": torch.zeros(1, 2)}
+
+            def structural_prior_loss(self, target: torch.Tensor) -> torch.Tensor:
+                return torch.tensor(0.25)
+
+        x = torch.randn(1, 1, 8, 8)
+        mock = TestBareTensorPosteriorRecovery._mock_with_last_aux(x, None, None)
+        mock.env.generator = _PriorVAE()
+        mock._loss_dict_reuse = {}
+        mock.loss_computer.compute = MagicMock(
+            return_value=SimpleNamespace(total=torch.tensor(1.0), components={}, metrics={})
+        )
+        VAETrainingStrategy._compute_losses_impl(mock, x, x.clone(), epoch=0, iteration=0)
+        assert mock._loss_dict_reuse["structural_prior"] == 0.25
+        assert mock._loss_dict_reuse["g_total_loss"] == 1.25
+        strategy = object.__new__(VAETrainingStrategy)
+        strategy.env = SimpleNamespace(generator=_PriorVAE())
+        assert "structural_prior" in strategy.declared_metric_keys()
+
 
 # --------------------------------------------------------------------------- #
 # VQVAETrainingStrategy: the train-metric iteration seam (#1937)

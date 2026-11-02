@@ -19,7 +19,7 @@ class MultiEchoB0FitConfig(StrictSchema):
 
     ``t_shift`` is the readout time-shift between the two echoes used for the
     phase-difference fit (seconds, i.e. ΔTE). It is load-bearing: the recovered
-    field scales as ``ΔB0 = -Δφ / (2π · t_shift)``, so it MUST match the
+    field scales as ``ΔB0 = +angle(E2·conj(E1)) / (2π · t_shift)``, so it MUST match the
     acquisition. ``gamma`` follows Koolstra et al. (2021): 2e-10 simulation,
     2e-8 phantom, 4e-8 in vivo.
     """
@@ -27,7 +27,7 @@ class MultiEchoB0FitConfig(StrictSchema):
     t_shift: float = Field(
         gt=0.0,
         description="Readout time-shift ΔTE between the two echoes (seconds). "
-        "Load-bearing: ΔB0 = -Δφ/(2π·t_shift).",
+        "Load-bearing: ΔB0 = Δφ/(2π·t_shift).",
     )
     gamma: float = Field(
         default=2e-10,

@@ -58,3 +58,13 @@ class TestProgressiveDiscriminator:
         out = disc(x)
         out.mean().backward()
         assert x.grad is not None
+
+
+def test_registered_as_discriminator_component() -> None:
+    from spectramr.models.factories.model_factory import ModelFactory
+
+    disc = ModelFactory().create_discriminator(
+        model_type="progressive_discriminator", in_channels=1, max_resolution=16, base_channels=8
+    )
+    assert isinstance(disc, ProgressiveDiscriminator)
+    assert callable(disc.set_phase)

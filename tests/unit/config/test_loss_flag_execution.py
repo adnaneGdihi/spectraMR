@@ -16,6 +16,19 @@ import pytest
 import torch
 import torch.nn as nn
 
+from spectramr.models.losses.build_set import declared_build_set, strategy_resolved
+from spectramr.models.losses.weights import build_loss_weight_table
+
+
+def _declared(losses):
+    """Weights the author declared (the table owns this, #1966); the build set is narrower."""
+    return {
+        k: s.weight
+        for k, s in build_loss_weight_table(losses).items()
+        if s.enabled and s.weight > 0
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -157,12 +170,17 @@ class TestReconstructionLossExecution:
                     f"LossBuilder._build_all_dynamic()"
                 )
 
-        assert expected_key in losses, (
-            f"LossBuilder did not create '{expected_key}' loss module even though "
-            f"enable_{expected_key}=True and lambda > 0.\n"
-            f"Keys actually created: {sorted(losses.keys())}\n"
-            "Check LossBuilder.registry_map or _build_all_dynamic() for a missing mapping."
+        # A reconstruction lambda is computed inline by its computer (models/losses/build_set.py),
+        # so the builder need not instantiate it; it must still be a declared, active term.
+        spec = build_loss_weight_table(settings.losses).get(expected_key)
+        assert spec is not None and spec.enabled and spec.weight > 0, (
+            f"'{expected_key}' is not a declared, active term for enable_{expected_key}=True."
         )
+        if expected_key not in losses:
+            assert strategy_resolved(spec), (
+                f"LossBuilder did not create '{expected_key}' and no computer or strategy owns it."
+            )
+            return
         assert isinstance(losses[expected_key], nn.Module), (
             f"losses['{expected_key}'] must be an nn.Module, "
             f"got {type(losses[expected_key]).__name__}"
@@ -277,7 +295,7 @@ class TestGANAuxiliaryLossExecution:
             }
         )
         # r1 is enabled and emitted by get_enabled_losses...
-        assert settings.losses.get_enabled_losses().get("r1", 0) > 0
+        assert _declared(settings.losses).get("r1", 0) > 0
         # ...but it is strategy-managed (applied in the GAN strategy's discriminator
         # step), so LossBuilder deliberately does NOT build a standalone module.
         # Confirm it is recognised as managed rather than silently dropped (#9).
@@ -383,7 +401,7 @@ class TestNoZeroWeightEnabledLoss:
         cfg = LossConfigSchema(
             reconstruction=ReconstructionLossesConfig(enable_l1=True, lambda_l1=0.0)
         )
-        enabled = cfg.get_enabled_losses()
+        enabled = declared_build_set(cfg)
         # If 'l1' is in enabled, its weight must be > 0
         if "l1" in enabled:
             assert enabled["l1"] > 0, (

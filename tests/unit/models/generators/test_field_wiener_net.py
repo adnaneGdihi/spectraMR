@@ -16,7 +16,7 @@ _HW = (64, 64)
 
 
 def test_forward_shape() -> None:
-    out = _net()(torch.rand(2, 1, 32, 32), field_strength=torch.tensor([0.1, 3.0]))
+    out = _net()(torch.rand(2, 1, 32, 32), field_strength=torch.tensor([0.1, 3.0]), field_strength_target=None)
     assert out.shape == (2, 1, 32, 32)
 
 
@@ -73,7 +73,7 @@ def test_field_blind_band_is_field_invariant() -> None:
 
 def test_field_batch_guard() -> None:
     with pytest.raises(ValueError, match="field_strength batch"):
-        _net()(torch.rand(2, 1, 16, 16), field_strength=torch.tensor([1.5]))
+        _net()(torch.rand(2, 1, 16, 16), field_strength=torch.tensor([1.5]), field_strength_target=None)
 
 
 def test_field_required_for_probe() -> None:
@@ -81,11 +81,38 @@ def test_field_required_for_probe() -> None:
 
     params = inspect.signature(FieldWienerNet.forward).parameters
     assert params["field_strength"].default is inspect.Parameter.empty
+    assert params["field_strength_target"].default is inspect.Parameter.empty
+
+
+def test_target_field_conditions_the_estimate() -> None:
+    # #196: on Task 3 one input is paired with several target fields; the net must see which.
+    torch.manual_seed(0)
+    m = _net(use_target_field=True).eval()
+    for p in m.target_film.parameters():
+        p.data += 0.1
+    x, b_s = torch.rand(1, 1, 16, 16), torch.tensor([1.5])
+    with torch.no_grad():
+        lo = m(x, field_strength=b_s, field_strength_target=torch.tensor([0.1]))
+        hi = m(x, field_strength=b_s, field_strength_target=torch.tensor([7.0]))
+    assert not torch.allclose(lo, hi)
+
+
+def test_target_conditioned_net_raises_without_target() -> None:
+    with pytest.raises(ValueError, match="field_strength_target"):
+        _net(use_target_field=True)(
+            torch.rand(1, 1, 8, 8), field_strength=torch.tensor([1.5]), field_strength_target=None
+        )
+    with pytest.raises(ValueError, match="use_target_field"):
+        FieldWienerNet(use_target_field="yes")  # type: ignore[arg-type]
 
 
 def test_rejects_complex_and_multichannel_and_nonbool() -> None:
     with pytest.raises(ValueError, match="magnitude"):
-        _net()(torch.rand(1, 1, 8, 8, dtype=torch.cfloat), field_strength=torch.tensor([1.5]))
+        _net()(
+            torch.rand(1, 1, 8, 8, dtype=torch.cfloat),
+            field_strength=torch.tensor([1.5]),
+            field_strength_target=None,
+        )
     with pytest.raises(ValueError, match="magnitude-only"):
         FieldWienerNet(in_channels=2)
     with pytest.raises(ValueError, match="use_field_noise"):

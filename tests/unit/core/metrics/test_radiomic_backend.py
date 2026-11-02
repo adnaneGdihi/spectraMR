@@ -193,3 +193,19 @@ def test_frd_raises_clear_error_without_scipy(monkeypatch) -> None:
     monkeypatch.setattr(r, "SCIPY_AVAILABLE", False)
     with pytest.raises(ImportError, match="scipy"):
         r.FrechetRadiomicDistance()
+
+
+def test_frechet_distance_runs_on_current_scipy() -> None:
+    """``sqrtm(..., disp=False)`` raised TypeError on SciPy >= 1.18; the distance must still compute."""
+    import numpy as np
+
+    from spectramr.core.metrics.radiomic import FrechetRadiomicDistance
+
+    rng = np.random.default_rng(0)
+    a, b = rng.standard_normal((50, 4)), rng.standard_normal((50, 4)) + 1.0
+    d = FrechetRadiomicDistance._frechet_distance(
+        a.mean(0), np.cov(a.T), b.mean(0), np.cov(b.T)
+    )
+    assert np.isfinite(d) and d > 1.0
+    same = FrechetRadiomicDistance._frechet_distance(a.mean(0), np.cov(a.T), a.mean(0), np.cov(a.T))
+    assert same == pytest.approx(0.0, abs=1e-6)

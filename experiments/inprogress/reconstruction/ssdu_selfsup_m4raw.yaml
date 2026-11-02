@@ -40,6 +40,7 @@ model:
     # scores the residual on the original *multi-coil* k-space, so coils are kept
     # (physics.coil_processing.combine = none below).
     num_coils: 4
+    output_activation: none
     img_size: [256, 256]
 
 training:
@@ -56,6 +57,7 @@ training:
     theta_fraction: 0.4                      # fraction of acquired points held out into Theta
     num_masks: 1                             # >1 → multi_mask_ssdu robust averaging
     split_seed: 0
+    n_coils: 4                               # the measurement carries 4 coils (#2349)
 
 data:
   # The declared undersampling block reached no route: the subject builder sets
@@ -86,10 +88,16 @@ data:
     type: auto
     validation_fraction: 0.15
   domain:
-    target_channels: 1
+    target_channels: 8
   processing:
     enable_kspace_normalization: false
     enable_image_normalization: false
+    # Coil maps for the 4-coil multi-coil data consistency (#2349).
+    transforms:
+    - name: espirit_sensitivity
+      kwargs:
+        acs_size: 20
+        keys: [input]
   sampling:
     patch_size:
     - 256
@@ -143,6 +151,7 @@ validation:
     batch_size: 2
   scoring:
     domain: image
+    output_transform: ifft_target_magnitude
   visualization:
     enabled: true
     interval: 2000

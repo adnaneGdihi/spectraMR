@@ -19,7 +19,7 @@ from spectramr.models.losses.computers.base import (
     BaseLossComputer,
     LossOutput,
 )
-from spectramr.models.losses.weights import is_loss_configured
+from spectramr.models.losses.weights import is_loss_configured, resolve_loss_weight
 
 logger = logging.getLogger(__name__)
 
@@ -481,6 +481,7 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
         iteration: int = 0,
         losses_dict: dict[str, Any] | None = None,
         critic_cond: "Mapping[str, Any] | None" = None,
+        diffusion_pair: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> LossOutput:
         """Compute diffusion training losses.
@@ -501,12 +502,17 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
                 reach an arbitrary loss as a stray keyword. Naming it in the
                 signature captures it here, so it can only ever reach the
                 critic.
+            diffusion_pair: Optional ``(prediction, target)`` for the ``diffusion``
+                term when it differs from ``(pred, target)``. The epsilon-prediction
+                arms pass ``(eps_hat, noise)`` here while ``pred`` is the x0 estimate
+                that the image and data-consistency terms score.
             **kwargs: timesteps, context, etc.
 
         Returns:
             LossOutput with total loss and components
         """
         components: dict[str, torch.Tensor] = {}
+        diff_pred, diff_target = diffusion_pair if diffusion_pair is not None else (pred, target)
         # Weight overrides for the stack: a term that arrives pre-weighted is
         # stacked at 1.0 so its lambda is applied once.
         preweighted: dict[str, float] = {}
@@ -517,10 +523,12 @@ class UnifiedDiffusionLossComputer(BaseLossComputer):
         lambda_diffusion = self._get_loss_weight("diffusion", epoch, iteration)
         if lambda_diffusion > 0:
             if self.diffusion_loss_fn:
-                diffusion_loss = _call_safe_loss(self.diffusion_loss_fn, pred, target, **kwargs)
+                diffusion_loss = _call_safe_loss(
+                    self.diffusion_loss_fn, diff_pred, diff_target, **kwargs
+                )
             else:
                 # Fallback: MSE loss
-                diffusion_loss = _complex_safe_mse(pred, target, counter=self._nonfinite)
+                diffusion_loss = _complex_safe_mse(diff_pred, diff_target, counter=self._nonfinite)
             components["diffusion"] = diffusion_loss
 
         # 2. RECONSTRUCTION LOSS (optional, at specific timesteps)
@@ -836,8 +844,14 @@ class UnifiedReconstructionLossComputer(BaseLossComputer):
         """
         components: dict[str, torch.Tensor] = {}
 
-        # 1. L1 LOSS
-        lambda_l1 = self._get_loss_weight("l1", epoch, iteration)
+        # 1. L1 LOSS (only when declared: an undeclared l1 must not train at the schema default, #2280)
+        lambda_l1 = resolve_loss_weight(
+            self._weight_table,
+            "l1",
+            iteration=iteration,
+            scheduled=getattr(self, "scheduled_weights", None),
+            declared_only=True,
+        )
         if lambda_l1 > 0:
             l1_loss = _complex_safe_l1(pred, target, counter=self._nonfinite)
             components["l1"] = l1_loss

@@ -129,6 +129,22 @@ def test_volume_consistency_gt_empty_pred_nonempty_scores_zero():
     assert abs(val - 0.0) < 1e-6
 
 
+def test_volume_consistency_without_segmenter_raises():
+    """#169: no injected segmenter must raise, never fall back to the label_dice proxy."""
+    img = torch.zeros(1, 1, 8, 8)
+    with pytest.raises(ValueError, match="volume_consistency"):
+        cm.VolumeConsistencyMetric()(img, img)
+
+
+def test_volume_consistency_rejects_label_dice_backend():
+    """#169: the intensity-quantile proxy cannot measure DGM volume agreement."""
+    from spectramr.core.metrics.quantitative.segmentation import LabelDiceBackend
+
+    img = torch.zeros(1, 1, 8, 8)
+    with pytest.raises(ValueError, match="label_dice"):
+        cm.VolumeConsistencyMetric()(img, img, segmenter=LabelDiceBackend(n_classes=5))
+
+
 def test_dgm_labels_14_are_the_freesurfer_ids():
     """DGM_LABELS_14 must be exactly the 14 FreeSurfer aseg IDs from the spec."""
     assert cm.DGM_LABELS_14 == (10, 49, 11, 50, 12, 51, 13, 52, 17, 53, 18, 54, 26, 58)

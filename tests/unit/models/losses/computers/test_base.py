@@ -13,6 +13,7 @@ import logging
 import pytest
 import torch
 
+from spectramr.domain.exceptions import ConfigurationError
 from spectramr.models.losses.computers.base import BaseLossComputer, LossOutput
 
 
@@ -34,6 +35,7 @@ def probe():
     p = _Probe.__new__(_Probe)
     torch.nn.Module.__init__(p)
     p.device = torch.device("cpu")
+    p.config = None  # no losses block: warmup_iterations is 0, so every step is post-warm-up
     p._weights = {}
     return p
 
@@ -120,18 +122,20 @@ class TestStackComponentsExitStates:
         assert torch.isfinite(total).all()  # the NaN was laundered into 0.0
         assert any("SILENT NaN COLLAPSE" in r.getMessage() for r in caplog.records)
 
-    def test_all_weights_zero_stays_grad_connected(self, probe, param, caplog):
-        """The dead-loss exit must NOT trip the backward guard.
-
-        ``total + 0.0 * loss`` still builds an ``AddBackward0``: a zero *gradient*,
-        not a severed graph. Its loud-but-non-raising diagnostic is deliberate and
-        the guard leaves it intact.
-        """
+    def test_all_weights_zero_after_warmup_raises(self, probe, param):
+        """#177: a training step with no weighted term raises, never a zero gradient."""
         connected = (param * 2).sum()
         probe._weights = {"a": 0.0, "b": 0.0}
-        with caplog.at_level(logging.ERROR):
-            total = probe._stack_components({"a": connected, "b": connected})
-        assert total.grad_fn is not None
+        with pytest.raises(ConfigurationError, match="objective is zero"):
+            probe._stack_components({"a": connected, "b": connected}, iteration=2000)
+
+    def test_all_weights_zero_without_grad_is_logged_not_raised(self, probe, param, caplog):
+        """A grad-free call (validation under no_grad) keeps the logged dead-loss exit."""
+        connected = (param * 2).sum()
+        probe._weights = {"a": 0.0, "b": 0.0}
+        with torch.no_grad(), caplog.at_level(logging.ERROR):
+            total = probe._stack_components({"a": connected, "b": connected}, iteration=2000)
+        assert float(total) == 0.0
         assert any("DEAD LOSS" in r.getMessage() for r in caplog.records)
 
     def test_one_surviving_component_stays_grad_connected(self, probe, param):

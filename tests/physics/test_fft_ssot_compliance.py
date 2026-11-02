@@ -163,7 +163,6 @@ LEGACY_EXEMPT_BUDGET: dict[str, int] = {
     # torch.fft.* calls) — stale budget entry removed per the "drop the entry"
     # contract of test_legacy_budget_entries_still_violate.
     "src/spectramr/infrastructure/physics/dipole.py": 2,
-    "src/spectramr/infrastructure/physics/forward_operator.py": 8,
     "src/spectramr/infrastructure/physics/implementations/fft_operator.py": 8,
     "src/spectramr/infrastructure/physics/motion_correction.py": 3,
     "src/spectramr/infrastructure/physics/motion_simulation.py": 1,
@@ -172,7 +171,6 @@ LEGACY_EXEMPT_BUDGET: dict[str, int] = {
     # — stale budget entry removed per test_legacy_budget_entries_still_violate.
     "src/spectramr/infrastructure/physics/vf_corrections.py": 7,
     "src/spectramr/infrastructure/physics/vf_field_extraction.py": 5,
-    "src/spectramr/infrastructure/physics/vf_operators_extended.py": 1,
     "src/spectramr/models/generators/aftnet_generator.py": 3,
     "src/spectramr/models/generators/vf_field_generators.py": 3,
 }

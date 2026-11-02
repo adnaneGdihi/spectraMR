@@ -11,6 +11,8 @@ from typing import Any, ClassVar
 import torch
 import torch.nn as nn
 
+from spectramr.infrastructure.training.strategies.patch_masking import create_patch_mask
+
 logger = logging.getLogger(__name__)
 
 from spectramr.infrastructure.training.strategies.reconstruction import (
@@ -148,53 +150,8 @@ class MaskedPretrainingStrategy(ReconstructionTrainingStrategy):
         self.patch_size = patch_size
 
     def _create_patch_mask(self, B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-        """Create patch-based mask for MIM.
-
-        Args:
-            B: Batch size
-            H, W: Image height and width
-            device: Device
-
-        Returns:
-            mask: [B, 1, H, W] boolean mask (True = masked)
-        """
-        # Calculate number of patches
-        num_patches_h = H // self.patch_size
-        num_patches_w = W // self.patch_size
-        total_patches = num_patches_h * num_patches_w
-        num_masked_patches = int(total_patches * self.mask_ratio)
-
-        # Create patch-level mask for each sample in batch
-        masks = []
-        for _ in range(B):
-            # Random selection of patches to mask
-            patch_indices = torch.randperm(total_patches, device=device)[:num_masked_patches]
-
-            # Create patch mask.
-            #
-            # The row/column form of this write is a flat scatter: for a
-            # contiguous 2-D tensor, ``[idx // W, idx % W]`` addresses exactly
-            # ``flat[idx]``, so scattering into the flat view and reshaping is
-            # the same set of ones. Doing it per element meant iterating a
-            # CUDA tensor -- one host sync AND one kernel launch per masked
-            # patch (192 of each per sample at 256x256 / patch 16), inside the
-            # training step (non-negotiable 9).
-            patch_mask = torch.zeros(total_patches, device=device)
-            patch_mask[patch_indices] = 1
-            patch_mask = patch_mask.view(num_patches_h, num_patches_w)
-
-            # Upsample to image resolution (repeat each patch)
-            mask = patch_mask.repeat_interleave(self.patch_size, dim=0).repeat_interleave(
-                self.patch_size, dim=1
-            )
-
-            # Crop to exact size if needed
-            mask = mask[:H, :W]
-            masks.append(mask)
-
-        # Stack and add batch and channel dimensions
-        mask = torch.stack(masks, dim=0).unsqueeze(1)  # [B, 1, H, W]
-        return mask > 0.5
+        """``[B, 1, H, W]`` boolean patch mask (True = masked), from the shared owner."""
+        return create_patch_mask(B, H, W, self.patch_size, self.mask_ratio, device)
 
     def _compute_losses_impl(
         self,

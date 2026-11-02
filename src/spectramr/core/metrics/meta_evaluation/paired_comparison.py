@@ -22,7 +22,10 @@ The two correlations come from the *same slices*. A slice that is intrinsically
 hard (low SNR, motion-prone anatomy) depresses both, and an unpaired test would
 count that shared, irrelevant variance as noise -- badly underpowering the design.
 So the bootstrap resamples **slices**, not observations, and recomputes both
-correlations on each draw. The CI is over the *paired* difference.
+correlations on each draw. The CI is over the *paired* difference. When the
+caller knows which subject each slice came from, the unit is the **subject**
+instead: slices of one volume share anatomy (and a degradation realisation), so
+resampling them as independent units would narrow the CI by pseudo-replication.
 
 Resampling observations instead of slices would also break the pairing: a draw
 could contain a lesion score from slice 7 and a control score from slice 12, which
@@ -112,6 +115,8 @@ class PairedDelta:
     ci_high: float
     n_slices: int
     n_boot: int
+    resampling_unit: str = "slice"
+    n_units: int = 0
 
     @property
     def significant(self) -> bool:
@@ -133,6 +138,8 @@ class PairedDelta:
             "significant": self.significant,
             "n_slices": self.n_slices,
             "n_boot": self.n_boot,
+            "resampling_unit": self.resampling_unit,
+            "n_units": self.n_units,
         }
 
 
@@ -145,6 +152,7 @@ def lesion_vs_control(
     lesion_scores: Sequence[float],
     control_scores: Sequence[float],
     slice_ids: Sequence[str],
+    subject_ids: Sequence[str] | None = None,
     n_boot: int = 2000,
     alpha: float = 0.05,
     seed: int = 0,
@@ -158,6 +166,8 @@ def lesion_vs_control(
             same artifact, same severity**.
         slice_ids: which slice each observation came from. The bootstrap resamples
             **these**, not the observations, so the pairing survives every draw.
+        subject_ids: optional subject of each observation. When given, the bootstrap
+            resamples subjects (every slice of a drawn subject comes along) instead.
 
     Returns:
         A :class:`PairedDelta`. ``significant`` is True only when the CI on
@@ -176,13 +186,15 @@ def lesion_vs_control(
     rho_c = spearman_rho(severity, control_scores)
     delta = rho_l - rho_c
 
-    by_slice: dict[str, list[int]] = {}
-    for i, sid in enumerate(slice_ids):
-        by_slice.setdefault(sid, []).append(i)
-    slices = sorted(by_slice)
-    n_slices = len(slices)
+    n_slices = len(set(slice_ids))
+    unit_ids, unit = _resampling_units(slice_ids, subject_ids)
+    by_unit: dict[str, list[int]] = {}
+    for i, uid in enumerate(unit_ids):
+        by_unit.setdefault(uid, []).append(i)
+    units = sorted(by_unit)
+    n_units = len(units)
 
-    if n_slices < 2 or not math.isfinite(delta):
+    if n_units < 2 or not math.isfinite(delta):
         return PairedDelta(
             metric=metric,
             artifact=artifact,
@@ -194,13 +206,15 @@ def lesion_vs_control(
             ci_high=float("nan"),
             n_slices=n_slices,
             n_boot=0,
+            resampling_unit=unit,
+            n_units=n_units,
         )
 
     gen = torch.Generator().manual_seed(seed)
     deltas: list[float] = []
     for _ in range(n_boot):
-        pick = torch.randint(0, n_slices, (n_slices,), generator=gen).tolist()
-        idx = [i for p in pick for i in by_slice[slices[p]]]
+        pick = torch.randint(0, n_units, (n_units,), generator=gen).tolist()
+        idx = [i for p in pick for i in by_unit[units[p]]]
 
         d = spearman_rho(
             [severity[i] for i in idx], [lesion_scores[i] for i in idx]
@@ -220,6 +234,8 @@ def lesion_vs_control(
             ci_high=float("nan"),
             n_slices=n_slices,
             n_boot=len(deltas),
+            resampling_unit=unit,
+            n_units=n_units,
         )
 
     t = torch.tensor(deltas, dtype=torch.float64)
@@ -237,7 +253,31 @@ def lesion_vs_control(
         ci_high=hi,
         n_slices=n_slices,
         n_boot=len(deltas),
+        resampling_unit=unit,
+        n_units=n_units,
     )
+
+
+def _resampling_units(
+    slice_ids: Sequence[str], subject_ids: Sequence[str] | None
+) -> tuple[Sequence[str], str]:
+    """The bootstrap unit of each observation: its subject when known, else its slice."""
+    if subject_ids is None:
+        return slice_ids, "slice"
+    if len(subject_ids) != len(slice_ids):
+        raise ValueError(
+            f"subject_ids has {len(subject_ids)} entries for {len(slice_ids)} observations."
+        )
+    owner: dict[str, str] = {}
+    for sid, subj in zip(slice_ids, subject_ids, strict=True):
+        if not subj:
+            raise ValueError(f"slice {sid!r} has an empty subject id.")
+        if owner.setdefault(sid, subj) != subj:
+            raise ValueError(
+                f"slice {sid!r} is assigned to subject {owner[sid]!r} and {subj!r}; a slice "
+                "belongs to exactly one subject."
+            )
+    return subject_ids, "subject"
 
 
 def money_table(rows: Sequence[Mapping[str, object]], **kw: object) -> list[PairedDelta]:
@@ -251,6 +291,7 @@ def money_table(rows: Sequence[Mapping[str, object]], **kw: object) -> list[Pair
             lesion_scores=r["lesion_scores"],  # type: ignore[arg-type]
             control_scores=r["control_scores"],  # type: ignore[arg-type]
             slice_ids=r["slice_ids"],  # type: ignore[arg-type]
+            subject_ids=r.get("subject_ids"),  # type: ignore[arg-type]
             **kw,  # type: ignore[arg-type]
         )
         for r in rows

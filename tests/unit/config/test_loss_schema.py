@@ -9,6 +9,17 @@ from spectramr.config.schemas.loss import (
     MetricsConfig,
     ReconstructionLossesConfig,
 )
+from spectramr.models.losses.weights import build_loss_weight_table
+
+
+def _declared(losses):
+    """Weights the author declared (the table owns this, #1966); the build set is narrower."""
+    return {
+        k: s.weight
+        for k, s in build_loss_weight_table(losses).items()
+        if s.enabled and s.weight > 0
+    }
+
 
 
 class TestLossConfigSchema:
@@ -77,7 +88,7 @@ class TestReconstructionLossesConfig:
                 enable_recon=True, lambda_recon=1.0
             )
         )
-        enabled = cfg.get_enabled_losses()
+        enabled = _declared(cfg)
         assert enabled.get("recon") == 1.0
 
     def test_enable_l1_independent_of_recon(self):
@@ -85,7 +96,7 @@ class TestReconstructionLossesConfig:
         cfg = LossConfigSchema(
             reconstruction=ReconstructionLossesConfig(enable_l1=True, lambda_l1=2.0)
         )
-        enabled = cfg.get_enabled_losses()
+        enabled = _declared(cfg)
         assert enabled.get("l1") == 2.0
         assert "recon" not in enabled
 

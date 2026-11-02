@@ -34,7 +34,7 @@ from spectramr.infrastructure.training.utils.metric_views import (
     real_stacked_to_complex,
 )
 
-from .validation_context import scoring_maps
+from .validation_context import coil_maps
 
 logger = logging.getLogger(__name__)
 
@@ -843,10 +843,9 @@ class MetricsMixin:
             target = kspace_rss_magnitude(target)
 
         elif transform_name == "sense_magnitude":
-            # The validation batch's scoring maps (#2664), else its own maps; not
-            # ``_current_smaps``, which only the diffusion strategies set. Missing
-            # maps raise inside the pair.
-            maps, _ = scoring_maps(batch_data, pred) if batch_data is not None else (None, None)
+            # The validation batch's own maps; not ``_current_smaps``, which only
+            # the diffusion strategies set. Missing maps raise inside the pair.
+            maps, _ = coil_maps(batch_data, pred) if batch_data is not None else (None, None)
             sense_pred, sense_target = sense_scoring_pair(pred, target, maps)
             complex_pred = sense_pred if torch.is_complex(sense_pred) else None
             complex_target = sense_target
@@ -971,13 +970,6 @@ class MetricsMixin:
         """
         metrics: dict[str, float] = {}
 
-        metrics_config = _get_config_value(config, "metrics", None)
-        enable_tracking = _get_config_value(metrics_config, "enable_tracking", True)
-        if not enable_tracking:
-            return metrics
-
-        train_metric_interval = _get_config_value(metrics_config, "train_metric_interval", 100)
-
         # Fire on the cadence, AND unconditionally on the first and final
         # iteration -- mirroring the CSV row gate at `training_loop.py`, which
         # carries `or is_first_iteration or is_last_iteration` for exactly this
@@ -1007,17 +999,7 @@ class MetricsMixin:
         #
         # A non-positive interval has no periodic firing rather than raising
         # `ZeroDivisionError`; first/final still produce data.
-        training_config = _get_config_value(config, "training", None)
-        max_iterations = _get_config_value(training_config, "max_iterations", 0)
-
-        on_interval = train_metric_interval > 0 and current_step % train_metric_interval == 0
-        is_first = current_step == 1
-        is_last = (
-            isinstance(max_iterations, int)
-            and max_iterations > 0
-            and current_step == max_iterations
-        )
-        if not (on_interval or is_first or is_last):
+        if not self._training_metrics_due(config, current_step):
             return metrics
 
         # Guard: some generators (e.g. DisentangledMRIGenerator) return a dict.
@@ -1043,12 +1025,36 @@ class MetricsMixin:
             return metrics
 
         pred, target = self._training_metric_inputs(pred, target)
+        metrics_config = _get_config_value(config, "metrics", None)
         views = self._metric_transform_views(pred, target, metrics_config, batch_data=batch_data)
+        return self._score_training_views(views)
 
+    def _score_training_views(self, views: MetricViews) -> dict[str, float]:
+        """``train_*`` metrics on views already in validation's units, with no transform.
+
+        A strategy whose validation scores a pair it prepares itself calls this
+        (after ``_training_metrics_due``), so train and val share units.
+        """
         with torch.no_grad():
             raw_metrics = views.compute(self.training_metrics_computer)
-
         return {f"train_{k}": v for k, v in raw_metrics.items()}
+
+    @staticmethod
+    def _training_metrics_due(config: Any, current_step: int) -> bool:
+        """Whether ``_compute_training_metrics`` scores this step: the cadence, plus first and last.
+
+        Callers that must prepare the pair (an IFFT, a magnitude) ask first, so the
+        preparation is paid only on the steps that are scored.
+        """
+        metrics_config = _get_config_value(config, "metrics", None)
+        if not _get_config_value(metrics_config, "enable_tracking", True):
+            return False
+        interval = _get_config_value(metrics_config, "train_metric_interval", 100)
+        training_config = _get_config_value(config, "training", None)
+        max_iterations = _get_config_value(training_config, "max_iterations", 0)
+        on_interval = interval > 0 and current_step % interval == 0
+        is_last = isinstance(max_iterations, int) and 0 < max_iterations == current_step
+        return on_interval or current_step == 1 or is_last
 
     def _training_metric_inputs(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -1079,12 +1085,17 @@ class MetricsMixin:
             input_batch = input_batch.to(self.device, non_blocking=True)
             target_batch = target_batch.to(self.device, non_blocking=True)
 
-            output = self.env.generator(input_batch)
+            output = self._validation_generator_forward(input_batch)
             metrics = self._score_validation_output(output, target_batch)
 
             self.env.generator.train()
 
             return metrics
+
+    def _validation_generator_forward(self, input_batch: torch.Tensor) -> Any:
+        """The generator call the default validation step scores; a strategy that feeds
+        the generator extra inputs at train time overrides it so validation sees them too."""
+        return self.env.generator(input_batch)
 
     def _score_validation_output(self, output: Any, target_batch: torch.Tensor) -> dict[str, float]:
         """Unpack a generator output and compute the validation metrics on it."""

@@ -10,8 +10,11 @@ lineage metadata only — there is no "legacy" vs "novel" split.
 # effect). Gen-1 statistical: statistical(adr/scvr/cdrs). Gen-2 info/sensitivity:
 # ms3, information(mi), sobol, bradley_terry(bt), task. Gen-3 structural: the 6
 # below (registered programmatically). Gen-4 clinical (gated): clinical(dcms/
-# acss/hibsl). Imports are alphabetical (registration is order-independent).
+# acss/hibsl). Gen-5 (opt-in, never pooled): blackwell, blackwell_relations. Imports
+# are alphabetical (registration is order-independent).
 from .base import BaseRanker
+from .blackwell import BlackwellConfig, BlackwellConsistencyRanker, radial_catalogue
+from .blackwell_relations import BlackwellRelationRanker
 from .bradley_terry import BTConfig, BTRanker
 from .cdscr import CDSCRConfig, CDSCRRanker
 from .clinical import ACSSRanker, DCMSRanker, HiBSLRanker
@@ -78,6 +81,10 @@ for _name, _cls, _desc, _fuses in _GEN3_RANKERS:
 
 __all__ = [
     "BaseRanker",
+    "BlackwellConfig",
+    "BlackwellConsistencyRanker",
+    "BlackwellRelationRanker",
+    "radial_catalogue",
     "CDSCRConfig",
     "CDSCRRanker",
     "LGDRConfig",

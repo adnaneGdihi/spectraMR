@@ -16,11 +16,17 @@ import torch
 from spectramr.config.schemas.training.equivariance_conformal import (
     EquivarianceConformalConfig,
 )
+import pytest
+
+from spectramr.infrastructure.training.strategies.equivariance_conformal_scoring import (
+    _extract_measurement,
+)
+from spectramr.infrastructure.training.strategies.equivariance_conformal_scoring import (
+    two_sample_ks as _two_sample_ks,
+)
 from spectramr.infrastructure.training.strategies.equivariance_conformal_strategy import (
     EquivarianceConformalCalibrationStrategy,
     run_equivariance_calibration,
-    _extract_measurement,
-    _two_sample_ks,
 )
 
 
@@ -133,10 +139,13 @@ def test_two_sample_ks_disjoint_distributions():
     assert p < 0.05  # flagged as non-exchangeable
 
 
-def _make_bare_strategy(cfg, device="cpu"):
+def _make_bare_strategy(cfg, device="cpu", checkpoint_path="frozen/best.safetensors"):
     """Build a strategy instance without running the heavyweight __init__."""
     strat = object.__new__(EquivarianceConformalCalibrationStrategy)
     strat._ec_cfg = cfg
+    strat.config = types.SimpleNamespace(
+        model=types.SimpleNamespace(checkpoint_path=checkpoint_path)
+    )
     strat.device = torch.device(device)
     # _frozen_reconstructor reads self.context.generator then generator_model.
     strat.context = types.SimpleNamespace(generator=torch.nn.Identity())
@@ -222,3 +231,61 @@ def test_setup_coerces_raw_dict_block_to_typed_config():
     assert isinstance(strat._ec_cfg, EquivarianceConformalConfig)
     assert strat._ec_cfg.alpha == 0.1
     assert strat._ec_cfg.num_rotations_K == 16
+
+
+def test_strategy_raises_without_declared_checkpoint():
+    """No model.checkpoint_path would calibrate a random-init network: refuse (rule 3)."""
+    strat = _make_bare_strategy(EquivarianceConformalConfig(num_rotations_K=2), checkpoint_path=None)
+    with pytest.raises(ValueError, match=r"model\.checkpoint_path"):
+        strat.run_calibration(_tensor_loader())
+
+
+def test_strategy_stamps_checkpoint_and_split():
+    strat = _make_bare_strategy(EquivarianceConformalConfig(num_rotations_K=2))
+    report = strat.run_calibration(_tensor_loader())
+    assert report["checkpoint_path"] == "frozen/best.safetensors"
+    assert report["exchangeability_split"] == "within_sample"
+    assert strat.calibration_needs_test_loader is False
+
+
+def test_strategy_held_out_scores_test_loader_separately():
+    cfg = EquivarianceConformalConfig(num_rotations_K=2, exchangeability_split="held_out")
+    strat = _make_bare_strategy(cfg)
+    assert strat.calibration_needs_test_loader is True
+    report = strat.run_calibration(_tensor_loader(n_batches=3), _tensor_loader(n_batches=2))
+    assert report["n_calibration"] == 6
+    assert report["n_test"] == 4
+    assert report["exchangeability"]["test"] == "ks_test"
+    with pytest.raises(ValueError, match="held-out test loader"):
+        strat.run_calibration(_tensor_loader())
+
+
+def test_reachability_factory_to_calibration_hook(tmp_path):
+    """Production path: factory resolves the strategy, the post-training hook hands it
+    the val and test loaders, and the held-out KS report is written."""
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+    from spectramr.pipelines.train import _maybe_run_calibration
+
+    config = types.SimpleNamespace(
+        training=types.SimpleNamespace(strategy_class=None, training_mode="equivariance_conformal")
+    )
+    cls = TrainingStrategyFactory().get_strategy_class(config)
+    assert cls is EquivarianceConformalCalibrationStrategy
+    out = tmp_path / "ks.json"
+    cfg = EquivarianceConformalConfig(
+        num_rotations_K=2, exchangeability_split="held_out", output_artefact=str(out)
+    )
+    strat = _make_bare_strategy(cfg)
+    strat.context = types.SimpleNamespace(generator=torch.nn.Conv2d(1, 1, 3, padding=1))
+    pipeline = types.SimpleNamespace(
+        data_loaders={"val": _tensor_loader(n_batches=2), "test": _tensor_loader(n_batches=3)}
+    )
+    _maybe_run_calibration(strat, pipeline, {"run_output_dir": str(tmp_path)}, None)
+    report = json.loads(out.read_text())
+    assert (report["n_calibration"], report["n_test"]) == (4, 6)
+    assert report["exchangeability_split"] == "held_out"
+    assert json.loads((tmp_path / "calibration_report.json").read_text())["n_test"] == 6
+
+    pipeline.data_loaders.pop("test")
+    with pytest.raises(RuntimeError, match="no test loader"):
+        _maybe_run_calibration(strat, pipeline, {"run_output_dir": str(tmp_path)}, None)

@@ -36,6 +36,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Literal
 
 __all__ = [
     "PhysicalParam",
@@ -100,6 +101,10 @@ def shape_severity_ratio(
         return (math.exp(r * 5.0) - 1.0) / (math.exp(5.0) - 1.0)
     if name == "step":
         return 0.0 if r < 0.5 else 1.0
+    if name == "log":
+        raise ValueError(
+            "log is applied to physical endpoints; only a severity-axis schedule may use it"
+        )
     raise ValueError(
         f"unknown severity schedule {name!r}. Valid: "
         "linear, polynomial, power_law, exponential, step."
@@ -125,10 +130,48 @@ class PhysicalParam:
     units: str
     at_theta_min: float
     at_theta_max: float
+    curve: Literal["affine", "geometric", "one_minus_exp"] = "affine"
+    curve_rate: float = 4.0
+    valid_min: float | None = None
+    valid_max: float | None = None
+    endpoint_kwargs: tuple[str | None, str | None] = (None, None)
+    endpoint_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.curve not in ("affine", "geometric", "one_minus_exp"):
+            raise ValueError(f"unknown curve {self.curve!r}")
+        if self.curve == "geometric" and not (self.at_theta_min > 0 and self.at_theta_max > 0):
+            raise ValueError("a geometric curve needs strictly positive endpoints")
+        if self.curve == "one_minus_exp" and not self.curve_rate > 0:
+            raise ValueError(f"curve_rate must be > 0, got {self.curve_rate}")
+        if (
+            self.valid_min is not None
+            and self.valid_max is not None
+            and self.valid_min > self.valid_max
+        ):
+            raise ValueError(f"valid_min ({self.valid_min}) exceeds valid_max ({self.valid_max})")
 
     def value_at(self, theta: float) -> float:
-        """Affine interpolation. Every current degrader is affine in ``theta``."""
-        return self.at_theta_min + (self.at_theta_max - self.at_theta_min) * float(theta)
+        """Physical value at ``theta`` along ``curve``: affine, geometric or ``1 - exp(-rate theta)``."""
+        t = float(theta)
+        lo, hi = self.at_theta_min, self.at_theta_max
+        if self.curve == "geometric":
+            return lo * (hi / lo) ** t
+        if self.curve == "one_minus_exp":
+            r = self.curve_rate
+            return lo + (hi - lo) * (1.0 - math.exp(-r * t)) / (1.0 - math.exp(-r))
+        return lo + (hi - lo) * t
+
+    def theta_at(self, value: float) -> float:
+        """Inverse of :meth:`value_at`; ``one_minus_exp`` (co-parameters) has none."""
+        lo, hi = self.at_theta_min, self.at_theta_max
+        if self.curve == "one_minus_exp":
+            raise ValueError("theta_at is undefined for one_minus_exp; it only describes co-parameters")
+        if lo == hi:
+            raise ValueError(f"{self.name}: endpoints coincide, theta is not recoverable")
+        if self.curve == "geometric":
+            return math.log(float(value) / lo) / math.log(hi / lo)
+        return (float(value) - lo) / (hi - lo)
 
     @property
     def direction(self) -> SeverityDirection:

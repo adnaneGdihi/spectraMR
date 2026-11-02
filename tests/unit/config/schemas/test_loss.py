@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from spectramr.config.schemas.enums import SignalDomain
 from spectramr.config.schemas.loss import LOSS_LIST_DOMAINS, LossConfigSchema
+from spectramr.models.losses.build_set import declared_build_set
 
 
 class TestLossListDomainsIsTheSSOT:
@@ -181,21 +182,17 @@ class TestEveryListReachesTheBuilder:
             cfg = LossConfigSchema(
                 output_domain=domain, **{block: [{"name": name, "weight": 1.0}]}
             )
-            assert cfg.get_enabled_losses().get(name) == 1.0, (
+            assert declared_build_set(cfg).get(name) == 1.0, (
                 f"{block} does not reach get_enabled_losses, so an arm "
                 "declaring only that list builds nothing"
             )
 
     def test_the_harvest_covers_every_mapped_list(self) -> None:
-        """Guards the loop against a list being added to the schema and the
-        domain map while the harvest keeps its own hand-written tuple."""
-        import inspect
+        """The weight table reads its lists from LOSS_LIST_DOMAINS, so a new list cannot be
+        forgotten: it is derived, not re-enumerated (#1966)."""
+        from spectramr.models.losses import weights
 
-        src = inspect.getsource(LossConfigSchema.get_enabled_losses)
-        assert "LOSS_LIST_DOMAINS" in src, (
-            "get_enabled_losses enumerates loss lists by hand; derive them from "
-            "LOSS_LIST_DOMAINS so a new list cannot be forgotten here"
-        )
+        assert tuple(LOSS_LIST_DOMAINS) == weights.LOSS_LISTS
 
     def test_a_disabled_entry_is_still_excluded(self) -> None:
         cfg = LossConfigSchema(
@@ -204,7 +201,7 @@ class TestEveryListReachesTheBuilder:
                 {"name": "physics_equivariance", "weight": 1.0, "enabled": False}
             ],
         )
-        assert "physics_equivariance" not in cfg.get_enabled_losses()
+        assert "physics_equivariance" not in declared_build_set(cfg)
 
 
 class TestComposedComponentsUseTheSameActivationRule:
@@ -235,7 +232,7 @@ class TestComposedComponentsUseTheSameActivationRule:
                 {"name": "ssim", "weight": 0.1, "enabled": False},
             ]
         )
-        assert cfg.get_enabled_losses() == {"l1": 10.0}
+        assert declared_build_set(cfg) == {"l1": 10.0}
 
     def test_zero_weight_component_is_excluded(self) -> None:
         """``weight: 0`` is the list loop's other guard, and validates here.
@@ -251,12 +248,12 @@ class TestComposedComponentsUseTheSameActivationRule:
                 {"name": "perceptual", "weight": 0.0},
             ]
         )
-        assert cfg.get_enabled_losses() == {"l1": 1.0}
+        assert declared_build_set(cfg) == {"l1": 1.0}
 
     def test_enabled_component_keeps_its_declared_weight(self) -> None:
         """Excluding must not be over-eager: the happy path still passes through."""
         cfg = self._composed([{"name": "l1", "weight": 10.0}])
-        assert cfg.get_enabled_losses() == {"l1": 10.0}
+        assert declared_build_set(cfg) == {"l1": 10.0}
 
     def test_exclude_defaults_still_applies_to_composed(self) -> None:
         """The one rule the composed loop *did* enforce must survive the merge."""
@@ -266,7 +263,7 @@ class TestComposedComponentsUseTheSameActivationRule:
                 "policy": {"exclude_defaults": ["l1"]},
             }
         )
-        assert "l1" not in cfg.get_enabled_losses()
+        assert "l1" not in declared_build_set(cfg)
 
     def test_both_blocks_answer_identically_for_identical_components(self) -> None:
         """The property, stated directly rather than through its symptoms.
@@ -279,12 +276,14 @@ class TestComposedComponentsUseTheSameActivationRule:
             {"name": "ssim", "weight": 0.5, "enabled": False},
             {"name": "perceptual", "weight": 0.0, "enabled": True},
         ]
-        via_composed = self._composed(components).get_enabled_losses()
+        via_composed = declared_build_set(self._composed(components))
 
         list_block = next(iter(LOSS_LIST_DOMAINS))
-        via_list = LossConfigSchema.model_validate(
-            {list_block: components, "output_domain": LOSS_LIST_DOMAINS[list_block]}
-        ).get_enabled_losses()
+        via_list = declared_build_set(
+            LossConfigSchema.model_validate(
+                {list_block: components, "output_domain": LOSS_LIST_DOMAINS[list_block]}
+            )
+        )
 
         assert via_composed == via_list
 

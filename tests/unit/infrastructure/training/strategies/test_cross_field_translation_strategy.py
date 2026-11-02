@@ -31,7 +31,8 @@ class _RecordingRenderer:
     def __init__(self) -> None:
         self.last_cid: object = "unset"
 
-    def encode(self, x):
+    def encode(self, x, b_s):
+        self.last_bs = b_s
         return x
 
     def render(self, q, b_t, cid):
@@ -97,6 +98,7 @@ def test_recon_decreases_toward_target() -> None:
     batch = {
         "input": x,
         "target": y,
+        "field_strength": torch.tensor([0.1, 3.0]),
         "field_strength_target": torch.tensor([7.0, 7.0]),
         "contrast_id": torch.tensor([0, 0]),
     }
@@ -154,6 +156,7 @@ def test_validation_contrast_conditioning_gates_cid() -> None:
         strat._validation_forward(
             torch.rand(2, 1, 16, 16),
             {"use_dc": False},
+            field_strength=torch.tensor([0.1, 3.0]),
             field_strength_target=torch.tensor([7.0, 7.0]),
             contrast_id=torch.tensor([0, 1]),
         )
@@ -186,6 +189,7 @@ def test_validation_forward_renders_at_target_field() -> None:
     pred = strat._validation_forward(
         x0,
         {"use_dc": False, "measured_kspace": None},
+        field_strength=torch.tensor([0.1, 3.0]),
         field_strength_target=torch.tensor([7.0, 7.0]),
         contrast_id=torch.tensor([0, 1]),
     )
@@ -226,3 +230,11 @@ def test_compute_losses_accepts_canonical_trainingbatch() -> None:
         input_batch=tb.input, target_batch=tb.target, epoch=0, batch=tb
     )
     assert torch.isfinite(out["loss_total"])
+
+
+def test_training_encodes_at_the_source_field() -> None:
+    # #197: the Task-1 target field is a constant 7 T; the per-sample SOURCE field must reach
+    # the encoder, or the "field-invariant" latent never sees which field it must factor out.
+    gen = _RecordingRenderer()
+    compute_cross_field_losses(gen, _batch(), lambda_latent_cycle=0.0)
+    torch.testing.assert_close(gen.last_bs, torch.tensor([0.1, 3.0]))

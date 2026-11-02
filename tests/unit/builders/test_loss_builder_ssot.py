@@ -14,6 +14,20 @@ from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.training.builders.loss_builder import LossBuilder
 
 
+@pytest.fixture
+def declare_build_set(monkeypatch):
+    """Stand in for the owner of the build set (models/losses/build_set.py)."""
+
+    def _declare(value):
+        monkeypatch.setattr(
+            "spectramr.infrastructure.training.builders.loss_builder.declared_build_set",
+            lambda _losses: dict(value),
+        )
+
+    return _declare
+
+
+
 class TestLossBuilderSSOT:
     """Test LossBuilder SSOT compliance for new losses."""
 
@@ -102,11 +116,11 @@ class TestLossBuilderSSOT:
 
         return config
 
-    def test_histogram_loss_creation(self, mock_config_with_histogram):
+    def test_histogram_loss_creation(self, mock_config_with_histogram, declare_build_set):
         """Test that histogram_consistency loss is created when enabled."""
-        mock_config_with_histogram.losses.get_enabled_losses.return_value = {
+        declare_build_set({
             "hist": 1.0
-        }
+        })
         builder = LossBuilder(mock_config_with_histogram, "cpu")
         losses = builder.build_reconstruction_losses().build()
 
@@ -115,7 +129,7 @@ class TestLossBuilderSSOT:
         ), "histogram_consistency loss not created (expected key 'hist')"
         assert isinstance(losses["hist"], nn.Module)
 
-    def test_histogram_loss_respects_bins_parameter(self, mock_config_with_histogram):
+    def test_histogram_loss_respects_bins_parameter(self, mock_config_with_histogram, declare_build_set):
         """Test that histogram loss uses bins parameter from config."""
         # ReconstructionLossesConfig is frozen, so we need to create a new one
         recon_config = ReconstructionLossesConfig(
@@ -126,16 +140,16 @@ class TestLossBuilderSSOT:
             enable_perceptual=False,
         )
         mock_config_with_histogram.losses.reconstruction = recon_config
-        mock_config_with_histogram.losses.get_enabled_losses.return_value = {
+        declare_build_set({
             "hist": 1.0
-        }
+        })
 
         builder = LossBuilder(mock_config_with_histogram, "cpu")
         losses = builder.build_reconstruction_losses().build()
 
         assert "hist" in losses
 
-    def test_histogram_loss_disabled_when_weight_zero(self):
+    def test_histogram_loss_disabled_when_weight_zero(self, declare_build_set):
         """Test that histogram loss is NOT created when lambda_hist = 0."""
         config = MagicMock(spec=TrainingSettings)
         config.losses = MagicMock(spec=LossConfigSchema)
@@ -170,7 +184,7 @@ class TestLossBuilderSSOT:
         config.losses.latent_losses = []
         config.losses.lambda_deep_supervision = 0.0
         config.deep_supervision_weight = 0.0
-        config.losses.get_enabled_losses.return_value = {}
+        declare_build_set({})
 
         builder = LossBuilder(config, "cpu")
         losses = builder.build_reconstruction_losses().build()
@@ -179,11 +193,11 @@ class TestLossBuilderSSOT:
             "hist" not in losses
         ), "histogram_consistency should not be created when lambda_hist=0"
 
-    def test_focal_frequency_loss_creation(self, mock_config_with_focal_frequency):
+    def test_focal_frequency_loss_creation(self, mock_config_with_focal_frequency, declare_build_set):
         """Test that focal_frequency loss is created when enabled."""
-        mock_config_with_focal_frequency.losses.get_enabled_losses.return_value = {
+        declare_build_set({
             "ffl": 1.0
-        }
+        })
         builder = LossBuilder(mock_config_with_focal_frequency, "cpu")
         losses = builder.build_reconstruction_losses().build()
 
@@ -191,7 +205,7 @@ class TestLossBuilderSSOT:
         assert isinstance(losses["ffl"], nn.Module)
 
     def test_focal_frequency_loss_respects_alpha_parameter(
-        self, mock_config_with_focal_frequency
+        self, mock_config_with_focal_frequency, declare_build_set
     ):
         """Test that focal frequency loss uses alpha parameter from config."""
         # Change alpha to non-default value
@@ -203,16 +217,16 @@ class TestLossBuilderSSOT:
             enable_perceptual=False,
         )
         mock_config_with_focal_frequency.losses.reconstruction = recon_config
-        mock_config_with_focal_frequency.losses.get_enabled_losses.return_value = {
+        declare_build_set({
             "ffl": 1.0
-        }
+        })
 
         builder = LossBuilder(mock_config_with_focal_frequency, "cpu")
         losses = builder.build_reconstruction_losses().build()
 
         assert "ffl" in losses
 
-    def test_focal_frequency_loss_disabled_when_weight_zero(self):
+    def test_focal_frequency_loss_disabled_when_weight_zero(self, declare_build_set):
         """Test that focal frequency loss is NOT created when lambda_ffl = 0."""
         config = MagicMock(spec=TrainingSettings)
         config.losses = MagicMock(spec=LossConfigSchema)
@@ -247,7 +261,7 @@ class TestLossBuilderSSOT:
         config.losses.latent_losses = []
         config.losses.lambda_deep_supervision = 0.0
         config.deep_supervision_weight = 0.0
-        config.losses.get_enabled_losses.return_value = {}
+        declare_build_set({})
 
         builder = LossBuilder(config, "cpu")
         losses = builder.build_reconstruction_losses().build()
@@ -256,7 +270,7 @@ class TestLossBuilderSSOT:
             "ffl" not in losses
         ), "focal_frequency should not be created when lambda_ffl=0"
 
-    def test_both_losses_created_together(self):
+    def test_both_losses_created_together(self, declare_build_set):
         """Test that both new losses can be created simultaneously."""
         config = MagicMock(spec=TrainingSettings)
         config.losses = MagicMock(spec=LossConfigSchema)
@@ -296,7 +310,7 @@ class TestLossBuilderSSOT:
         config.losses.latent_losses = []
         config.losses.lambda_deep_supervision = 0.0
         config.deep_supervision_weight = 0.0
-        config.losses.get_enabled_losses.return_value = {"hist": 1.0, "ffl": 1.0}
+        declare_build_set({"hist": 1.0, "ffl": 1.0})
 
         builder = LossBuilder(config, "cpu")
         losses = builder.build_reconstruction_losses().build()
@@ -311,7 +325,7 @@ class TestLossBuilderSSOT:
         assert "hist" in losses
         assert "ffl" in losses
 
-    def test_ssot_principle_no_hardcoded_defaults(self, mock_config_with_histogram):
+    def test_ssot_principle_no_hardcoded_defaults(self, mock_config_with_histogram, declare_build_set):
         """Test that builder reads all parameters from config (SSOT compliance)."""
         # Change to non-default values to prove they come from config
         recon_config = ReconstructionLossesConfig(
@@ -322,9 +336,9 @@ class TestLossBuilderSSOT:
             enable_perceptual=False,
         )
         mock_config_with_histogram.losses.reconstruction = recon_config
-        mock_config_with_histogram.losses.get_enabled_losses.return_value = {
+        declare_build_set({
             "hist": 1.0
-        }
+        })
 
         builder = LossBuilder(mock_config_with_histogram, "cpu")
         losses = builder.build_reconstruction_losses().build()

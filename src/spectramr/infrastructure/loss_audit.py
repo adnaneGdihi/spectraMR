@@ -471,7 +471,7 @@ def audit_losses(config: LossConfigSchema) -> LossAuditResult:
         # (b) Composite-bundled — built INSIDE another loss via lambda
         #     parameters. The composite shows up under its own key
         #     (e.g. ``adversarial``); the sub-loss appears in
-        #     ``get_enabled_losses()`` but never in ``built_losses``.
+        #     the build set but never in ``built_losses``.
         # (c) Context-requiring — built by LossBuilder, but ``forward()``
         #     needs a strategy-injected ``context`` dict that the synthetic
         #     forward test below cannot supply. Marking them strategy-

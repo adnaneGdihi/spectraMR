@@ -11,6 +11,11 @@ synthesize an ultra-high SNR pseudo-ground truth by averaging
 uncombined complex k-space across all repetitions, then reconstructing
 via the SENSE adjoint.
 
+Everything here is a pure tensor (or header-string) function. The file reads live in
+:mod:`spectramr.data.datasets.kspace_volume_stack`, and the path-taking 2-D reference
+:func:`~spectramr.data.datasets.pseudo_gt_reference.synthesize_pseudo_gt` composes the two
+(rule 7).
+
 Reference:
     Macovski (1996), "Noise in MRI", MRM — complex k-space averaging
     increases baseline SNR by sqrt(N_reps) prior to the non-linear
@@ -24,7 +29,6 @@ import re
 from collections import Counter
 from pathlib import Path
 
-import h5py
 import torch
 
 logger = logging.getLogger(__name__)
@@ -123,31 +127,19 @@ def _encoded_triple(xml: str, block: str) -> tuple[float, float, float] | None:
     return tuple(float(m.group(1)) for m in axes)  # type: ignore[union-attr]
 
 
-def read_acquisition_params(path: Path) -> dict[str, object]:
-    """Acquisition parameters from an M4Raw file's ``ismrmrd_header``.
+def parse_acquisition_header(xml: str) -> dict[str, object]:
+    """Acquisition parameters from an ISMRMRD header string (M4Raw and fastMRI).
 
     The data has always carried these; nothing read them. ``brc`` and ``qvcr`` reported
     ``needs acq_params`` and ``phys_residual_consistency`` raised *"requires
     ``acquisition`` (TR/TE/TI in ms)"*, on files whose header states
-    ``TR=7500, TE=98, TI=1655, flipAngle=160 deg`` outright — three metrics declared
-    inapplicable for want of a parser (#606).
+    ``TR=7500, TE=98, TI=1655, flipAngle=160 deg`` outright (#606).
 
     Numeric tags are returned as floats and string tags verbatim; a tag that is absent
     is simply omitted rather than defaulted, so a downstream metric sees "not supplied"
-    rather than a fabricated value.
-
-    Returns:
-        ``{}`` when the file has no header or no recognised tag — the honest empty,
-        which keeps the metric ``not_applicable`` instead of feeding it invented physics.
+    rather than a fabricated value. The file read lives in
+    :func:`spectramr.data.datasets.kspace_volume_stack.read_acquisition_params`.
     """
-    if not path.exists():
-        raise FileNotFoundError(f"H5 file not found: {path}")
-    with h5py.File(str(path), "r") as f:
-        if "ismrmrd_header" not in f:
-            return {}
-        raw = f["ismrmrd_header"][()]
-    xml = raw.decode() if isinstance(raw, bytes | bytearray) else str(raw)
-
     out: dict[str, object] = {}
     for tag, key in _ACQ_PARAM_TAGS.items():
         # Namespace-agnostic: M4Raw writes ``<ns0:TR>``, other vendors write ``<TR>``.
@@ -170,133 +162,53 @@ def read_acquisition_params(path: Path) -> dict[str, object]:
     return out
 
 
-def _kspace_shape_from_h5(path: Path) -> tuple[int, ...]:
-    """The ``kspace`` dataset's shape, read from the HDF5 header only.
+def nex_merge(
+    reps: list[torch.Tensor], labels: list[Path]
+) -> tuple[torch.Tensor, list[Path]]:
+    """Complex k-space mean over the largest shape-consistent subset of ``reps``.
 
-    No voxel IO: h5py exposes ``.shape`` from the dataset metadata. Used to pick
-    the target slice before deciding what to read, so the reps are never fully
-    materialised just to learn how many slices they have (#616).
+    Each rep is ``(Coils, H, W)`` (one slice) or ``(Slices, Coils, H, W)`` (a volume);
+    the mean keeps that shape. Returns ``(mean, labels of the reps kept)``.
     """
-    if not path.exists():
-        raise FileNotFoundError(f"H5 file not found: {path}")
-    with h5py.File(str(path), "r") as f:
-        if "kspace" not in f:
-            raise KeyError(f"No 'kspace' dataset in {path}. Keys: {list(f.keys())}")
-        return tuple(int(d) for d in f["kspace"].shape)
+    kept, kept_labels = _select_consistent_reps(reps, labels)
+    n_reps = len(kept)
+    logger.info(
+        "Synthesizing pseudo-GT from %d repetitions (SNR boost √%d = %.2f)",
+        n_reps,
+        n_reps,
+        n_reps**0.5,
+    )
+    return torch.stack(kept, dim=0).mean(dim=0), kept_labels
 
 
-def _load_kspace_from_h5(path: Path, slice_index: int | None = None) -> torch.Tensor:
-    """Load complex k-space tensor from an M4Raw H5 file.
-
-    Mirrors the proven logic in
-    :class:`~spectramr.data.datasets.m4raw_dataset.M4RawRepetitionDataset`.
-
-    Args:
-        path: H5 file.
-        slice_index: When given, read ONLY that slice through h5py's partial
-            read instead of materialising the whole volume. Pseudo-GT synthesis
-            averages one slice across every repetition, so reading all of them
-            held N whole multi-slice volumes to use N single slices (#616).
-
-    Returns:
-        Complex float32 tensor, ``(Slices, Coils, H, W)`` — or that shape with
-        the leading axis dropped when *slice_index* is given.
-    """
-    if not path.exists():
-        raise FileNotFoundError(f"H5 file not found: {path}")
-
-    with h5py.File(str(path), "r") as f:
-        if "kspace" not in f:
-            raise KeyError(f"No 'kspace' dataset in {path}. Keys: {list(f.keys())}")
-        raw = f["kspace"][()] if slice_index is None else f["kspace"][slice_index]
-
-    t = torch.from_numpy(raw)
-    if not torch.is_complex(t):
-        if t.shape[-1] == 2:
-            t = torch.view_as_complex(t.contiguous().float())
-        else:
-            t = t.float()
-    else:
-        t = t.to(torch.complex64)
-    return t
-
-
-def extract_contrast_label(path: Path) -> str:
-    """Extract an MRI contrast label from an acquisition filename.
-
-    Handles both naming schemes we ingest:
-
-    - **fastMRI brain** — ``file_brain_AXT2FLAIR_201_6002670`` → ``AXT2FLAIR``
-      (the ``AX*`` acquisition token; also ``AXT1``/``AXT2``/``AXFLAIR``/
-      ``AXT1POST``/``AXT1PRE``). Without this the M4Raw pattern below silently
-      fell through to ``return stem`` and mislabelled every brain volume with
-      its full filename (issue #307).
-    - **M4Raw** — ``2022091411_T101`` → ``T1``, ``..._T201`` → ``T2``,
-      ``..._FLAIR01`` → ``FLAIR``. The contrast token is everything after the
-      last ``_`` minus the trailing 2-digit repetition index (matching
-      ``M4RawSource._group_id``'s ``stem[:-2]``). The old letters-only pattern
-      captured just the leading letters, so ``T1`` and ``T2`` both collapsed to
-      ``T`` and ``available_contrasts`` conflated them (issue #307).
-    """
-    stem = path.stem
-    # fastMRI brain acquisition token: ``_AX<...>_<digits>`` (T1/T2/FLAIR/POST/PRE).
-    fastmri = re.search(r"_(AX[A-Za-z0-9]+?)_\d", stem)
-    if fastmri:
-        return fastmri.group(1).upper()
-    # M4Raw: <contrast><field?> then the 2-digit repetition suffix. Keep the
-    # field digit (T1 vs T2); strip only the rep index.
-    m4raw = re.search(r"_([A-Za-z]+\d*?)\d{2}$", stem)
-    if m4raw:
-        return m4raw.group(1).upper()
-    logger.warning("Could not extract contrast from %r, using stem.", stem)
-    return stem
-
-
-def synthesize_pseudo_gt(
-    rep_paths: list[Path],
-    target_slice: int | None = None,
-    device: torch.device = torch.device("cpu"),
-    smaps: torch.Tensor | None = None,
+def pseudo_gt_from_kspace(
+    y_gt: torch.Tensor, smaps: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Synthesize ultra-high SNR pseudo-ground truth from multi-repetition data.
+    r"""Pseudo ground truth from NEX-merged, fully sampled k-space ``(B, Coils, H, W)``.
 
     Multi-repetition merge is **NEX averaging in complex k-space** (Macovski 1996,
     *Noise in MRI*): averaging :math:`N` complex repetitions before the magnitude
-    operation gives the full :math:`\sqrt{N}` SNR boost (magnitude-domain averaging
-    would not, because of the Rician noise floor). The coil maps are the canonical
-    7-step **ESPIRiT** (Uecker 2014) estimated from that high-SNR merged k-space.
+    operation gives the full :math:`\sqrt{N}` SNR boost. The coil maps are the
+    canonical 7-step **ESPIRiT** (Uecker 2014) estimated from that merged k-space.
 
     .. math::
 
-        Y_{GT} = \frac{1}{N_{\text{reps}}} \sum_{i=1}^{N_{\text{reps}}} Y_i
-        \qquad
         \hat{x}_{GT} = A^H(Y_{GT}, S) = \sum_c S_c^* \cdot \text{IFFT}(Y_{GT,c})
 
+    ``B`` is one slice for the 2-D reference and every slice of a volume for the
+    volume stack; one robust 99th percentile normalises the whole batch, so the
+    slices of a volume keep their relative intensity.
+
     Args:
-        rep_paths: Sorted list of H5 file paths for one anatomy group
-            (all repetitions of the same contrast/subject).
-        target_slice: If provided, extract only this slice index.
-            Otherwise uses the central slice.
-        device: Target device for output tensors.
-        smaps: Optional pre-estimated ESPIRiT maps ``(1, C_coils, H, W)`` to
-            **reuse** instead of re-estimating. The intended use is sim->real
-            transfer: estimate ESPIRiT once from the NEX-merged multi-rep
-            reference, then pass those maps when reconstructing each single-rep
-            *degraded* acquisition so reference and degraded share ONE coil
-            operator. The comparison then isolates the noise/averaging
-            degradation rather than a per-acquisition recon-basis shift, and a
-            single noisy rep never drives its own (poor) map estimate.
+        y_gt: Complex k-space, ``(B, Coils, H, W)``.
+        smaps: Optional pre-estimated maps of ``y_gt``'s shape to **reuse** instead of
+            re-estimating, so a single-rep *degraded* acquisition shares the NEX-merged
+            reference's coil operator (sim->real transfer).
 
     Returns:
-        ``(coil_images, smaps, x_gt_mag, p99)``:
-            - ``coil_images`` — complex ``(1, C_coils, H, W)`` image-domain
-              tensor (NOT k-space — DigitalTwinSimulator expects image domain).
-            - ``smaps`` — ESPIRiT coil sensitivity maps ``(1, C_coils, H, W)``
-              (the reused maps verbatim when ``smaps`` was provided).
-            - ``x_gt_mag`` — SENSE-adjoint magnitude image ``(1, 1, H, W)``,
-              normalised to ``[0, 1]`` by robust 99th-percentile.
-            - ``p99`` — the raw 99th-percentile scalar (so callers can
-              normalise degraded images consistently).
+        ``(coil_images, smaps, x_gt_mag, p99)``: complex image-domain coil images
+        ``(B, Coils, H, W)`` (NOT k-space), the maps, the SENSE-adjoint magnitude
+        ``(B, 1, H, W)`` divided by ``p99``, and the raw ``p99`` scalar.
     """
     from spectramr.infrastructure.physics.coil_sensitivity import (
         coil_combine_sense,
@@ -305,96 +217,10 @@ def synthesize_pseudo_gt(
     )
     from spectramr.infrastructure.physics.fft_ops import ifft2c
 
-    # Two cheap passes instead of one expensive one (#616). Pseudo-GT averages
-    # ONE slice across every repetition, but the target slice is derived from
-    # the slice count — so the old single pass loaded every rep in full to learn
-    # a number, held them all resident, and then used one slice each. For an
-    # M4Raw multi-slice multi-coil acquisition that is the whole volume per rep.
-    #
-    # Pass 1 reads shapes from the HDF5 header (no voxel IO). Pass 2 reads only
-    # the chosen slice. The per-file error handling is unchanged and now covers
-    # both passes, so a rep that fails either way is still named rather than
-    # crashing the run.
-    errors: list[str] = []
-    shapes: dict[Path, tuple[int, ...]] = {}
-    for p in rep_paths:
-        try:
-            shapes[p] = _kspace_shape_from_h5(p)
-        except FileNotFoundError as exc:
-            errors.append(f"{p.name}: {exc}")
-            logger.warning("File not found: %s", p)
-        except KeyError as exc:
-            errors.append(f"{p.name}: {exc}")
-            logger.warning("No kspace dataset in %s: %s", p, exc)
-        except Exception as exc:  # defensive: surfaced via errors[]
-            errors.append(f"{p.name}: {type(exc).__name__}: {exc}")
-            logger.warning("Failed to probe %s: %s: %s", p, type(exc).__name__, exc)
-
-    if not shapes:
-        raise RuntimeError(
-            f"All {len(rep_paths)} repetition files failed to load.\n"
-            f"Errors:\n" + "\n".join(f"  • {e}" for e in errors)
-        )
-
-    # The slice count comes from the first rep that probed, matching the old
-    # "first successfully loaded rep" semantics.
-    n_slices = next(iter(shapes.values()))[0]
-    if target_slice is None:
-        target_slice = n_slices // 2
-    target_slice = min(target_slice, n_slices - 1)
-
-    slices: list[torch.Tensor] = []
-    loaded_paths: list[Path] = []
-    for p, shape in shapes.items():
-        try:
-            ks = _load_kspace_from_h5(p, slice_index=min(target_slice, shape[0] - 1))
-        except Exception as exc:  # defensive: surfaced via errors[]
-            errors.append(f"{p.name}: {type(exc).__name__}: {exc}")
-            logger.warning("Failed to load %s: %s: %s", p, type(exc).__name__, exc)
-            continue
-        # The leading (slice) axis is already gone: 4-D -> (Coils, H, W),
-        # 3-D single-coil -> (H, W) which still needs a coil axis.
-        if ks.dim() == 3:
-            slices.append(ks)
-        elif ks.dim() == 2:
-            slices.append(ks.unsqueeze(0))
-        else:
-            raise ValueError(f"Unexpected kspace slice shape: {ks.shape}")
-        loaded_paths.append(p)
-        logger.debug("Loaded rep %s slice %d: shape=%s", p.name, target_slice, ks.shape)
-
-    if not slices:
-        raise RuntimeError(
-            f"All {len(rep_paths)} repetition files failed to load.\n"
-            f"Errors:\n" + "\n".join(f"  • {e}" for e in errors)
-        )
-
-    # NEX averaging is only valid across reps that share one receive array. Reps
-    # whose selected slice differs in (Coils, H, W) are not a valid NEX set (coil
-    # c of a 20-coil scan is a different physical element than coil c of a 16-coil
-    # scan), so keep the largest consistent subset and name the drops at WARNING
-    # rather than crash torch.stack or silently average incompatible reps (#16).
-    slices, _ = _select_consistent_reps(slices, loaded_paths)
-
-    n_reps = len(slices)
-    logger.info(
-        "Synthesizing pseudo-GT from %d repetitions (SNR boost √%d = %.2f)",
-        n_reps,
-        n_reps,
-        n_reps**0.5,
-    )
-
-    stacked = torch.stack(slices, dim=0)  # (N_reps, Coils, H, W)
-    y_gt = stacked.mean(dim=0, keepdim=False).unsqueeze(0).to(device)  # (1, Coils, H, W)
-
+    if y_gt.dim() != 4 or not y_gt.is_complex():
+        raise ValueError(f"y_gt must be complex (B, Coils, H, W); got {tuple(y_gt.shape)}")
     n_coils = y_gt.shape[1]
-    logger.info(
-        "Pseudo-GT k-space: shape=%s, n_coils=%d, slice=%d/%d",
-        y_gt.shape,
-        n_coils,
-        target_slice,
-        n_slices,
-    )
+    logger.info("Pseudo-GT k-space: shape=%s, n_coils=%d", tuple(y_gt.shape), n_coils)
 
     if smaps is not None:
         # Reuse caller-provided maps (the NEX-merged reference's ESPIRiT maps
@@ -495,11 +321,9 @@ def synthesize_pseudo_gt(
     else:
         smaps = torch.ones_like(y_gt)
 
-    coil_images = ifft2c(y_gt)  # (1, Coils, H, W)
-    if n_coils > 1:
-        x_gt_complex = coil_combine_sense(coil_images, smaps)  # (1, 1, H, W)
-    else:
-        x_gt_complex = coil_images
+    coil_images = ifft2c(y_gt)  # (B, Coils, H, W)
+    # (B, 1, H, W); a single coil is its own combination.
+    x_gt_complex = coil_combine_sense(coil_images, smaps) if n_coils > 1 else coil_images
 
     x_gt_mag = x_gt_complex.abs().float()
     p99 = torch.quantile(x_gt_mag.flatten(), 0.99).clamp(min=1e-8)
@@ -520,8 +344,7 @@ def synthesize_pseudo_gt(
 
 
 __all__ = [
-    "_load_kspace_from_h5",
-    "extract_contrast_label",
-    "read_acquisition_params",
-    "synthesize_pseudo_gt",
+    "nex_merge",
+    "parse_acquisition_header",
+    "pseudo_gt_from_kspace",
 ]

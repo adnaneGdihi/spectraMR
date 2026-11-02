@@ -1539,11 +1539,19 @@ class TestOnEpochDefaultMatchesRealisedBehaviour:
 
         assert ValidationScheduleConfigSchema().on_epoch is False
 
+    #: Arms written after the trigger went live that opt in on purpose; they never ran
+    #: under the dead gate, so the default flip cannot have changed their behaviour.
+    _OPTED_IN_AFTER_THE_FLIP = frozenset({
+        # 79b76c48c (2026-10-29): epochs 40, interval_epochs 1, early-stopping patience 8.
+        "pc4d_synth_supervised_r6.yaml",
+    })
+
     def test_no_arm_asks_for_epoch_mode_in_either_spelling(self):
         """Measured 2026-08-05: 0 arms declare it true under the current name,
-        and all 1395 legacy `eval_on_epoch` declarations are `false`. If this
-        ever goes red, the default flip is no longer behaviour-preserving and
-        the corpus impact must be re-measured before shipping."""
+        and all 1395 legacy `eval_on_epoch` declarations are `false`. Re-measured
+        2026-10-30: one arm declares it, written after the trigger went live
+        (``_OPTED_IN_AFTER_THE_FLIP``). If this goes red, the default flip is no
+        longer behaviour-preserving and the corpus impact must be re-measured."""
         import pathlib
 
         import yaml as _yaml
@@ -1565,7 +1573,8 @@ class TestOnEpochDefaultMatchesRealisedBehaviour:
             sched = val.get("schedule")
             if isinstance(sched, dict) and sched.get("on_epoch") is True:
                 asked.append(p.name)
-        assert not asked, f"arms now request epoch mode: {sorted(set(asked))[:10]}"
+        unexpected = set(asked) - self._OPTED_IN_AFTER_THE_FLIP
+        assert not unexpected, f"arms now request epoch mode: {sorted(unexpected)[:10]}"
 
 
 # ── the cascade drain (issue #697) ───────────────────────────────────────────
@@ -2254,6 +2263,8 @@ def _guard_config(
     on_epoch=False,
     interval_epochs=1,
     with_validation=True,
+    epochs=None,
+    training_mode=None,
 ):
     validation = (
         SimpleNamespace(
@@ -2268,7 +2279,12 @@ def _guard_config(
     )
     return SimpleNamespace(
         data=None,
-        training=SimpleNamespace(max_iterations=max_iterations, epochs=None),
+        training=SimpleNamespace(
+            max_iterations=max_iterations,
+            epochs=epochs,
+            training_mode=training_mode,
+            strategy_class=None,
+        ),
         logging=LoggingConfigSchema(intervals={"log": 100}),
         metrics=SimpleNamespace(train_metric_interval=100),
         validation=validation,
@@ -2351,6 +2367,21 @@ class TestValidationIntervalBudgetGuard:
             _guard_config(4000, 5000, on_epoch=True), _guard_pipeline(train_len=10)
         )
         assert not isinstance(verdict, ConfigurationError), str(verdict)
+
+    def test_a_certify_only_mode_passes_its_zero_budget(self):
+        """#1374: the calibration arms' val loader is the cohort the post-loop hook
+        certifies, so `epochs: 0` must reach that hook instead of this raise."""
+        for mode in ("calibration", "phys_residual_conformal", "validation_badge"):
+            verdict = _guard_verdict(
+                _guard_config(0, 1, epochs=0, training_mode=mode), _guard_pipeline()
+            )
+            assert not isinstance(verdict, ConfigurationError), f"{mode}: {verdict}"
+
+    def test_a_training_mode_with_the_same_zero_budget_still_raises(self):
+        verdict = _guard_verdict(
+            _guard_config(0, 1, epochs=0, training_mode="reconstruction"), _guard_pipeline()
+        )
+        assert isinstance(verdict, ConfigurationError), repr(verdict)
 
     def test_epoch_mode_with_an_epoch_longer_than_the_budget_still_raises(self):
         verdict = _guard_verdict(
@@ -3150,15 +3181,21 @@ class TestProducerDeclaredColumns:
             NoiseToNoiseStrategy,
         )
 
+        from spectramr.infrastructure.training.strategies.reconstruction import (
+            ReconstructionStepMixin,
+        )
+
         assert BaseTrainingStrategy.forwards_loss_components is False
-        for cls in (
-            NoiseToNoiseStrategy,
-            HSSCStrategy,
-            DIFFSirenStrategy,
-            DiffusionTrainingStrategy,
-        ):
+        for cls in (HSSCStrategy, DIFFSirenStrategy, DiffusionTrainingStrategy):
             assert cls.forwards_loss_components is True, cls.__name__
             assert "update(loss_output.components)" in inspect.getsource(cls), cls.__name__
+        # Noise2Noise has no step of its own: it forwards through the inherited reconstruction step.
+        assert NoiseToNoiseStrategy.forwards_loss_components is True
+        step = ReconstructionStepMixin._compute_losses_impl
+        assert NoiseToNoiseStrategy._compute_losses_impl is step
+        step_src = inspect.getsource(step)
+        assert "components = loss_output.components" in step_src
+        assert "self._loss_dict_reuse.update(components)" in step_src
 
     def test_production_path_calls_the_resolver(self):
         assert "resolve_producer_declared_columns" in _calls_in_training_loop()
@@ -3433,7 +3470,7 @@ class TestSchedulerLrCallSiteIsPinned:
 # ---------------------------------------------------------------------------
 # Wall-clock yield: stopping in time to write a checkpoint.
 #
-# A production arm gets 120h per job and needs more. What was missing was never
+# A production arm gets 96 h per job and needs more. What was missing was never
 # resume -- the checkpoint has carried every piece of state all along -- it was
 # STOPPING IN TIME TO WRITE ONE. These pin the four places the yield has to
 # touch, each of which is independently satisfiable while the feature is dead:
@@ -3775,7 +3812,12 @@ def test_the_final_checkpoint_carries_strategy_state_and_the_live_scaler(
     monkeypatch.setattr(
         strategy, "amp_helper", SimpleNamespace(scaler=_LiveScaler()), raising=False
     )
-    written = codecs.read(real_save(pipeline, **kw))
+    # checkpoint.async_write defaults on: the replayed save is queued, so land it before reading.
+    writer = kw.get("writer")
+    path = real_save(pipeline, **kw)
+    if writer is not None:
+        writer.close()
+    written = codecs.read(path)
     assert torch.equal(written["strategy"]["params"]["sigma"], owned["params"]["sigma"])
     assert written["scaler"] == {"scale": 1024.0, "_growth_tracker": 7}
 
@@ -4918,3 +4960,61 @@ def test_a_validation_declared_off_is_not_warned_about_as_a_missing_loader():
 
     assert "_validation_declared_off = validation_declared_off(config.validation)" in src
     assert "if logging_service and not _validation_declared_off:" in src
+
+
+class TestTrainMetricColumnsOptOut:
+    """#183: a strategy whose step never scores ``train_*`` must not be given the columns."""
+
+    def test_default_and_opt_out(self):
+        from spectramr.pipelines.training_loop import strategy_reports_train_metrics
+
+        class _Quiet:
+            reports_train_metrics = False
+
+        assert strategy_reports_train_metrics(object())
+        assert not strategy_reports_train_metrics(_Quiet())
+
+    @pytest.mark.parametrize(
+        ("module", "cls"),
+        [
+            ("multi_acquisition_strategy", "ConcreteMultiAcquisitionStrategy"),
+            ("bloch_manifold_dps_strategy", "BlochManifoldDPSStrategy"),
+            ("equivariance_conformal_strategy", "EquivarianceConformalCalibrationStrategy"),
+            ("hamiltonian_acquisition_strategy", "HamiltonianAcquisitionStrategy"),
+            ("motion_meta_strategy", "ConcreteMotionMetaTrainingStrategy"),
+            ("se3_equivariant_navigator_strategy", "SE3EquivariantNavigatorStrategy"),
+            ("tto_strategy", "ConcreteTTOStrategy"),
+        ],
+    )
+    def test_strategies_that_never_score_train_metrics_opt_out(self, module, cls):
+        import importlib
+
+        strategy = getattr(
+            importlib.import_module(f"spectramr.infrastructure.training.strategies.{module}"), cls
+        )
+        assert strategy.reports_train_metrics is False
+        source = "".join(inspect.getsource(k) for k in strategy.__mro__ if k.__name__ == cls)
+        assert "_compute_training_metrics" not in source and "_score_training_views" not in source
+
+    def test_production_path_calls_the_gate(self):
+        assert "strategy_reports_train_metrics" in _calls_in_training_loop()
+
+
+def test_evaluate_record_false_writes_no_curves(monkeypatch):
+    """An unrecorded re-score (the compression export) must not reach the val curves."""
+    import spectramr.pipelines.training_loop as training_loop_mod
+
+    captured: dict = {}
+
+    def fake_validation(*args, **kw):
+        captured.update(kw)
+        return {"val_psnr": 30.0}
+
+    monkeypatch.setattr(training_loop_mod, "_run_validation", fake_validation)
+    pipeline = MagicMock()
+    pipeline.generator.training = False
+    loop = TrainingLoop("strat", pipeline, "cfg", "unet", metrics_service="met", tb_writer="tb")
+    assert loop.evaluate(record=False) == {"val_psnr": 30.0}
+    assert captured["metrics_service"] is None
+    assert captured["tb_writer"] is None
+    assert captured["split"] == "val"

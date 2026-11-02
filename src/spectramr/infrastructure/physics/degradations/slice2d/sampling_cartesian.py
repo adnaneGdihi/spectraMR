@@ -5,7 +5,11 @@ from __future__ import annotations
 
 import torch
 
-from spectramr.infrastructure.physics.degradations._common import _ensure_complex, _generator
+from spectramr.infrastructure.physics.degradations._common import (
+    _ensure_complex,
+    _generator,
+    reject_override_with_endpoint,
+)
 from spectramr.infrastructure.physics.digital_twin_simulator import (
     outer_line_count,
     simulate_gibbs_ringing,
@@ -37,7 +41,9 @@ def degrade_cartesian_undersampling(
     device = x.device
     g = _generator(device, seed)
 
-    n_center = max(1, int(H * center_fraction))
+    # Past R = 1/center_fraction the ACS alone exceeds the line budget; it then takes
+    # the whole budget, so the realised R still reaches the declared one.
+    n_center = min(max(1, int(H * center_fraction)), max(1, round(H / R)))
     cs = H // 2 - n_center // 2
     ce = cs + n_center
     n_outer = outer_line_count(H, n_center, R)
@@ -85,7 +91,8 @@ def degrade_variable_density_cartesian(
     device = x.device
     g = _generator(device, seed)
 
-    n_center = max(1, int(H * center_fraction))
+    # Same ACS cap as D3: past R = 1/center_fraction the ACS takes the whole budget.
+    n_center = min(max(1, int(H * center_fraction)), max(1, round(H / R)))
     cs = H // 2 - n_center // 2
     ce = cs + n_center
 
@@ -98,7 +105,7 @@ def degrade_variable_density_cartesian(
     # Outer-line budget: the ACS lines count TOWARDS the declared acceleration,
     # they are not free (issue #246 — the old `(H - n_center) / R` budget realised
     # R = 5.3 at a declared R = 8).
-    n_target = max(1, outer_line_count(H, n_center, R))
+    n_target = outer_line_count(H, n_center, R)
     # Incoherent variable-density draw: keep n_target DISTINCT outer lines sampled
     # WITHOUT replacement with probability proportional to p(k_y). ``topk`` would
     # deterministically keep the highest-p (central) lines -- a contiguous low-pass
@@ -106,11 +113,11 @@ def degrade_variable_density_cartesian(
     # that variable-density sampling is defined by (Lustig 2007). ``multinomial`` keeps
     # the EXACT declared count (honours #246) while distributing the kept lines
     # incoherently across the spectrum.
-    top = torch.multinomial(p_lines_outer, n_target, replacement=False, generator=g)
-
     mask = torch.zeros(1, 1, H, 1, device=device)
     mask[..., cs:ce, :] = 1.0
-    mask[..., top, :] = 1.0
+    if n_target > 0:
+        top = torch.multinomial(p_lines_outer, n_target, replacement=False, generator=g)
+        mask[..., top, :] = 1.0
     return ifft2c(fft2c(x) * mask)
 
 
@@ -155,12 +162,16 @@ def degrade_partial_fourier(
     return ifft2c(k * mask)
 
 
-def _delegate_gibbs(x, theta, seed=0, **kw):
+def _delegate_gibbs(x, theta, seed=0, min_truncation_radius=0.085, **kw):
     x = _ensure_complex(x)
+    reject_override_with_endpoint(
+        "gibbs", "truncation_fraction", kw.get("truncation_fraction"),
+        "min_truncation_radius", min_truncation_radius, 0.085,
+    )
     # theta=1 retains 8.5% of the k-space RADIUS, producing heavy truncation
     # ringing. The floor moved 0.12 -> 0.085 when the window's radius was
     # normalised by its true maximum (#246): 0.12 / sqrt(2) = 0.085 is the same
     # physical window as before, so the theta=1 severity is unchanged while
     # theta=0 becomes a genuine identity instead of a 22.8%-of-k-space pedestal.
-    trunc = float(kw.get("truncation_fraction", 1.0 - float(theta) * 0.915))
+    trunc = float(kw.get("truncation_fraction", 1.0 - float(theta) * (1.0 - min_truncation_radius)))
     return ifft2c(simulate_gibbs_ringing(fft2c(x), truncation_fraction=trunc))

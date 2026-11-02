@@ -955,6 +955,8 @@ class DisentangledMRI(nn.Module, IGenerator):
         # The disentangled_vae strategy conditions on [TR, TE, TI, B0]; built here so the
         # optimizer and a fresh state_dict both see the projection (#2388).
         self.phys_to_style_proj = nn.Linear(PHYSICS_VECTOR_DIM, style_dim)
+        # The posterior variance of that physics-conditioned style code (zero-init below).
+        self.phys_to_style_logvar = nn.Linear(PHYSICS_VECTOR_DIM, style_dim) if use_vae else None
         self.gen = Generator(
             self.enc_c.output_dim,
             style_dim,
@@ -1008,6 +1010,11 @@ class DisentangledMRI(nn.Module, IGenerator):
         # [FIX] Initialize physics heads with physiologically plausible values
         # This MUST be called after apply(_init_weights) to avoid being overwritten
         self._init_physics_heads()
+
+        # Unit variance at step 0 (the variance this path used to fix); training learns it.
+        if self.phys_to_style_logvar is not None:
+            nn.init.zeros_(self.phys_to_style_logvar.weight)
+            nn.init.zeros_(self.phys_to_style_logvar.bias)
 
         # Validate no NaN in initial weights
         self._validate_weights()
@@ -1154,7 +1161,7 @@ class DisentangledMRI(nn.Module, IGenerator):
             Tuple of (output, mu, logvar) for VAE strategy compatibility.
             output: Either image tensor or dict of tissue params {rho, t1, t2, t2star, chi, adc}
             mu: Style encoding
-            logvar: Zeros (no KL regularization)
+            logvar: Style log-variance (zeros when use_vae is off)
 
         forward method for DisentangledMRI.
 
@@ -1206,10 +1213,11 @@ class DisentangledMRI(nn.Module, IGenerator):
         # skip the StyleEncoder (which uses Conv2d and requires 4D image input).
         # Use the vector directly as the style code.
         if x_style_source.ndim == 2:
-            style_output = self._style_from_vector(x_style_source)
-            # In VAE mode, create dummy logvar for compatibility
-            if self.use_vae:
-                style_output = (style_output, torch.zeros_like(style_output))
+            style_output = (
+                self._style_posterior_from_vector(x_style_source)
+                if self.use_vae
+                else self._style_from_vector(x_style_source)
+            )
         else:
             style_output = self.enc_s(x_style_source)
 
@@ -1285,6 +1293,19 @@ class DisentangledMRI(nn.Module, IGenerator):
             f"style vector has width {vec.shape[-1]}; expected style_dim={style_dim} "
             f"or the {PHYSICS_VECTOR_DIM}-element physics vector"
         )
+
+    def _style_posterior_from_vector(
+        self, vec: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(mu, logvar) of q(style | physics vector); one learned Gaussian per acquisition."""
+        if vec.shape[-1] != PHYSICS_VECTOR_DIM or vec.shape[-1] == self.enc_s.output_dim:
+            raise ValueError(
+                f"use_vae needs the {PHYSICS_VECTOR_DIM}-element physics vector as a 2-D style "
+                f"source (got width {vec.shape[-1]}, style_dim={self.enc_s.output_dim}); a "
+                "ready style code carries no posterior to sample"
+            )
+        logvar = torch.clamp(self.phys_to_style_logvar(vec), min=-10.0, max=10.0)
+        return self.phys_to_style_proj(vec), logvar
 
     def decode(self, content: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
         """Decode content + style to image.

@@ -21,7 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from spectramr.config.schemas.data import AcquisitionParamsSchema
 
@@ -167,8 +167,48 @@ class ProtocolSamplingConfig(BaseModel):
     site_weights: dict[str, float] = Field(default_factory=dict)
 
 
+class SynthesisTissuePriorConfig(BaseModel):
+    """The frozen Phase-1 prior Stage C reverse-samples, and the schedule it was trained on.
+
+    The checkpoint stores weights only, so the architecture and the diffusion schedule are
+    restated here and must equal the Stage-A arm's ``model.model_kwargs`` and
+    ``training.diffusion``; ``prediction_type`` is the objective Stage A trained (``sample``
+    when it declares no ``prediction_type``).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())
+
+    checkpoint: Path
+    part: Literal["generator", "ema"]
+    model_kwargs: dict[str, Any] = Field(default_factory=dict)
+    timesteps: int = Field(ge=1)
+    noise_schedule: Literal["linear", "cosine"]
+    beta_start: float = Field(default=1e-4, gt=0.0)
+    beta_end: float = Field(default=0.02, gt=0.0)
+    prediction_type: Literal["sample", "epsilon"]
+
+
+class SynthesisCorruptionConfig(BaseModel):
+    """The frozen Phase-2 operators: the calibrated ULF operator and the declared HF one.
+
+    ``ulf_model_kwargs`` must equal the Stage-B arm's ``model.model_kwargs``: the operator's
+    base noise level is derived from them and is not in its state dict.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, protected_namespaces=())
+
+    checkpoint: Path
+    part: Literal["generator", "ema"]
+    ulf_model_kwargs: dict[str, Any] = Field(default_factory=dict)
+    hf: HFCorruptionConfig = Field(default_factory=HFCorruptionConfig)
+
+
 class TrainingConfigPairedSynthesis(BaseTrainingConfigSchema):
-    """Paired-synthesis pipeline config (PMPS Phase 3)."""
+    """Paired-synthesis pipeline config (PMPS Phase 3).
+
+    ``training:`` loads through ``TrainingStrategyConfigSchema``, so ``PairedSynthesisStrategy``
+    validates the arm's extra keys against this schema at construction.
+    """
 
     model_config = ConfigDict(extra="allow", protected_namespaces=())
 
@@ -179,6 +219,8 @@ class TrainingConfigPairedSynthesis(BaseTrainingConfigSchema):
     defensibility_threshold: float = Field(default=1.5, ge=1.0, le=5.0)
     write_rejected: bool = Field(default=True)
     parallel_shards: int = Field(default=8, ge=1)
+    tissue_prior: SynthesisTissuePriorConfig
+    corruption: SynthesisCorruptionConfig
 
 
 # ----------------------------------------------------------------------
@@ -208,7 +250,10 @@ class TrainingConfigDataEfficiencyHarness(BaseTrainingConfigSchema):
     )
     downstream_translator_kwargs: dict[str, Any] = Field(default_factory=dict)
     real_paired_manifest: Path
-    synthetic_paired_manifest: Path
+    synthetic_paired_manifest: Path | None = Field(
+        default=None,
+        description="Synthetic pair manifest; required only when a cell has n_synthetic > 0.",
+    )
     settings: list[DataEfficiencySettingConfig] = Field(default_factory=list)
     n_seeds_per_setting: int = Field(default=5, ge=1)
     loso_n_folds: int = Field(default=10, ge=1)
@@ -228,6 +273,16 @@ class TrainingConfigDataEfficiencyHarness(BaseTrainingConfigSchema):
             raise ValueError("data_efficiency_harness.settings must contain at least one cell.")
         return v
 
+    @model_validator(mode="after")
+    def _synthetic_manifest_when_used(self) -> TrainingConfigDataEfficiencyHarness:
+        needs = [s.name for s in self.settings if s.n_synthetic > 0]
+        if needs and self.synthetic_paired_manifest is None:
+            raise ValueError(
+                "data_efficiency_harness.synthetic_paired_manifest is unset, but cells "
+                f"{needs} declare n_synthetic > 0."
+            )
+        return self
+
 
 __all__ = [
     "AcquisitionParam",
@@ -237,6 +292,8 @@ __all__ = [
     "ProtocolSamplingConfig",
     "PseudoQMRIBackrecoveryConfig",
     "SiteConditioningConfig",
+    "SynthesisCorruptionConfig",
+    "SynthesisTissuePriorConfig",
     "TrainingConfigCorruptionCalibration",
     "TrainingConfigDataEfficiencyHarness",
     "TrainingConfigPairedSynthesis",

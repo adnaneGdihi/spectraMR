@@ -101,11 +101,6 @@
       "20 axes"
     ],
     [
-      "scripts/sim2rank/metrics_list.py",
-      "<module>",
-      "210 metrics"
-    ],
-    [
       "scripts/sim2rank/per_axis_figures.py",
       "<module>",
       "65 metrics"
@@ -139,16 +134,6 @@
       "scripts/sim2rank/probe_metrics.py",
       "unswept_specs",
       "209 metrics"
-    ],
-    [
-      "scripts/sim2rank/severity_calibration.py",
-      "<module>",
-      "13 axes"
-    ],
-    [
-      "scripts/sim2rank/severity_calibration.py",
-      "_shorter_ladder_can_help",
-      "30-axis"
     ],
     [
       "scripts/sim2rank/sim2rank.py",

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from spectramr.config.training_budget import NO_TRAINING_MODES, zero_budget_defect
+from spectramr.config.training_budget import (
+    NO_TRAINING_MODES,
+    declares_no_training,
+    zero_budget_defect,
+)
 
 
 def test_zero_epochs_with_no_iterations_is_the_finding() -> None:
@@ -50,3 +54,17 @@ def test_a_bare_strategy_class_alias_names_the_mode_too() -> None:
     )
     dotted = "spectramr.infrastructure.training.strategies.calibration.Calibration"
     assert zero_budget_defect({"epochs": 0, "strategy_class": dotted}) is not None
+
+
+def test_declares_no_training_is_what_the_loop_exempts() -> None:
+    """The loop's validation gate exempts exactly these blocks (#1374)."""
+    assert declares_no_training({"training_mode": "calibration", "strategy_class": None})
+    assert declares_no_training({"training_mode": None, "strategy_class": "validation_badge"})
+    assert declares_no_training(
+        {"training_mode": "phys_residual_conformal", "strategy_class": "phys_residual_conformal"}
+    )
+    assert not declares_no_training({"training_mode": "reconstruction", "strategy_class": None})
+    assert not declares_no_training(
+        {"strategy_class": "spectramr.infrastructure.training.strategies.calibration.Calibration"}
+    )
+    assert not declares_no_training(None)

@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 from typing import Any
 
@@ -7,7 +8,18 @@ import torch.nn as nn
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
-__all__ = ["SymbolicRegressionWrapper"]
+__all__ = ["HAVE_PYSR", "HAVE_SKLEARN", "SymbolicRegressionWrapper"]
+
+_logger = logging.getLogger(__name__)
+
+# Availability is probed without importing: importing pysr starts juliacall, which must not
+# happen at registry import. The import in analyze_residuals then fails loudly, never silently.
+HAVE_PYSR = importlib.util.find_spec("pysr") is not None
+HAVE_SKLEARN = importlib.util.find_spec("sklearn") is not None
+if not HAVE_PYSR:
+    _logger.info("pysr is not installed; SymbolicRegressionWrapper.analyze_residuals will raise.")
+if not HAVE_SKLEARN:
+    _logger.info("scikit-learn is not installed; analyze_residuals on >10 features will raise.")
 
 # NOTE: Defer factory import to avoid circular imports during registry initialization.
 
@@ -91,45 +103,39 @@ class SymbolicRegressionWrapper(nn.Module, IGenerator):
             mse = torch.mean(residual**2).item()
             self.logger.info(f"Analyzing residuals: MSE={mse:.6f}")
 
-            # PySR integration for equation discovery
-            try:
-                from pysr import PySRRegressor
-
-                # Flatten tensors for PySR (expects 2D numpy arrays)
-                x_flat = x.reshape(x.size(0), -1).cpu().numpy()
-                residual_flat = residual.reshape(residual.size(0), -1).cpu().numpy()
-
-                # Use first few principal components if too high-dimensional
-                max_features = 10
-                if x_flat.shape[1] > max_features:
-                    from sklearn.decomposition import PCA
-
-                    pca = PCA(n_components=max_features)
-                    x_flat = pca.fit_transform(x_flat)
-
-                # Run symbolic regression
-                model = PySRRegressor(
-                    niterations=40,
-                    binary_operators=["+", "-", "*", "/"],
-                    unary_operators=["sin", "cos", "exp", "log", "sqrt"],
-                    maxsize=20,
-                    verbosity=0,
-                    temp_equation_file=True,
+            if not HAVE_PYSR:
+                raise ImportError(
+                    "analyze_residuals needs pysr, which is not installed (pip install pysr)."
                 )
+            from pysr import PySRRegressor
 
-                # Fit on first output channel
-                model.fit(
-                    x_flat,
-                    residual_flat[:, 0] if residual_flat.ndim > 1 else residual_flat,
-                )
+            # PySR expects 2D numpy arrays; this is an offline diagnostic, not a training step.
+            x_flat = x.reshape(x.size(0), -1).cpu().numpy()
+            residual_flat = residual.reshape(residual.size(0), -1).cpu().numpy()
 
-                self.logger.info(f"Discovered equations: {model.equations_}")
-                self._discovered_equations = model.equations_
+            max_features = 10
+            if x_flat.shape[1] > max_features:
+                if not HAVE_SKLEARN:
+                    raise ImportError(
+                        "analyze_residuals reduces >10 features with PCA, which needs "
+                        "scikit-learn (not installed)."
+                    )
+                from sklearn.decomposition import PCA
 
-            except ImportError:
-                self.logger.warning("PySR not installed. Install with: pip install pysr")
-            except Exception as e:
-                self.logger.warning(f"PySR failed: {e}")
+                x_flat = PCA(n_components=max_features).fit_transform(x_flat)
+
+            model = PySRRegressor(
+                niterations=40,
+                binary_operators=["+", "-", "*", "/"],
+                unary_operators=["sin", "cos", "exp", "log", "sqrt"],
+                maxsize=20,
+                verbosity=0,
+                temp_equation_file=True,
+            )
+            model.fit(x_flat, residual_flat[:, 0] if residual_flat.ndim > 1 else residual_flat)
+
+            self.logger.info(f"Discovered equations: {model.equations_}")
+            self._discovered_equations = model.equations_
 
     @property
     def name(self) -> str:

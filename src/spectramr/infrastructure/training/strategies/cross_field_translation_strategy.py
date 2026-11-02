@@ -29,9 +29,9 @@ def compute_cross_field_losses(
     Args:
         generator: an :class:`AnatomyFieldRenderer`-like module with
             ``encode``/``render``.
-        batch: dict with ``input``, ``target``, ``field_strength_target`` and
-            optionally ``contrast_id``.
-        lambda_latent_cycle: weight of ``||E(R(q,b)) - q||_1`` (0 disables).
+        batch: dict with ``input``, ``target``, ``field_strength`` (source),
+            ``field_strength_target`` and optionally ``contrast_id``.
+        lambda_latent_cycle: weight of ``||E(R(q,b_t), b_t) - q||_1`` (0 disables).
         contrast_conditioning: when False, the contrast id is NOT fed to the
             renderer FiLM (the ``cross_field.contrast_conditioning`` knob); the
             renderer then uses its zero/default contrast vector.
@@ -41,13 +41,14 @@ def compute_cross_field_losses(
     """
     x = batch["input"]
     y = batch["target"]
+    b_s = batch["field_strength"]
     b_t = batch["field_strength_target"]
     cid = batch.get("contrast_id") if contrast_conditioning else None
-    q = generator.encode(x)
+    q = generator.encode(x, b_s)
     x_hat = generator.render(q, b_t, cid)
     loss_recon = F.l1_loss(x_hat, y)
     if lambda_latent_cycle > 0.0:
-        q_re = generator.encode(x_hat)
+        q_re = generator.encode(x_hat, b_t)  # the rendered image sits at the target field
         loss_cycle = torch.mean(torch.abs(q_re - q))
     else:
         loss_cycle = x_hat.new_zeros(())
@@ -131,17 +132,20 @@ class CrossFieldTranslationStrategy(ReconstructionTrainingStrategy):
         self,
         input_batch: Any,
         target_batch: Any,
+        field_strength: Any = None,
         field_strength_target: Any = None,
         contrast_id: Any = None,
         **kwargs: Any,
     ) -> Any:
-        """Fold the per-sample target field + contrast into ``batch_context``.
+        """Fold the per-sample source/target fields + contrast into ``batch_context``.
 
         Declaring these makes the pipeline's gated validation seam forward them so
         :meth:`_validation_forward` can render at the validation sample's own target
         field (AnatomyFieldRenderer.forward requires ``field_strength``).
         """
         bc = kwargs.pop("batch_context", None) or {}
+        if field_strength is not None:
+            bc["field_strength"] = field_strength
         if field_strength_target is not None:
             bc["field_strength_target"] = field_strength_target
         if contrast_id is not None:
@@ -159,12 +163,14 @@ class CrossFieldTranslationStrategy(ReconstructionTrainingStrategy):
         scores the actually-translated image).
         """
         x0 = batch_context.get("input", input_batch)
+        b_s = batch_context.get("field_strength", kwargs.get("field_strength"))
         b_t = batch_context.get("field_strength_target", kwargs.get("field_strength_target"))
-        if b_t is None:
+        if b_t is None or b_s is None:
             raise ValueError(
                 "CrossFieldTranslationStrategy validation requires per-sample "
-                "'field_strength_target'. Set data.expose_field_strength_target on "
-                "the mrixfields dataset. Got field_strength_target=None."
+                "'field_strength' (source) and 'field_strength_target'. Set "
+                "data.expose_field_strength_target on the mrixfields dataset. Got "
+                f"field_strength={b_s!r}, field_strength_target={b_t!r}."
             )
         cid = (
             batch_context.get("contrast_id", kwargs.get("contrast_id"))
@@ -172,4 +178,5 @@ class CrossFieldTranslationStrategy(ReconstructionTrainingStrategy):
             else None
         )
         gen = self.env.generator
-        return gen.render(gen.encode(x0), b_t, cid)
+        b_s = torch.as_tensor(b_s, device=x0.device).reshape(-1).float()
+        return gen.render(gen.encode(x0, b_s), b_t, cid)

@@ -59,6 +59,12 @@ KNOB_APPLICABILITY: tuple[KnobScope, ...] = (
         regimes=frozenset({Regime.FLOW}),
         enabled_key="enabled",
     ),
+    # The synthetic phase-contrast phantom emits velocity-encoded k-space only.
+    KnobScope(
+        "data.flow_synthetic",
+        regimes=frozenset({Regime.FLOW}),
+        enabled_key="enabled",
+    ),
     # The DCE time axis / AIF source only mean something when the arm is
     # actually fitting tracer kinetics.
     KnobScope(

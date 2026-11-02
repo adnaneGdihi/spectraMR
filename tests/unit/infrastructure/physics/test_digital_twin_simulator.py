@@ -1404,6 +1404,40 @@ class TestAtAcceleration:
             pass
 
 
+class TestAtSeverity:
+    """``DigitalTwinSimulator.at_severity`` (the held-out-severity readout's seam)."""
+
+    @staticmethod
+    def _sim() -> DigitalTwinSimulator:
+        return DigitalTwinSimulator(
+            im_size=IM_SIZE,
+            motion_severity=1.5,
+            b0_strength=0.3,
+            b1_strength=0.2,
+            enable_undersampling=True,
+            acceleration=4.0,
+        )
+
+    def test_scales_motion_b0_b1_inside_and_restores_them(self) -> None:
+        sim = self._sim()
+        with sim.at_severity(2.0):
+            assert sim._motion_severity == pytest.approx(3.0)
+            assert sim.b0_strength == pytest.approx(0.6)
+            assert sim.b1_strength == pytest.approx(0.4)
+            assert sim.acceleration == 4.0  # acceleration belongs to at_acceleration
+        assert (sim._motion_severity, sim.b0_strength, sim.b1_strength) == (1.5, 0.3, 0.2)
+
+    def test_restored_when_the_pass_raises(self) -> None:
+        sim = self._sim()
+        with pytest.raises(RuntimeError, match="boom"), sim.at_severity(3.0):
+            raise RuntimeError("boom")
+        assert (sim._motion_severity, sim.b0_strength, sim.b1_strength) == (1.5, 0.3, 0.2)
+
+    def test_a_multiplier_at_or_below_one_is_refused(self) -> None:
+        with pytest.raises(ValueError, match=r"must exceed 1\.0"), self._sim().at_severity(1.0):
+            pass
+
+
 class TestAcquisitionProfileWiring:
     """``physics.digital_twin.acquisition`` reaches the stage-5 registry operators."""
 
@@ -1821,3 +1855,182 @@ def test_the_twin_imports_cold_before_the_degradations_package(first: str) -> No
         check=False,
     )
     assert done.returncode == 0, done.stderr[-2000:]
+
+
+class TestSeverityAxes:
+    """``severity_axes``: the twin applies the same local θ that Sim2Rank sweeps."""
+
+    _QUIET: typing.ClassVar[dict[str, bool]] = {
+        "enable_motion": False,
+        "enable_b0": False,
+        "enable_b1": False,
+    }
+    _CART: typing.ClassVar[dict[str, dict[str, object]]] = {
+        "cartesian_undersamp": {"start": 2, "end": 16, "schedule": "log"}
+    }
+
+    @staticmethod
+    def _dense(h: int) -> torch.Tensor:
+        # Dense complex noise: no k-space cell is incidentally zero, so the support IS the mask.
+        g = torch.Generator().manual_seed(1234)
+        return torch.complex(
+            torch.randn(1, 1, h, h, generator=g), torch.randn(1, 1, h, h, generator=g)
+        )
+
+    def test_twin_and_sweep_agree(self) -> None:
+        from spectramr.config.schemas.severity_axes import SeverityAxis
+        from spectramr.infrastructure.physics.severity_local import LocalSeverity
+
+        sim = DigitalTwinSimulator(
+            im_size=(256, 256),
+            progressive_degradations=["cartesian_undersamp"],
+            severity_axes=self._CART,
+            **self._QUIET,
+        )
+        local = LocalSeverity.resolve(
+            "cartesian_undersamp", SeverityAxis.model_validate(self._CART["cartesian_undersamp"])
+        )
+        probe = self._dense(256)
+        for cf in (0.0, 0.5, 1.0):
+            out, _, _ = sim.forward(probe, corruption_factor=cf, seed=7, degradation_only=True)
+            kept = float((fft2c(out).abs() > 1e-6).float().mean())
+            assert 1.0 / kept == pytest.approx(local.physical(cf), rel=0.12), cf
+
+    def test_overlap_with_degradation_ranges_raises(self) -> None:
+        for extra in (
+            {"degradation_ranges": {"cartesian_undersamp": (0.2, 1.0)}},
+            {"degradation_schedules": {"cartesian_undersamp": "step"}},
+        ):
+            with pytest.raises(ValueError, match=r"cartesian_undersamp.*one owner"):
+                DigitalTwinSimulator(
+                    im_size=IM_SIZE,
+                    progressive_degradations=["cartesian_undersamp"],
+                    severity_axes=self._CART,
+                    **extra,
+                )
+
+    def test_native_axis_in_severity_axes_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"gibbs.*native"):
+            DigitalTwinSimulator(
+                im_size=IM_SIZE,
+                progressive_degradations=["gibbs"],
+                severity_axes={"gibbs": {"start": 0.9, "end": 0.5}},
+            )
+
+    def test_unknown_axis_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"not_an_axis.*DEGRADATION_REGISTRY"):
+            DigitalTwinSimulator(im_size=IM_SIZE, severity_axes={"not_an_axis": {"start": 1, "end": 2}})
+
+    def test_axis_the_twin_never_applies_raises(self) -> None:
+        with pytest.raises(ValueError, match=r"cartesian_undersamp.*progressive_degradations"):
+            DigitalTwinSimulator(
+                im_size=IM_SIZE, progressive_degradations=["rician"], severity_axes=self._CART
+            )
+
+    def test_raw_kwargs_validated(self) -> None:
+        with pytest.raises(ValueError, match=r"valid range"):
+            DigitalTwinSimulator(
+                im_size=IM_SIZE,
+                progressive_degradations=["cartesian_undersamp"],
+                severity_axes={"cartesian_undersamp": {"start": 0.5, "end": 4}},
+            )
+        with pytest.raises(ValueError, match=r"n_steps.*unread"):
+            DigitalTwinSimulator(
+                im_size=IM_SIZE,
+                progressive_degradations=["cartesian_undersamp"],
+                severity_axes={"cartesian_undersamp": {"start": 2, "end": 4, "n_steps": 5}},
+            )
+        with pytest.raises(ValueError, match=r"extra|Extra"):
+            DigitalTwinSimulator(
+                im_size=IM_SIZE,
+                progressive_degradations=["cartesian_undersamp"],
+                severity_axes={"cartesian_undersamp": {"start": 2, "end": 4, "bogus": 1}},
+            )
+
+    def test_registry_call_receives_local_theta_and_endpoint_kwargs(self, monkeypatch) -> None:
+        from spectramr.infrastructure.physics.degradations import registry
+
+        calls: list[tuple[str, float, dict]] = []
+        real = registry.apply_degradation
+
+        def spy(axis, x, *, theta, **kwargs):
+            calls.append((axis, theta, kwargs))
+            return real(axis, x, theta=theta, **kwargs)
+
+        monkeypatch.setattr(registry, "apply_degradation", spy)
+        sim = DigitalTwinSimulator(
+            im_size=IM_SIZE,
+            progressive_degradations=["cartesian_undersamp"],
+            severity_axes=self._CART,
+            **self._QUIET,
+        )
+        sim.forward(self._dense(IM_SIZE[0]), corruption_factor=1.0, seed=1, degradation_only=True)
+        ((axis, theta, kwargs),) = calls
+        assert axis == "cartesian_undersamp" and theta == 1.0 and kwargs["R_max"] == 16.0
+
+    def test_static_axis_holds_the_user_end(self) -> None:
+        sim = DigitalTwinSimulator(
+            im_size=IM_SIZE, progressive_degradations=["cartesian_undersamp"], severity_axes=self._CART
+        )
+        sim.progressive_degradations = ["motion"]  # the per-axis visualisation rewrites it at runtime
+        assert sim._get_effective_cf("cartesian_undersamp", 0.0) == sim._local[
+            "cartesian_undersamp"
+        ].native_theta(1.0)
+
+    def test_unconfigured_registry_axis_keeps_its_range_floor(self) -> None:
+        sim = DigitalTwinSimulator(
+            im_size=IM_SIZE,
+            progressive_degradations=["cartesian_undersamp", "rician"],
+            severity_axes=self._CART,
+            degradation_ranges={"rician": (0.3, 0.9)},
+        )
+        assert sim._get_effective_cf("rician", 0.0) == pytest.approx(0.3)
+        assert sim._get_effective_cf("cartesian_undersamp", 0.0) == pytest.approx(1.0 / 15.0)
+
+    @pytest.mark.parametrize("cf", [0.0, 0.3, 1.0])
+    def test_empty_severity_axes_is_bit_identical(self, cf: float) -> None:
+        clean = self._dense(IM_SIZE[0])
+        kw = {"im_size": IM_SIZE, "progressive_degradations": ["rician", "cartesian_undersamp"]}
+        a, _, _ = DigitalTwinSimulator(**kw).forward(clean, corruption_factor=cf, seed=4)
+        b, _, _ = DigitalTwinSimulator(**kw, severity_axes={}).forward(
+            clean, corruption_factor=cf, seed=4
+        )
+        assert torch.equal(a, b)
+
+    def test_provenance_records_the_physical_range(self) -> None:
+        sim = DigitalTwinSimulator(
+            im_size=IM_SIZE, progressive_degradations=["cartesian_undersamp"], severity_axes=self._CART
+        )
+        record = sim.severity_axes_provenance()["cartesian_undersamp"]
+        assert (record["start"], record["end"], record["schedule"]) == (2.0, 16.0, "log")
+        assert DigitalTwinSimulator(im_size=IM_SIZE).severity_axes_provenance() == {}
+
+    def test_profile_that_overrides_the_range_raises(self) -> None:
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        axis = "b0_geometric_distortion"  # the profile's condition sets b0_strength
+        dt = DigitalTwinConfig(
+            progressive_degradations=[axis],
+            acquisition={"readout_bw_hz_per_px": 100.0, "sequence": "spin_echo"},
+            severity_axes={axis: {"start": 0.0, "end": 0.5}},
+        )
+        with pytest.raises(ValueError, match=r"scanner profile.*b0_strength.*b0_geometric"):
+            DigitalTwinSimulator.from_config(dt, (32, 32), field_strength_t=3.0)
+
+    def test_profile_without_a_range_still_builds(self) -> None:
+        from spectramr.infrastructure.physics.scanner_presets import M4RAW_03T
+
+        sim = DigitalTwinSimulator(
+            im_size=IM_SIZE,
+            progressive_degradations=["b0_geometric_distortion", "cartesian_undersamp"],
+            severity_axes=self._CART,
+            scanner_profile=M4RAW_03T,
+        )
+        assert sim.severity_axes_provenance()["cartesian_undersamp"]["end"] == 16.0
+
+    def test_from_config_forwards_severity_axes(self) -> None:
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        dt = DigitalTwinConfig(progressive_degradations=["cartesian_undersamp"], severity_axes=self._CART)
+        sim = DigitalTwinSimulator.from_config(dt, IM_SIZE)
+        assert sim.severity_axes_provenance()["cartesian_undersamp"]["end"] == 16.0

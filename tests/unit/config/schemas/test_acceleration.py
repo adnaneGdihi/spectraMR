@@ -305,3 +305,20 @@ def test_adaptive_budget_rejects_unknown_value_and_rate_must_be_positive() -> No
         AdaptiveAccelerationConfig(budget="greedy")
     with pytest.raises(pydantic.ValidationError):
         AdaptiveAccelerationConfig(mask_learning_rate=0.0)
+
+
+def test_acceleration_schedule_rejects_log() -> None:
+    with pytest.raises(ValidationError, match="log is applied to physical endpoints"):
+        AccelerationConfigSchema(acceleration_schedule="log")
+
+
+def test_schedule_type_rejects_log() -> None:
+    with pytest.raises(ValidationError, match="log is applied to physical endpoints"):
+        AccelerationConfigSchema(schedule_type="log")
+
+
+def test_sampling_pattern_is_the_one_loader_mask_key() -> None:
+    """The loader mask's outer samples have one owner; the loader refuses unknown patterns."""
+    assert "mask_type" not in AccelerationConfigSchema.model_fields
+    assert AccelerationConfigSchema().sampling_pattern is None
+    assert AccelerationConfigSchema(sampling_pattern="sle_kappa").sampling_pattern == "sle_kappa"

@@ -1,6 +1,6 @@
 """An acquisition tuple has exactly ONE definition. Issue #828.
 
-``config/schemas/training/pmps.py`` re-declared ``AcquisitionParam`` with the
+``config/schemas/training/pmps.py`` redeclared ``AcquisitionParam`` with the
 same eight fields, types and defaults as ``AcquisitionParamsSchema``
 (``config/schemas/data.py``) — **except** ``contrast_type``:
 
@@ -38,7 +38,7 @@ from spectramr.config.schemas.training.pmps import (
 def test_acquisition_param_is_the_data_schema_not_a_copy() -> None:
     """Identity, not equivalence.
 
-    A re-declared class with identical fields would satisfy any field-by-field
+    A redeclared class with identical fields would satisfy any field-by-field
     comparison on the day it was written and drift the day either side changed —
     which is exactly what happened. Only `is` catches that.
     """
@@ -87,3 +87,42 @@ def test_an_unknown_contrast_is_still_rejected() -> None:
     """
     with pytest.raises(ValidationError):
         AcquisitionParam(name="x", TE=10.0, TR=500.0, contrast_type="not_a_contrast")
+
+
+def test_stage_c_requires_its_prior_and_corruption_sources() -> None:
+    """Stage C loads both frozen stages, so neither source may be left out."""
+    from spectramr.config.schemas.training.pmps import TrainingConfigPairedSynthesis
+
+    with pytest.raises(ValidationError, match="tissue_prior"):
+        TrainingConfigPairedSynthesis(output_root="out")
+    with pytest.raises(ValidationError, match="prediction_type"):
+        TrainingConfigPairedSynthesis(
+            output_root="out",
+            tissue_prior={"checkpoint": "a", "part": "ema", "timesteps": 10,
+                          "noise_schedule": "cosine", "prediction_type": "v"},
+            corruption={"checkpoint": "b", "part": "generator"},
+        )
+
+
+def test_real_only_harness_needs_no_synthetic_manifest() -> None:
+    """The n_synthetic 0 cell reads no synthetic pairs, so it names no manifest."""
+    from spectramr.config.schemas.training.pmps import TrainingConfigDataEfficiencyHarness
+
+    cfg = TrainingConfigDataEfficiencyHarness(
+        real_paired_manifest="real.json",
+        settings=[{"name": "R10", "n_real": 10, "n_synthetic": 0}],
+    )
+    assert cfg.synthetic_paired_manifest is None
+
+
+def test_synthetic_cell_without_manifest_raises() -> None:
+    from spectramr.config.schemas.training.pmps import TrainingConfigDataEfficiencyHarness
+
+    with pytest.raises(ValidationError, match="R10_S100"):
+        TrainingConfigDataEfficiencyHarness(
+            real_paired_manifest="real.json",
+            settings=[
+                {"name": "R10", "n_synthetic": 0},
+                {"name": "R10_S100", "n_synthetic": 100},
+            ],
+        )

@@ -30,7 +30,8 @@ class _PrimaryCapsules(nn.Module):
 
     def _squash(self, x: torch.Tensor) -> torch.Tensor:
         sq_norm = (x**2).sum(dim=-1, keepdim=True)
-        scale = sq_norm / (1 + sq_norm) / (sq_norm.sqrt() + 1e-8)
+        # Epsilon inside the root: sqrt has an infinite derivative at a zero norm.
+        scale = sq_norm / (1 + sq_norm) / (sq_norm + 1e-8).sqrt()
         return scale * x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -67,7 +68,8 @@ class _RoutingCapsules(nn.Module):
 
     def _squash(self, x: torch.Tensor) -> torch.Tensor:
         sq_norm = (x**2).sum(dim=-1, keepdim=True)
-        scale = sq_norm / (1 + sq_norm) / (sq_norm.sqrt() + 1e-8)
+        # Epsilon inside the root: sqrt has an infinite derivative at a zero norm.
+        scale = sq_norm / (1 + sq_norm) / (sq_norm + 1e-8).sqrt()
         return scale * x
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
@@ -85,11 +87,11 @@ class _RoutingCapsules(nn.Module):
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         # u: [BHW, in_caps, in_dim]
         N = u.shape[0]
-        # Transform: u_hat[i,j] = W[j,i] @ u[i]
-        u_hat = torch.einsum("bil,xijkl->bijk", u, self.W.expand(N, -1, -1, -1, -1))
+        # Per-sample prediction vectors u_hat[n,i,j] = W[i,j] @ u[n,i] (Sabour 2017).
+        u_hat = torch.einsum("bil,ijkl->bijk", u, self.W[0])
         # u_hat: [N, in_caps, out_caps, out_dim]
 
-        b = torch.zeros(N, u.shape[1], self.out_caps, device=u.device)
+        b = torch.zeros(N, u.shape[1], self.out_caps, device=u.device, dtype=u.dtype)
         for _ in range(self.routing_iters):
             c = F.softmax(b, dim=-1)  # [N, in, out]
             s = torch.einsum("bij,bijd->bjd", c, u_hat)  # [N, out, dim]

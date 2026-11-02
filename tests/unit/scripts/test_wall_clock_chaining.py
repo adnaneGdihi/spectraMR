@@ -1,6 +1,6 @@
-"""The 120 h wall-clock chain, end to end across bash and Python.
+"""The 96 h wall-clock chain, end to end across bash and Python.
 
-A production arm is allowed 120 h per job and needs more, so the run has to
+A production arm is allowed 96 h per job and needs more, so the run has to
 survive being cut in half. Three things have to hold together for that, and
 each one is silently satisfiable on its own:
 
@@ -317,7 +317,7 @@ def test_a_yield_without_resume_refuses_to_requeue(monkeypatch, tmp_path, capsys
     The deadline is derived, and the loop yields, whether or not the launch
     carried --resume. A requeued task re-runs the identical command: without
     resume it starts at iteration 0, yields at the next wall, and repeats --
-    burning the allocation forever without ever passing 120h of training.
+    burning the allocation forever without ever passing 96 h of training.
     """
     from spectramr.cli import manifest_dispatch as md
 
@@ -401,7 +401,7 @@ def test_a_fresh_first_link_whose_requeue_resumes_is_requeued(monkeypatch, tmp_p
 
 @pytest.mark.unit
 def test_prod_implies_resume() -> None:
-    """A production arm does not fit in one 120h allocation, so a production run
+    """A production arm does not fit in one 96 h allocation, so a production run
     is a chain by definition and every link must continue the last."""
     import inspect
 
@@ -514,7 +514,7 @@ def test_a_failing_squeue_does_not_kill_the_job(tmp_path: Path) -> None:
     """The launchers run under `set -euo pipefail`.
 
     A busy controller returning nonzero propagates through the pipe into the
-    assignment and, without `|| true`, exits the whole 120h job before it trains
+    assignment and, without `|| true`, exits the whole 96 h job before it trains
     a step. The other tests here run `bash -c` WITHOUT `-e`, so they are
     structurally blind to this -- hence the explicit flags.
     """

@@ -50,6 +50,11 @@ def _scatter_along_sfc(seq: torch.Tensor, indices: torch.Tensor, shape) -> torch
     return out.view(B, C, H, W)
 
 
+def _straight_through(hard: torch.Tensor, soft: torch.Tensor) -> torch.Tensor:
+    # Forward value is ``hard``; only the soft permutation receives the extra gradient.
+    return hard + (soft - soft.detach())
+
+
 @register_model(
     "conformal_geomamba_ulf",
     training_mode="reconstruction",
@@ -107,6 +112,7 @@ class ConformalGeoMambaULF(nn.Module):
         x: torch.Tensor,
         *args,
         sfc_indices: torch.Tensor | None = None,
+        sfc_soft_perm: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         feats = [self.stem(x)]
@@ -134,8 +140,22 @@ class ConformalGeoMambaULF(nn.Module):
         else:
             indices = self._hilbert_indices.to(b_resized.device).unsqueeze(0).expand(x.shape[0], -1)
         seq = _gather_along_sfc(b_resized, indices)
-        seq = self.scan(seq) + seq
-        b_back = _scatter_along_sfc(seq, indices, (gs, gs))
+        if sfc_soft_perm is not None:
+            if sfc_indices is None:
+                raise ValueError("sfc_soft_perm requires the sfc_indices it relaxes")
+            if tuple(sfc_soft_perm.shape) != (x.shape[0], gs * gs, gs * gs):
+                raise ValueError(
+                    "sfc_soft_perm must have shape (B, grid_size**2, grid_size**2); "
+                    f"got {tuple(sfc_soft_perm.shape)}"
+                )
+            perm = sfc_soft_perm.to(dtype=seq.dtype)
+            flat = b_resized.detach().reshape(seq.shape)
+            seq = _straight_through(seq, torch.bmm(flat, perm.transpose(1, 2)))
+        seq_out = self.scan(seq) + seq
+        b_back = _scatter_along_sfc(seq_out, indices, (gs, gs))
+        if sfc_soft_perm is not None:
+            soft_back = torch.bmm(seq_out.detach(), perm).view_as(b_back)
+            b_back = _straight_through(b_back, soft_back)
         b_out = F.interpolate(b_back, size=(Hb, Wb), mode="bilinear", align_corners=False)
         h = b_out
         for s in range(self.scales - 1, -1, -1):

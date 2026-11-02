@@ -63,3 +63,11 @@ def test_reconstruction_output_prefers_the_reconstruction_key():
     assert reconstruction_output({"image": x * 0, "reconstruction": x}) is x
     assert reconstruction_output({"output": x}) is x
     assert reconstruction_output({"other": x}) is x
+
+
+def test_mapping_of_per_sample_tensors_is_sliced_entry_by_entry():
+    """``acquisition_params`` is a dict of ``[B]`` rows; a chunk gets its own rows."""
+    acq = {"TE": torch.arange(5.0), "B0": torch.tensor(0.3)}
+    out = slice_batch_aligned({"acquisition_params": acq}, 1, 3, 5)
+    assert out["acquisition_params"]["TE"].tolist() == [1.0, 2.0]
+    assert out["acquisition_params"]["B0"] is acq["B0"]

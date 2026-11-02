@@ -206,6 +206,7 @@ def create_default_detector() -> StrategyDetector:
         "domain_adaptation",
         "latent_gan",
         "latent_diffusion",
+        "cascaded_diffusion",
         "mae",
         "vae",
         "diffusion",

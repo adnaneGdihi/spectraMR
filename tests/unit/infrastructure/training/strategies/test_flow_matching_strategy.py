@@ -6,6 +6,7 @@ sampler, distinct from the ``flow_matching`` alias that merely points at
 the generic :class:`DiffusionTrainingStrategy`.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -328,7 +329,8 @@ def test_flow_matching_declares_the_interpolant_it_feeds() -> None:
 
 
 def test_it_declares_its_own_loss_ownership() -> None:
-    """Issue #1918: mse_loss(pred, u_t) regresses the velocity field, not the target.
+    """Issue #1918: mse_loss(pred, u_t) regresses the velocity; declared image losses fold on the
+    endpoint estimate.
 
     Read off ``__dict__``, never the inherited value: this class sits under
     ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
@@ -337,7 +339,8 @@ def test_it_declares_its_own_loss_ownership() -> None:
     PASS every declared ``losses.image_losses`` entry on this strategy's arms
     while the training step discards them.
     """
-    assert FlowMatchingStrategy.__dict__["folds_image_losses"] is False
+    assert FlowMatchingStrategy.__dict__["folds_image_losses"] is True
+    assert FlowMatchingStrategy.__dict__["empty_loss_stack_is_design"] is True
     assert FlowMatchingStrategy.__dict__["inline_losses"] == frozenset()
 
 
@@ -417,3 +420,42 @@ def test_validation_samples_the_flow_under_the_ulf_input(training_env) -> None:
     )
     assert out.shape == y.shape
     assert seen and torch.equal(seen[0], y)
+
+
+def _image_cfg(weight: float) -> SimpleNamespace:
+    entry = SimpleNamespace(name="l1", weight=weight, enabled=True, role="target")
+    return SimpleNamespace(losses=SimpleNamespace(image_losses=[entry]))
+
+
+class _RecordingLoss:
+    """Image loss that records what it was asked to compare."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        self.calls.append((pred, target))
+        return (pred - target).abs().mean()
+
+
+def test_flow_matching_declared_image_loss_is_folded_onto_the_endpoint_estimate() -> None:
+    x1 = torch.randn(2, 1, 8, 8)
+    weight = 0.5
+
+    torch.manual_seed(1)
+    s_off = _bare_fm({})
+    s_off.config = _image_cfg(weight)
+    s_off.env.losses = {}
+    loss_off = s_off._compute_losses_impl(input_batch={"target": x1}, target_batch=x1)["loss_total"]
+
+    torch.manual_seed(1)
+    s_on = _bare_fm({})
+    s_on.config = _image_cfg(weight)
+    l1 = _RecordingLoss()
+    s_on.env.losses = {"l1": l1}
+    out = s_on._compute_losses_impl(input_batch={"target": x1}, target_batch=x1)
+
+    assert "loss_l1" in out
+    ((pred, target),) = l1.calls
+    assert torch.equal(target, x1), "the endpoint estimate is compared with the data endpoint x1"
+    assert torch.allclose(out["loss_total"] - loss_off, weight * (pred - x1).abs().mean())

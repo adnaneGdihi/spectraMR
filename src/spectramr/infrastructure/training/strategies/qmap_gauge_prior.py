@@ -97,7 +97,12 @@ def gain_ratio_penalty(
     prior: GainRatioPrior,
 ) -> torch.Tensor:
     """``weight * mean_images sum_ratios ((log ratio - log median) / std_log)^2``."""
-    g = projected_gains(renders, targets, masks).clamp_min(1e-12)
+    return gain_ratio_penalty_from_gains(projected_gains(renders, targets, masks), prior)
+
+
+def gain_ratio_penalty_from_gains(gains: torch.Tensor, prior: GainRatioPrior) -> torch.Tensor:
+    """The penalty on ``(B, 3)`` gains fitted elsewhere (the repetition split's input fit)."""
+    g = gains.clamp_min(1e-12)
     log_ratio = torch.log(g[:, 1:]) - torch.log(g[:, :1])
     z = (log_ratio - prior.log_median.to(g)) / prior.std_log.to(g)
     return prior.weight * z.pow(2).sum(1).mean()

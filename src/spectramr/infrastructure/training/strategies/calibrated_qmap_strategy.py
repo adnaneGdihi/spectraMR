@@ -31,10 +31,15 @@ from spectramr.infrastructure.training.strategies.qmap_availability import (
 from spectramr.infrastructure.training.strategies.qmap_conformal import SubjectResiduals
 from spectramr.infrastructure.training.strategies.qmap_gauge_prior import (
     gain_ratio_penalty,
+    gain_ratio_penalty_from_gains,
     parse_gain_ratio_prior,
 )
 from spectramr.infrastructure.training.strategies.qmap_heldout import heldout_pass
-from spectramr.infrastructure.training.strategies.qmap_rep_split import repetition_risk
+from spectramr.infrastructure.training.strategies.qmap_rep_split import (
+    power_projected_gains,
+    repetition_loss,
+    repetition_risk,
+)
 from spectramr.infrastructure.training.strategies.qmap_scores import (
     coefficient_of_variation,
     white_matter_medians,
@@ -199,17 +204,39 @@ class CalibratedQMapStrategy(BaseTrainingStrategy):
         x, y = self._rows(input_batch), self._rows(target_batch)
         # Hidden series are still supervised: the loss below covers all three.
         available = draw_availability(x.shape[0], self._dropout, x.device)
-        _, renders = self._render(x, kwargs.get("batch"), available)
-        masks = self._signal_masks(y)
+        batch = kwargs.get("batch")
+        _, renders = self._render(x, batch, available)
+        noise_power = read_batch_field(batch, "noise_power")
+        # On a repetition split the target is one noisy repetition: masks come from the
+        # input and the loss is in the power domain, which is unbiased for A^2 (#2976).
+        masks = self._signal_masks(x if noise_power is not None else y)
         if self._gains is not None and not self._gain_initialised:
             self._initialise_gain(renders[0], y[:, :1], masks[0])
-        total = sum(
-            self._loss(
-                None, y[:, k : k + 1], context={"render": r, "mask": masks[k], "gain": self._gain(k)}
+        if noise_power is not None:
+            total = sum(
+                repetition_loss(
+                    r,
+                    x[:, k : k + 1],
+                    y[:, k : k + 1],
+                    noise_power[:, k],
+                    gain2=None if self._gains is None else self._gain(k) ** 2,
+                    signal_floor=_SIGNAL_FLOOR,
+                )
+                for k, r in enumerate(renders)
             )
-            for k, r in enumerate(renders)
-        )
-        if self._gauge_prior is not None:  # closes the two gain directions (qmap_gauge_prior)
+        else:
+            total = sum(
+                self._loss(
+                    None,
+                    y[:, k : k + 1],
+                    context={"render": r, "mask": masks[k], "gain": self._gain(k)},
+                )
+                for k, r in enumerate(renders)
+            )
+        if self._gauge_prior is not None and noise_power is not None:  # input-fitted gains
+            gains = power_projected_gains(renders, x, noise_power, signal_floor=_SIGNAL_FLOOR)
+            total = total + gain_ratio_penalty_from_gains(gains, self._gauge_prior)
+        elif self._gauge_prior is not None:  # closes the two gain directions (qmap_gauge_prior)
             ys = [y[:, k : k + 1] for k in range(len(CONTRASTS))]
             total = total + gain_ratio_penalty(renders, ys, masks, self._gauge_prior)
         return {"g_total_loss": total}

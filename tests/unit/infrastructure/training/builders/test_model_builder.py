@@ -314,7 +314,7 @@ def test_the_director_is_the_one_warm_starting_caller() -> None:
     from spectramr.infrastructure.training.builders import director
 
     src = inspect.getsource(director)
-    assert "ModelBuilder(self._config, self._device, warm_start=True)" in src
+    assert re.search(r"ModelBuilder\(\s*self\._config,\s*self\._device,\s*warm_start=True,", src)
     pkg = Path(director.__file__).resolve().parents[3]
     others = [
         p for p in pkg.rglob("*.py")

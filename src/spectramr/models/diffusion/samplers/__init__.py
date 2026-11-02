@@ -13,6 +13,8 @@ reused by M2 (EDM) and M1 (RED).
 # PR-20: posterior samplers register on import.
 # PR-9 (M1): Plug-and-Play / RED priors register on import.
 from . import (
+    annealed_langevin_dc,  # noqa: F401
+    pc_sampler_consistency,  # noqa: F401
     pnp_red,  # noqa: F401
     posterior_samplers,  # noqa: F401
 )

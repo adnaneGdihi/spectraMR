@@ -21,9 +21,11 @@ generates the relaxation rates from a field-invariant tissue latent
 
 Because the latent parametrises the dispersion *law* and not its value at one
 field, it is field-invariant **by construction**. For a single pool the three
-constants :math:`(a_0, b, \tau_c)` are identifiable from measurements at
+constants :math:`(a_0, b, \tau_c)` are identifiable from *R1 values* at
 :math:`M \ge 2P+1 = 3` distinct fields (a :math:`P`-pool model needs
-:math:`M \ge 2P+1`).
+:math:`M \ge 2P+1`). A magnitude stack with one image per field observes
+neither rate directly: :func:`magnitude_stack_unknowns` counts what it must
+determine instead.
 
 References
 ----------
@@ -237,6 +239,24 @@ def is_t1_monotone_in_b0(
     return bool(torch.all(t1[1:] - t1[:-1] >= -tol))
 
 
+def magnitude_stack_unknowns(n_pools: int) -> int:
+    r"""Per-voxel unknowns of a :math:`P`-pool latent seen through one magnitude per field.
+
+    The latent :math:`(\rho, a_0, c_0, \{b_k, \tau_{c,k}\}_{k=1}^P)` has
+    :math:`2P+3` constants, and a stack of :math:`M` magnitudes supplies :math:`M`
+    numbers per voxel, so :math:`M \ge 2P+3` is necessary for T1 to be determined
+    at the acquired fields (#2417). It is not sufficient: with one TE,
+    :math:`(\rho, c_0) \to (\rho e^{TE\,t}, c_0 + t)` leaves every magnitude unchanged.
+
+    Raises:
+        ValueError: when ``n_pools < 1``.
+    """
+    n_pools = int(n_pools)
+    if n_pools < 1:
+        raise ValueError(f"n_pools must be >= 1; got {n_pools}.")
+    return 2 * n_pools + 3
+
+
 def power_law_t1_transport(
     t1_ref: torch.Tensor,
     b0_src: float | torch.Tensor,
@@ -366,6 +386,7 @@ __all__ = [
     "dispersion_t2",
     "fit_single_pool_dispersion",
     "is_t1_monotone_in_b0",
+    "magnitude_stack_unknowns",
     "power_law_t1_transport",
     "power_law_t2_transport",
 ]

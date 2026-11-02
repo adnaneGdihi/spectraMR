@@ -1,13 +1,14 @@
 """Soft Dynamic Time Warping Loss for misregistered MRI pairs.
 
 Computes a differentiable approximation of Dynamic Time Warping between
-predicted and target 1D sequences.  Designed for use with Hilbert-linearized
-MRI sequences where paired ULF/HF scans may not be perfectly registered.
+predicted and target 1D sequences, for paired ULF/HF scans that may not be
+perfectly registered. Image inputs are linearized per slice in the order
+``order`` names: ``raster`` (row-major, the default) or ``hilbert_2d``.
 
-A spatial shift in 3D mathematically results in localized insertions/deletions
-in the 1D Hilbert sequence.  Standard L1/L2 losses produce blurry averages
-under such misalignment.  Soft-DTW allows elastic alignment while maintaining
-differentiability.
+Neither order turns every spatial shift into a local insertion/deletion: in
+raster windows a vertical neighbour is a full row away, so horizontal shifts
+are absorbed and vertical ones are not; the Hilbert order is isotropic but
+aligns only about half of the samples of a window for a unit shift (#2412).
 
 To keep computation tractable, the loss operates on **windowed subsequences**
 of length ``window_size`` (default 64), giving O(B · K · w²) work where
@@ -27,7 +28,13 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from spectramr.models.blocks.topology_linearizer import (
+    ImageTopologyLinearizer,
+    resolution_agnostic_mode,
+)
 from spectramr.models.losses.registry import register_loss
+
+SEQUENCE_ORDERS: tuple[str, ...] = ("raster", "hilbert_2d")
 
 
 def _soft_dtw_distance(
@@ -88,7 +95,7 @@ def _soft_dtw_distance(
 
 @register_loss("soft_dtw", aliases=["SoftDTW", "sdtw"])
 class SoftDTWLoss(nn.Module):
-    """Windowed Soft-DTW loss for Hilbert-linearized MRI sequences.
+    """Windowed Soft-DTW loss over a linearized image sequence.
 
     Applies Soft-DTW on non-overlapping windows of the flattened sequence
     to keep memory and compute tractable.
@@ -98,6 +105,8 @@ class SoftDTWLoss(nn.Module):
         window_size: Size of each DTW window.
         stride_size: Stride between windows (default = window_size).
         normalize: Whether to normalize by window count.
+        order: How a ``[B, C, H, W]`` slice is flattened: ``"raster"`` or
+            ``"hilbert_2d"``. Any other value raises.
 
     Example::
 
@@ -114,12 +123,31 @@ class SoftDTWLoss(nn.Module):
         window_size: int = 64,
         stride_size: int | None = None,
         normalize: bool = True,
+        order: str = "raster",
     ) -> None:
         super().__init__()
+        if order not in SEQUENCE_ORDERS:
+            raise ValueError(f"SoftDTWLoss order={order!r} is not one of {SEQUENCE_ORDERS}")
         self.gamma = gamma
         self.window_size = window_size
         self.stride_size = stride_size or window_size
         self.normalize = normalize
+        self.order = order
+        self._order_index: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+
+    def _flatten(self, x: torch.Tensor) -> torch.Tensor:
+        """``[B, C, H, W]`` -> ``[B, H*W, C]`` in the declared order."""
+        b, c, h, w = x.shape
+        flat = x.reshape(b, c, h * w)
+        if self.order == "hilbert_2d":
+            key = (h, w, x.device)
+            idx = self._order_index.get(key)
+            if idx is None:
+                lin = ImageTopologyLinearizer((h, w), resolution_agnostic_mode("hilbert_2d"))
+                idx = lin.forward_idx.to(x.device)
+                self._order_index[key] = idx
+            flat = flat.index_select(2, idx)
+        return flat.permute(0, 2, 1)
 
     def forward(
         self,
@@ -161,11 +189,10 @@ class SoftDTWLoss(nn.Module):
             prediction = prediction.permute(0, 4, 1, 2, 3).reshape(b * depth, c, h, w)
             target = target.permute(0, 4, 1, 2, 3).reshape(b * depth, c, h, w)
 
-        # Flatten to [B, L, D] if spatial
+        # Flatten to [B, L, D] if spatial, in the declared order
         if prediction.dim() == 4:
-            b4, c4 = prediction.shape[0], prediction.shape[1]
-            pred_seq = prediction.reshape(b4, c4, -1).permute(0, 2, 1)
-            tgt_seq = target.reshape(b4, c4, -1).permute(0, 2, 1)
+            pred_seq = self._flatten(prediction)
+            tgt_seq = self._flatten(target)
         elif prediction.dim() == 3:
             pred_seq = prediction
             tgt_seq = target

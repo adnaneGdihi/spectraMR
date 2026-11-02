@@ -108,6 +108,24 @@ def test_cuda_state_is_skipped_when_device_count_differs(caplog):
 
 
 @pytest.mark.unit
+def test_a_peer_takes_the_stream_the_capturing_rank_drew_from():
+    """A model-parallel peer on another device restores rank 0's device stream onto its own."""
+    state = capture_rng_state()
+    state["cuda"] = [torch.full((16,), i, dtype=torch.uint8) for i in range(2)]
+    state["cuda_device"] = 1
+
+    with (
+        patch("spectramr.core.rng_state.torch.cuda.is_available", return_value=True),
+        patch("spectramr.core.rng_state.torch.cuda.set_rng_state") as set_one,
+        patch("spectramr.core.rng_state.torch.cuda.set_rng_state_all") as set_all,
+    ):
+        restore_rng_state(state, peer=True)
+
+    set_all.assert_not_called()
+    assert torch.equal(set_one.call_args.args[0], state["cuda"][1])
+
+
+@pytest.mark.unit
 def test_cuda_state_is_restored_when_the_device_count_matches():
     state = capture_rng_state()
     state["cuda"] = [torch.zeros(16, dtype=torch.uint8) for _ in range(2)]

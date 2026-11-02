@@ -23,9 +23,10 @@ from spectramr.data.contrast_registration import (
     apply_fit,
     group_registrable,
     register_split,
-    voxel_spacing,
 )
+from spectramr.data.datasets.kspace_volume_stack import header_voxel_mm
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+from spectramr.infrastructure.physics.m4raw_pseudo_gt import parse_acquisition_header
 from tests.fixtures import m4raw_phantom as ph
 
 pytest.importorskip("SimpleITK")
@@ -159,11 +160,35 @@ def test_acs_disc_keeps_the_declared_fraction_about_the_centre() -> None:
     assert disc.float().mean().item() == pytest.approx(0.02, rel=0.05)
 
 
-def test_voxel_spacing_reads_the_prefixed_header_and_refuses_a_matrix_mismatch() -> None:
-    assert voxel_spacing(ph.header(), ph.SIZE, ph.SIZE) == (5.0, 0.9375, 0.9375)
-    assert voxel_spacing(ph.header(prefix=""), ph.SIZE, ph.SIZE) == (5.0, 0.9375, 0.9375)
-    with pytest.raises(ValueError, match="does not match kspace"):
-        voxel_spacing(ph.header(), ph.SIZE, ph.SIZE * 2)
+def _voxel(header: bytes, height: int, width: int):
+    return header_voxel_mm(parse_acquisition_header(header.decode()), height, width, "x.h5")
+
+
+def test_the_registration_voxel_reads_the_prefixed_header_and_refuses_a_matrix_mismatch() -> None:
+    for header in (ph.header(), ph.header(prefix="")):
+        voxel = _voxel(header, ph.SIZE, ph.SIZE)
+        assert voxel.voxel_mm == (5.0, 0.9375, 0.9375)
+        assert voxel.spacing_source == "encoded_fov_z"  # the fixture has no spacingBetweenSlices
+    with pytest.raises(ValueError, match="is not kspace H"):
+        _voxel(ph.header(), ph.SIZE, ph.SIZE * 2)
+
+
+def test_a_square_matrix_with_an_anisotropic_fov_maps_x_to_h() -> None:
+    """Regression pin: the retired voxel_spacing mapped y to H and gave (5.0, 3.0, 3.75)."""
+    header = (
+        b"<ismrmrdHeader><encoding><encodedSpace><matrixSize><x>64</x><y>64</y><z>1</z>"
+        b"</matrixSize><fieldOfView_mm><x>240</x><y>192</y><z>5</z></fieldOfView_mm>"
+        b"</encodedSpace></encoding></ismrmrdHeader>"
+    )
+    assert _voxel(header, 64, 64).voxel_mm == (5.0, 3.75, 3.0)
+
+
+def test_a_fit_records_the_voxel_and_its_spacing_source(tmp_path: Path) -> None:
+    (record,) = _register(_subject(tmp_path / "src"), tmp_path / "dst")
+    assert record["status"] == "registered"
+    assert record["voxel_mm"] == [5.0, 0.9375, 0.9375]
+    assert record["spacing_source"] == "encoded_fov_z"
+    assert record["pe_dim"] == -1
 
 
 @pytest.mark.parametrize("name", ["2022000001_T101.h5", "2022000001_T202.h5"])

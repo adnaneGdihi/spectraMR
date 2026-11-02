@@ -19,18 +19,37 @@ from typing import Any
 
 import torch
 
+from spectramr.data.batch_types import read_batch_field
 from spectramr.data.transforms.acquisition_params_injector import (
     infer_acquisition_params,
 )
-from spectramr.infrastructure.physics.fft_ops import fft2c
+from spectramr.infrastructure.builders.leaf.adapter_builders import apply_pre_model
+from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.infrastructure.physics.hermitian import (
     enforce_hermitian,
     hermitian_gaussian_noise,
 )
+from spectramr.infrastructure.physics.line_axis import line_axis_for
+from spectramr.infrastructure.physics.sampling import (
+    ACCELERATOR_TO_MASK_TYPE,
+    MaskGenerator,
+    MaskType,
+)
+from spectramr.infrastructure.physics.sampling_registry import SamplingPatternRegistry
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.models.diffusion.samplers import SamplerRegistry
+from spectramr.models.diffusion.samplers.annealed_langevin_dc import (
+    complex_to_interleaved,
+    interleaved_to_complex,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _as_interleaved(x: torch.Tensor) -> torch.Tensor:
+    """The model's real ``[B, 2C, H, W]`` view of a complex image (``ifft_kspace_to_image`` output)."""
+    return complex_to_interleaved(x) if torch.is_complex(x) else x
 
 
 class ScoreFieldTomographyStrategy(BaseTrainingStrategy):
@@ -40,6 +59,11 @@ class ScoreFieldTomographyStrategy(BaseTrainingStrategy):
     # tensor, not the prepared input; declared here and emitted under the tag.
     snapshot_prepared_is_model_input: bool = False
     snapshot_model_input_tag: str | None = "diffusion_step"
+    # Validation undersamples the target with the arm's ``undersampling:`` block
+    # (``_validation_mask``); training is unconditional DSM on the target.
+    applies_undersampling = True
+    #: The one reconstruction sampler this strategy validates with.
+    validation_sampler: str = "annealed_langevin_dc"
 
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
@@ -49,12 +73,20 @@ class ScoreFieldTomographyStrategy(BaseTrainingStrategy):
         self.sigma_min = float(sft.sigma_min) if sft is not None else 1e-3
         self.sigma_max = float(sft.sigma_max) if sft is not None else 1.0
         self.cond_dim = int(sft.cond_dim) if sft is not None else 5
+        self.val_num_levels = int(sft.val_num_levels) if sft is not None else 10
+        self.val_steps_per_level = int(sft.val_steps_per_level) if sft is not None else 5
+        self.val_step_size = float(sft.val_step_size) if sft is not None else 0.2
         logger.info(
-            "ScoreFieldTomographyStrategy (source=%s): sigma_min=%.4g, sigma_max=%.4g, cond_dim=%d",
+            "ScoreFieldTomographyStrategy (source=%s): sigma_min=%.4g, sigma_max=%.4g, "
+            "cond_dim=%d, val sampler=%s (levels=%d, steps/level=%d, eps=%.3g)",
             "config" if sft is not None else "defaults",
             self.sigma_min,
             self.sigma_max,
             self.cond_dim,
+            self.validation_sampler,
+            self.val_num_levels,
+            self.val_steps_per_level,
+            self.val_step_size,
         )
         # μ(σ) = σ² · (dim c / dim x) per the plan; dim x is set when first batch arrives.
         self._dim_x: int | None = None
@@ -75,29 +107,12 @@ class ScoreFieldTomographyStrategy(BaseTrainingStrategy):
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         del epoch
-        x_clean = target_batch
+        x_clean = _as_interleaved(target_batch)
         b = x_clean.shape[0]
         device = x_clean.device
         if self._dim_x is None:
             self._dim_x = int(x_clean[0].numel())
-        # Acquisition parameters: pulled from the batch dict when
-        # ``data.expose_acquisition_params`` is set (Tier-1 audit gates
-        # this), else fabricated from the static PHYSICS_REGISTRY via
-        # :func:`infer_acquisition_params` so the strategy can still
-        # run on synthetic / metadata-less data.
-        batch_dict = kwargs.get("batch", {})
-        if isinstance(batch_dict.get("acquisition_params"), torch.Tensor):
-            c_clean = batch_dict["acquisition_params"].to(device).float()
-        else:
-            ref = {"image": x_clean}
-            c_clean = infer_acquisition_params(ref).to(device)
-            # Truncate / pad to declared cond_dim so the strategy works
-            # for non-default cond_dim values during ablations.
-            if c_clean.shape[-1] > self.cond_dim:
-                c_clean = c_clean[..., : self.cond_dim]
-            elif c_clean.shape[-1] < self.cond_dim:
-                pad = torch.zeros(b, self.cond_dim - c_clean.shape[-1], device=device)
-                c_clean = torch.cat([c_clean, pad], dim=-1)
+        c_clean = self._resolve_condition(kwargs.get("batch"), x_clean)
         sigma = self._sample_sigma(b, device)
         # Image-domain noise (real); k-space Hermitian-Gaussian noise is
         # used when the model's input_domain is kspace (see TODO marker
@@ -130,6 +145,158 @@ class ScoreFieldTomographyStrategy(BaseTrainingStrategy):
             "score_field_loss_c": loss_c.detach(),
             "score_field_herm_residual": herm_residual,
         }
+
+    def _resolve_condition(self, batch: Any, x: torch.Tensor) -> torch.Tensor:
+        """The acquisition vector ``c`` for ``x``: the batch's, else inferred.
+
+        Read from the batch when ``data.expose.acquisition_params`` publishes it,
+        else built from the static PHYSICS_REGISTRY by
+        :func:`infer_acquisition_params` and truncated / zero-padded to
+        ``cond_dim``. Training and validation share this so ``c*`` at sampling
+        time is the vector the score was trained on.
+        """
+        device = x.device
+        published = read_batch_field(batch, "acquisition_params") if batch is not None else None
+        if isinstance(published, torch.Tensor):
+            return published.to(device).float()
+        c = infer_acquisition_params({"image": x}).to(device)
+        if c.shape[-1] > self.cond_dim:
+            return c[..., : self.cond_dim]
+        if c.shape[-1] < self.cond_dim:
+            pad = torch.zeros(x.shape[0], self.cond_dim - c.shape[-1], device=device)
+            c = torch.cat([c, pad], dim=-1)
+        return c
+
+    def _undersampling_record(self) -> dict[str, Any]:
+        """The declared undersampling the validation mask is drawn from (raises on unsupported)."""
+        us = getattr(self.config, "undersampling", None)
+        if us is None:
+            raise ValueError(
+                "ScoreFieldTomographyStrategy validation reconstructs from undersampled "
+                "k-space and needs an `undersampling:` block (base_acceleration, "
+                "center_fraction)."
+            )
+        direction = getattr(us, "mask_direction", None)
+        acq = getattr(getattr(self.config, "data", None), "acquisition", None)
+        # Undeclared direction samples rows ('y', dim -2), MaskGenerator's native axis.
+        line_axis = (
+            line_axis_for(direction, getattr(acq, "phase_encode_axis", None))
+            if direction is not None
+            else "y"
+        )
+        raw = str(us.acceleration_type).strip().lower()
+        try:
+            mask_type = MaskType(raw)
+        except ValueError:
+            canonical = SamplingPatternRegistry.resolve(raw)  # raises on an unknown name
+            mask_type = ACCELERATOR_TO_MASK_TYPE.get(canonical)
+            if mask_type is None:
+                raise ValueError(
+                    f"undersampling.acceleration_type={raw!r} is accelerator-only and has no "
+                    f"static mask; supported: {sorted(ACCELERATOR_TO_MASK_TYPE)}"
+                ) from None
+        seed = us.mask_seed if us.mask_seed is not None else int(self.config.run.seed)
+        return {
+            "mask_type": mask_type.value,
+            "acceleration": float(us.base_acceleration),
+            "center_fraction": float(us.center_fraction),
+            "density_power": float(us.density_power),
+            "seed": int(seed),
+            "line_axis": line_axis,
+        }
+
+    def _validation_mask(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        """Fixed-seed ``[1, 1, H, W]`` mask, cached per shape so ``val_psnr`` is comparable."""
+        cache = self.__dict__.setdefault("_val_mask_cache", {})
+        key = (height, width, str(device))
+        if key not in cache:
+            rec = self._undersampling_record()
+            columns = rec["line_axis"] == "x"
+            mask = MaskGenerator(seed=rec["seed"]).generate_mask(
+                rec["mask_type"],
+                (width, height) if columns else (height, width),
+                acceleration_factor=rec["acceleration"],
+                center_fraction=rec["center_fraction"],
+                density_power=rec["density_power"],
+            )
+            mask = mask.T if columns else mask
+            cache[key] = mask.to(device=device, dtype=torch.float32)[None, None]
+        return cache[key]
+
+    def _build_validation_sampler(self) -> Any:
+        sampler = self.__dict__.get("_val_sampler")
+        if sampler is None:
+            sampler = SamplerRegistry.get(
+                self.validation_sampler,
+                sigma_min=self.sigma_min,
+                sigma_max=self.sigma_max,
+                num_levels=self.val_num_levels,
+                steps_per_level=self.val_steps_per_level,
+                step_size=self.val_step_size,
+                seed=int(self.config.run.seed),
+            )
+            self._val_sampler = sampler
+        return sampler
+
+    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
+        """Stamp the resolved score-field and validation-sampler knobs (pitfall 15)."""
+        extra = super()._first_steps_extra(epoch, batch=batch)
+        try:
+            undersampling: dict[str, Any] | str = self._undersampling_record()
+        except ValueError as exc:  # validation raises on it; the stamp records why
+            undersampling = f"unresolvable: {exc}"
+        extra["score_field_tomography"] = {
+            "sigma_min": self.sigma_min,
+            "sigma_max": self.sigma_max,
+            "cond_dim": self.cond_dim,
+            "validation_sampler": self.validation_sampler,
+            "val_num_levels": self.val_num_levels,
+            "val_steps_per_level": self.val_steps_per_level,
+            "val_step_size": self.val_step_size,
+            "validation_undersampling": undersampling,
+        }
+        return extra
+
+    @torch.no_grad()
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        batch_data: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Reconstruct by annealed Langevin on ``s_x`` at fixed ``c*`` and score it.
+
+        The target image (after the same ``pre_model`` chain as training) is
+        undersampled with the arm's declared mask, ``y = M * fft2c(x)``; the chain
+        starts from the zero-filled image and is projected onto ``y`` after every
+        step. ``c*`` is the target's acquisition vector, resolved as in training.
+        PSNR/SSIM are computed on magnitude images, the convention of the cohort.
+        """
+        del kwargs
+        input_batch, target_batch = apply_pre_model(
+            self.adapter_chains, input_batch, target_batch
+        )
+        target = _as_interleaved(target_batch.to(self.device, non_blocking=True)).float()
+        z_target = interleaved_to_complex(target)
+        mask = self._validation_mask(target.shape[-2], target.shape[-1], target.device)
+        measured = fft2c(z_target) * mask
+        x_init = complex_to_interleaved(ifft2c(measured))
+        c_star = self._resolve_condition(batch_data, target)
+
+        model = self.generator_model
+        was_training = model.training
+        model.eval()
+        try:
+
+            def score_fn(x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+                return model(x, sigma, c_star)[0]
+
+            recon = self._build_validation_sampler().sample(score_fn, x_init, measured, mask)
+        finally:
+            model.train(was_training)
+        mag_recon = interleaved_to_complex(recon).abs()
+        return self._score_validation_output(mag_recon, z_target.abs())
 
 
 __all__ = ["ScoreFieldTomographyStrategy", "hermitian_gaussian_noise"]

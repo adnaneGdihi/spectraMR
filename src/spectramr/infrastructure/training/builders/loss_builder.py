@@ -6,7 +6,6 @@ SSOT for loss instantiation.
 """
 
 import logging
-import re
 from typing import Any
 
 import torch
@@ -15,6 +14,15 @@ import torch.nn as nn
 from spectramr.config.settings import TrainingSettings
 from spectramr.core.component_signature import signature_contract
 from spectramr.domain.exceptions import ConfigurationError
+
+# Re-exported: the skip sets are owned by models/losses/build_set.py.
+from spectramr.models.losses.build_set import (  # noqa: F401
+    COMPUTER_RESOLVED_LAMBDA_SOURCES,
+    REINTERPRETED_LAMBDA_SOURCES,
+    STRATEGY_MANAGED_LOSSES,
+    declared_build_set,
+    declared_names_in,
+)
 from spectramr.models.losses.registry import LossRegistry, create_loss, get_loss_capabilities
 
 from .base import Builder
@@ -28,150 +36,11 @@ _BRIDGE_WRAPPERS: dict[str, tuple[bool, str]] = {
     "ifft_complex": (True, "iFFT→complex bridge"),
 }
 
-#: Losses that ``LossBuilder`` must NOT instantiate as standalone modules
-#: because a training strategy computes them inline (they need gradients,
-#: encoder features, an injected ``context`` dict, or are bundled inside a
-#: composite GAN loss). This is the SSOT for the skip set — the loss-coverage
-#: auditor (``infrastructure/loss_audit.py``) imports it so the two cannot
-#: drift (the F41 2026-05-23 incident, re-broken when this set grew but the
-#: auditor's private copy did not — re-derived 2026-06-11).
-STRATEGY_MANAGED_LOSSES: frozenset[str] = frozenset(
-    {
-        # Strategy-managed (built by the training strategy)
-        "calibrated_gain_bloch",  # CalibratedQMapStrategy: needs the render and gain context
-        "commitment",
-        "codebook",
-        "r1",
-        "patch_nce",
-        "reconstruction",
-        "marker",
-        "prior",
-        "distill",
-        "sim",
-        "smooth",
-        "padnet_l2",
-        "padnet_dc",
-        "padnet_reg",
-        "bloch",
-        "anat",
-        "style",
-        "content",
-        "recon",
-        "bloch_residual",
-        "physics_constraint",
-        "parallel_imaging_kspace",
-        "snr_preserving",
-        "biophysical_flow",
-        "physics_informed",
-        # Composite-bundled GAN sub-losses (built by ``_build_composite_gan``;
-        # live inside ``losses.gan`` as ``enable_gradient_penalty`` /
-        # ``lambda_gp`` / ``lambda_feat_match`` rather than declarative entries).
-        "gradient_penalty",
-        "feature_matching",
-        # Strategy-inline, read straight off ``losses.*`` with NO ``enable_*``
-        # gate and no list entry possible. Each is exempt because its read site
-        # was verified, not because it looked unbuilt (#9: a declared exemption,
-        # never a silent fallback).
-        "pre_dc_kspace",  # strategies/diffusion.py:2593 — `lam > 0.0` then inline
-        "pre_dc_acquired",  # same site, the acquired-bin half — `lam > 0.0` then inline
-        "cycle_adv",  # strategies/cycle_bloch_strategy.py:212 — losses.gan.lambda_cycle_adv
-        "cycle_bloch",  # strategies/cycle_bloch_strategy.py:211 — losses.gan.lambda_cycle_bloch
-    }
-)
-
-#: Declaration *sources* whose weight a loss **computer** resolves from the weight
-#: table directly, rather than naming a module ``LossBuilder`` must instantiate.
-#: Each entry cites the read site that consumes the weight and computes the term
-#: inline, so refusing the declaration would refuse a term that does train.
-#:
-#: Keyed on the exact ``LossWeightSpec.source`` string and NOT on the loss name.
-#: Several sections canonicalise onto one name -- ``losses.diffusion.lambda_mse``,
-#: ``losses.reconstruction.lambda_l2`` and a future third field would all become
-#: ``l2`` -- and only the fields listed here have had their read site read.
-#: Exempting the name would carry the next such field in unexamined.
-#:
-#: **The exemptions are strategy-blind.** ``udr.py:751/757`` run under
-#: ``UnifiedReconstructionLossComputer`` and ``unified_vae.py:281`` under the VAE
-#: computer; under a different strategy the same lambdas are inert and this guard
-#: now passes them. That bound is shared by every skip set in this module
-#: (``STRATEGY_MANAGED_LOSSES`` included) and is not narrowed here.
-COMPUTER_RESOLVED_LAMBDA_SOURCES: dict[str, str] = {
-    # 4-source resolution chain, ending at the weight table.
-    "losses.diffusion.lambda_mse": (
-        "models/losses/computers/unified_diffusion_reconstruction.py:381-413"
-    ),
-    # Weight-gated only, term computed inline by ``_complex_safe_l1`` /
-    # ``_complex_safe_mse``. ``self.l1_loss_fn`` / ``self.l2_loss_fn`` are assigned
-    # ``None`` at udr.py:716-717 and never read, and
-    # ``UnifiedReconstructionLossComputer._initialize_losses`` is ``pass`` --
-    # no computer asks the builder for an l1 or l2 module.
-    "losses.reconstruction.lambda_l1": (
-        "models/losses/computers/unified_diffusion_reconstruction.py:751-754"
-    ),
-    "losses.reconstruction.lambda_l2": (
-        "models/losses/computers/unified_diffusion_reconstruction.py:757-760"
-    ),
-    # ``lambda_l1`` exists on LatentLossesConfig too and canonicalises to the same
-    # ``l1`` the read site above consumes.
-    "losses.latent.lambda_l1": (
-        "models/losses/computers/unified_diffusion_reconstruction.py:751-754"
-    ),
-    # Weight-gated only; the closed-form KL is computed in the branch itself.
-    "losses.latent.lambda_kl": ("models/losses/computers/unified_vae.py:281-301"),
-}
-
-#: The subset of the above whose computer reads the lambda as a *different knob*
-#: from the table key it canonicalises to. ``losses.diffusion.lambda_mse`` is step
-#: 3 of ``UnifiedDiffusionReconstructionLossComputer._resolve_diffusion_weight``
-#: and means the diffusion-term weight, while the table aliases ``lambda_mse`` to
-#: ``l2`` and joins it to any image or k-space ``mse`` entry. One table key, two
-#: knobs, so such a lambda beside a list entry of the same name is not a duplicate.
-#:
-#: A separate constant because the two questions differ. The set above answers
-#: "would refusing this lambda-only declaration stop a run that trains?" and the
-#: set below answers "is this lambda redundant beside a list entry?". The four
-#: reconstruction and latent sources are in the first and not the second:
-#: ``_get_loss_weight("l1")`` reads the table value a list entry already supplies,
-#: so the lambda beside it adds nothing and ``dual_surface_loss_declarations``
-#: should report it (non-negotiable 17 — one owner per invariant, not one
-#: constant for two).
-REINTERPRETED_LAMBDA_SOURCES: dict[str, str] = {
-    "losses.diffusion.lambda_mse": COMPUTER_RESOLVED_LAMBDA_SOURCES["losses.diffusion.lambda_mse"],
-}
-
-#: Matches ``losses.<section>.lambda_<field>`` or ``losses.<list>[<raw>].weight``.
-_SOURCE_NAME_RE = re.compile(r"lambda_(?P<field>\w+)$|\[(?P<raw>[^\]]+)\]\.weight$")
-
-
-def declared_names_in(source: str) -> set[str]:
-    """The RAW names an author wrote, recovered from a ``LossWeightSpec.source``.
-
-    ``LossWeightSpec.name`` is canonical, while the skip sets in this module are
-    keyed on the spelling the schema uses. Three of the 29
-    ``STRATEGY_MANAGED_LOSSES`` entries canonicalise to something else
-    (``marker`` -> ``marker_corruption``, ``content`` -> ``perceptual``,
-    ``patch_nce`` -> ``cut_patch_nce``), so a canonical-only membership test
-    silently loses those three exemptions — measured as a false raise on
-    ``pillars/exp_pillar_07_vf_fourier_shift.yaml``, whose ``lambda_marker`` the
-    VF strategy applies inline.
-
-    Canonicalising the skip set instead would be worse: it would also exempt
-    ``perceptual``, a real buildable loss that #421 established is a DIFFERENT
-    term from ``content``. Recovering the raw name keeps both spellings exact.
-    """
-    names: set[str] = set()
-    for segment in source.split("+"):
-        m = _SOURCE_NAME_RE.search(segment)
-        if m:
-            names.add(m.group("field") or m.group("raw"))
-    return names
-
-
 class LossBuilder(Builder):
     """Builds loss functions dynamically from objectives config.
 
     Creates all loss functions needed for training by automatically parsing
-    the enabled losses from the LossConfigSchema via `get_enabled_losses()`.
+    the declared build set (``declared_build_set``, #1966).
     Config-specific parameters are injected automatically based on loss type.
     """
 
@@ -230,9 +99,7 @@ class LossBuilder(Builder):
         Returns:
             dict[str, float]: Description.
         """
-        if hasattr(self._config.losses, "get_enabled_losses"):
-            return self._config.losses.get_enabled_losses()
-        return {}
+        return declared_build_set(self._config.losses)
 
     def get_loss_weights(self) -> dict[str, float]:
         """get_loss_weights.
@@ -296,6 +163,14 @@ class LossBuilder(Builder):
             # Build GAN composite if enabled and not in list-based
             if "adversarial" not in list_loss_names and gan_config:
                 if enabled_losses.get("adversarial", 0) > 0:
+                    if not getattr(gan_config, "enable_adversarial", False):
+                        # The list path declares the arm; a lambda_adv with the flag off would
+                        # never build the composite, so the weight would buy nothing (#9).
+                        raise ConfigurationError(
+                            "losses.gan.lambda_adv is declared, but losses.gan.enable_adversarial "
+                            "is false, so the adversarial term would not be built. Set "
+                            "enable_adversarial: true or drop lambda_adv."
+                        )
                     self._build_composite_gan(gan_config, recon_config)
 
             # Deep Supervision special case
@@ -373,7 +248,7 @@ class LossBuilder(Builder):
                     flagged.add(canonical_loss_name(loss_name))
 
             # ---- second pass: the weight table -----------------------------
-            # ``get_enabled_losses()`` keeps a ``lambda_<name>`` only while its
+            # The build set keeps a ``lambda_<name>`` only while its
             # sibling ``enable_<name>`` is true, and every ``enable_*`` defaults
             # False -- so a lambda-only declaration never reached the loop above
             # and this guard could not fire on the very shape its message
@@ -533,7 +408,8 @@ class LossBuilder(Builder):
 
             # Special cases for GAN/Adversarial
             if cfg_name == "adversarial" and gan_config:
-                self._build_composite_gan(gan_config, recon_config)
+                if getattr(gan_config, "enable_adversarial", False):
+                    self._build_composite_gan(gan_config, recon_config)
                 continue
 
             # Strategy-managed losses: commitment and codebook are computed
@@ -865,30 +741,31 @@ class LossBuilder(Builder):
                 )
             return merged
 
-        # Build each list
-        for component in self._config.losses.kspace_losses:
-            if component.enabled and component.weight > 0:
+        # `_losses` is keyed by bare name, so a name in two domain lists would keep only the
+        # later list's module (#2039); refuse it until the key carries the domain.
+        first_list: dict[str, str] = {}
+        bridges = {
+            "kspace_losses": kspace_bridge,
+            "image_losses": image_bridge,
+            "complex_losses": complex_bridge,
+            # Native by construction: the schema admits latent losses only with output_domain='latent'.
+            "latent_losses": "none",
+        }
+        for list_name, bridge_mode in bridges.items():
+            for component in getattr(self._config.losses, list_name):
+                if not (component.enabled and component.weight > 0):
+                    continue
+                earlier = first_list.setdefault(component.name, list_name)
+                if earlier != list_name:
+                    raise ConfigurationError(
+                        f"Loss {component.name!r} is declared in both losses.{earlier} and "
+                        f"losses.{list_name}. Losses are keyed by name, so only the later "
+                        "module would be built and the other term would silently vanish. "
+                        "Keep each name in one domain list."
+                    )
                 _create_and_register(
-                    component.name, component.weight, _merged(component), kspace_bridge
+                    component.name, component.weight, _merged(component), bridge_mode
                 )
-
-        for component in self._config.losses.image_losses:
-            if component.enabled and component.weight > 0:
-                _create_and_register(
-                    component.name, component.weight, _merged(component), image_bridge
-                )
-
-        for component in self._config.losses.complex_losses:
-            if component.enabled and component.weight > 0:
-                _create_and_register(
-                    component.name, component.weight, _merged(component), complex_bridge
-                )
-
-        # Latent losses are native by construction: the schema only admits them
-        # with output_domain='latent', so there is never a bridge to insert.
-        for component in self._config.losses.latent_losses:
-            if component.enabled and component.weight > 0:
-                _create_and_register(component.name, component.weight, _merged(component), "none")
 
     def _build_composite_gan(self, gan_config, recon_config):
         """Helper to build CompositeGANLoss."""
@@ -968,7 +845,7 @@ class LossBuilder(Builder):
             # this method; it is kept in the signature only because three test
             # modules call the method positionally.
             # The last two raw readers, and the same defect as ``lambda_l1``
-            # above wearing an enable flag. ``get_enabled_losses`` pairs
+            # above wearing an enable flag. The build set pairs
             # ``lambda_gp`` with ``enable_gradient_penalty`` and
             # ``feature_matching`` with ``enable_feature_matching``; this builder
             # -- the surface that actually CONSTRUCTS the term -- read the weight

@@ -31,7 +31,16 @@ ENTRIES = (
         fn=VoxelSliceKernel(degrade_metal_artifact),
         description="Metal-implant susceptibility artefact (void, pile-up, GRE dephasing)",
         severity=SeveritySpec(
-            (_P("sphere_radius", "mm", 0.0, 5.0),),
+            (
+                _P(
+                    "sphere_radius",
+                    "mm",
+                    0.0,
+                    5.0,
+                    endpoint_kwargs=(None, "max_radius_mm"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="a metal sphere of radius 5 mm x theta at a seeded 3-D position (a voxel of the "
             "central half of each axis plus a through-plane offset z0 in [-a, a]) in every mode; "
             "dchi = 200 ppm (kwarg delta_chi_ppm, signed; titanium is ~180 ppm, Schenck 1996). "
@@ -60,7 +69,11 @@ ENTRIES = (
         fn=degrade_chemical_shift_phase,
         description="Fat-water in/opposed-phase interference (GRE type-2 chemical shift)",
         severity=SeveritySpec(
-            (_P("te_sweep", "fraction of TE_in to TE_opp", 0.0, 1.0),),
+            (_P(
+                "te_sweep", "fraction of TE_in to TE_opp", 0.0, 1.0,
+                endpoint_kwargs=(None, "max_te_sweep"),
+                valid_min=0.0,
+            ),),
             notes="|W + F exp(i 2 pi df TE)| with df = -sigma gamma B0, sigma the profile's chi_ppm "
             "(3.5 ppm: -447 Hz at 3 T; kwarg sigma_ppm, default scanner_profile.DEFAULT_CHI_PPM), "
             "TE = TE_in + theta (TE_opp - TE_in), TE_in = 1/|df|, TE_opp = 1.5/|df|, so theta=0 "

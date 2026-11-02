@@ -16,9 +16,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from spectramr.core.metrics.compression_metrics import QUANTIZABLE_MODULES, model_storage_bytes
 from spectramr.models.registry import register_model
 
 logger = logging.getLogger(__name__)
+
+#: Largest symmetric integer level per supported weight precision.
+_QMAX: dict[int, int] = {8: 127, 4: 7}
+
+
+def quantize_tensor_symmetric(tensor: torch.Tensor, bits: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-tensor quantization: integer levels (int8 container) and the fp32 scale.
+
+    An all-zero tensor (a fully pruned layer) gets scale 1 so no division by zero occurs.
+    """
+    if bits not in _QMAX:
+        raise ValueError(f"Unsupported weight_bits={bits}; supported: {sorted(_QMAX)}.")
+    qmax = _QMAX[bits]
+    amax = tensor.detach().abs().amax().float()
+    scale = torch.where(amax > 0, amax / qmax, torch.ones_like(amax))
+    levels = torch.round(tensor.detach().float() / scale).clamp_(-qmax, qmax).to(torch.int8)
+    return levels, scale
 
 
 @dataclass
@@ -32,8 +50,9 @@ class CompressionConfig:
     activation_bits: int = 8
 
     # Pruning settings
-    pruning_method: str = "l1"  # "l1", "l2", "random", "structured"
+    pruning_method: str = "l1_global"  # "l1_global", "l2_filter", "random"
     pruning_ratio: float = 0.3
+    pruning_seed: int = 0  # read by "random" only
     pruning_schedule: str = "linear"  # "linear", "exponential", "cosine"
 
     # Knowledge distillation
@@ -112,37 +131,16 @@ class QuantizationManager:
         return quantized_model
 
     def _quantize_weights(self, model: nn.Module) -> nn.Module:
-        """Quantize model weights to specified bit precision."""
+        """Fake-quantize Conv/Linear weights in place (dequantized values on the int grid).
+
+        Biases stay fp32, as in INT8 deployment runtimes that accumulate bias in 32 bits.
+        """
         bits = self.config.weight_bits
-
-        def quantize_tensor(tensor: torch.Tensor) -> torch.Tensor:
-            """quantize_tensor.
-
-            Args:
-                tensor (torch.Tensor): Description.
-            Returns:
-                torch.Tensor: Description.
-            """
-            if bits == 8:
-                # 8-bit quantization
-                scale = tensor.abs().max() / 127
-                quantized = torch.round(tensor / scale).clamp(-127, 127)
-                return quantized * scale
-            if bits == 4:
-                # 4-bit quantization
-                scale = tensor.abs().max() / 7
-                quantized = torch.round(tensor / scale).clamp(-7, 7)
-                return quantized * scale
-            self.logger.warning(f"Unsupported quantization bits: {bits}")
-            return tensor
-
-        for _name, module in model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.Linear)):
+        for module in model.modules():
+            if isinstance(module, QUANTIZABLE_MODULES) and module.weight is not None:
                 with torch.no_grad():
-                    module.weight.data = quantize_tensor(module.weight.data)
-                    if module.bias is not None:
-                        module.bias.data = quantize_tensor(module.bias.data)
-
+                    levels, scale = quantize_tensor_symmetric(module.weight, bits)
+                    module.weight.copy_(levels.to(module.weight.dtype) * scale)
         return model
 
     def _quantize_activations(
@@ -150,23 +148,11 @@ class QuantizationManager:
         model: nn.Module,
         calibration_data: torch.Tensor,
     ) -> nn.Module:
-        """Quantize activations using calibration data.
-
-        .. warning:: **LIMITATION**: Activation quantization is not yet
-           implemented.  Full activation quantization requires either:
-
-           1. **PyTorch QAT** (``torch.quantization.prepare_qat`` →
-              ``convert``) for training-time quantization, or
-           2. **Post-training quantization** via TensorRT / ONNX Runtime.
-
-           This method currently returns the model unmodified.
-        """
-        self.logger.warning(
-            "Activation quantization is a no-op. Use PyTorch QAT or "
-            "TensorRT post-training quantization for real activation "
-            "quantization.  Returning model unchanged."
+        """Activation quantization is not implemented; requesting it raises."""
+        raise NotImplementedError(
+            "Activation quantization is not implemented (it needs QAT or a static PTQ backend); "
+            "set quantize_activations=False."
         )
-        return model
 
     def get_quantization_stats(self, model: nn.Module) -> dict[str, Any]:
         """Get quantization statistics."""
@@ -209,113 +195,73 @@ class PruningManager:
             Pruned model
 
         """
+        pruners = {
+            "l1_global": self._l1_pruning,
+            "l2_filter": self._l2_pruning,
+            "random": self._random_pruning,
+        }
+        pruner = pruners.get(self.config.pruning_method)
+        if pruner is None:
+            raise ValueError(
+                f"Unsupported pruning_method={self.config.pruning_method!r}; "
+                f"supported: {sorted(pruners)}."
+            )
         self.logger.info(f"Starting {self.config.pruning_method} pruning...")
-
-        pruned_model = copy.deepcopy(model)
-
-        if self.config.pruning_method == "l1":
-            pruned_model = self._l1_pruning(pruned_model)
-        elif self.config.pruning_method == "l2":
-            pruned_model = self._l2_pruning(pruned_model)
-        elif self.config.pruning_method == "random":
-            pruned_model = self._random_pruning(pruned_model)
-        elif self.config.pruning_method == "structured":
-            pruned_model = self._structured_pruning(pruned_model)
-
+        pruned_model = pruner(copy.deepcopy(model))
         self.logger.info("Model pruning completed.")
         return pruned_model
 
+    def _prunable(self, model: nn.Module) -> list[tuple[str, nn.Module]]:
+        return [
+            (name, m)
+            for name, m in model.named_modules()
+            if isinstance(m, QUANTIZABLE_MODULES) and m.weight is not None
+        ]
+
     def _l1_pruning(self, model: nn.Module) -> nn.Module:
-        """Apply L1 norm-based pruning with global thresholding."""
-        # 1. Gather all weights into one list
-        all_weights = []
-        for module in model.modules():
-            if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.Linear)):
-                all_weights.append(module.weight.data.view(-1))
-
-        if not all_weights:
+        """Zero the globally smallest-magnitude fraction of all prunable weights."""
+        layers = self._prunable(model)
+        if not layers:
             return model
-
-        # 2. Concat and sort ONCE
-        global_weights = torch.cat(all_weights)
-        # Use abs() for magnitude-based pruning
-        threshold = torch.quantile(global_weights.abs(), self.config.pruning_ratio)
-
-        # 3. Apply masks
-        for name, module in model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.Linear)):
-                # Create mask
-                mask = (module.weight.data.abs() > threshold).float()
-
-                # Apply pruning
-                module.weight.data *= mask
-                self.pruning_masks[name] = mask
-
+        magnitudes = torch.cat([m.weight.detach().abs().flatten() for _, m in layers])
+        k = int(self.config.pruning_ratio * magnitudes.numel())
+        if k == 0:
+            return model
+        # kthvalue, not quantile: quantile caps its input at 2**24 elements.
+        threshold = magnitudes.float().kthvalue(k).values
+        for name, module in layers:
+            with torch.no_grad():
+                mask = (module.weight.abs() > threshold).to(module.weight.dtype)
+                module.weight.mul_(mask)
+            self.pruning_masks[name] = mask
         return model
 
     def _l2_pruning(self, model: nn.Module) -> nn.Module:
-        """Apply L2 norm-based pruning."""
-        for name, module in model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.Linear)):
-                with torch.no_grad():
-                    # Calculate L2 norm for each filter/channel
-                    if isinstance(module, nn.Linear):
-                        norms = torch.norm(module.weight.data, p=2, dim=1)
-                    else:
-                        norms = torch.norm(module.weight.data, p=2, dim=(1, 2, 3))
-
-                    # Calculate threshold
-                    threshold = torch.quantile(norms, self.config.pruning_ratio)
-
-                    # Create mask
-                    mask = (norms > threshold).float()
-
-                    # Apply pruning
-                    if isinstance(module, nn.Linear):
-                        mask = mask.unsqueeze(1).expand_as(module.weight.data)
-                    else:
-                        mask = mask.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-                        mask = mask.expand_as(module.weight.data)
-
-                    module.weight.data *= mask
-                    self.pruning_masks[name] = mask
-
+        """Per layer, zero the output filters with the smallest L2 norm."""
+        for name, module in self._prunable(model):
+            # ConvTranspose stores (in, out, ...): its output filters are dim 1.
+            out_dim = 1 if isinstance(module, nn.modules.conv._ConvTransposeNd) else 0
+            with torch.no_grad():
+                w = module.weight
+                norms = w.transpose(0, out_dim).flatten(1).norm(p=2, dim=1)
+                threshold = torch.quantile(norms.float(), self.config.pruning_ratio)
+                shape = [1] * w.dim()
+                shape[out_dim] = -1
+                mask = (norms > threshold).to(w.dtype).view(shape).expand_as(w)
+                w.mul_(mask)
+            self.pruning_masks[name] = mask
         return model
 
     def _random_pruning(self, model: nn.Module) -> nn.Module:
-        """Apply random pruning."""
-        for name, module in model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.Linear)):
-                with torch.no_grad():
-                    # Create random mask
-                    mask = torch.rand_like(module.weight.data) > self.config.pruning_ratio
-                    module.weight.data *= mask.float()
-                    self.pruning_masks[name] = mask.float()
-
-        return model
-
-    def _structured_pruning(self, model: nn.Module) -> nn.Module:
-        """Apply structured pruning (remove entire channels/filters)."""
-        for name, module in model.named_modules():
-            if isinstance(module, (nn.Conv2d, nn.Conv3d)):
-                with torch.no_grad():
-                    # Calculate importance scores for each channel
-                    norms = torch.norm(module.weight.data, p=2, dim=(1, 2, 3))
-
-                    # Select channels to keep
-                    num_keep = int(norms.size(0) * (1 - self.config.pruning_ratio))
-                    _, indices = torch.topk(norms, num_keep)
-
-                    # Create new weight tensor with selected channels
-                    new_weight = module.weight.data[indices]
-                    module.weight.data = new_weight
-
-                    # Update output channels
-                    module.out_channels = num_keep
-
-                    # Store pruning info
-                    self.pruning_masks[name] = indices
-
+        """Zero a random fraction of each prunable weight, seeded by ``pruning_seed``."""
+        gen = torch.Generator().manual_seed(self.config.pruning_seed)
+        for name, module in self._prunable(model):
+            with torch.no_grad():
+                w = module.weight
+                keep = torch.rand(w.shape, generator=gen) >= self.config.pruning_ratio
+                mask = keep.to(device=w.device, dtype=w.dtype)
+                w.mul_(mask)
+            self.pruning_masks[name] = mask
         return model
 
     def get_pruning_stats(self, model: nn.Module) -> dict[str, Any]:
@@ -431,9 +377,7 @@ class ModelCompressionPipeline:
         """
         self.logger.info("Starting model compression pipeline...")
 
-        # Store original model info
-        original_params = sum(p.numel() for p in model.parameters())
-        original_size = original_params * 4 / (1024 * 1024)  # MB (float32)
+        original_size = model_storage_bytes(model, weight_bits=32) / (1024 * 1024)
         self.stats.original_size_mb = original_size
 
         compressed_model = copy.deepcopy(model)
@@ -452,9 +396,8 @@ class ModelCompressionPipeline:
                 calibration_data,
             )
 
-        # Calculate final statistics
-        final_params = sum(p.numel() for p in compressed_model.parameters())
-        final_size = final_params * self.config.weight_bits / 8 / (1024 * 1024)
+        bits = self.config.weight_bits if self.config.quantize_weights else 32
+        final_size = model_storage_bytes(compressed_model, weight_bits=bits) / (1024 * 1024)
         self.stats.compressed_size_mb = final_size
         self.stats.compression_ratio = original_size / final_size if final_size > 0 else 1
 
@@ -663,31 +606,3 @@ def create_efficient_architecture(
         base_channels=base_channels,
         use_depthwise=use_depthwise,
     )
-
-
-# Test/example usage
-if __name__ == "__main__":
-    # Create a simple test model
-    model = nn.Sequential(
-        nn.Conv2d(1, 64, 3, padding=1),
-        nn.ReLU(),
-        nn.Conv2d(64, 32, 3, padding=1),
-        nn.ReLU(),
-        nn.Conv2d(32, 1, 3, padding=1),
-    )
-
-    # Test compression pipeline
-    config = CompressionConfig(quantize_weights=True, weight_bits=8, pruning_ratio=0.1)
-
-    pipeline = ModelCompressionPipeline(config)
-
-    # Compress model
-    compressed = pipeline.compress_model(model)
-
-    # Get stats
-    stats = pipeline.get_compression_stats()
-
-    logger.debug(f"Original size: {stats.original_size_mb:.2f}MB")
-    logger.debug(f"Compressed size: {stats.compressed_size_mb:.2f}MB")
-    logger.debug(f"Compression ratio: {stats.compression_ratio:.2f}x")
-    logger.debug("Model compression test completed!")

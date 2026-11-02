@@ -14,6 +14,7 @@ reproducible and what makes the bootstrap variance estimates in FSPD valid.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from .damage import YARDSTICKS, damage_batch
 from .types import DegradationSample
 
 if TYPE_CHECKING:
@@ -338,6 +340,15 @@ class SimulatorConfig:
     operator_library: (
         dict[str, Callable[[torch.Tensor, float, torch.Generator], torch.Tensor]] | None
     ) = field(default=None, repr=False)
+    # Per-family ``theta_local -> {"physical": ..., "native": ...}``, injected from the
+    # application layer (core cannot import the severity resolver). ``None`` adds no keys.
+    severity_annotators: Mapping[str, Callable[[float], dict[str, float]]] | None = field(
+        default=None, repr=False
+    )
+    # Yardsticks measured per sample into ``severity["damage_<name>"]``; empty adds no keys.
+    damage_yardsticks: tuple[str, ...] = ()
+    # Stamped verbatim into ``degradation_provenance`` by the pipeline.
+    severity_provenance: Mapping[str, Any] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         library = self.operator_library or DEGRADATION_LIBRARY
@@ -346,6 +357,16 @@ class SimulatorConfig:
         unknown = set(self.families) - library.keys()
         if unknown:
             raise ValueError(f"unknown degradation families: {sorted(unknown)}")
+        self.damage_yardsticks = tuple(self.damage_yardsticks)
+        bad = [y for y in self.damage_yardsticks if y not in YARDSTICKS]
+        if bad:
+            raise ValueError(
+                f"unknown damage yardstick(s) {bad}; expected from {sorted(YARDSTICKS)}"
+            )
+        if self.severity_annotators is not None:
+            missing = sorted(set(self.families) - set(self.severity_annotators))
+            if missing:
+                raise ValueError(f"severity_annotators has no entry for families {missing}")
 
     @property
     def effective_library(
@@ -355,10 +376,21 @@ class SimulatorConfig:
         return self.operator_library or DEGRADATION_LIBRARY
 
 
+#: Stamped beside ``seed`` in every bundle: draws are comparable only within one scheme.
+SEED_SCHEME = "blake2b_v1"
+
+
+def content_seed(seed: int, content_id: str) -> int:
+    """32-bit per-content seed hashed over the WHOLE id, so ids sharing a prefix differ."""
+    digest = hashlib.blake2b(f"{seed}:{content_id}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big") & 0xFFFFFFFF
+
+
 def run_simulator(
     clean_volumes: Iterable[tuple[str, torch.Tensor]],
     config: SimulatorConfig,
     assets_by_content: Mapping[str, MetricContext] | None = None,
+    subject_of: Mapping[str, str] | None = None,
 ) -> list[DegradationSample]:
     """Sweep all (family, severity) pairs over each clean reference.
 
@@ -373,6 +405,8 @@ def run_simulator(
             context so the NR/physics battery is graded on the true acquisition
             rather than a synthetic stand-in. Absent content_ids fall back to the
             synthesised context (magnitude-only cohort).
+        subject_of: optional ``{content_id: subject_id}``. When given it must name
+            every content, so no sample silently falls back to its own content id.
 
     Returns:
         A flat list of ``DegradationSample`` objects.
@@ -382,14 +416,22 @@ def run_simulator(
     severities = halton_grid(config.n_severities_per_family, dim=1).flatten()
     library = config.effective_library
 
+    seen: set[str] = set()
     for content_id, clean in clean_volumes:
-        # Stable per-content seed so reruns are deterministic.
-        content_seed = (
-            config.seed ^ int.from_bytes(content_id.encode("utf-8")[:8].ljust(8, b"\0"), "big")
-        ) & 0xFFFFFFFF
-        for fi, family in enumerate(config.families):
+        seen.add(content_id)
+        subject_id = None
+        if subject_of is not None:
+            if content_id not in subject_of:
+                raise ValueError(f"subject_of names no subject for content {content_id!r}.")
+            subject_id = subject_of[content_id]
+            if not subject_id:
+                raise ValueError(f"subject_of gives content {content_id!r} an empty subject id.")
+        base_seed = content_seed(config.seed, content_id)
+        for fi, family in enumerate(config.families or ()):
             fn = library[family]
             stable = family in TRAJECTORY_STABLE_FAMILIES
+            annotate = config.severity_annotators[family] if config.severity_annotators else None
+            family_samples: list[DegradationSample] = []
             for si, theta in enumerate(severities.tolist()):
                 # Per-sample generator so single (content, family, theta) always
                 # yields the same image. Trajectory-stable families omit the
@@ -397,23 +439,38 @@ def run_simulator(
                 # drawn ONCE per (content, family) and only ``theta`` scales it —
                 # keeping the degradation monotone in severity (critique C1).
                 seed = (
-                    (content_seed + fi * 7919) & 0xFFFFFFFF
+                    (base_seed + fi * 7919) & 0xFFFFFFFF
                     if stable
-                    else (content_seed + fi * 7919 + si * 13) & 0xFFFFFFFF
+                    else (base_seed + fi * 7919 + si * 13) & 0xFFFFFFFF
                 )
                 gen = torch.Generator().manual_seed(seed)
                 degraded = fn(clean.detach(), float(theta), gen)
-                samples.append(
+                severity: dict[str, float] = {"theta": float(theta)}
+                if annotate is not None:
+                    severity.update(annotate(float(theta)))
+                family_samples.append(
                     DegradationSample(
                         clean=clean.detach(),
                         degraded=degraded.detach(),
                         degradation_family=family,
-                        severity={"theta": float(theta)},
+                        severity=severity,
                         content_id=content_id,
                         seed=seed,
+                        subject_id=subject_id,
                         assets=assets_by_content.get(content_id),
                     )
                 )
+            # One batched yardstick call and one device->host transfer per (content, family).
+            for y in config.damage_yardsticks:
+                stack = torch.stack([smp.degraded for smp in family_samples])
+                values = damage_batch(clean.detach(), stack, y).tolist()
+                for smp, v in zip(family_samples, values, strict=True):
+                    smp.severity[f"damage_{y}"] = float(v)
+            samples.extend(family_samples)
+    if subject_of is not None and set(subject_of) - seen:
+        raise ValueError(
+            f"subject_of names contents that were never simulated: {sorted(set(subject_of) - seen)}"
+        )
     return samples
 
 

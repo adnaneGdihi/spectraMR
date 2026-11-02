@@ -94,7 +94,8 @@ class _BackboneAlias(nn.Module):
     name="loupe",
     training_mode="learnable_acquisition",
     spatial_dims=(2,),
-    input_domain="kspace",
+    # The backbone sees the pre_model image the strategy undersamples, not k-space.
+    input_domain="image",
     output_domain="image",
     accepts_complex=True,
     requires_paired_data=True,
@@ -107,7 +108,8 @@ class LOUPEModel(_BackboneAlias):
     name="pilot",
     training_mode="learnable_acquisition",
     spatial_dims=(2,),
-    input_domain="kspace",
+    # The backbone sees the pre_model image the strategy undersamples, not k-space.
+    input_domain="image",
     output_domain="image",
     accepts_complex=True,
     requires_paired_data=True,
@@ -172,16 +174,7 @@ class FrozenBackboneWithHead(_BackboneAlias):
 # the cdiffmr/shen2024/fdb baselines noted further down.
 
 
-@register_model(
-    name="latent_diffusion_multi_axis_cfg",
-    training_mode="diffusion",
-    spatial_dims=(2,),
-    input_domain="image",
-    output_domain="image",
-    supports_contrast_conditioning=True,
-)
-class LatentDiffusionMultiAxisCFG(_BackboneAlias):
-    """Latent diffusion with multi-axis CFG schedule."""
+# latent_diffusion_multi_axis_cfg lives in models/generators/latent_diffusion_multi_axis_cfg.py.
 
 
 @register_model(

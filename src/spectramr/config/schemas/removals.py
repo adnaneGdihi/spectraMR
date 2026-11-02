@@ -262,11 +262,13 @@ _RECORDS = [
         "training.tissue_prior_checkpoint",
         "2026-10-10",
         "Existence-checked, never loaded: no code read the weights (#647).",
+        live="training.tissue_prior.checkpoint",
     ),
     RemovalRecord(
         "training.corruption_calibration_checkpoint",
         "2026-10-10",
         "Existence-checked, never loaded: no code read the weights (#647).",
+        live="training.corruption.checkpoint",
     ),
     RemovalRecord(
         "training.bloch_manifold_dps.pretrained_score_checkpoint",

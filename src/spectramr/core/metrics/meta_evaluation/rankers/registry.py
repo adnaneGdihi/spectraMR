@@ -18,6 +18,7 @@ Capability flags gate rankers whose ground truth is external data:
 
 * ``requires_likert``   — needs radiologist Likert observations.
 * ``requires_task_net`` — needs a frozen downstream task network (the ΔP target).
+* ``opt_in``            — never resolved into a default pool; a run must name it.
 * ``data_kwargs``       — the ``__init__`` keyword(s) that CARRY that external
   data. Declaring the flag without declaring the kwarg makes the gate decorative:
   ``available_rankers(have_task_net=True)`` would happily hand back a ranker
@@ -82,6 +83,9 @@ class RankerSpec:
     #: Names of the registered rankers this one is a deterministic fusion of. A
     #: fusion must not vote next to its own constituents (#256).
     fuses: tuple[str, ...] = ()
+    #: Never resolved by :func:`available_rankers`: the ranker is run only when a
+    #: caller names it, so registering it cannot change an existing pool's aggregate.
+    opt_in: bool = False
 
     def instantiate(self, **overrides: Any) -> BaseRanker:
         """Build the ranker from its default kwargs (overridable)."""
@@ -101,6 +105,7 @@ def register_ranker(
     default_kwargs: Mapping[str, Any] | None = None,
     data_kwargs: tuple[str, ...] = (),
     fuses: tuple[str, ...] = (),
+    opt_in: bool = False,
 ) -> Callable[[type], type]:
     """Decorator: register a :class:`BaseRanker` subclass under ``name``.
 
@@ -115,6 +120,7 @@ def register_ranker(
             without it the capability gate can only *omit* the ranker, never
             *supply* it, which is what made the Gen-4 pipeline path dead code.
         fuses: Registered ranker names this one deterministically fuses.
+        opt_in: Keep the ranker out of every :func:`available_rankers` pool.
     """
     if (requires_likert or requires_task_net) and not data_kwargs:
         raise ValueError(
@@ -147,6 +153,7 @@ def register_ranker(
             default_kwargs=dict(default_kwargs or {}),
             data_kwargs=tuple(data_kwargs),
             fuses=tuple(fuses),
+            opt_in=opt_in,
         )
         logger.debug("Registered ranker %r (gen=%d, cls=%s)", name, generation, cls.__name__)
         return cls
@@ -199,6 +206,8 @@ def available_rankers(
     """
     out = []
     for spec in list_rankers():
+        if spec.opt_in:
+            continue
         if spec.requires_likert and not have_likert:
             continue
         if spec.requires_task_net and not have_task_net:

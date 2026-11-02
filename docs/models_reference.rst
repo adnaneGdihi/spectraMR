@@ -260,8 +260,9 @@ Cascaded Diffusion Generator
 
 **Registry:** ``cascaded_diffusion`` — **File:** ``cascaded_diffusion_generator.py``
 
-Multi-stage coarse-to-fine diffusion: each stage operates at increasing
-spatial resolution with the previous stage's output as conditioning.
+Two-stage spectral cascade: stage 1 denoises the low-pass circle of the image in
+k-space, stage 2 the high-pass residual conditioned on the stage-1 output
+(``CascadedDiffusionStrategy``, ``training_mode: cascaded_diffusion``).
 
 
 ---

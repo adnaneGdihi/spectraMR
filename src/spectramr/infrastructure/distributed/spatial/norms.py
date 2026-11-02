@@ -4,7 +4,9 @@ Each adopts the original module in place (parameters, buffers and state-dict key
 unchanged) and reduces its sums across the spatial group with a differentiable
 all-reduce, so forward values and gradients equal the unsplit layer's. Statistics
 are taken in two passes (mean, then centred second moment) for the same numerics as
-the native kernels at float32.
+the native kernels at float32. A half-precision slab is normalised in float32 (an fp16
+sum over a volume overflows at 65504; autocast does the same for the native norms) and
+returned in its own dtype, so an FSDP fp16 layer after it receives fp16.
 """
 
 from __future__ import annotations
@@ -40,6 +42,16 @@ def _group_stats(
     return mean, var
 
 
+def _f32(x: torch.Tensor) -> torch.Tensor:
+    return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+
+
+def _affine(y: torch.Tensor, norm: nn.Module, dtype: torch.dtype) -> torch.Tensor:
+    if norm.affine:
+        y = y * norm.weight.view(1, -1, 1, 1, 1) + norm.bias.view(1, -1, 1, 1, 1)
+    return y.to(dtype)
+
+
 class SpatialGroupNorm(nn.GroupNorm):
     """``GroupNorm`` over a depth-split ``[B, C, D, H, W]`` volume."""
 
@@ -54,12 +66,10 @@ class SpatialGroupNorm(nn.GroupNorm):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         require_spatial_scope("SpatialGroupNorm")
         b, c = x.shape[:2]
-        grouped = x.reshape(b, self.num_groups, c // self.num_groups, *x.shape[2:])
+        grouped = _f32(x).reshape(b, self.num_groups, c // self.num_groups, *x.shape[2:])
         mean, var = _group_stats(grouped, tuple(range(2, grouped.dim())), self.spatial_group)
-        y = ((grouped - mean) / torch.sqrt(var + self.eps)).reshape_as(x)
-        if self.affine:
-            y = y * self.weight.view(1, -1, 1, 1, 1) + self.bias.view(1, -1, 1, 1, 1)
-        return y
+        y = ((grouped - mean) / torch.sqrt(var + self.eps)).reshape(x.shape)
+        return _affine(y, self, x.dtype)
 
 
 class SpatialInstanceNorm3d(nn.InstanceNorm3d):
@@ -77,11 +87,9 @@ class SpatialInstanceNorm3d(nn.InstanceNorm3d):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         require_spatial_scope("SpatialInstanceNorm3d")
-        mean, var = _group_stats(x, (2, 3, 4), self.spatial_group)
-        y = (x - mean) / torch.sqrt(var + self.eps)
-        if self.affine:
-            y = y * self.weight.view(1, -1, 1, 1, 1) + self.bias.view(1, -1, 1, 1, 1)
-        return y
+        x32 = _f32(x)
+        mean, var = _group_stats(x32, (2, 3, 4), self.spatial_group)
+        return _affine((x32 - mean) / torch.sqrt(var + self.eps), self, x.dtype)
 
 
 class SpatialBatchNorm3d(nn.BatchNorm3d):
@@ -103,7 +111,8 @@ class SpatialBatchNorm3d(nn.BatchNorm3d):
         require_spatial_scope("SpatialBatchNorm3d")
         if not (self.training or not self.track_running_stats):
             return super().forward(x)
-        mean, var = _group_stats(x, (0, 2, 3, 4), self.spatial_group)
+        x32 = _f32(x)
+        mean, var = _group_stats(x32, (0, 2, 3, 4), self.spatial_group)
         if self.training and self.track_running_stats:
             count = _global_count(x, (0, 2, 3, 4), self.spatial_group)
             with torch.no_grad():
@@ -114,12 +123,9 @@ class SpatialBatchNorm3d(nn.BatchNorm3d):
                     else 1.0 / float(self.num_batches_tracked)
                 )
                 unbiased = var.flatten() * (count / max(count - 1, 1.0))
-                self.running_mean.lerp_(mean.flatten(), momentum)
-                self.running_var.lerp_(unbiased, momentum)
-        y = (x - mean) / torch.sqrt(var + self.eps)
-        if self.affine:
-            y = y * self.weight.view(1, -1, 1, 1, 1) + self.bias.view(1, -1, 1, 1, 1)
-        return y
+                self.running_mean.lerp_(mean.flatten().to(self.running_mean.dtype), momentum)
+                self.running_var.lerp_(unbiased.to(self.running_var.dtype), momentum)
+        return _affine((x32 - mean) / torch.sqrt(var + self.eps), self, x.dtype)
 
 
 class SpatialGlobalAvgPool3d(nn.AdaptiveAvgPool3d):
@@ -139,7 +145,8 @@ class SpatialGlobalAvgPool3d(nn.AdaptiveAvgPool3d):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         require_spatial_scope("SpatialGlobalAvgPool3d")
         count = _global_count(x, (2, 3, 4), self.spatial_group)
-        return _all_sum(x.sum(dim=(2, 3, 4), keepdim=True), self.spatial_group) / count
+        total = _all_sum(_f32(x).sum(dim=(2, 3, 4), keepdim=True), self.spatial_group)
+        return (total / count).to(x.dtype)
 
 
 def adaptive_pool_is_global(pool: nn.Module) -> bool:

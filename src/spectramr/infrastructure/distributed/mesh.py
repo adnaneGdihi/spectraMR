@@ -35,7 +35,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DATA_PARALLEL_DIMS",
+    "GRAD_REDUCE_DIM",
+    "GRAD_SHARD_DIM",
     "MESH_DIM_NAMES",
+    "REPLICA_DIMS",
     "ParallelMesh",
     "build_parallel_mesh",
     "dp_group",
@@ -52,6 +55,22 @@ MESH_DIM_NAMES: tuple[str, ...] = ("pp", "dp_replicate", "dp_shard", "cp", "sp",
 #: The two axes whose product is the data-parallel size. Adjacent, so their slice is
 #: a contiguous sub-mesh that can be flattened into one group.
 DATA_PARALLEL_DIMS: tuple[str, ...] = ("dp_replicate", "dp_shard")
+
+#: Flattened ``dp_replicate x dp_shard x cp x sp``: the ranks one gradient is averaged
+#: over when context or spatial peers each compute a partial gradient of one sample.
+GRAD_REDUCE_DIM = "dp_cp_sp"
+
+#: Flattened ``dp_shard x cp x sp``: the shard axis of a hybrid-sharded FSDP run with them.
+GRAD_SHARD_DIM = "dp_shard_cp_sp"
+
+#: The raw axes behind :data:`GRAD_REDUCE_DIM` and :data:`GRAD_SHARD_DIM`.
+_GRAD_REDUCE_AXES = ("dp_replicate", "dp_shard", "cp", "sp")
+_GRAD_SHARD_AXES = ("dp_shard", "cp", "sp")
+
+#: Mesh dims, raw or flattened, whose peers hold the same parameters. ``tp`` is never
+#: among them: tensor peers hold different slices, so no gradient reduction or FSDP
+#: shard may span it, alone or composed with context parallelism.
+REPLICA_DIMS: tuple[str, ...] = (*DATA_PARALLEL_DIMS, GRAD_REDUCE_DIM, GRAD_SHARD_DIM)
 
 _FSDP_SHARDING = ("full_shard", "shard_grad_op", "no_shard", "hybrid_shard")
 
@@ -123,10 +142,12 @@ class ParallelMesh:
     device_mesh: Any
     layout: DPLayout
     shape: dict[str, int]
+    #: This rank's ``cp`` peers (chunks of one token sequence); ``None`` unless cp > 1.
+    context_group: Any = None
     #: The ``sp`` peers of this rank (depth slabs of one volume); ``None`` unless sp > 1.
     spatial_group: Any = None
-    #: The ``dp x sp`` group DDP averages gradients over; ``None`` unless sp > 1, so
-    #: the data-parallel group is used as before.
+    #: The group DDP averages gradients over: ``dp x cp x sp`` when cp or sp > 1, else
+    #: ``None`` and the data-parallel group is used.
     grad_group: Any = None
 
     def provenance(self) -> dict[str, Any]:
@@ -197,13 +218,15 @@ def build_parallel_mesh(
     else:
         group = device_mesh[DATA_PARALLEL_DIMS]._flatten("dp").get_group()
 
+    context_group = device_mesh["cp"].get_group() if shape["cp"] > 1 else None
     spatial_group = device_mesh["sp"].get_group() if shape["sp"] > 1 else None
     grad_group = None
-    if shape["sp"] > 1:
-        # cp is size 1 here (refused with sp > 1 by the schema), so the slice is contiguous.
-        grad_group = (
-            device_mesh[("dp_replicate", "dp_shard", "cp", "sp")]._flatten("dp_sp").get_group()
-        )
+    if shape["cp"] * shape["sp"] > 1:
+        # Every peer holds the same parameters and computes a partial gradient, so the
+        # average spans them as well as the data-parallel ranks.
+        grad_group = device_mesh[_GRAD_REDUCE_AXES]._flatten(GRAD_REDUCE_DIM).get_group()
+        if strategy == "fsdp":
+            device_mesh[_GRAD_SHARD_AXES]._flatten(GRAD_SHARD_DIM)
 
     layout = DPLayout(
         rank=rank_in_dp,
@@ -227,6 +250,7 @@ def build_parallel_mesh(
         device_mesh=device_mesh,
         layout=layout,
         shape=shape,
+        context_group=context_group,
         spatial_group=spatial_group,
         grad_group=grad_group,
     )

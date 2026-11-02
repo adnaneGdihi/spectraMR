@@ -6,6 +6,8 @@ batch consistency, non-square inputs, and physics correctness.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 import torch
 
@@ -270,3 +272,111 @@ class TestVCCPhysics:
             y = model(x, marker_prior=marker)
         assert y.shape == (1, 2, 16, 16)
         assert torch.isfinite(y).all()
+
+
+class TestWienerRefiner:
+    """wiener_unet's post-Wiener refiner (model_kwargs.refiner), resolved via the registry."""
+
+    _SWIN: ClassVar[dict[str, object]] = {
+        "img_size": 16,
+        "window_size": 4,
+        "embed_dim": 8,
+        "depths": [1],
+        "num_heads": [2],
+        "mlp_ratio": 2.0,
+    }
+
+    def _build(self, **kw: object) -> torch.nn.Module:
+        from spectramr.models.registry import get_model_class
+
+        return get_model_class("wiener_unet")(in_channels=2, out_channels=2, **kw)
+
+    def test_swinir_refiner_is_built_and_runs(self) -> None:
+        from spectramr.models.generators.swinir_generator import SwinIRGenerator
+
+        model = self._build(refiner="swinir", refiner_kwargs=self._SWIN)
+        assert isinstance(model.swinir, SwinIRGenerator)
+        assert not hasattr(model, "resblocks")
+        x = torch.randn(2, 2, 16, 16)
+        # zero-init head: identity at init, then the refiner trains away from it
+        assert torch.allclose(model(x), x, atol=1e-6)
+        torch.nn.init.normal_(model.swinir.upsample[-1].weight)
+        y = model(x)
+        assert y.shape == x.shape and not torch.allclose(y, x)
+        y.sum().backward()
+        assert any(p.grad is not None for p in model.swinir.parameters())
+
+    def test_resnet_default_keeps_checkpoint_keys(self) -> None:
+        keys = set(self._build(num_resblocks=1, features=8).state_dict())
+        assert {"stem.weight", "head.weight"} <= keys
+        assert not any(k.startswith("swinir.") for k in keys)
+
+    def test_unknown_refiner_and_kwargs_raise(self) -> None:
+        with pytest.raises(ValueError, match="unknown refiner"):
+            self._build(refiner="unet")
+        with pytest.raises(ValueError, match="unknown refiner_kwargs"):
+            self._build(refiner="swinir", refiner_kwargs={"depth": 2})
+        with pytest.raises(ValueError, match="only with refiner='swinir'"):
+            self._build(refiner_kwargs={"embed_dim": 8})
+
+    @pytest.mark.parametrize(
+        "arm", ["exp_vf_02_psf_deconvolution_v2", "exp_vf_02_psf_deconvolution_baseline_v2"]
+    )
+    def test_vf_02_pair_resolves_the_swinir_refiner(self, arm: str) -> None:
+        """The production kwarg resolver hands the arm's refiner to wiener_unet."""
+        import pathlib
+
+        from spectramr.config.settings import TrainingSettings
+        from spectramr.infrastructure.builders.generator_kwargs import resolve_generator_kwargs
+
+        root = pathlib.Path(__file__).resolve().parents[4]
+        config = TrainingSettings.from_yaml(str(root / f"experiments/inprogress/vf/{arm}.yaml"))
+        kwargs = resolve_generator_kwargs(config, device=torch.device("cpu"))
+        assert config.model.model_type == "wiener_unet"
+        assert kwargs["refiner"] == "swinir"
+        assert set(kwargs["refiner_kwargs"]) <= set(self._SWIN)
+
+
+def _dirichlet(use_marker: bool) -> DirichletESPIRiTGenerator:
+    torch.manual_seed(0)
+    model = DirichletESPIRiTGenerator(
+        in_channels=8, out_channels=8, num_power_iters=2, chans=4, use_marker=use_marker
+    )
+    for param in model.parameters():  # the zero-initialised head would hide every change
+        param.data.normal_(0.0, 0.1)
+    return model.eval()
+
+
+def _corner_marker(amplitude: float = 1.0) -> torch.Tensor:
+    # vf_admm hands the RSS marker prior real-stacked: [B, 2, H, W], zero-ish off the corners.
+    marker = torch.full((1, 2, 16, 16), 1e-4)
+    marker[..., 2:5, 2:5] = amplitude
+    return marker
+
+
+def test_dirichlet_espirit_pins_csm_features_to_the_marker_value_on_the_footprint() -> None:
+    model = _dirichlet(True)
+    x = torch.randn(1, 8, 16, 16, generator=torch.Generator().manual_seed(1))
+    captured: list[torch.Tensor] = []
+    model.recon.register_forward_pre_hook(lambda _m, args: captured.append(args[0][:, :4]))
+    with torch.no_grad():
+        w, g = model._marker_boundary(_corner_marker(), 1)
+        model(x, marker_prior=_corner_marker())
+    footprint = w[0, 0].bool()
+    assert footprint.sum() == 9 and footprint[2:5, 2:5].all()
+    S = captured[0]
+    assert torch.allclose(S[..., footprint], g[..., footprint])
+    assert not torch.allclose(S[..., ~footprint], g[..., ~footprint])
+
+
+def test_dirichlet_espirit_output_follows_the_marker_only_when_use_marker() -> None:
+    x = torch.randn(1, 8, 16, 16, generator=torch.Generator().manual_seed(1))
+    on, off = _dirichlet(True), _dirichlet(False)
+    with torch.no_grad():
+        assert not torch.allclose(on(x, marker_prior=_corner_marker()), on(x))
+        moved = _corner_marker().roll(shifts=(8, 8), dims=(-2, -1))
+        assert not torch.allclose(on(x, marker_prior=_corner_marker()), on(x, marker_prior=moved))
+        assert torch.equal(off(x, marker_prior=_corner_marker()), off(x))
+    assert off.marker_embed is None
+    with pytest.raises(TypeError, match="use_marker"):
+        DirichletESPIRiTGenerator(use_marker="no")

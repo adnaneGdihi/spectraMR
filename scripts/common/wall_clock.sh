@@ -6,7 +6,7 @@
 #
 # WHY THIS EXISTS
 # ---------------
-# A production arm gets 120 h per job and needs more, so the run must survive
+# A production arm gets 96 h per job and needs more, so the run must survive
 # being cut in half. What was missing was never *resume* — the checkpoint has
 # carried model / optimizer / scheduler / scaler / EMA / RNG / counter state all
 # along — it was STOPPING IN TIME TO WRITE ONE. A job killed at the wall loses
@@ -62,7 +62,7 @@ derive_wall_clock_deadline() {
     local end_time deadline
     # `|| true`: the launcher runs under `set -euo pipefail`, where a busy
     # controller returning nonzero propagates through the pipe into this
-    # assignment and kills the whole 120h job before it trains a step. Not
+    # assignment and kills the whole 96 h job before it trains a step. Not
     # having a deadline is a recoverable state; dying at startup is not.
     end_time="$(squeue -h -j "${SLURM_JOB_ID}" -O EndTime 2>/dev/null | tr -d ' ' || true)"
     if [[ -z "${end_time}" || "${end_time}" == "UNLIMITED" || "${end_time}" == "N/A" ]]; then

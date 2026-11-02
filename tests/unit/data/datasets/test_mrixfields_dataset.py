@@ -154,6 +154,10 @@ def test_transform_applied_via_subject_wrapping_multi_source() -> None:
     assert item["sources"].shape == (2, 1, 8, 8)
     assert item["input"].shape == (1, 8, 8)
     assert item["target"].shape == (1, 8, 8)
+    # #197: the per-source fields survive the TorchIO subject round-trip.
+    torch.testing.assert_close(
+        torch.as_tensor(item["source_field_strengths"]), torch.tensor([0.1, 3.0])
+    )
 
 
 def _fake_loader_4d(path: str) -> torch.Tensor:
@@ -226,9 +230,8 @@ def test_multi_source_emits_stacked_tuple() -> None:
     assert float(item["field_strength"]) == pytest.approx(
         0.1
     )  # first-source compat alias
-    assert (
-        "field_strengths" not in item
-    )  # per-source vector NOT emitted (renderer field-invariant)
+    # #197: each source's field reaches the renderer's encoder (the target is pinned at 7 T).
+    torch.testing.assert_close(item["source_field_strengths"], torch.tensor([0.1, 3.0]))
     assert torch.equal(
         item["input"], item["sources"][0]
     )  # input = first source (compat)
@@ -1763,3 +1766,16 @@ def test_every_non_pair_policy_has_a_loader_that_exists() -> None:
     assert set(table) == {"multi_source", "multi_contrast", "multi_field"}
     for method in table.values():
         assert callable(getattr(MRIxFieldsPairedDataset, method))
+
+
+def test_central_slice_refuses_non_3d_nifti(monkeypatch) -> None:
+    """A 4-D file must not be memoised whole into the 128-slot slice cache."""
+    import pytest
+
+    import spectramr.data.datasets.mrixfields_dataset as mod
+
+    mod._load_central_slice.cache_clear()
+    monkeypatch.setattr(mod, "_nifti_depth", lambda path: None)
+    with pytest.raises(ValueError, match="use the volume mode"):
+        mod._load_central_slice("/nonexistent/4d.nii.gz")
+    mod._load_central_slice.cache_clear()

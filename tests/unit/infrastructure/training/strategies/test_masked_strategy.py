@@ -194,7 +194,18 @@ def test_the_mae_computer_discards_the_losses_dict_it_accepts() -> None:
         return calls, spy
 
     dropped_calls, dropped_spy = make_spy()
-    dropped = UnifiedMAELossComputer(config=None, device=torch.device("cpu")).compute(
+    from spectramr.config.settings import TrainingSettings
+
+    mse_arm = TrainingSettings.settings_from_dict(
+        {
+            "model": {"model_type": "unet"},
+            "data": {"dataset_type": "synthetic"},
+            "optimization": {},
+            "logging": {},
+            "losses": {"output_domain": "image", "image_losses": [{"name": "mse", "weight": 1.0}]},
+        }
+    )
+    dropped = UnifiedMAELossComputer(config=mse_arm, device=torch.device("cpu")).compute(
         pred=pred, target=target, losses_dict={"ssim": dropped_spy}
     )
     assert dropped_calls == [], "UnifiedMAELossComputer called a losses_dict entry -- it now folds"
@@ -208,3 +219,15 @@ def test_the_mae_computer_discards_the_losses_dict_it_accepts() -> None:
     )
     assert folded_calls == [1], "the control computer did not fold -- the spy itself is broken"
     assert [k for k in folded.components if "ssim" in k]
+
+
+def test_patch_mask_has_one_owner() -> None:
+    """The strategy delegates to ``patch_masking.create_patch_mask`` (rule 17)."""
+    from spectramr.infrastructure.training.strategies.patch_masking import create_patch_mask
+
+    strat = _strategy(patch_size=16, mask_ratio=0.5)
+    torch.manual_seed(11)
+    via_strategy = strat._create_patch_mask(2, 64, 96, torch.device("cpu"))
+    torch.manual_seed(11)
+    direct = create_patch_mask(2, 64, 96, 16, 0.5, torch.device("cpu"))
+    assert torch.equal(via_strategy, direct)

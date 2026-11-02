@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import get_args
+
 import pytest
 from pydantic import ValidationError
 
@@ -9,7 +11,9 @@ from spectramr.config.schemas.certification import (
     CertificationConfigSchema,
     ConformalCertificateConfig,
     DiceRiskCertificateConfig,
+    PACBayesCertificateConfig,
 )
+from spectramr.infrastructure.calibration.pac_bayes_kl import KL_ESTIMATOR_REGISTRY, RISK_LOSSES
 
 
 def test_dice_risk_defaults() -> None:
@@ -39,9 +43,25 @@ def test_enabled_pathology_recall_is_refused_at_load() -> None:
         CertificationConfigSchema(pathology_recall={"enabled": True})
 
 
-def test_enabled_pac_bayes_is_refused_at_load() -> None:
-    with pytest.raises(ValidationError, match=r"missing KL\(Q\|\|P\) estimator"):
-        CertificationConfigSchema(pac_bayes={"enabled": True})
+def test_enabled_pac_bayes_requires_both_checkpoints() -> None:
+    with pytest.raises(ValidationError, match="prior_checkpoint_path"):
+        CertificationConfigSchema(pac_bayes={"enabled": True, "checkpoint_path": "q.pt"})
+    cfg = CertificationConfigSchema(
+        pac_bayes={"enabled": True, "checkpoint_path": "q.pt", "prior_checkpoint_path": "p.pt"}
+    )
+    assert cfg.pac_bayes.kl_estimator == "isotropic_gaussian"
+
+
+def test_pac_bayes_rejects_unadvertised_options_at_load() -> None:
+    for bad in ({"kl_estimator": "laplace"}, {"risk_loss": "mse"}, {"loss_out_of_range": "clip"}):
+        with pytest.raises(ValidationError):
+            PACBayesCertificateConfig(**bad)
+
+
+def test_pac_bayes_advertised_sets_match_the_registries() -> None:
+    fields = PACBayesCertificateConfig.model_fields
+    assert set(get_args(fields["kl_estimator"].annotation)) == set(KL_ESTIMATOR_REGISTRY)
+    assert set(get_args(fields["risk_loss"].annotation)) == set(RISK_LOSSES)
 
 
 def test_foreground_threshold_defaults_and_accepts_none() -> None:

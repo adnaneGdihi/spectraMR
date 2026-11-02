@@ -48,29 +48,51 @@ class TestPCGrad:
         assert torch.allclose(projected[0], g_secondary[0])
 
     def test_none_gradients_handled(self):
-        """None gradients (unused params) should be passed through."""
+        """A None gradient is a zero: no overlap means no conflict and nothing moves."""
         g_primary = [None, torch.tensor([1.0])]
         g_secondary = [torch.tensor([-1.0]), None]
 
         projected = project_conflicting_gradients(g_primary, g_secondary)
 
         assert projected[0] is g_secondary[0]
-        assert projected[1] is None
+        assert torch.equal(projected[1], torch.zeros(1))
+
+    def test_missing_secondary_entry_takes_its_share_of_the_projection(self):
+        """Where only the primary has a gradient, the projection still subtracts coeff * g_p."""
+        g_primary = [torch.tensor([1.0]), torch.tensor([1.0])]
+        g_secondary = [torch.tensor([-2.0]), None]
+
+        projected = project_conflicting_gradients(g_primary, g_secondary)
+
+        # dot = -2, ||g_p||^2 = 2, coeff = -1: g_s + g_p over the whole task vector.
+        assert torch.allclose(projected[0], torch.tensor([-1.0]))
+        assert torch.allclose(projected[1], torch.tensor([1.0]))
 
     def test_multiple_parameters(self):
-        """Should handle multiple parameter gradients independently."""
+        """The projection removes the conflict of the concatenated task gradients."""
         g_p = [torch.tensor([1.0, 0.0]), torch.tensor([0.0, 1.0])]
         g_s = [torch.tensor([-0.5, 0.3]), torch.tensor([0.5, -0.5])]
 
         projected = project_conflicting_gradients(g_p, g_s)
 
         assert len(projected) == 2
-        # First param: conflicting (dot = -0.5 < 0)
-        dot0 = torch.dot(g_p[0], projected[0])
-        assert dot0 >= -1e-6
-        # Second param: conflicting (dot = -0.5 < 0)
-        dot1 = torch.dot(g_p[1], projected[1])
-        assert dot1 >= -1e-6
+        global_dot = torch.dot(torch.cat(g_p), torch.cat(projected))
+        assert global_dot.abs() < 1e-6
+        assert torch.allclose(projected[0], torch.tensor([0.0, 0.3]))
+        assert torch.allclose(projected[1], torch.tensor([0.5, 0.0]))
+
+    def test_layer_conflict_with_agreeing_tasks_is_left_alone(self):
+        """Yu et al. test the whole task gradient: one conflicting layer is not projected.
+
+        A per-tensor projection (the earlier behaviour, #2298) rewrote the first entry.
+        """
+        g_p = [torch.tensor([1.0, 0.0]), torch.tensor([1.0, 0.0])]
+        g_s = [torch.tensor([-0.5, 0.0]), torch.tensor([2.0, 0.0])]
+
+        projected = project_conflicting_gradients(g_p, g_s)
+
+        assert torch.equal(projected[0], g_s[0])
+        assert torch.equal(projected[1], g_s[1])
 
     def test_zero_primary_gradient(self):
         """Zero primary gradient should leave secondary unchanged."""

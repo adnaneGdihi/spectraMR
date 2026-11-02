@@ -40,7 +40,12 @@ ENTRIES = (
         fn=degrade_fov_foldover,
         description="Wrap-around from a reduced phase-encode field of view",
         severity=SeveritySpec(
-            (_P("fov_reduction", "fraction of the object's extent", 0.0, 0.5),),
+            (_P(
+                "fov_reduction", "fraction of the object's extent", 0.0, 0.5,
+                endpoint_kwargs=(None, "max_reduction"),
+                valid_min=0.0,
+                valid_max=0.95,
+            ),),
             notes="the prescribed FOV along the axis is FOV' = E x (1 - 0.5 theta) with E the object's "
             "extent: the span of the support of the projection sum |x| over the other axes "
             "(readout, coils, slices) above 10% of that profile's maximum, measured on the device, "
@@ -72,7 +77,11 @@ ENTRIES = (
         fn=degrade_tse_t2_blur,
         description="T2 decay across the turbo-spin-echo train",
         severity=SeveritySpec(
-            (_P("train_length_over_t2", "ETL x ESP / T2", 0.0, 2.0),),
+            (_P(
+                "train_length_over_t2", "ETL x ESP / T2", 0.0, 2.0,
+                endpoint_kwargs=(None, "max_train_over_t2"),
+                valid_min=0.0,
+            ),),
             notes="line n is acquired at echo e(n) = floor(rank x min(ETL, lines) / lines) of the "
             "train (a train longer than the lines leaves its last echoes unused) and weighted "
             "exp(-(TE_e - TE_centre) / T2_eff), TE_e = (e + 1) ESP, T2_eff = ETL x ESP / (2 theta), "
@@ -97,7 +106,11 @@ ENTRIES = (
         fn=degrade_t1_shot_blur,
         description="T1 recovery across an inversion-recovery readout train",
         severity=SeveritySpec(
-            (_P("readout_train_over_t1", "N_train x TR_ro / T1", 0.0, 1.0),),
+            (_P(
+                "readout_train_over_t1", "N_train x TR_ro / T1", 0.0, 1.0,
+                endpoint_kwargs=(None, "max_train_over_t1"),
+                valid_min=0.0,
+            ),),
             notes="after an inversion (M_0 = 1 - 2 exp(-TI / T1), TI to the first readout pulse) a train of "
             "N_train = theta T1 / TR_ro pulses drives Mz towards M_ss = (1 - E1) / (1 - E1 cos alpha), "
             "line j of L inner-loop lines seeing M_p = M_ss + (M_0 - M_ss)(E1 cos alpha)^p, "
@@ -124,7 +137,11 @@ ENTRIES = (
         fn=degrade_offres_blur_noncartesian,
         description="Off-resonance blur of a radial readout",
         severity=SeveritySpec(
-            (_P("peak_offresonance_x_readout", "cycles", 0.0, 2.0),),
+            (_P(
+                "peak_offresonance_x_readout", "cycles", 0.0, 2.0,
+                endpoint_kwargs=(None, "max_cycles"),
+                valid_min=0.0,
+            ),),
             notes="peak |df| x T_ro = 2 theta phase cycles across the readout (T_ro = kwarg t_ro_ms, "
             "default 5; only the product matters). A seeded smooth df field (or kwarg b0_map_hz, "
             "whose pattern is scaled to that peak) modulates a time-segmented NUFFT of a golden-angle "

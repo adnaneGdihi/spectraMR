@@ -30,7 +30,7 @@ from spectramr.models.registry import register_model
 
 from ..blocks.acquisition_film import AcquisitionTableFiLM
 from ..latent_diffusion.latent_unet import LatentUNet
-from .latent_cfg import axis_keep_masks, guided_noise, resolve_latent_cfg
+from .latent_cfg import axis_keep_masks, guided_noise, resolve_latent_cfg, reverse_progress
 from .latent_scale_calibration import (
     AUTO_LATENT_SCALE,
     global_latent_std,
@@ -775,6 +775,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
             kwargs.get("cfg_weights"),
             has_condition=bool(self.config.conditional_translation),
             has_contrast=bool(self.config.use_contrast_guidance),
+            schedule=kwargs.get("cfg_schedule"),
         )
         import logging
 
@@ -877,78 +878,8 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
     def load_autoencoder_state(
         self, state: Mapping[str, torch.Tensor], *, freeze: bool, source: str
     ) -> None:
-        """Load a stage-1 VAE's state dict into ``self.autoencoder``.
-
-        The training builder reads the stage-1 checkpoint's generator part and calls
-        this; the keys may sit under ``autoencoder.`` / ``vae.`` / ``module.``. Any
-        incomplete restore raises, because stage 2 cannot train in a random latent
-        space (#9).
-
-        Args:
-            state: The stage-1 generator's state dict.
-            freeze: If True, set ``requires_grad=False`` on every autoencoder
-                parameter so the LDM only trains its diffusion U-Net + conditioning
-                encoder.
-            source: Where ``state`` came from, for the error messages.
-        """
-        # Strip a wrapping prefix when the stage-1 model embedded the
-        # autoencoder under e.g. ``autoencoder.``, ``vae.``, or ``module.``.
-        autoencoder_state = {}
-        # Parameters AND buffers: a buffer absent from ``ae_param_names`` would
-        # otherwise land in ``missing`` below and trip the completeness check.
-        ae_param_names = {n for n, _ in self.autoencoder.named_parameters()} | {
-            n for n, _ in self.autoencoder.named_buffers()
-        }
-        for prefix in ("autoencoder.", "vae.", "module.autoencoder.", "module.", ""):
-            stripped = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
-            hits = {k for k in stripped if k in ae_param_names}
-            if hits:
-                autoencoder_state = {k: v for k, v in stripped.items() if k in ae_param_names}
-                break
-
-        if not autoencoder_state:
-            # #9 — raise rather than degrade to a random-initialised VAE.
-            raise RuntimeError(
-                f"vae_checkpoint_path={source} loaded but contained no keys "
-                "matching the LDM autoencoder. Names diverge between the stage-1 "
-                "and stage-2 VAE architectures — check that stage-1 used "
-                "model_type=autoencoder_kl_pretrain with the SAME latent_channels/"
-                "base_channels as this arm."
-            )
-
-        missing, unexpected = self.autoencoder.load_state_dict(autoencoder_state, strict=False)
-        if missing:
-            # #9 — ``strict=False`` tolerates MISSING keys, leaving them at their
-            # random init. The emptiness guard above only catches a *total* miss, so a
-            # stage-1 VAE whose key set merely diverges (different depth: matching
-            # ``encoder.down.0.*``, absent ``encoder.down.3.*``) loaded a PARTIALLY
-            # random autoencoder and still reported PASS. Shape drift already raises
-            # inside load_state_dict; name drift is what slips through. Demand a
-            # complete restore.
-            raise RuntimeError(
-                f"vae_checkpoint_path={source} restored only "
-                f"{len(autoencoder_state)} of {len(ae_param_names)} autoencoder "
-                f"tensors; {len(missing)} would stay randomly initialised "
-                f"(first: {sorted(missing)[:5]}). Stage 2 cannot train in a "
-                "partially random latent space — stage-1 and stage-2 VAE "
-                "architectures must match."
-            )
-        if freeze:
-            for p in self.autoencoder.parameters():
-                p.requires_grad_(False)
-            self.autoencoder.eval()
-
-        import logging
-
-        logging.getLogger(__name__).info(
-            "[LDM] Loaded pretrained AutoencoderKL from %s (matched=%d, "
-            "missing=%d, unexpected=%d, frozen=%s)",
-            source,
-            len(autoencoder_state),
-            len(missing),
-            len(unexpected),
-            freeze,
-        )
+        """Load a stage-1 VAE's state dict into ``self.autoencoder`` (see ``load_autoencoder_state_into``)."""
+        load_autoencoder_state_into(self.autoencoder, state, freeze=freeze, source=source)
 
     def set_diffusion_schedule(
         self,
@@ -1214,6 +1145,13 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
             )
 
         if z.dim() == 5:  # 3D case [B, C, D, H, W]
+            if cond_latent is not None:
+                # The per-slice loop below feeds the U-Net z alone; running it would
+                # drop the SR3 condition and train unconditionally (#642).
+                raise ValueError(
+                    "LatentDiffusionGenerator: conditional translation on a 5-D latent is "
+                    "not implemented; run the arm in 2-D slice mode (spatial_dims: 2)."
+                )
             B, C, D, H, W = z.shape
             results = []
 
@@ -1396,6 +1334,7 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
                     z_cond,
                     self.config.use_contrast_guidance and contrast_idx is not None,
                     self._cfg,
+                    progress=reverse_progress(t, n_total),
                 )
             else:
                 predicted_noise = self._process_slices(
@@ -1421,6 +1360,11 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         # ds; align to the caller's shape so metrics/DC see the exact geometry.
         decoded = self.decode_from_latent(z_t)
         return self._match_spatial(decoded, shape[2:])
+
+    @property
+    def cfg_guidance_record(self) -> dict[str, dict]:
+        """The resolved per-axis dropout, weights and schedule, stamped into provenance."""
+        return self._cfg.to_dict()
 
     def _stacked_denoiser(self, contrast_idx: torch.Tensor | None, batch_size: int):
         """Denoise a stack of ``n * batch_size`` inputs, repeating ``contrast_idx`` to match."""
@@ -1505,6 +1449,83 @@ class LatentDiffusionGenerator(nn.Module, IGenerator):
         if device is not None:
             self.diffusion.to(device)
         return self
+
+
+def load_autoencoder_state_into(
+    autoencoder: nn.Module, state: Mapping[str, torch.Tensor], *, freeze: bool, source: str
+) -> None:
+    """Load a stage-1 VAE's state dict into ``autoencoder``, the one owner of the restore rules.
+
+    The training builder reads the stage-1 checkpoint's generator part and calls
+    this; the keys may sit under ``autoencoder.`` / ``vae.`` / ``module.``. Any
+    incomplete restore raises, because stage 2 cannot train in a random latent
+    space (#9).
+
+    Args:
+        state: The stage-1 generator's state dict.
+        freeze: If True, set ``requires_grad=False`` on every autoencoder
+            parameter so the LDM only trains its diffusion U-Net + conditioning
+            encoder.
+        source: Where ``state`` came from, for the error messages.
+    """
+    # Strip a wrapping prefix when the stage-1 model embedded the
+    # autoencoder under e.g. ``autoencoder.``, ``vae.``, or ``module.``.
+    autoencoder_state = {}
+    # Parameters AND buffers: a buffer absent from ``ae_param_names`` would
+    # otherwise land in ``missing`` below and trip the completeness check.
+    ae_param_names = {n for n, _ in autoencoder.named_parameters()} | {
+        n for n, _ in autoencoder.named_buffers()
+    }
+    for prefix in ("autoencoder.", "vae.", "module.autoencoder.", "module.", ""):
+        stripped = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
+        hits = {k for k in stripped if k in ae_param_names}
+        if hits:
+            autoencoder_state = {k: v for k, v in stripped.items() if k in ae_param_names}
+            break
+
+    if not autoencoder_state:
+        # #9 — raise rather than degrade to a random-initialised VAE.
+        raise RuntimeError(
+            f"vae_checkpoint_path={source} loaded but contained no keys "
+            "matching the LDM autoencoder. Names diverge between the stage-1 "
+            "and stage-2 VAE architectures — check that stage-1 used "
+            "model_type=autoencoder_kl_pretrain with the SAME latent_channels/"
+            "base_channels as this arm."
+        )
+
+    missing, unexpected = autoencoder.load_state_dict(autoencoder_state, strict=False)
+    if missing:
+        # #9 — ``strict=False`` tolerates MISSING keys, leaving them at their
+        # random init. The emptiness guard above only catches a *total* miss, so a
+        # stage-1 VAE whose key set merely diverges (different depth: matching
+        # ``encoder.down.0.*``, absent ``encoder.down.3.*``) loaded a PARTIALLY
+        # random autoencoder and still reported PASS. Shape drift already raises
+        # inside load_state_dict; name drift is what slips through. Demand a
+        # complete restore.
+        raise RuntimeError(
+            f"vae_checkpoint_path={source} restored only "
+            f"{len(autoencoder_state)} of {len(ae_param_names)} autoencoder "
+            f"tensors; {len(missing)} would stay randomly initialised "
+            f"(first: {sorted(missing)[:5]}). Stage 2 cannot train in a "
+            "partially random latent space — stage-1 and stage-2 VAE "
+            "architectures must match."
+        )
+    if freeze:
+        for p in autoencoder.parameters():
+            p.requires_grad_(False)
+        autoencoder.eval()
+
+    import logging
+
+    logging.getLogger(__name__).info(
+        "[LDM] Loaded pretrained AutoencoderKL from %s (matched=%d, "
+        "missing=%d, unexpected=%d, frozen=%s)",
+        source,
+        len(autoencoder_state),
+        len(missing),
+        len(unexpected),
+        freeze,
+    )
 
 
 def _parse_channel_multipliers(raw: object) -> tuple[int, ...]:

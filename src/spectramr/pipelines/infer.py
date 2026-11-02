@@ -27,7 +27,11 @@ from spectramr.domain.exceptions import (
 )
 from spectramr.infrastructure.checkpointing.restore import weights
 from spectramr.infrastructure.inference.inference_factory import InferenceStrategyFactory
-from spectramr.infrastructure.inference.predict_contrast import resolve_predict_contrast
+from spectramr.infrastructure.inference.predict_contrast import (
+    expand_conditioning,
+    resolve_predict_conditioning,
+    resolve_predict_contrast,
+)
 from spectramr.infrastructure.inference.predict_kspace import PredictKSpace
 from spectramr.infrastructure.inference.predict_rung import resolve_predict_rung
 from spectramr.infrastructure.logging.log_policy import apply_logging_config
@@ -559,7 +563,10 @@ def _process_single_file(
     acquired = _predict_acquired_lines(strategy, input_file, tensor)
     volume_scale = _volume_kspace_scale(strategy, tensor, config)
     rung = resolve_predict_rung(strategy, input_file, tensor, acquired, acceleration)
-    contrast = _predict_contrast(config, input_file, contrast_idx)
+    conditioning = _predict_conditioning(config, model, strategy, input_file, contrast_idx)
+    contrast = (
+        None if conditioning is not None else _predict_contrast(config, input_file, contrast_idx)
+    )
     if rung is not None:
         logger.info(
             "[PREDICT-RUNG] %s: R=%g (%s) -> start_timestep=%d (realises R=%.4f)",
@@ -594,6 +601,8 @@ def _process_single_file(
             dc_kwargs["kspace_scale"] = volume_scale[i:batch_end]
         if contrast is not None:
             dc_kwargs["contrast_idx"] = contrast.expand(batch_end - i)
+        if conditioning is not None:
+            dc_kwargs.update(expand_conditioning(conditioning, batch_end - i))
         with torch.no_grad():
             if prepared is None:
                 batch_output = _first(strategy.infer_single(batch_tensor, **dc_kwargs))
@@ -628,6 +637,32 @@ def _process_single_file(
     results["num_processed"] += 1
 
 
+def _predict_conditioning(
+    config: TrainingSettings,
+    model: torch.nn.Module,
+    strategy: Any,
+    input_file: Path,
+    explicit: int | None,
+) -> dict[str, Any] | None:
+    """``contrast_idx`` / ``acquisition_params`` for a generator training fed them (#2410).
+
+    ``None`` for cold diffusion (``_predict_contrast`` owns it) and for any arm trained
+    unconditioned. A strategy that would drop the kwargs before the forward is refused.
+    """
+    if "kspace_cold_diffusion" in str(config.model.model_type).lower():
+        return None
+    conditioning = resolve_predict_conditioning(
+        config.data.multi_contrast, model.forward, input_file, explicit
+    )
+    if conditioning is not None and not getattr(strategy, "forwards_contrast_conditioning", False):
+        raise ConfigurationError(
+            f"{type(strategy).__name__} does not pass contrast_idx/acquisition_params to the "
+            f"forward, but {config.model.model_type} was trained conditioned on them; predicting "
+            "through it would serve unconditioned output."
+        )
+    return conditioning
+
+
 def _predict_contrast(
     config: TrainingSettings, input_file: Path, explicit: int | None
 ) -> torch.Tensor | None:
@@ -635,7 +670,10 @@ def _predict_contrast(
     kwargs = config.model.model_kwargs or {}
     if "kspace_cold_diffusion" not in str(config.model.model_type).lower():
         if explicit is not None:
-            raise ConfigurationError("--contrast-idx applies to kspace_cold_diffusion checkpoints.")
+            raise ConfigurationError(
+                "--contrast-idx applies to kspace_cold_diffusion checkpoints and to generators "
+                "trained with data.multi_contrast.enabled."
+            )
         return None
     if str(getattr(config.data.dataset_type, "value", config.data.dataset_type)).lower() == "m4raw":
         from spectramr.data.datasets.m4raw_dataset import CONTRAST_MAP

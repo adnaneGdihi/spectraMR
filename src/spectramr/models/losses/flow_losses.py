@@ -14,6 +14,8 @@ import torch.nn as nn
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.infrastructure.physics.signal_models.flow_encoding import (
     velocity_to_phase,
+    venc_on_axis,
+    wrap_phase,
 )
 from spectramr.models.losses.registry import register_loss
 
@@ -25,11 +27,13 @@ from spectramr.models.losses.registry import register_loss
     tasks=frozenset({Task.PARAMETER_MAPPING}),
 )
 class PhaseContrastVelocityLoss(nn.Module):
-    """Velocity-consistency loss in the phase domain.
+    """Velocity-consistency loss on the wrapped encoded-phase difference.
 
-    Compares predicted and target velocity by first mapping both to encoded
-    phase at the arm's ``venc`` — so the penalty lives on the physically
-    meaningful, wrap-aware quantity the scanner actually measures.
+    Both fields are mapped to phase at the arm's ``venc`` and their difference is
+    wrapped to ``(-pi, pi]``, so two velocities that alias to the same signal
+    (``v`` and ``v - 2 venc``) score zero. ``weight`` (e.g. reference magnitude
+    times a vessel mask) turns the mean into a weighted mean, so voxels whose
+    phase is noise do not dominate.
     """
 
     def __init__(self, venc: float = 1.0, p: int = 1):
@@ -45,13 +49,17 @@ class PhaseContrastVelocityLoss(nn.Module):
         self,
         v_pred: torch.Tensor,
         v_target: torch.Tensor,
-        venc: float | None = None,
+        venc: float | torch.Tensor | None = None,
+        weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        vc = float(venc) if venc is not None else self.venc
-        phi_pred = velocity_to_phase(v_pred, vc)
-        phi_target = velocity_to_phase(v_target, vc)
-        diff = phi_pred - phi_target
-        return diff.abs().mean() if self.p == 1 else (diff**2).mean()
+        # Channel-first [B, n_dir, ...]: a per-direction venc goes on axis 1.
+        vc = venc_on_axis(venc if venc is not None else self.venc, v_pred.ndim, 1)
+        diff = wrap_phase(velocity_to_phase(v_pred, vc) - velocity_to_phase(v_target, vc))
+        err = diff.abs() if self.p == 1 else diff**2
+        if weight is None:
+            return err.mean()
+        w = torch.broadcast_to(weight.to(err.dtype), err.shape)
+        return (w * err).sum() / w.sum().clamp_min(torch.finfo(err.dtype).eps)
 
 
 @register_loss(
@@ -98,13 +106,63 @@ class VelocityUnwrapConsistencyLoss(nn.Module):
             raise ValueError(f"venc must be positive, got {venc}")
         self.venc = float(venc)
 
-    def forward(self, v_pred: torch.Tensor, venc: float | None = None) -> torch.Tensor:
-        vc = float(venc) if venc is not None else self.venc
+    def forward(
+        self, v_pred: torch.Tensor, venc: float | torch.Tensor | None = None
+    ) -> torch.Tensor:
+        vc = venc_on_axis(venc if venc is not None else self.venc, v_pred.ndim, 1)
         excess = torch.clamp(v_pred.abs() - vc, min=0.0)
         return excess.mean()
 
 
+def _per_sample_ratio(num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
+    num, den = num.flatten(1).sum(dim=1), den.flatten(1).sum(dim=1)
+    return (num / den.clamp_min(torch.finfo(den.dtype).tiny)).mean()
+
+
+@register_loss(
+    name="phase_contrast_image_nmse",
+    domain="complex",
+    workflows=frozenset({Regime.FLOW}),
+    tasks=frozenset({Task.RECONSTRUCTION}),
+)
+class PhaseContrastImageNMSELoss(nn.Module):
+    """``sum |x_hat - x|^2 / sum |x|^2`` per sample over the encoded complex images.
+
+    Scale-free, so its weight means the same on noise-whitened scanner data and
+    on the phantom. Inputs are complex ``[B, E, ...]``.
+    """
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return _per_sample_ratio((pred - target).abs().pow(2), target.abs().pow(2))
+
+
+@register_loss(
+    name="phase_contrast_phasor",
+    domain="complex",
+    workflows=frozenset({Regime.FLOW}),
+    tasks=frozenset({Task.RECONSTRUCTION, Task.PARAMETER_MAPPING}),
+)
+class PhaseContrastPhasorLoss(nn.Module):
+    """Agreement of the velocity-encoded phases, without ``angle()``.
+
+    For each direction ``z = x_d conj(x_ref)`` (encoding axis 1, reference first),
+    the loss is ``sum(|z_p||z_r| - Re(z_p conj z_r)) / sum |z_r|^2``, i.e. the
+    reference-weighted ``1 - cos`` of the phase error: wrap-free, blind to any
+    background phase (it multiplies both phasors), and smooth where ``angle()``'s
+    gradient grows as ``1 / |z|``. It can also fall by shrinking ``|z_p|``, so a
+    strategy pairs it with an image term.
+    """
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        z_p = pred[:, 1:] * pred[:, :1].conj()
+        z_r = target[:, 1:] * target[:, :1].conj()
+        misfit = z_p.abs() * z_r.abs() - (z_p * z_r.conj()).real
+        return _per_sample_ratio(misfit, z_r.abs().pow(2))
+
+
 __all__ = [
+    "PhaseContrastImageNMSELoss",
+    "PhaseContrastPhasorLoss",
     "PhaseContrastVelocityLoss",
     "ThroughPlaneFluxConservationLoss",
     "VelocityUnwrapConsistencyLoss",

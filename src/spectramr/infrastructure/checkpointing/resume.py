@@ -51,14 +51,18 @@ def _gate(checkpoint_cfg: Any, name: str) -> bool:
 
 
 def _restore_rng(rng: dict[str, Any] | None) -> None:
-    # The file holds the data-parallel index-0 streams. Every rank with that index
-    # (rank 0 and its model-parallel peers, such as spatial slabs of one volume) restores
-    # them, so the peers that draw the same batch keep drawing the same noise. Other
-    # replicas keep their own stream: replaying one stream on all of them would give
-    # every replica one augmentation sequence.
-    if rng and dp_rank() == 0:
+    # The file holds rank 0's streams only; replaying them on every rank would give all
+    # ranks one augmentation sequence, which train.py's rank-offset seeding prevents.
+    # Rank 0's model-parallel peers drive the same data shard and must draw the same
+    # timesteps and noise, so every rank with data-parallel index 0 restores it.
+    if rng and RankUtility.is_main_rank():
         restore_rng_state(rng)
         logger.info("Restored RNG state (torch + cuda + numpy + python)")
+    elif rng and dp_rank() == 0:
+        restore_rng_state(rng, peer=True)
+        logger.info(
+            "[RNG] rank %d restored rank 0's stream (model-parallel peer)", RankUtility.get_rank()
+        )
     elif rng:
         logger.info(
             "[RNG] rank %d keeps its own stream; the checkpoint carries data-parallel "

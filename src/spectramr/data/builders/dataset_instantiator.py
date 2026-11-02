@@ -31,6 +31,8 @@ def _m4raw_pairing_kwargs(pairing: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"source_contrast": pairing.cross_contrast_source}
     if pairing.cross_contrast_targets is not None:
         kwargs["target_contrasts"] = tuple(pairing.cross_contrast_targets)
+    if pairing.stacked_combine != "joint":
+        kwargs["stacked_combine"] = pairing.stacked_combine
     return kwargs
 
 
@@ -190,6 +192,12 @@ class DatasetInstantiator:
                 cls._create_fmri_dataset,
                 False,
                 "4-D BOLD series with a legible time axis",
+            ),
+            (
+                "flow_synthetic",
+                cls._create_flow_synthetic,
+                False,
+                "analytic 4D-flow phantom (phase-contrast cine, k-space slices)",
             ),
         ]
         for name, fn, indexed, serves in routes:
@@ -382,17 +390,6 @@ class DatasetInstantiator:
         coil_maps_missing = config.coil_maps_missing
         coil_maps_recipe = config.coil_maps_recipe
         coil_maps_acs_size = config.coil_maps_acs_size
-        # Scoring maps for the validation split only (#2664); the training split
-        # never receives them, which is half of what keeps #2510's leak closed.
-        coil_maps_reference_root = (
-            None
-            if config.coil_maps_reference_root is None
-            else PathResolver.resolve(config.coil_maps_reference_root)
-        )
-        if coil_maps_reference_root is not None:
-            coil_maps_reference_root = stage_subtree(
-                config.staging, coil_maps_reference_root, val_maps
-            )
         nex_exclude_input = config.nex_target_exclude_input
         nex_fallback = config.nex_fallback
         nex_registration = config.nex_registration
@@ -487,7 +484,6 @@ class DatasetInstantiator:
             coil_maps_missing=coil_maps_missing,
             coil_maps_recipe=coil_maps_recipe,
             coil_maps_acs_size=coil_maps_acs_size,
-            coil_maps_reference_root=coil_maps_reference_root,
             noise_fit_support_policy=noise_fit_support_policy,
             noise_covariance_root=noise_covariance_root,
             noise_covariance_missing=noise_covariance_missing,
@@ -1814,6 +1810,13 @@ class DatasetInstantiator:
         train_ds = tio.SubjectsDataset(train_subjects, transform=train_tfm)
         val_ds = tio.SubjectsDataset(val_subjects, transform=val_tfm)
         return train_ds, val_ds
+
+    @staticmethod
+    def _create_flow_synthetic(config, train_tfm, val_tfm):
+        """Readout slices of the analytic 4D-flow phantom (plain k-space dicts)."""
+        from spectramr.data.datasets.flow_synthetic_dataset import create_flow_synthetic_datasets
+
+        return create_flow_synthetic_datasets(config, train_tfm, val_tfm)
 
     @staticmethod
     def _create_npy_slice_dataset(config, train_tfm, val_tfm):

@@ -18,18 +18,17 @@ transport map, not measure/marginal optimality.
 potential is then a generic CNN whose gradient is NOT a guaranteed OT map (the one-knob
 ablation, isolating the Brenier/convexity guarantee). Magnitude-only (1->1).
 
-``model_kwargs.intensity_adaptation`` (``none`` | ``undamped`` | ``transfer``) lets the map adapt
+``model_kwargs.intensity_adaptation`` (``none`` | ``transfer``) lets the map adapt
 INTENSITY/CONTRAST — the residual on co-registered, normalised source/7T pairs. ``none`` (default)
-is the original mean-pooled map, pinned at identity; ``undamped`` sum-pools the potential so the
-convex map can realise an EXPANSIVE intensity change; ``transfer`` composes a field-conditioned
-monotone intensity transfer (``gain(b) < 1`` can COMPRESS contrast) while staying a monotone
-Brenier map. See :class:`InputConvexNeuralNetwork` for the math and the one-knob ablation arms
-``b15_brenier_intensity_undamped`` / ``b15_brenier_intensity_transfer`` (vs ``b15_brenier_map``).
+is the displacement map alone, which can realise an EXPANSIVE intensity change; ``transfer``
+composes a field-conditioned monotone intensity transfer (``gain(b) < 1`` can COMPRESS contrast)
+while staying a monotone Brenier map. See :class:`InputConvexNeuralNetwork` for the math and the
+one-knob arm ``b15_brenier_intensity_transfer`` (vs ``b15_brenier_map``).
 """
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any
 
 import torch
 from torch import nn
@@ -45,13 +44,6 @@ from spectramr.models.registry import register_model
 @register_model(name="brenier_icnn", training_mode="brenier_synthesis")
 class BrenierICNN(nn.Module):
     """Source-field-conditioned Brenier OT map to 7T (B-1.5)."""
-
-    # A Brenier OT map is NEAR-IDENTITY at init by design (displacement form, small
-    # map_scale) — the genuine, sane starting point. The Tier-2 identity-collapse heuristic
-    # (``|T(x)-x|`` small) is a false positive for it; suppress ONLY that check. The
-    # input-invariance check (constant output regardless of input — the real #20 degeneracy)
-    # stays active and passes (the map is genuinely input-dependent).
-    synthetic_forward_probe_skip: ClassVar[set[str]] = {"identity_collapse"}
 
     def __init__(
         self,
@@ -77,10 +69,7 @@ class BrenierICNN(nn.Module):
         # The field enters ONLY through the ICNN's gamma>=0 softplus FiLM, so convexity in x
         # is preserved for any field_dim (see InputConvexNeuralNetwork).
         field_dim = contrast_sequence_dim(1, self.num_contrasts, self.use_contrast_conditioning)
-        # intensity_adaptation: "none" (curl-free near-identity spatial map; pinned at identity on
-        # registered+normalised pairs), "undamped" (un-damp the potential gradient so the convex
-        # map adapts intensity), or "transfer" (compose a field-conditioned monotone intensity
-        # transfer). Validated inside the ICNN block (raises on an unknown value).
+        # intensity_adaptation is validated inside the ICNN block (raises on an unknown value).
         self.icnn = InputConvexNeuralNetwork(
             in_channels=1,
             hidden_channels=hidden_channels,

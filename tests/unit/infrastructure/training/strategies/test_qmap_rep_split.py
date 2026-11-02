@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from spectramr.infrastructure.training.strategies.qmap_rep_split import repetition_risk
+from spectramr.infrastructure.training.strategies.qmap_rep_split import (
+    power_projected_gains,
+    power_residual,
+    repetition_loss,
+    repetition_risk,
+)
 
 
 def _rss(
@@ -74,3 +79,57 @@ def test_a_zero_filled_scan_is_unbiased_with_its_acquired_noise_power() -> None:
         [amplitude] * 3, x, y, torch.tensor([[coils * f] * 3]), signal_floor=0.0
     )
     assert abs(out["val_rep_split_bias"]) < 0.05
+
+
+def test_the_training_loss_is_minimised_at_the_noise_free_amplitude() -> None:
+    """#2976: a magnitude loss against M_b is minimised near E[M_b] > A at low SNR.
+
+    The power loss with a known gain must prefer the true amplitude's gain (1) over the
+    gain that matches the noisy magnitude's mean.
+    """
+    amplitude, x, y, noise_power = _setup()
+    render = amplitude.clone()
+    biased = float((y[:, :1].mean() / amplitude.mean()) ** 2)
+    assert biased > 1.05  # the Rician floor this test is about (about 1.10 at A = 6, C = 4)
+    at_truth = repetition_loss(render, x[:, :1], y[:, :1], noise_power[:, 0], gain2=torch.ones(()))
+    at_bias = repetition_loss(
+        render, x[:, :1], y[:, :1], noise_power[:, 0], gain2=torch.tensor(biased)
+    )
+    assert at_truth < at_bias
+
+
+def test_the_training_mask_is_built_from_the_input_repetition() -> None:
+    """A target voxel outside the input's signal mask never reaches the loss."""
+    amplitude, x, y, noise_power = _setup(n=1_000)
+    x, y = x[:, :1].clone(), y[:, :1].clone()
+    x[..., :100, :] = 0.0  # below the floor in the INPUT
+    base = repetition_loss(amplitude, x, y, noise_power[:, 0])
+    y[..., :100, :] = 1e3  # bright in the target only
+    assert torch.equal(base, repetition_loss(amplitude, x, y, noise_power[:, 0]))
+
+
+def test_the_training_loss_is_in_magnitude_units() -> None:
+    """At A = 30 noise units the loss matches the magnitude MSE, not the 4 A^2 larger power MSE.
+
+    A gauge prior of weight 1 is calibrated against the magnitude loss, so the data term
+    must keep that scale.
+    """
+    gen = torch.Generator().manual_seed(0)
+    amplitude = torch.full((1, 1, 50_000, 1), 30.0)
+    x, y = _rss(amplitude, 4, gen), _rss(amplitude, 4, gen)
+    power = torch.tensor([4.0])
+    render = amplitude * 1.02  # a small shape error, true gain
+    loss = repetition_loss(render, x, y, power, gain2=torch.ones(()))
+    magnitude = ((render - y) ** 2).mean()
+    assert 0.5 < float(loss / magnitude) < 2.0
+    resid, w = power_residual(render, x, y, power, gain2=torch.ones(()))
+    unweighted = resid.pow(2).sum() / w.sum()
+    assert float(unweighted / loss) > 1000.0  # about 4 A^2 = 3600
+
+
+def test_the_prior_gains_are_fitted_on_the_input_only() -> None:
+    amplitude, x, _, noise_power = _setup(n=1_000)
+    renders = [amplitude] * 3
+    g = power_projected_gains(renders, x, noise_power)
+    assert g.shape == (1, 3)
+    assert torch.allclose(g, torch.ones_like(g), atol=0.05)

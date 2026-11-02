@@ -49,7 +49,7 @@ from spectramr.application.use_cases.nr_validation.cards import (
     eval_metric,
     spearman,
 )
-from spectramr.core.metrics.meta_evaluation.simulator import DEGRADATION_LIBRARY
+from spectramr.core.metrics.meta_evaluation.simulator import DEGRADATION_LIBRARY, content_seed
 from spectramr.infrastructure.physics.model_observer import (
     ChannelizedHotellingObserver,
     gabor_channel_bank,
@@ -245,13 +245,12 @@ def score_cho_concordance(
 
         present_ref = _insert_blob(clean, lesion_contrast, lesion_radius_frac)
         absent_ref = clean
-        # Stable per-content seed mixed from master seed and content id.
-        cid_hash = int.from_bytes(content_id.encode("utf-8")[:8].ljust(8, b"\0"), "big")
-        content_seed = (seed ^ cid_hash ^ (ci * 0x85EBCA77)) & 0xFFFFFFFF
+        # The simulator's blake2b content seed (seed_scheme blake2b_v1), mixed with ci.
+        cseed = (content_seed(seed, content_id) ^ (ci * 0x85EBCA77)) & 0xFFFFFFFF
 
         for fi, family in enumerate(fams):
             for ti, theta in enumerate(thetas):
-                base = (content_seed + fi * 7919 + ti * 13) & 0xFFFFFFFF
+                base = (cseed + fi * 7919 + ti * 13) & 0xFFFFFFFF
                 # Distinct seed streams for present / absent ensembles.
                 present_seed = base
                 absent_seed = (base ^ 0xABCDEF01) & 0xFFFFFFFF

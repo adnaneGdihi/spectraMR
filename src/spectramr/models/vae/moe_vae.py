@@ -27,7 +27,19 @@ from spectramr.models.blocks.moe.top1_router import Top1Router
 from spectramr.models.registry import register_model
 
 
-class _ExpertDecoder(nn.Module):
+def trunk_encoder(in_channels: int, hidden: int) -> nn.Sequential:
+    """The shared encoder trunk; ``single_decoder_vae`` builds the same one."""
+    return nn.Sequential(
+        nn.Conv2d(in_channels, hidden // 2, 4, 2, 1),
+        nn.GroupNorm(8, hidden // 2),
+        nn.SiLU(),
+        nn.Conv2d(hidden // 2, hidden, 4, 2, 1),
+        nn.GroupNorm(8, hidden),
+        nn.SiLU(),
+    )
+
+
+class ExpertDecoder(nn.Module):
     """One expert: latent -> image, mirroring the shared trunk."""
 
     def __init__(self, latent_dim: int, hidden: int, pooled_size: int, out_channels: int) -> None:
@@ -92,14 +104,7 @@ class MoEVAE(nn.Module):
         self.pooled_size = pooled_size
         feature_dim = hidden * pooled_size * pooled_size
 
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, hidden // 2, 4, 2, 1),
-            nn.GroupNorm(8, hidden // 2),
-            nn.SiLU(),
-            nn.Conv2d(hidden // 2, hidden, 4, 2, 1),
-            nn.GroupNorm(8, hidden),
-            nn.SiLU(),
-        )
+        self.encoder = trunk_encoder(in_channels, hidden)
         self.pool = nn.AdaptiveAvgPool2d((pooled_size, pooled_size))
         self.fc_mu = nn.Linear(feature_dim, latent_dim)
         self.fc_logvar = nn.Linear(feature_dim, latent_dim)
@@ -107,7 +112,7 @@ class MoEVAE(nn.Module):
         self.router = Top1Router(latent_dim, num_experts)
         self.experts = nn.ModuleList(
             [
-                _ExpertDecoder(latent_dim, hidden, pooled_size, out_channels)
+                ExpertDecoder(latent_dim, hidden, pooled_size, out_channels)
                 for _ in range(num_experts)
             ]
         )
@@ -175,4 +180,4 @@ class MoEVAE(nn.Module):
         }
 
 
-__all__ = ["MoEVAE"]
+__all__ = ["ExpertDecoder", "MoEVAE", "trunk_encoder"]

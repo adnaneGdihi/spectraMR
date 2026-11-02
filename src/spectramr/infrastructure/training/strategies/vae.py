@@ -150,6 +150,16 @@ class VAETrainingStrategy(BaseTrainingStrategy):
                     f"batch_size={batch} gives it no second sample; use >= 2."
                 )
 
+    def declared_metric_keys(self) -> frozenset[str]:
+        """Declare ``structural_prior`` when the generator stamps it (see ``_compute_losses_impl``)."""
+        keys = set(super().declared_metric_keys())
+        gen = getattr(getattr(self, "env", None), "generator", None)
+        if gen is not None and callable(
+            getattr(type(unwrap_model(gen)), "structural_prior_loss", None)
+        ):
+            keys.add("structural_prior")
+        return frozenset(keys)
+
     def _compute_losses_impl(
         self,
         input_batch: torch.Tensor,
@@ -276,6 +286,16 @@ class VAETrainingStrategy(BaseTrainingStrategy):
         total_loss = loss_output.total
         components = loss_output.components
 
+        # A bare-tensor VAE may declare its own structural prior; slat_vae_slab_to_volume's
+        # occupancy/sparsity weights reach the objective only through this hook (#642).
+        inner_gen = unwrap_model(self.env.generator)
+        if not isinstance(output, (tuple, dict)) and callable(
+            getattr(type(inner_gen), "structural_prior_loss", None)
+        ):
+            structural = inner_gen.structural_prior_loss(target_batch)
+            total_loss = total_loss + structural
+            components = {**components, "structural_prior": structural}
+
         # Get KL weight (beta for beta-VAE). Honor the configured value
         # verbatim — a deliberate ``lambda_kl_divergence: 0`` (β=0, e.g. an
         # autoencoder ablation) must stay 0. A previous override that promoted
@@ -289,9 +309,8 @@ class VAETrainingStrategy(BaseTrainingStrategy):
         self._loss_dict_reuse.update(
             {
                 "g_total_loss": total_loss,
-                "g_loss_kl": components.get(
-                    "kl_divergence", torch.tensor(0.0, device=total_loss.device)
-                ),
+                # UnifiedVAELossComputer stores the term as "kl" (#642).
+                "g_loss_kl": components.get("kl", torch.tensor(0.0, device=total_loss.device)),
                 "kl_weight": kl_weight,
             }
         )
@@ -381,10 +400,19 @@ class VAETrainingStrategy(BaseTrainingStrategy):
                     torch.zeros(input_batch.shape[0], 1, device=input_batch.device),
                 )
             else:
-                # Non-VAE model (e.g., UNet) - just use reconstruction
+                # A bare tensor may still carry a cached posterior, as on the training path.
                 hr_fakes = vae_output
-                mu = torch.zeros(input_batch.shape[0], 1, device=input_batch.device)
-                logvar = torch.zeros(input_batch.shape[0], 1, device=input_batch.device)
+                last_aux = getattr(unwrap_model(self.env.generator), "last_aux", None)
+                aux = last_aux() if callable(last_aux) else None
+                if (
+                    isinstance(aux, dict)
+                    and aux.get("mu") is not None
+                    and aux.get("logvar") is not None
+                ):
+                    mu, logvar = aux["mu"], aux["logvar"]
+                else:
+                    mu = torch.zeros(input_batch.shape[0], 1, device=input_batch.device)
+                    logvar = torch.zeros(input_batch.shape[0], 1, device=input_batch.device)
 
             # Autoencoder semantics: target ≡ input is guaranteed by the data
             # layer (bidirectional_mode: hf_to_hf / ulf_to_ulf). Raise on a

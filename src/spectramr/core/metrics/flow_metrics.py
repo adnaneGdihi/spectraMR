@@ -1,10 +1,15 @@
-"""Flow MRI Quality Metrics.
+"""Phase-contrast / 4D-flow metrics (regime: ``mri_flow``).
 
-Implements metrics for phase-contrast and 4D flow MRI:
-- Consistency of Mass (mass conservation)
-- Divergence (velocity field quality)
+Velocity is ``[B, n_dir, *extra, *spatial]`` in m/s: component ``i`` is the
+velocity along spatial axis ``i`` (the axes in the order they appear), and any
+axes between the component axis and the spatial ones (cardiac frames) are
+pooled. The spatial rank is never guessed from the shape; it is the length of
+``context.voxel_size_mm`` or the rank of a plane mask.
 
-Follows unit-test.md rules.
+Everything beyond ``(prediction, target)`` arrives through
+:class:`~spectramr.core.metrics.context.MetricContext` and is declared in
+``needs``; a metric handed a context missing a declared field raises
+:class:`MetricNotApplicableError` rather than inventing a value.
 """
 
 from __future__ import annotations
@@ -14,321 +19,224 @@ import torch.nn as nn
 from torch import Tensor
 
 from spectramr.config.schemas.enums import Regime
+from spectramr.core.metrics.context import MetricContext, resolve_context
+from spectramr.core.metrics.outcome import MetricNotApplicableError, NotApplicableReason
 from spectramr.core.metrics.registry import register_metric
 
-try:
-    from beartype import beartype
-    from jaxtyping import Float, jaxtyped
+_FLOW = frozenset({Regime.FLOW})
 
-    JAXTYPING_AVAILABLE = True
-except ImportError:
-    JAXTYPING_AVAILABLE = False
 
-    def jaxtyped(fn):
-        """jaxtyped.
+def _missing(name: str, ctx: MetricContext, *fields: str) -> MetricNotApplicableError:
+    absent = [f for f in fields if getattr(ctx, f, None) is None]
+    return MetricNotApplicableError(
+        name, NotApplicableReason.MISSING_MEASUREMENT_CONTEXT, f"context lacks {absent}"
+    )
 
-        Args:
-            fn (Any): Description.
-        Returns:
-            Any: Description.
-        """
-        return fn
 
-    def beartype(fn):
-        """beartype.
+def _require(name: str, ctx: MetricContext, *fields: str) -> None:
+    if not ctx.has(*fields):
+        raise _missing(name, ctx, *fields)
 
-        Args:
-            fn (Any): Description.
-        Returns:
-            Any: Description.
-        """
-        return fn
+
+def _masked_mean(values: Tensor, weight: Tensor | None) -> Tensor:
+    if weight is None:
+        return values.mean()
+    w = torch.broadcast_to(weight.to(values.dtype), values.shape)
+    return (w * values).sum() / w.sum().clamp_min(torch.finfo(values.dtype).eps)
+
+
+def _velocity_jacobian(velocity: Tensor, spacing_mm: Tensor) -> list[list[Tensor]]:
+    """``d v_i / d x_j`` in 1/s by central differences, ``[i][j] -> [B, *extra, *spatial]``."""
+    rank = spacing_mm.numel()
+    spatial_dims = tuple(range(velocity.ndim - 1 - rank, velocity.ndim - 1))
+    spacing_m = spacing_mm.to(velocity) * 1e-3
+    rows = []
+    for i in range(velocity.shape[1]):
+        partials = torch.gradient(velocity[:, i], dim=spatial_dims)
+        rows.append([partials[j] / spacing_m[j] for j in range(rank)])
+    return rows
+
+
+def _plane_flow(velocity: Tensor, plane: Tensor) -> Tensor:
+    """Flow rate through a plane, ``[B, *extra]`` in mL/s (m/s x mm^2 = mL/s)."""
+    rank = plane.ndim - 1
+    v = velocity.flatten(start_dim=velocity.ndim - rank)
+    return torch.einsum("bn...s,ns->b...", v, plane.flatten(start_dim=1).to(v))
+
+
+def _divergence(
+    name: str, velocity: Tensor, ctx: MetricContext
+) -> tuple[list[list[Tensor]], Tensor]:
+    """The velocity Jacobian and the ROI it is graded on."""
+    # The ROI is required: outside the vessel the phase is noise or air, and a
+    # whole-grid mean would grade that instead of the flow.
+    spacing, roi = ctx.voxel_size_mm, ctx.foreground_mask
+    if spacing is None or roi is None:
+        raise _missing(name, ctx, "voxel_size_mm", "foreground_mask")
+    rank = spacing.numel()
+    if velocity.shape[1] < rank:
+        raise MetricNotApplicableError(
+            name,
+            NotApplicableReason.VELOCITY_DIRECTIONS_BELOW_SPATIAL_RANK,
+            f"{velocity.shape[1]} encoded direction(s) over a rank-{rank} grid; "
+            "divergence needs every in-grid component (through-plane data has one)",
+        )
+    return _velocity_jacobian(velocity[:, :rank], spacing), roi
 
 
 @register_metric(
-    "mass_conservation", aliases=["MassConservation"], workflows=frozenset({Regime.FLOW})
+    "divergence",
+    aliases=["Divergence"],
+    requires_reference=False,
+    needs=("voxel_size_mm", "foreground_mask"),
+    workflows=_FLOW,
 )
-class ConsistencyOfMass(nn.Module):
-    """Mass Conservation metric for flow data.
+class Divergence(nn.Module):  # type: ignore[misc]
+    """Mean ``|div v|`` (1/s) over the vessel ROI; zero for incompressible flow."""
 
-    For incompressible flow, mass must be conserved:
-
-    .. math::
-
-        \\int \rho \\mathbf{v} \\cdot d\\mathbf{A} = 0 \\quad (\text{through closed surface})
-
-    Or for multiple inlets/outlets:
-
-    .. math::
-
-        \\sum (\text{inlet flows}) = \\sum (\text{outlet flows})
-
-    Deviation from this indicates measurement error or artifacts.
-    """
-
-    def __init__(
-        self,
-        tolerance: float = 0.05,  # 5% tolerance
-    ) -> None:
-        """__init__.
-
-        Args:
-            tolerance (float): Description.
-        """
-        super().__init__()
-        self.tolerance = tolerance
-
-    @jaxtyped
-    @beartype
     def forward(
         self,
-        inlet_flows: Float[Tensor, "batch num_inlets"],
-        outlet_flows: Float[Tensor, "batch num_outlets"],
-    ) -> dict:
-        """Compute mass conservation error.
-
-        Args:
-            inlet_flows: Flow rates through inlet planes [ml/s]
-            outlet_flows: Flow rates through outlet planes [ml/s]
-
-        Returns:
-            Dictionary with:
-                - error: Absolute mass conservation error
-                - percent_error: Percentage error relative to inlet
-                - passes: Boolean if within tolerance
-
-        forward method for ConsistencyOfMass.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            inlet_flows (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-            outlet_flows (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            dict: Dictionary containing tensor outputs.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # Sum flows
-        total_inlet = inlet_flows.sum(dim=1)
-        total_outlet = outlet_flows.sum(dim=1)
-
-        # Mass conservation error
-        error = (total_inlet - total_outlet).abs()
-        percent_error = error / (total_inlet.abs() + 1e-8) * 100.0
-
-        # Check tolerance
-        passes = percent_error < (self.tolerance * 100)
-
-        return {
-            "error": error.mean(),
-            "percent_error": percent_error.mean(),
-            "passes": passes.float().mean(),
-        }
-
-    @jaxtyped
-    @beartype
-    def compute_from_velocity(
-        self,
-        velocity: Float[Tensor, "batch 3 depth height width"],
-        plane_normal: Float[Tensor, 3],
-        plane_mask: Float[Tensor, "batch 1 depth height width"],
-        voxel_area: float = 1.0,
-    ) -> Float[Tensor, ""]:
-        """Compute flow through a plane from velocity field.
-
-        Args:
-            velocity: 3D velocity field [B, 3, D, H, W]
-            plane_normal: Normal vector to plane
-            plane_mask: Binary mask of plane voxels
-            voxel_area: Area per voxel [mm²]
-
-        Returns:
-            Total flow through plane [ml/s]
-        """
-        # Dot product with normal
-        flow_component = (velocity * plane_normal.view(1, 3, 1, 1, 1)).sum(dim=1, keepdim=True)
-
-        # Integrate over plane
-        total_flow = (flow_component * plane_mask).sum() * voxel_area
-
-        return total_flow
-
-
-@register_metric("divergence", aliases=["Divergence"], workflows=frozenset({Regime.FLOW}))
-class Divergence(nn.Module):
-    """Velocity Field Divergence metric.
-
-    For incompressible flow:
-
-    .. math::
-
-        \nabla \\cdot \\mathbf{v} = \frac{\\partial v_x}{\\partial x} + \frac{\\partial v_y}{\\partial y} + \frac{\\partial v_z}{\\partial z} = 0
-
-    Non-zero divergence indicates:
-    1. Measurement noise
-    2. Partial volume effects
-    3. Flow artifacts
-    """
-
-    def __init__(
-        self,
-        voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
-    ) -> None:
-        """
-        Args:
-            voxel_size: Voxel dimensions (dx, dy, dz) in mm
-        """
-        super().__init__()
-        self.voxel_size = voxel_size
-
-    def _compute_gradient(
-        self,
-        field: Tensor,
-        dim: int,
-        spacing: float,
+        prediction: Tensor,
+        target: Tensor | None = None,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: object,
     ) -> Tensor:
-        """Compute gradient using central differences."""
-        # Pad for central difference
-        if dim == 2:  # D dimension
-            padded = torch.nn.functional.pad(field, (0, 0, 0, 0, 1, 1), mode="replicate")
-            grad = (padded[:, :, 2:, :, :] - padded[:, :, :-2, :, :]) / (2 * spacing)
-        elif dim == 3:  # H dimension
-            padded = torch.nn.functional.pad(field, (0, 0, 1, 1, 0, 0), mode="replicate")
-            grad = (padded[:, :, :, 2:, :] - padded[:, :, :, :-2, :]) / (2 * spacing)
-        else:  # dim == 4, W dimension
-            padded = torch.nn.functional.pad(field, (1, 1, 0, 0, 0, 0), mode="replicate")
-            grad = (padded[:, :, :, :, 2:] - padded[:, :, :, :, :-2]) / (2 * spacing)
-
-        return grad
-
-    @jaxtyped
-    @beartype
-    def forward(
-        self,
-        velocity: Float[Tensor, "batch 3 depth height width"],
-        mask: Float[Tensor, "batch 1 depth height width"] | None = None,
-    ) -> dict:
-        """Compute divergence of velocity field.
-
-        Args:
-            velocity: 3D velocity field [B, 3, D, H, W]
-                velocity[:, 0] = vx
-                velocity[:, 1] = vy
-                velocity[:, 2] = vz
-            mask: Optional mask for ROI (e.g., vessel lumen)
-
-        Returns:
-            Dictionary with:
-                - divergence_mean: Mean absolute divergence
-                - divergence_max: Maximum absolute divergence
-                - divergence_map: Full divergence field
-
-        forward method for Divergence.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            velocity (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-            mask (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            dict: Dictionary containing tensor outputs.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        dx, dy, dz = self.voxel_size
-
-        # Compute partial derivatives
-        dvx_dx = self._compute_gradient(velocity[:, 0:1], dim=4, spacing=dx)
-        dvy_dy = self._compute_gradient(velocity[:, 1:2], dim=3, spacing=dy)
-        dvz_dz = self._compute_gradient(velocity[:, 2:3], dim=2, spacing=dz)
-
-        # Divergence
-        divergence = dvx_dx + dvy_dy + dvz_dz
-
-        # Apply mask if provided
-        if mask is not None:
-            divergence_masked = divergence * mask
-            valid_voxels = mask.sum()
-            mean_div = divergence_masked.abs().sum() / (valid_voxels + 1e-8)
-            max_div = (divergence_masked.abs() * mask).max()
-        else:
-            mean_div = divergence.abs().mean()
-            max_div = divergence.abs().max()
-
-        return {
-            "divergence_mean": mean_div,
-            "divergence_max": max_div,
-            "divergence_map": divergence,
-        }
+        ctx = resolve_context(context, kwargs)
+        jac, roi = _divergence("divergence", prediction, ctx)
+        div = sum(jac[i][i] for i in range(len(jac)))
+        return _masked_mean(div.abs(), roi)
 
 
-@register_metric("vnr", aliases=["VelocityNoiseRatio"], workflows=frozenset({Regime.FLOW}))
-class VelocityNoiseRatio(nn.Module):
-    """Velocity-to-Noise Ratio (VNR) for phase-contrast MRI.
+@register_metric(
+    "divergence_normalised",
+    requires_reference=False,
+    needs=("voxel_size_mm", "foreground_mask"),
+    workflows=_FLOW,
+)
+class NormalisedDivergence(nn.Module):  # type: ignore[misc]
+    """``sum |div v| / sum_ij |d v_i / d x_j|`` over the ROI, in ``[0, 1]``.
 
-    Analogous to SNR but for velocity data.
+    Raw divergence rewards a field that is flat or zero; dividing by the total
+    velocity gradient scores how much of the field's variation is compressive.
     """
 
-    @jaxtyped
-    @beartype
     def forward(
         self,
-        velocity: Float[Tensor, "batch 3 depth height width"],
-        signal_mask: Float[Tensor, "batch 1 depth height width"],
-        noise_mask: Float[Tensor, "batch 1 depth height width"] | None = None,
-    ) -> Float[Tensor, ""]:
-        """Compute velocity-to-noise ratio.
-
-        Args:
-            velocity: Velocity field
-            signal_mask: Mask of region with flow
-            noise_mask: Mask of static region (background)
-
-        Returns:
-            VNR (higher is better)
-
-        forward method for VelocityNoiseRatio.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            velocity (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-            signal_mask (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-            noise_mask (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            Float[Tensor, '']: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # Signal: mean velocity magnitude in flow region
-        vel_magnitude = velocity.norm(dim=1, keepdim=True)
-        signal = (vel_magnitude * signal_mask).sum() / (signal_mask.sum() + 1e-8)
-
-        # Noise: velocity std in static region
-        if noise_mask is not None:
-            noise_region = vel_magnitude * noise_mask
-            noise = (
-                noise_region[noise_mask.bool()].std()
-                if noise_mask.sum() > 0
-                else vel_magnitude.std() * 0.1
+        prediction: Tensor,
+        target: Tensor | None = None,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: object,
+    ) -> Tensor:
+        ctx = resolve_context(context, kwargs)
+        jac, roi = _divergence("divergence_normalised", prediction, ctx)
+        div = sum(jac[i][i] for i in range(len(jac))).abs()
+        total = sum(d.abs() for row in jac for d in row)
+        w = torch.broadcast_to(roi.to(div), div.shape)
+        denom = (w * total).sum()
+        if denom <= 0:
+            raise MetricNotApplicableError(
+                "divergence_normalised",
+                NotApplicableReason.DEGENERATE_VELOCITY_FIELD,
+                "the velocity field has no gradient in the ROI",
             )
-        else:
-            # Use background (low velocity) as noise estimate
-            threshold = vel_magnitude.median()
-            background = vel_magnitude < threshold
-            noise = vel_magnitude[background].std()
-
-        vnr = signal / (noise + 1e-8)
-
-        return vnr
+        return (w * div).sum() / denom
 
 
-@register_metric("velocity_rmse", aliases=["VelocityRMSE"], workflows=frozenset({Regime.FLOW}))
-class VelocityRMSE(nn.Module):
+@register_metric(
+    "mass_conservation",
+    aliases=["MassConservation"],
+    requires_reference=False,
+    needs=("inlet_mask", "outlet_mask"),
+    workflows=_FLOW,
+)
+class ConsistencyOfMass(nn.Module):  # type: ignore[misc]
+    """Inlet-minus-outlet flow imbalance, in percent of the inlet flow.
+
+    Pooled over batch and frames, ``100 * sum |Q_in - Q_out| / sum |Q_in|``, so a
+    diastolic frame with near-zero inflow cannot dominate the ratio.
+    """
+
+    def forward(
+        self,
+        prediction: Tensor,
+        target: Tensor | None = None,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: object,
+    ) -> Tensor:
+        ctx = resolve_context(context, kwargs)
+        _require("mass_conservation", ctx, "inlet_mask", "outlet_mask")
+        q_in = _plane_flow(prediction, ctx.inlet_mask)
+        q_out = _plane_flow(prediction, ctx.outlet_mask)
+        inflow = q_in.abs().sum()
+        if inflow <= 0:
+            raise MetricNotApplicableError(
+                "mass_conservation",
+                NotApplicableReason.DEGENERATE_VELOCITY_FIELD,
+                "no flow through the inlet plane",
+            )
+        return 100.0 * (q_in - q_out).abs().sum() / inflow
+
+
+@register_metric(
+    "net_flow_error",
+    aliases=["NetFlowError"],
+    requires_reference=True,
+    needs=("inlet_mask",),
+    workflows=_FLOW,
+)
+class NetFlowError(nn.Module):  # type: ignore[misc]
+    """``|mean_t Q_pred - mean_t Q_target|`` through the inlet plane, mL/s, batch-averaged."""
+
+    def forward(
+        self,
+        prediction: Tensor,
+        target: Tensor,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: object,
+    ) -> Tensor:
+        ctx = resolve_context(context, kwargs)
+        _require("net_flow_error", ctx, "inlet_mask")
+        q_pred = _plane_flow(prediction, ctx.inlet_mask).flatten(start_dim=1).mean(dim=1)
+        q_true = _plane_flow(target, ctx.inlet_mask).flatten(start_dim=1).mean(dim=1)
+        return (q_pred - q_true).abs().mean()
+
+
+@register_metric(
+    "vnr",
+    aliases=["VelocityNoiseRatio"],
+    requires_reference=False,
+    needs=("foreground_mask", "static_mask"),
+    workflows=_FLOW,
+)
+class VelocityNoiseRatio(nn.Module):  # type: ignore[misc]
+    """Mean speed in the vessel over the per-component velocity RMS in static tissue."""
+
+    def forward(
+        self,
+        prediction: Tensor,
+        target: Tensor | None = None,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: object,
+    ) -> Tensor:
+        ctx = resolve_context(context, kwargs)
+        _require("vnr", ctx, "foreground_mask", "static_mask")
+        speed = prediction.norm(dim=1)
+        noise = _masked_mean(prediction.pow(2).mean(dim=1), ctx.static_mask).sqrt()
+        return _masked_mean(speed, ctx.foreground_mask) / noise.clamp_min(1e-12)
+
+
+@register_metric(
+    "velocity_rmse",
+    aliases=["VelocityRMSE"],
+    requires_reference=True,
+    workflows=_FLOW,
+)
+class VelocityRMSE(nn.Module):  # type: ignore[misc]
     """Root-mean-square error between predicted and reference velocity fields."""
 
     def forward(self, v_pred: Tensor, v_target: Tensor) -> Tensor:
@@ -337,9 +245,34 @@ class VelocityRMSE(nn.Module):
 
 
 @register_metric(
-    "peak_velocity_error", aliases=["PeakVelocityError"], workflows=frozenset({Regime.FLOW})
+    "velocity_rmse_roi",
+    requires_reference=True,
+    needs=("foreground_mask",),
+    workflows=_FLOW,
 )
-class PeakVelocityError(nn.Module):
+class VelocityRMSEROI(nn.Module):  # type: ignore[misc]
+    """Per-component velocity RMSE (m/s) restricted to the vessel ROI."""
+
+    def forward(
+        self,
+        prediction: Tensor,
+        target: Tensor,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: object,
+    ) -> Tensor:
+        ctx = resolve_context(context, kwargs)
+        _require("velocity_rmse_roi", ctx, "foreground_mask")
+        return _masked_mean((prediction - target).pow(2).mean(dim=1), ctx.foreground_mask).sqrt()
+
+
+@register_metric(
+    "peak_velocity_error",
+    aliases=["PeakVelocityError"],
+    requires_reference=True,
+    workflows=_FLOW,
+)
+class PeakVelocityError(nn.Module):  # type: ignore[misc]
     """Absolute error in peak velocity magnitude (a key clinical PC-MRI readout)."""
 
     def forward(self, v_pred: Tensor, v_target: Tensor) -> Tensor:
@@ -347,23 +280,3 @@ class PeakVelocityError(nn.Module):
         peak_pred = v_pred.norm(dim=1).amax()
         peak_target = v_target.norm(dim=1).amax()
         return (peak_pred - peak_target).abs()
-
-
-@register_metric("net_flow_error", aliases=["NetFlowError"], workflows=frozenset({Regime.FLOW}))
-class NetFlowError(nn.Module):
-    """Absolute error in net through-plane flow (integral of through-plane velocity)."""
-
-    def forward(
-        self,
-        v_through_plane_pred: Tensor,
-        v_through_plane_target: Tensor,
-        plane_mask: Tensor | None = None,
-        voxel_area: float = 1.0,
-    ) -> Tensor:
-        """Compute |net_flow_pred - net_flow_target| over the plane."""
-        if plane_mask is not None:
-            v_through_plane_pred = v_through_plane_pred * plane_mask
-            v_through_plane_target = v_through_plane_target * plane_mask
-        flow_pred = v_through_plane_pred.sum() * voxel_area
-        flow_target = v_through_plane_target.sum() * voxel_area
-        return (flow_pred - flow_target).abs()

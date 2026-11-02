@@ -210,11 +210,11 @@ class TestClusterDataAnnotations:
 class TestRequiredAxesEnforcement:
     """The tables must actually reject the regimes they exist to reject."""
 
-    def test_no_annotated_type_exposes_velocity_encoding(self) -> None:
-        # profiles.py's mri_flow comment relies on this: no dataset_type exposes
-        # VELOCITY_ENCODING, so a flow arm on M4Raw is rejected.
-        for axes in DATASET_TYPE_AXES.values():
-            assert Axis.VELOCITY_ENCODING not in axes
+    def test_only_phase_contrast_types_expose_velocity_encoding(self) -> None:
+        # A flow arm on M4Raw (or any magnitude corpus) must still be rejected; only
+        # the phase-contrast loaders carry a velocity-encoding axis.
+        exposing = {t for t, axes in DATASET_TYPE_AXES.items() if Axis.VELOCITY_ENCODING in axes}
+        assert exposing == {"flow_synthetic"}
 
     @pytest.mark.parametrize(
         "required",

@@ -67,3 +67,41 @@ def test_model_is_registered() -> None:
 
     populate_model_registry()
     assert "mcgi_encoder" in MODEL_REGISTRY
+
+
+def test_train_mode_backbone_receives_gradient() -> None:
+    from spectramr.models.encoders.mcgi_encoder import MCGIEncoder
+
+    enc = MCGIEncoder(in_channels=1, hidden_channels=4, out_channels=1, depth=2).train()
+    enc(torch.rand(1, 1, 8, 8)).sum().backward()
+    assert all(p.grad is not None for p in enc.backbone.parameters())
+
+
+def test_hard_rank_eval_false_raises() -> None:
+    from spectramr.models.encoders.mcgi_encoder import MCGIEncoder
+
+    with pytest.raises(ValueError, match="2409"):
+        MCGIEncoder(hard_rank_eval=False)
+
+
+def test_retired_soft_rank_knob_is_not_a_parameter() -> None:
+    from spectramr.models.encoders.mcgi_encoder import MCGIEncoder
+
+    with pytest.raises(TypeError):
+        MCGIEncoder(soft_rank_temperature=0.05)
+
+
+def test_rank_transform_false_is_the_non_invariant_twin() -> None:
+    torch.manual_seed(0)
+    x = torch.rand(2, 1, 16, 16)
+    enc = _encoder(rank_transform=False)
+    assert isinstance(enc.rank, torch.nn.Identity)
+    assert not torch.allclose(enc(x), enc(_mono(x)), atol=1e-3)
+
+
+def test_registered_strict_so_unknown_model_kwargs_fail_the_build() -> None:
+    from spectramr.models.init_registry import populate_model_registry
+    from spectramr.models.registry import is_strict_kwargs
+
+    populate_model_registry()
+    assert is_strict_kwargs("mcgi_encoder")

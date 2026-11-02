@@ -13,6 +13,8 @@ metadata:
   name: Stochastic Differential Equation Diffusion Models
   primary_metric: val_psnr  # diffusion review 2026-09-03: the arm's selector
   description: SDE-based diffusion with learnable variance schedules
+  status: needs_implementation
+  status_reason: "The VE-SDE path needs sigma_min/sigma_max and physics.data_consistency.method (pc_sampler_consistency), which this arm does not declare (the score_sde_declaration audit rejects it); learnable_variance is read by nothing, so the learnable variance schedule the arm tests is not implemented."
   tags:
   - sde
   - stochastic_differential_equation
@@ -32,10 +34,8 @@ model:
     feature_dim: 64
     num_layers: 2
     # F-VE-VP-ALIGN — catalog purpose is VE-SDE (variance-exploding), but this knob
-    # was set to vpsde (the opposite). Aligned to vesde to match the documented
-    # hypothesis. NOTE: sde_type is still inert (swallowed by ScoreBasedDiffusionGenerator
-    # **kwargs) — see deferred finding sde-type-inert; the value must be wired before
-    # VE-vs-VP can actually be measured.
+    # was set to vpsde (the opposite). Aligned to vesde; the generator now reads it and
+    # needs sigma_min/sigma_max alongside (see metadata.status_reason).
     sde_type: vesde
     learnable_variance: true
   denoising_model:

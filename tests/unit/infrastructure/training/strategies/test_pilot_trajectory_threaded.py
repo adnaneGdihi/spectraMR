@@ -406,3 +406,14 @@ class TestPILOTTrajectoryGradient:
         loss.backward()
         assert s._trajectory.grad is not None
         assert s._trajectory.grad.abs().sum().item() > 0.0
+
+
+def test_backbone_is_registered_on_the_image_and_the_bridge_stays_off() -> None:
+    # The pre_model chain is the adjoint; a strategy-side ifft2c would replace the
+    # sampled image with the context's fully sampled k-space.
+    import spectramr.models._v6_1_registrations  # noqa: F401  (registers loupe/pilot)
+    from spectramr.models.registry import get_model_capabilities
+
+    assert get_model_capabilities("pilot").input_domain == "image"
+    s = object.__new__(PILOTStrategy)
+    assert s._needs_kspace_adjoint({"measured_kspace": torch.ones(1)}) is False

@@ -382,14 +382,16 @@ class DynamicDPSSampler(nn.Module):
             # Noise-level-adaptive: weight grows with alpha_bar (late steps).
             weight = self.guidance_scale * ab
             return x0 - weight * adjoint_op(residual)
-        # adaptive_step / ncchi share the residual-normalized step.
-        r_norm = residual.abs().pow(2).sum().sqrt()
+        # adaptive_step / ncchi share the residual-normalized step, reduced per sample
+        # so one image's step does not depend on the rest of its batch.
+        bshape = (-1, *([1] * (residual.dim() - 1)))
+        r_norm = residual.abs().pow(2).flatten(1).sum(1).sqrt().view(bshape)
         step = self.guidance_scale / (r_norm + 1e-8)
         if self.guidance_mode == "ncchi":
             # Down-weight the step where the measurement is noise-floor-dominated;
             # at sigma=0 the factor is 1 (== adaptive_step).
             floor = 2.0 * self.n_coils * (self.sigma or 0.0) ** 2
-            sig_energy = forward_op(x0).abs().pow(2).mean()
+            sig_energy = forward_op(x0).abs().pow(2).flatten(1).mean(1).view(bshape)
             snr_factor = (1.0 - floor / (sig_energy + 1e-8)).clamp(min=0.0, max=1.0)
             step = step * snr_factor
         return x0 - step * adjoint_op(residual)

@@ -118,6 +118,7 @@ def gnl_displacement_px(
     device: torch.device,
     voxel_mm: _Voxel | None = None,
     dtype: torch.dtype = torch.float32,
+    max_severity: float = _GNL_MAX_SEVERITY,
 ) -> Tensor:
     """``[B, 3, D, H, W]`` ``(dz, dy, dx)`` gradient non-linearity warp in voxels.
 
@@ -135,7 +136,7 @@ def gnl_displacement_px(
         # Same half-extent as field_coords: normalised units -> mm -> voxels of each axis.
         half = max((n // 2) * v for n, v in zip(shape, voxel_mm, strict=True)) or 1.0
         to_px = [half / v for v in voxel_mm]
-    scale = float(theta) * _GNL_MAX_SEVERITY * _GNL_REFERENCE_GRID
+    scale = float(theta) * float(max_severity) * _GNL_REFERENCE_GRID
     coeffs = per_sample_randn(
         batch,
         3,
@@ -157,6 +158,7 @@ def gradient_nonlinearity_volume(
     seed: int,
     geometry: AcquisitionGeometry,
     severity: float | None = None,
+    max_severity: float = _GNL_MAX_SEVERITY,
 ) -> Tensor:
     """D21: 3-D polynomial warp; multislice slices curve through-plane (the "potato chip")."""
     check_volume(x, geometry, "gradient_nonlinearity")
@@ -176,5 +178,6 @@ def gradient_nonlinearity_volume(
         x.device,
         voxel_mm=geometry.voxel_mm,
         dtype=x.real.dtype,
+        max_severity=max_severity,
     )
     return warp_volume(x, d)

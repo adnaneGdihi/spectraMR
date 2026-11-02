@@ -5,6 +5,8 @@ This is the high-level entry point for building training components.
 """
 
 import logging
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 
@@ -138,12 +140,20 @@ class TrainingEnvironmentDirector:
             zero_stage=getattr(deepspeed, "zero_stage", None),
         )
 
-    def build_environment(self, *, with_test_loader: bool = True) -> TrainingEnvironment:
+    def build_environment(
+        self,
+        *,
+        with_test_loader: bool = True,
+        checkpoint_layout: Mapping[str, Any] | None = None,
+    ) -> TrainingEnvironment:
         """Build complete training environment in correct order.
 
         Orchestrates all builders to create models, optimizers, losses,
         physics operators, data loaders, and metrics. ``with_test_loader=False``
         leaves the held-out test set unindexed (``data.source.test_pass: infer``).
+        ``checkpoint_layout`` is the generator layout of the checkpoint a resume will
+        load (``checkpointing.legacy_layout``); the models must be built with it before
+        the optimizer exists.
 
         Returns:
             TrainingEnvironment: Immutable container with all components
@@ -170,7 +180,12 @@ class TrainingEnvironmentDirector:
         # 1. Models (must come first - needed by optimizers)
         logger.info("Step 1/6: Building models...")
         model_builder = (
-            ModelBuilder(self._config, self._device, warm_start=True)
+            ModelBuilder(
+                self._config,
+                self._device,
+                warm_start=True,
+                checkpoint_layout=checkpoint_layout,
+            )
             .build_generator()
             .build_discriminator()
             .build_encoder_decoder()

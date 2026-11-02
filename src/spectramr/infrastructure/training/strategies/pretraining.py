@@ -3,14 +3,52 @@
 This module contains MAEPretrainingStrategy training strategies.
 """
 
-from typing import Any
+from collections.abc import Sequence
+from typing import Any, ClassVar
 
 import torch
 
+from spectramr.core.module_utils import unwrap_model
+from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+from spectramr.infrastructure.physics.sampling import MaskGenerator, MaskType
 from spectramr.infrastructure.training.contexts import TrainingEnvironment
 from spectramr.models.losses.computers import UnifiedMAELossComputer
 
 from .base import BaseTrainingStrategy
+from .patch_masking import create_patch_mask
+from .rng_streams import rank_seeded_generator
+
+#: Validation masks are fixed per validation sample: seed = base + batch_idx * stride + i.
+_VAL_MASK_SEED = 42
+_VAL_MASK_STRIDE = 1 << 16
+
+
+def kspace_masked_input(
+    images: torch.Tensor, seeds: Sequence[int], mask_ratio: float
+) -> torch.Tensor:
+    """Undersample each sample's centred k-space with its own variable-density mask.
+
+    ``seeds[i]`` seeds sample ``i``'s mask, so a batch never shares one mask (#2393).
+    The acceleration is ``1 / (1 - mask_ratio)``. A real input returns the real part.
+    """
+    if len(seeds) != images.shape[0]:
+        raise ValueError(f"need one mask seed per sample: {len(seeds)} for {images.shape[0]}")
+    acceleration = 1.0 / (1.0 - mask_ratio) if mask_ratio < 1.0 else 4.0
+    shape = tuple(images.shape[-2:])
+    masks = torch.stack(
+        [
+            MaskGenerator(seed=int(seed)).generate_mask(
+                mask_type=MaskType.VARIABLE_DENSITY, shape=shape, acceleration_factor=acceleration
+            )
+            for seed in seeds
+        ]
+    )
+    masks = masks.view(images.shape[0], *([1] * (images.dim() - 3)), *shape)
+    masks = masks.to(images.device, non_blocking=True)
+    was_real = not torch.is_complex(images)
+    x = torch.complex(images, torch.zeros_like(images)) if was_real else images
+    recovered = ifft2c(fft2c(x) * masks)
+    return recovered.real if was_real else recovered
 
 
 class MAEPretrainingStrategy(BaseTrainingStrategy):
@@ -131,6 +169,9 @@ class MAEPretrainingStrategy(BaseTrainingStrategy):
         - Xie et al. (2022): An Empirical Study of Training Self-Supervised Vision Transformers
     """
 
+    #: The training-mask stream: one per rank, carried through the checkpoint.
+    checkpointed_streams: ClassVar[tuple[str, ...]] = ("_mask_rng",)
+
     def __init__(
         self,
         env: TrainingEnvironment | None = None,
@@ -145,7 +186,50 @@ class MAEPretrainingStrategy(BaseTrainingStrategy):
 
         # Initialize strategy-specific components using unified loss computer
         self.loss_computer = UnifiedMAELossComputer(config=self.config, device=self.device)
+        self._mask_rng = rank_seeded_generator(int(self.config.run.seed))
         self._setup_strategy_specific_components()
+
+    def _mae_masking(self) -> tuple[str, float, int]:
+        """``(mask_domain, mask_ratio, patch_size)``: the typed ``training.mae`` block, else task_settings."""
+        training = self.config.training
+        settings = getattr(self.config, "task_settings", None)
+        if not isinstance(settings, dict) and training is not None:
+            settings = getattr(self.config.training, "task_settings", None)
+        settings = settings if isinstance(settings, dict) else {}
+        mae_cfg = self.config.training.mae if training is not None else None
+        if mae_cfg is not None:
+            return mae_cfg.mask_domain, float(mae_cfg.mask_ratio), int(mae_cfg.patch_size)
+        domain = settings.get("mask_domain", "image")
+        if domain not in ("image", "kspace"):
+            raise ValueError(f"mask_domain must be 'image' or 'kspace', got {domain!r}")
+        return domain, float(settings.get("mask_ratio", 0.75)), int(settings.get("patch_size", 16))
+
+    def _masked_generator_input(
+        self, images: torch.Tensor, seeds: Sequence[int] | None, gen_kwargs: dict[str, Any]
+    ) -> torch.Tensor:
+        """Corrupt ``images`` as ``training.mae`` declares; ``seeds=None`` draws from the training stream.
+
+        A generator that drops patch tokens itself (``owns_spatial_masking``) receives the
+        clean image on the image route, so the image is never masked twice.
+        """
+        mask_domain, mask_ratio, patch_size = self._mae_masking()
+        if mask_domain == "kspace":
+            if seeds is None:
+                seeds = torch.randint(
+                    0, 2**31 - 1, (images.shape[0],), generator=self._mask_rng
+                ).tolist()
+            # The k-space mask is the corruption; the model must not drop patches too.
+            gen_kwargs["disable_spatial_masking"] = True
+            return kspace_masked_input(images, seeds, mask_ratio)
+        if getattr(unwrap_model(self.env.generator), "owns_spatial_masking", False):
+            return images
+        stream = self._mask_rng if seeds is None else torch.Generator().manual_seed(int(seeds[0]))
+        height, width = images.shape[-2:]
+        mask = create_patch_mask(
+            images.shape[0], height, width, patch_size, mask_ratio, images.device, stream
+        )
+        mask = mask.view(images.shape[0], *([1] * (images.dim() - 3)), height, width)
+        return images.masked_fill(mask, 0.0)
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize MAE-specific components and perform validation."""
@@ -194,81 +278,12 @@ class MAEPretrainingStrategy(BaseTrainingStrategy):
             # Use target_batch as input for MAE (self-supervised on high-res images)
             input_batch = target_batch
 
-        # The reconstruction target is the ORIGINAL clean image. In the
-        # k-space branch below ``input_batch`` is overwritten with its
-        # undersampled-IFFT corruption (that corruption is the *generator
-        # input*), so the target must be captured here, before the overwrite.
-        # Using the corrupted image as the target makes the identity map
-        # optimal — a degenerate objective (CLAUDE.md pitfall #20).
+        # The target is the clean image, captured before masking overwrites the
+        # generator input; a corrupted target makes the identity map optimal (pitfall #20).
         mae_target = input_batch
 
-        # [Phase 3.3] K-Space Block Masking
-        mask_domain = "image"
-        if hasattr(self.config, "task_settings") and isinstance(self.config.task_settings, dict):
-            mask_domain = self.config.task_settings.get("mask_domain", mask_domain)
-        elif hasattr(self.config.training, "task_settings") and isinstance(
-            getattr(self.config.training, "task_settings", None), dict
-        ):
-            mask_domain = self.config.training.task_settings.get("mask_domain", mask_domain)
-
-        if (
-            hasattr(self.config, "training")
-            and self.config.training is not None
-            and hasattr(self.config.training, "mae")
-        ):
-            mae_config = self.config.training.mae
-            if hasattr(mae_config, "mask_domain"):
-                mask_domain = mae_config.mask_domain
-            elif isinstance(mae_config, dict):
-                mask_domain = mae_config.get("mask_domain", mask_domain)
-
-        if mask_domain == "kspace":
-            from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
-            from spectramr.infrastructure.physics.sampling import MaskGenerator, MaskType
-
-            # Route through the centered-FFT SSOT (fft2c/ifft2c handle the 4-D
-            # [B,C,H,W] MAE batch; the old FFTTransformer.fft2 unpacked a 5-D
-            # volume and raised ValueError on every k-space-masking step).
-            # Treat a real image as complex for the round-trip.
-            _was_real = not torch.is_complex(input_batch)
-            _x_complex = (
-                torch.complex(input_batch, torch.zeros_like(input_batch))
-                if _was_real
-                else input_batch
-            )
-            kspace = fft2c(_x_complex)
-
-            # Prefer the typed training.mae block (validated 0 ≤ ratio < 1);
-            # fall back to the legacy task_settings dict, then the default
-            # (pitfall #15 — mask_ratio was previously read only from the
-            # untyped dict, so a typed/validated value was a silent no-op).
-            mae_cfg = self.config.training.mae if self.config.training is not None else None
-            if mae_cfg is not None and hasattr(mae_cfg, "mask_ratio"):
-                mask_ratio = float(mae_cfg.mask_ratio)
-            elif hasattr(self.config, "task_settings") and isinstance(
-                self.config.task_settings, dict
-            ):
-                mask_ratio = self.config.task_settings.get("mask_ratio", 0.75)
-            else:
-                mask_ratio = 0.75
-
-            acceleration = 1.0 / (1.0 - mask_ratio) if mask_ratio < 1.0 else 4.0
-            mask_gen = MaskGenerator(seed=epoch)
-
-            mask = mask_gen.generate_mask(
-                mask_type=MaskType.VARIABLE_DENSITY,
-                shape=input_batch.shape[-2:],
-                acceleration_factor=acceleration,
-            ).to(input_batch.device)
-
-            masked_kspace = kspace * mask.unsqueeze(0).unsqueeze(0)
-            _recovered = ifft2c(masked_kspace)
-            input_batch = _recovered.real if _was_real else _recovered
-
-            # Prevent generator from doing standard spatial masking
-            kwargs["disable_spatial_masking"] = True
-
-        # The MAE model handles spatial masking internally (unless disabled above)
+        # A fresh mask per sample and step, drawn from the run's seeded stream.
+        input_batch = self._masked_generator_input(input_batch, None, kwargs)
         outputs = self.env.generator(input_batch, **kwargs)
 
         # Handle both dict and tensor outputs
@@ -342,79 +357,14 @@ class MAEPretrainingStrategy(BaseTrainingStrategy):
 
         input_batch = source.to(self.device, non_blocking=True)
 
-        # Reference for metrics is the clean image, captured before the
-        # k-space branch overwrites ``input_batch`` with its corruption
-        # (otherwise val PSNR grades agreement with the corruption, not
-        # reconstruction quality — pitfall #20).
+        # Metrics grade against the clean image, captured before masking (pitfall #20).
         mae_target = input_batch
 
-        # [Phase 3.3] K-Space Block Masking for Validation
-        mask_domain = "image"
-        if hasattr(self.config, "task_settings") and isinstance(self.config.task_settings, dict):
-            mask_domain = self.config.task_settings.get("mask_domain", mask_domain)
-        elif hasattr(self.config.training, "task_settings") and isinstance(
-            getattr(self.config.training, "task_settings", None), dict
-        ):
-            mask_domain = self.config.training.task_settings.get("mask_domain", mask_domain)
-
-        if (
-            hasattr(self.config, "training")
-            and self.config.training is not None
-            and hasattr(self.config.training, "mae")
-        ):
-            mae_config = self.config.training.mae
-            if hasattr(mae_config, "mask_domain"):
-                mask_domain = mae_config.mask_domain
-            elif isinstance(mae_config, dict):
-                mask_domain = mae_config.get("mask_domain", mask_domain)
-
-        gen_kwargs = {}
-        if mask_domain == "kspace":
-            from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
-            from spectramr.infrastructure.physics.sampling import MaskGenerator, MaskType
-
-            # Route through the centered-FFT SSOT (fft2c/ifft2c handle the 4-D
-            # [B,C,H,W] MAE batch; the old FFTTransformer.fft2 unpacked a 5-D
-            # volume and raised ValueError on every k-space-masking step).
-            # Treat a real image as complex for the round-trip.
-            _was_real = not torch.is_complex(input_batch)
-            _x_complex = (
-                torch.complex(input_batch, torch.zeros_like(input_batch))
-                if _was_real
-                else input_batch
-            )
-            kspace = fft2c(_x_complex)
-
-            # Prefer the typed training.mae block (validated 0 ≤ ratio < 1);
-            # fall back to the legacy task_settings dict, then the default
-            # (pitfall #15 — mask_ratio was previously read only from the
-            # untyped dict, so a typed/validated value was a silent no-op).
-            mae_cfg = self.config.training.mae if self.config.training is not None else None
-            if mae_cfg is not None and hasattr(mae_cfg, "mask_ratio"):
-                mask_ratio = float(mae_cfg.mask_ratio)
-            elif hasattr(self.config, "task_settings") and isinstance(
-                self.config.task_settings, dict
-            ):
-                mask_ratio = self.config.task_settings.get("mask_ratio", 0.75)
-            else:
-                mask_ratio = 0.75
-
-            acceleration = 1.0 / (1.0 - mask_ratio) if mask_ratio < 1.0 else 4.0
-
-            # Fixed validation seed
-            mask_gen = MaskGenerator(seed=42)
-
-            mask = mask_gen.generate_mask(
-                mask_type=MaskType.VARIABLE_DENSITY,
-                shape=input_batch.shape[-2:],
-                acceleration_factor=acceleration,
-            ).to(input_batch.device)
-
-            masked_kspace = kspace * mask.unsqueeze(0).unsqueeze(0)
-            _recovered = ifft2c(masked_kspace)
-            input_batch = _recovered.real if _was_real else _recovered
-
-            gen_kwargs["disable_spatial_masking"] = True
+        gen_kwargs: dict[str, Any] = {}
+        seeds = [
+            _VAL_MASK_SEED + batch_idx * _VAL_MASK_STRIDE + i for i in range(input_batch.shape[0])
+        ]
+        input_batch = self._masked_generator_input(input_batch, seeds, gen_kwargs)
 
         self.env.generator.eval()
         outputs = self.env.generator(input_batch, **gen_kwargs)

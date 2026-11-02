@@ -2,30 +2,37 @@
 
 from __future__ import annotations
 
+import math
 import types
+from pathlib import Path
 
 import pytest
 import torch
+import yaml
 from torch import nn
+
+from spectramr.config.schemas.certification import CertificationConfigSchema
 
 from spectramr.infrastructure.training.strategies.conformal_calibration_strategy import (
     ConformalCalibrationStrategy,
 )
+from tests.fixtures.run_state_files import write_run_state
 
 
 class _Identity(nn.Module):
-    """Trained-model stand-in: pred = input, and load_state_dict({}) succeeds (no
-    params), so a checkpoint round-trips. Lets the math tests exercise the REAL
-    checkpoint-gated branch instead of bypassing it."""
+    """Trained-model stand-in: pred = input. One buffer gives the checkpoint a shared
+    name, so it round-trips through the REAL checkpoint-gated branch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("tag", torch.zeros(1))
 
     def forward(self, x, **_):
         return x
 
 
 def _write_ckpt(tmp_path, model: nn.Module) -> str:
-    p = tmp_path / "best.pt"
-    torch.save({"generator_state_dict": model.state_dict()}, p)
-    return str(p)
+    return str(write_run_state(tmp_path / "best.pt", {"generator": model.state_dict()}))
 
 
 def _bare_strategy(dice_cfg, model: nn.Module | None = None) -> ConformalCalibrationStrategy:
@@ -130,15 +137,19 @@ def _subject_batches(subjects_per_batch: list[list[str]]) -> list[dict]:
     return out
 
 
-def _conformal_strategy(seed: int = 42, **cert) -> ConformalCalibrationStrategy:
+def _conformal_strategy(
+    seed: int = 42, ckpt: str | None = None, model: nn.Module | None = None, **cert
+) -> ConformalCalibrationStrategy:
     strat = object.__new__(ConformalCalibrationStrategy)
     strat.device = torch.device("cpu")
     strat._enabled_certs = list(cert)
     strat.config = types.SimpleNamespace(
         run=types.SimpleNamespace(seed=seed),
+        model=types.SimpleNamespace(checkpoint_path=ckpt),
+        checkpoint=types.SimpleNamespace(produced_by_arm="producer_arm"),
         certification=types.SimpleNamespace(**cert),
     )
-    strat.env = types.SimpleNamespace(generator=_Identity())
+    strat.env = types.SimpleNamespace(generator=model if model is not None else _Identity())
     return strat
 
 
@@ -337,6 +348,32 @@ def test_calibration_pair_passes_no_mask_to_a_model_without_geometry_planes() ->
     assert seen == [{}]
 
 
+def test_calibration_pair_feeds_a_two_field_renderer_source_target_and_contrast() -> None:
+    """#197: the b17 certificate fed the TARGET field as ``field_strength`` and no contrast,
+    so the renderer was scored under conditioning it never trained with."""
+    seen: list[dict] = []
+
+    class _TwoField(nn.Module):
+        def forward(self, x, *, field_strength, field_strength_target, contrast_id=None, **_):
+            seen.append(
+                {"src": field_strength, "tgt": field_strength_target, "cid": contrast_id}
+            )
+            return x
+
+    y = torch.ones(2, 1, 4, 4)
+    batch = {
+        "input": y,
+        "target": y,
+        "field_strength": torch.tensor([0.1, 3.0]),
+        "field_strength_target": torch.tensor([7.0, 7.0]),
+        "contrast_id": torch.tensor([0, 2]),
+    }
+    ConformalCalibrationStrategy._unpack_calibration_pair(batch, _TwoField())
+    torch.testing.assert_close(seen[0]["src"], torch.tensor([0.1, 3.0]))
+    torch.testing.assert_close(seen[0]["tgt"], torch.tensor([7.0, 7.0]))
+    torch.testing.assert_close(seen[0]["cid"], torch.tensor([0, 2]))
+
+
 # ── Planted violations for the certificate branches (#3041) ────────────────────
 
 
@@ -350,7 +387,7 @@ def test_chd_branch_writes_a_stamped_artefact(tmp_path) -> None:
         foreground_threshold=None,
         output_artefact=str(out),
     )
-    strat = _conformal_strategy(chd=chd)
+    strat = _conformal_strategy(ckpt=_write_ckpt(tmp_path, _Identity()), chd=chd)
     loader = _subject_batches([["a", "a"], ["b", "b"], ["c", "c"], ["d", "d"]])
     torch.manual_seed(0)
     reports = strat.run_calibration(loader)
@@ -363,11 +400,11 @@ def test_chd_branch_writes_a_stamped_artefact(tmp_path) -> None:
     assert payload["score_fn"] == "absolute_residual"
 
 
-def test_chd_cap_raises_when_the_calibration_half_is_too_small() -> None:
+def test_chd_cap_raises_when_the_calibration_half_is_too_small(tmp_path) -> None:
     chd = types.SimpleNamespace(
         beta=0.2, delta=0.05, n_calibration=50, foreground_threshold=None, output_artefact=None
     )
-    strat = _conformal_strategy(chd=chd)
+    strat = _conformal_strategy(ckpt=_write_ckpt(tmp_path, _Identity()), chd=chd)
     loader = _subject_batches([["a", "a"], ["b", "b"], ["c", "c"], ["d", "d"]])
     with pytest.raises(ValueError, match="n_calibration=50"):
         strat.run_calibration(loader)
@@ -383,17 +420,12 @@ def test_chd_cap_raises_when_the_calibration_half_is_too_small() -> None:
             ),
             "lesion detector",
         ),
-        (
-            "pac_bayes",
-            types.SimpleNamespace(
-                delta=0.05, tv_tolerance_tau=0.05, loss_bound_M=1.0, output_artefact=None
-            ),
-            "KL",
-        ),
     ],
 )
-def test_uncomputable_certificates_refuse_instead_of_faking_a_result(cert_name, cert, message):
-    strat = _conformal_strategy(**{cert_name: cert})
+def test_uncomputable_certificates_refuse_instead_of_faking_a_result(
+    cert_name, cert, message, tmp_path
+):
+    strat = _conformal_strategy(ckpt=_write_ckpt(tmp_path, _Identity()), **{cert_name: cert})
     with pytest.raises(NotImplementedError, match=message):
         strat.run_calibration(_subject_batches([["a", "a"], ["b", "b"]]))
 
@@ -403,3 +435,197 @@ def test_subject_split_names_the_loader_when_subject_id_is_missing() -> None:
     batches = [{"input": torch.rand(2, 1, 8, 8), "target": torch.rand(2, 1, 8, 8)}]
     with pytest.raises(ValueError, match="M4Raw k-space val loader must emit it"):
         _conformal_strategy()._subject_split(batches, seed=1)
+
+
+# ---------------------------------------------------------------------------
+# R5 PAC-Bayes (#3041): KL(Q||P) between Gaussians around two checkpoints and
+# a Monte-Carlo Gibbs risk, driven through the production run_calibration path.
+# ---------------------------------------------------------------------------
+
+
+def _pac_cfg(tmp_path, posterior: nn.Module, prior: nn.Module, **over):
+    q = write_run_state(tmp_path / "q.pt", {"generator": posterior.state_dict()})
+    p = write_run_state(tmp_path / "p.pt", {"generator": prior.state_dict()})
+    base = {
+        "enabled": True,
+        "delta": 0.05,
+        "tv_tolerance_tau": 0.05,
+        "loss_bound_M": 1.0,
+        "checkpoint_path": str(q),
+        "prior_checkpoint_path": str(p),
+        "kl_estimator": "isotropic_gaussian",
+        "posterior_sigma": 1e-2,
+        "prior_sigma": 1e-2,
+        "n_mc_samples": 3,
+        "risk_loss": "nmse",
+        "loss_out_of_range": "raise",
+        "independence_unit": "subject",
+        "output_artefact": str(tmp_path / "pac.json"),
+    }
+    base.update(over)
+    return CertificationConfigSchema(pac_bayes=base)
+
+
+def _pac_strategy(cert: CertificationConfigSchema, model: nn.Module):
+    strat = object.__new__(ConformalCalibrationStrategy)
+    strat.device = torch.device("cpu")
+    strat._enabled_certs = ConformalCalibrationStrategy._collect_enabled_certs(cert)
+    strat.config = types.SimpleNamespace(run=types.SimpleNamespace(seed=42), certification=cert)
+    strat.env = types.SimpleNamespace(generator=model)
+    return strat
+
+
+def test_pac_bayes_certificate_fires_and_restores_weights(tmp_path) -> None:
+    torch.manual_seed(0)
+    posterior = nn.Conv2d(1, 1, 3, padding=1)
+    prior = nn.Conv2d(1, 1, 3, padding=1)
+    with torch.no_grad():
+        posterior.weight.zero_()
+        posterior.weight[0, 0, 1, 1] = 1.0  # identity map: low NMSE
+        posterior.bias.zero_()
+    model = nn.Conv2d(1, 1, 3, padding=1)  # random init, overwritten by checkpoint_path
+    strat = _pac_strategy(_pac_cfg(tmp_path, posterior, prior), model)
+    assert strat._enabled_certs == ["pac_bayes"]
+    loader = [
+        {"input": (x := torch.rand(2, 1, 8, 8) + 0.5), "target": x, "subject_id": [s, s]}
+        for s in ("a", "b", "c")
+    ]
+    rep = strat.run_calibration(loader)["r5_pac_bayes"]
+    assert (tmp_path / "pac.json").exists()
+    expected_sq = sum(
+        (posterior.state_dict()[k] - prior.state_dict()[k]).pow(2).sum().item()
+        for k in ("weight", "bias")
+    )
+    assert rep["kl_q_p"] == pytest.approx(expected_sq / (2 * 1e-4), rel=1e-5)
+    assert rep["n"] == 3 and rep["n_samples_scored"] == 6
+    assert 0.0 < rep["mc_risk_mean"] < 0.1
+    mc_term = math.sqrt(math.log(1 / 0.01) / (2 * 3))
+    assert rep["mc_hoeffding_term"] == pytest.approx(mc_term)
+    assert rep["empirical_risk"] == pytest.approx(rep["mc_risk_mean"] + mc_term)
+    assert rep["delta"] == pytest.approx(0.04) and rep["delta_total"] == 0.05
+    assert rep["prior_checkpoint_path"].endswith("p.pt") and rep["mc_seed"] == 42
+    assert torch.equal(model.weight, posterior.weight)  # perturbations undone
+
+
+def test_pac_bayes_raises_on_loss_above_bound(tmp_path) -> None:
+    posterior = nn.Conv2d(1, 1, 3, padding=1)
+    prior = nn.Conv2d(1, 1, 3, padding=1)
+    with torch.no_grad():
+        posterior.weight.fill_(5.0)
+    cfg = _pac_cfg(tmp_path, posterior, prior, independence_unit="sample")
+    strat = _pac_strategy(cfg, nn.Conv2d(1, 1, 3, padding=1))
+    loader = [{"input": (x := torch.rand(2, 1, 8, 8) + 0.5), "target": x}]
+    with pytest.raises(ValueError, match="exceed loss_bound_M"):
+        strat.run_calibration(loader)
+
+
+def test_pac_bayes_arm_enables_the_certificate_through_the_schema() -> None:
+    arm = (
+        Path(__file__).parents[5]
+        / "experiments/inprogress/conformal/exp_pac_bayes_certificate.yaml"
+    )
+    cert = CertificationConfigSchema(**yaml.safe_load(arm.read_text())["certification"])
+    assert ConformalCalibrationStrategy._collect_enabled_certs(cert) == ["pac_bayes"]
+
+
+# ── The model under certification is the producer's checkpoint, loaded exactly ──
+
+
+class _Scale(nn.Module):
+    """pred = w * x with one learnable scalar, so a load is observable in the residual."""
+
+    def __init__(self, w: float = 0.0) -> None:
+        super().__init__()
+        self.w = nn.Parameter(torch.tensor(w))
+
+    def forward(self, x, **_):
+        return self.w * x
+
+
+def _conformal_cert(n_calibration: int = 4):
+    return types.SimpleNamespace(
+        score_fn="absolute_residual",
+        alpha=0.1,
+        foreground_threshold=None,
+        n_calibration=n_calibration,
+        output_artefact=None,
+    )
+
+
+def test_conformal_branch_certifies_the_checkpoint_weights(tmp_path) -> None:
+    """Reachability: run_calibration loads model.checkpoint_path before scoring.
+
+    The generator starts at w=0 (pred = 0); the checkpoint holds w=1 (pred = input). On
+    pairs with target == input the quantile is 0 only if the checkpoint was loaded.
+    """
+    ckpt = _write_ckpt(tmp_path, _Scale(1.0))
+    model = _Scale(0.0)
+    strat = _conformal_strategy(ckpt=ckpt, model=model, conformal=_conformal_cert())
+    batches = []
+    for ids in (["a", "a"], ["b", "b"], ["c", "c"], ["d", "d"]):
+        x = torch.rand(2, 1, 8, 8) + 0.5
+        batches.append({"input": x, "target": x.clone(), "subject_id": ids})
+    report = strat.run_calibration(batches)["r1_cdfc"]
+    assert model.w.item() == 1.0
+    assert report["quantile"] == pytest.approx(0.0)
+    assert report["checkpoint_path"] == ckpt
+
+
+def test_production_calibration_hook_certifies_the_producer_checkpoint(tmp_path) -> None:
+    """Reachability through production: the arm's strategy_class string resolves the class,
+    and pipelines.train._maybe_run_calibration drives run_calibration on the val loader."""
+    import importlib
+
+    from spectramr.pipelines.train import _maybe_run_calibration
+
+    dotted = (
+        "spectramr.infrastructure.training.strategies.conformal_calibration_strategy."
+        "ConformalCalibrationStrategy"
+    )
+    module_name, cls_name = dotted.rsplit(".", 1)
+    cls = getattr(importlib.import_module(module_name), cls_name)
+    assert cls is ConformalCalibrationStrategy
+
+    ckpt = _write_ckpt(tmp_path, _Scale(1.0))
+    model = _Scale(0.0)
+    strat = _conformal_strategy(ckpt=ckpt, model=model, conformal=_conformal_cert())
+    batches = []
+    for ids in (["a", "a"], ["b", "b"], ["c", "c"], ["d", "d"]):
+        x = torch.rand(2, 1, 8, 8) + 0.5
+        batches.append({"input": x, "target": x.clone(), "subject_id": ids})
+    pipeline = types.SimpleNamespace(data_loaders={"val": batches})
+    _maybe_run_calibration(strat, pipeline, {"run_output_dir": str(tmp_path)}, None)
+
+    import json
+
+    written = json.loads((tmp_path / "calibration_report.json").read_text())
+    assert model.w.item() == 1.0
+    assert written["r1_cdfc"]["checkpoint_path"] == ckpt
+    assert written["r1_cdfc"]["quantile"] == pytest.approx(0.0)
+
+
+def test_conformal_branch_refuses_without_a_checkpoint_path() -> None:
+    strat = _conformal_strategy(conformal=_conformal_cert())
+    with pytest.raises(ValueError, match=r"model\.checkpoint_path is required"):
+        strat.run_calibration(_subject_batches([["a", "a"], ["b", "b"]]))
+
+
+def test_conformal_branch_names_the_producer_when_the_checkpoint_is_absent(tmp_path) -> None:
+    strat = _conformal_strategy(ckpt=str(tmp_path / "best.pt"), conformal=_conformal_cert())
+    with pytest.raises(FileNotFoundError, match=r"produced_by_arm='producer_arm'"):
+        strat.run_calibration(_subject_batches([["a", "a"], ["b", "b"]]))
+
+
+def test_conformal_branch_refuses_a_partially_matching_checkpoint(tmp_path) -> None:
+    """Planted: the warm start's overlap policy would keep unmatched layers random."""
+
+    class _Wider(_Scale):
+        def __init__(self) -> None:
+            super().__init__(0.0)
+            self.extra = nn.Parameter(torch.zeros(3))
+
+    strat = _conformal_strategy(
+        ckpt=_write_ckpt(tmp_path, _Scale(1.0)), model=_Wider(), conformal=_conformal_cert()
+    )
+    with pytest.raises(RuntimeError):
+        strat.run_calibration(_subject_batches([["a", "a"], ["b", "b"]]))

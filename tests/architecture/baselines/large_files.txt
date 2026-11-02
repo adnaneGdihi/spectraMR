@@ -41,7 +41,6 @@ src/spectramr/core/metrics/anchor_conformal.py  # 319 loc
 src/spectramr/core/metrics/computer.py  # 506 loc
 src/spectramr/core/metrics/equivariance_defect.py  # 352 loc
 src/spectramr/core/metrics/evaluation_metrics.py  # 2846 loc
-src/spectramr/core/metrics/flow_metrics.py  # 375 loc
 src/spectramr/core/metrics/inference.py  # 525 loc
 src/spectramr/core/metrics/meta_evaluation/aggregation.py  # 401 loc
 src/spectramr/core/metrics/meta_evaluation/figures.py  # 1203 loc
@@ -166,7 +165,7 @@ src/spectramr/infrastructure/physics/fno_epg.py  # 403 loc
 src/spectramr/infrastructure/physics/forward_operator.py  # 694 loc
 src/spectramr/infrastructure/physics/integration.py  # 811 loc
 src/spectramr/infrastructure/physics/iterative_recon.py  # 411 loc
-src/spectramr/infrastructure/physics/m4raw_pseudo_gt.py  # 494 loc
+src/spectramr/infrastructure/physics/m4raw_pseudo_gt.py  # 350 loc
 src/spectramr/infrastructure/physics/magnus_exponential.py  # 427 loc
 src/spectramr/infrastructure/physics/manifolds/bloch_manifold.py  # 343 loc
 src/spectramr/infrastructure/physics/marker_estimators.py  # 638 loc
@@ -225,7 +224,6 @@ src/spectramr/infrastructure/training/strategies/disentangled_vae_strategy.py  #
 src/spectramr/infrastructure/training/strategies/distillation_strategy.py  # 335 loc
 src/spectramr/infrastructure/training/strategies/domain_adaptation.py  # 470 loc
 src/spectramr/infrastructure/training/strategies/doob_bridge_strategy.py  # 363 loc
-src/spectramr/infrastructure/training/strategies/equivariance_conformal_strategy.py  # 352 loc
 src/spectramr/infrastructure/training/strategies/field_cocycle_strategy.py  # 547 loc
 src/spectramr/infrastructure/training/strategies/gan.py  # 777 loc
 src/spectramr/infrastructure/training/strategies/geomamba_ulf_strategy.py  # 372 loc
@@ -369,7 +367,6 @@ src/spectramr/models/generators/inr_cristal_generator.py  # 470 loc
 src/spectramr/models/generators/kan_vae_generator.py  # 623 loc
 src/spectramr/models/generators/kspace_cold_diffusion_generator.py  # 3197 loc
 src/spectramr/models/generators/latent_diffusion_generator.py  # 1453 loc
-src/spectramr/models/generators/latent_flow_generator.py  # 356 loc
 src/spectramr/models/generators/mamba_unet.py  # 833 loc
 src/spectramr/models/generators/mno_family.py  # 472 loc
 src/spectramr/models/generators/multi_contrast_conditioning.py  # 452 loc

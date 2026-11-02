@@ -8,19 +8,17 @@ Refactored to use DiffusionMixin for shared diffusion logic.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch import Tensor, nn
 
 from spectramr.models.diffusion.score_sde.score_network import ScoreNetwork
+from spectramr.models.diffusion.score_sde.sde_spec import refuse_discrete_path, resolve_sde
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 from .mixins import DiffusionMixin
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +43,11 @@ class ScoreBasedDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
     - Schedule initialization
     """
 
-    # This is an UNCONDITIONAL score/eps prior: its forward denoises x_t with NO
-    # measurement input, so the Tier-2 ``input_invariant`` probe (which checks the
-    # bare forward for measurement-dependence) does not apply. The measurement
-    # enters at INFERENCE via the posterior sampler (sample() → get_sampler → e.g.
-    # DDSReconSampler / A-DPS, data-consistency, unit-tested) and at TRAINING via
-    # the held-out k-space consistency (Ambient). Opt out per the probe's own
-    # prescription for intentional priors (pitfall #20 exemption).
+    # The bare forward self-noises a clean input, so the Tier-2 ``input_invariant``
+    # probe cannot judge measurement dependence on it. The measurement enters through
+    # the strategy instead: ``training.diffusion.condition_on_input`` concatenates it
+    # onto x_t at training and in the validation sampler, or a posterior sampler
+    # (``sample()``, e.g. dds) takes it at inference.
     synthetic_forward_probe_skip = frozenset({"input_invariant"})
 
     def __init__(
@@ -63,6 +59,9 @@ class ScoreBasedDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
         gradient_lambda: float = 1.0,
         entropy_lambda: float = 0.1,
         ssim_lambda: float = 0.5,
+        sde_type: str | None = None,
+        sigma_min: float | None = None,
+        sigma_max: float | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize Score-Based Diffusion Generator.
@@ -75,27 +74,22 @@ class ScoreBasedDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
             gradient_lambda: Weight for gradient error loss.
             entropy_lambda: Weight for gradient entropy loss.
             ssim_lambda: Weight for SSIM loss.
+            sde_type: ``None`` (discrete DDPM) or ``"vesde"`` with ``sigma_min``/``sigma_max``.
             **kwargs: Extra parameters for ScoreNetwork if denoising_model is None.
         """
         super().__init__()
+        self.sde_type, self.sigma_min, self.sigma_max = resolve_sde(sde_type, sigma_min, sigma_max)
 
         if denoising_model is None:
-            # Auto-build ScoreNetwork from kwargs
+            # Auto-build ScoreNetwork from kwargs; num_layers > 4 reads as total depth, so 2 per level.
             features = kwargs.get("features", [32, 64, 128, 256])
             nf = features[0]
-            # Calculate multipliers: [1, 2, 4, 8] etc.
             ch_mult = [f // nf for f in features[1:]]
             if not ch_mult:
                 ch_mult = [1, 2, 2]  # Default fallback
-
-            # num_layers in config roughly maps to res blocks? or just default to 2
             num_res_blocks = kwargs.get("num_layers", 2)
-            # If num_layers is large (e.g. 8), it might mean total depth.
-            # ScoreNetwork uses num_res_blocks per level. 2 is standard.
             if num_res_blocks > 4:
                 num_res_blocks = 2
-
-            # Input channels should be passed via config or assumed 2 (complex)
             in_ch = kwargs.get("in_channels", 2)
 
             self.denoising_model = ScoreNetwork(
@@ -202,19 +196,27 @@ class ScoreBasedDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
     # -------------------------------------------------------------------------
     # IGenerator Interface
     # -------------------------------------------------------------------------
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass for training: add noise and predict noise.
+    def forward(self, x: Tensor, timesteps: Tensor | None = None) -> Tensor:
+        """Predict noise; self-noise a clean input only when no timestep is given.
 
         Args:
-            x: Input clean image of shape (B, C, H, W).
+            x: The noised sample x_t (plus any channel-concatenated condition) when
+                ``timesteps`` is given, else a clean image of shape (B, C, H, W).
+            timesteps: Diffusion step per sample. The strategy owns the forward
+                process and passes its own t, so x must not be noised again here.
 
         Returns:
-            Predicted noise of shape (B, C, H, W).
+            Predicted noise.
         """
         # Shape guard
         if x.dim() != 4:
             msg = f"Expected 4D input tensor (B, C, H, W), got {x.dim()}D"
             raise ValueError(msg)
+        if self.sde_type is not None and timesteps is None:
+            refuse_discrete_path(self, "the self-noising DDPM forward (no timesteps)")
+
+        if timesteps is not None:
+            return self._model_forward(x, timesteps)
 
         # Sample random timesteps
         t = torch.randint(0, self.timesteps, (x.shape[0],), device=x.device)
@@ -236,6 +238,8 @@ class ScoreBasedDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
         Returns:
             Generated tensor.
         """
+        if self.sde_type is not None:
+            refuse_discrete_path(self, "generate (discrete p_sample_loop)")
         return self.p_sample_loop(z.shape, **kwargs)
 
     def sample(
@@ -268,6 +272,8 @@ class ScoreBasedDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
             The reconstructed image.
         """
         del device, kwargs  # device follows the measurement; no extra kwargs needed.
+        if self.sde_type is not None:
+            refuse_discrete_path(self, f"the {self._sampler_name!r} posterior sampler")
         from spectramr.models.diffusion.samplers import get_sampler
 
         steps = int(inference_timesteps or self._sampling_steps)

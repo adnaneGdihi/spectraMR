@@ -123,6 +123,16 @@ class CycleBlochConfig(StrictSchema):
         ge=0.0,
         description="Weight of the total-variation penalty on the estimated B1+ map.",
     )
+    cycle_criterion: Literal["l1", "mse"] = Field(
+        default="l1",
+        description="Registered loss comparing the simulated ULF with the measured ULF.",
+    )
+    segmenter_backend: Literal["none", "label_dice"] = Field(
+        default="none",
+        description="Frozen segmenter fed to a declared segmentation_equivariance loss. "
+        "label_dice: fixed intensity-class soft segmenter (not contrast-agnostic). "
+        "none: no segmenter, so declaring segmentation_equivariance raises.",
+    )
     sequences: dict[str, CycleBlochSequence] | None = Field(
         default=None,
         description="Per-contrast sequences keyed by data.multi_contrast.contrast_map names; "

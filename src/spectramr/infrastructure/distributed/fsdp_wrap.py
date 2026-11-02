@@ -57,6 +57,9 @@ def _resolve_layer_classes(names: tuple[str, ...]) -> set[type]:
         "spectramr.models.blocks",
         "spectramr.models.layers",
         "spectramr.models.generators",
+        # The transformer blocks the tensor-parallel plan splits; not package exports.
+        "spectramr.models.generators.dit_backbone",
+        "spectramr.models.generators.uvit_backbone",
     ):
         try:
             _collect(__import__(module_path, fromlist=["*"]))
@@ -100,17 +103,35 @@ def fsdp_shard_mesh(mesh: Any, sharding_strategy: str) -> Any:
     ``full_shard`` and ``shard_grad_op`` shard over ``dp_shard`` alone (1-D).
     ``no_shard`` and ``hybrid_shard`` use the 2-D (replicate, shard) pair. The mesh is
     built once by ``infrastructure.distributed.mesh``, so FSDP never creates groups of its own.
-    """
-    from spectramr.infrastructure.distributed.mesh import DATA_PARALLEL_DIMS
 
-    if sharding_strategy in ("full_shard", "shard_grad_op"):
-        return mesh["dp_shard"]
-    if sharding_strategy in ("no_shard", "hybrid_shard"):
-        return mesh[DATA_PARALLEL_DIMS]
-    raise ValueError(
-        f"Unknown FSDP sharding_strategy={sharding_strategy!r}. Use full_shard | "
-        "shard_grad_op | no_shard | hybrid_shard."
+    With context or spatial peers (``cp`` or ``sp > 1``) the shard axis also spans them:
+    the peers hold identical parameters and each computes a partial gradient, so the
+    reduce-scatter must average over ``dp x cp x sp``, as DDP's ``grad_group`` does.
+    """
+    from spectramr.infrastructure.distributed.mesh import (
+        DATA_PARALLEL_DIMS,
+        GRAD_REDUCE_DIM,
+        GRAD_SHARD_DIM,
     )
+
+    if sharding_strategy not in ("full_shard", "shard_grad_op", "no_shard", "hybrid_shard"):
+        raise ValueError(
+            f"Unknown FSDP sharding_strategy={sharding_strategy!r}. Use full_shard | "
+            "shard_grad_op | no_shard | hybrid_shard."
+        )
+    peers = mesh["cp"].size() * mesh["sp"].size() > 1
+    if sharding_strategy in ("full_shard", "shard_grad_op"):
+        # dp_replicate is 1 under these strategies, so dp x cp x sp is dp_shard x cp x sp.
+        return mesh[GRAD_REDUCE_DIM] if peers else mesh["dp_shard"]
+    if sharding_strategy == "hybrid_shard" and peers:
+        return mesh[("dp_replicate", GRAD_SHARD_DIM)]
+    if peers:
+        raise ValueError(
+            "fsdp.sharding_strategy='no_shard' cannot average gradients over context or "
+            "spatial peers (parallel.mesh.context/spatial > 1); use strategy: ddp for a "
+            "replicated run."
+        )
+    return mesh[DATA_PARALLEL_DIMS]
 
 
 def _select_units(model: nn.Module, cfg: Any) -> list[str]:
@@ -149,6 +170,33 @@ def _select_units(model: nn.Module, cfg: Any) -> list[str]:
     raise ValueError(
         f"Unknown FSDP auto_wrap_policy={policy!r}. Use size_based | transformer_block | none."
     )
+
+
+def _check_tensor_parallel_compatible(model: nn.Module, units: list[str], shard_mesh: Any) -> None:
+    """Refuse a shard layout that would cross, or cut into, the tensor-parallel split.
+
+    Tensor ranks hold different slices, so sharding or reducing across them mixes
+    unrelated tensors. A unit strictly inside a split block would also reshard the
+    weights that block reads directly (``proj.weight``) outside the unit's forward.
+    """
+    from spectramr.infrastructure.distributed.mesh import REPLICA_DIMS
+    from spectramr.infrastructure.distributed.tensor_parallel.plan import TP_PLAN_ATTR
+
+    plan = getattr(model, TP_PLAN_ATTR, None)
+    if plan is None:
+        return
+    dims = tuple(shard_mesh.mesh_dim_names or ())
+    if not dims or not set(dims) <= set(REPLICA_DIMS):
+        raise RuntimeError(
+            f"FSDP over a tensor-parallel model must shard over {REPLICA_DIMS} only (data "
+            f"parallel, flattened with context peers); the shard mesh spans {dims}."
+        )
+    inside = [u for u in units if any(u.startswith(block + ".") for block in plan.blocks)]
+    if inside:
+        raise ValueError(
+            f"FSDP units {inside[:3]} lie inside tensor-parallel blocks; shard the "
+            "enclosing transformer blocks instead (auto_wrap_policy: transformer_block)."
+        )
 
 
 def _apply_units(model: nn.Module, units: list[str], **shard_kwargs: Any) -> None:
@@ -226,6 +274,7 @@ def maybe_wrap_with_fsdp(
         kwargs["offload_policy"] = CPUOffloadPolicy(pin_memory=True)
 
     units = _select_units(model, cfg)
+    _check_tensor_parallel_compatible(model, units, shard_mesh)
     _apply_units(model, units, **kwargs)
     logger.info(
         "FSDP2 sharded %s: sharding=%s mesh=%s units=%d mp=%s cpu_offload=%s",
@@ -252,8 +301,14 @@ def shard_like(target: nn.Module, reference: nn.Module) -> nn.Module:
             f"{type(reference).__name__} was not sharded by maybe_wrap_with_fsdp, so there "
             "is no shard plan to copy onto the EMA shadow."
         )
+    from spectramr.infrastructure.distributed.spatial.wrapper import SpatialModel
+
+    if isinstance(reference, SpatialModel) and not isinstance(target, SpatialModel):
+        # The shadow is a copy of the bare model built before the depth-split wrap, so the
+        # wrapper's "module" unit is the shadow's root, and its children lose the prefix.
+        units = tuple(name.removeprefix("module").removeprefix(".") for name in units)
     mesh = next(reference.parameters()).device_mesh
-    _apply_units(target, [name for name in units if name], mesh=mesh)
+    _apply_units(target, list(dict.fromkeys(name for name in units if name)), mesh=mesh)
     return target
 
 

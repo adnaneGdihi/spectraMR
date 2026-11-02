@@ -109,17 +109,6 @@ class DispersionBlochAEStrategy(ReconstructionTrainingStrategy):
                 "config block (schema TrainingConfigDispersionBlochAE). Declare it "
                 "in the arm YAML."
             )
-        fields = tuple(float(b) for b in getattr(cfg, "fields_present", ()))
-        n_pools = int(getattr(cfg, "num_pools", 1))
-        required = 2 * n_pools + 1
-        if len(fields) < required:
-            # Belt and braces: the Tier-1 check catches this at audit time, but a
-            # strategy constructed programmatically must not train a rank-deficient
-            # fit to a meaningless optimum (pitfall #9).
-            raise ValueError(
-                f"DL-BAE is under-determined: num_pools={n_pools} needs M >= {required} "
-                f"distinct fields, but fields_present names {len(fields)} ({fields!r})."
-            )
         self._dlbae_dc_weight = float(getattr(cfg, "data_consistency_weight", 1.0))
         self._dlbae_mono_weight = float(getattr(cfg, "monotonicity_weight", 1.0))
         self._dlbae_data_consistency = MultiFieldDataConsistency()

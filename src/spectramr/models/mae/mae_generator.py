@@ -12,6 +12,8 @@ Architecture:
 - Random patch masking during pretraining
 """
 
+from typing import ClassVar
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -375,19 +377,17 @@ class ViTEncoder(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        B, N, C = x.shape
+        return self.encode_positioned(x + self.pos_embed[:, 1 : x.shape[1] + 1, :])
 
-        # Add class token
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+    def encode_positioned(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode patch tokens that already carry their own positional embedding.
 
-        # Add position embedding (slice to match sequence length)
-        seq_len = x.shape[1]
-        pos_embed = self.pos_embed[:, :seq_len, :]
-        x = x + pos_embed
-        x = self.pos_drop(x)
+        MAE adds positions before masking (He et al. 2022), so a masked caller passes the
+        visible subset here; only the class token and its position are added.
+        """
+        cls_tokens = (self.cls_token + self.pos_embed[:, :1, :]).expand(x.shape[0], -1, -1)
+        x = self.pos_drop(torch.cat((cls_tokens, x), dim=1))
 
-        # Apply transformer blocks
         for blk in self.blocks:
             x = blk(x)
 
@@ -477,6 +477,9 @@ class MAEGenerator(nn.Module, IGenerator):
     During pretraining: Takes masked input, reconstructs full volume
     During finetuning: Can be used as feature extractor for SR tasks
     """
+
+    #: Drops patch tokens itself, so MAEPretrainingStrategy must not mask the image input too.
+    owns_spatial_masking: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -628,6 +631,10 @@ class MAEGenerator(nn.Module, IGenerator):
         """Apply random masking to patches."""
         N, L, D = x.shape  # batch, length, dim
         len_keep = int(L * (1 - mask_ratio))
+        if len_keep >= L:
+            # Nothing to drop: skip the shuffle and keep patch order.
+            ids_restore = torch.arange(L, device=x.device).expand(N, L)
+            return x, torch.zeros(N, L, device=x.device), ids_restore
 
         noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
 
@@ -653,14 +660,12 @@ class MAEGenerator(nn.Module, IGenerator):
         mask_ratio: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass through encoder with masking."""
-        # Embed patches
+        vit = self.encoder.encoder
+        # Positions are added before masking so each visible patch keeps its spatial embedding.
         x = self.encoder.patch_embed(x)
-
-        # Apply masking
+        x = x + vit.pos_embed[:, 1 : x.shape[1] + 1, :]
         x, mask, ids_restore = self.random_masking(x, mask_ratio)
-
-        # Encode visible patches
-        x = self.encoder.encoder(x)
+        x = vit.encode_positioned(x)
 
         return x, mask, ids_restore
 
@@ -709,9 +714,9 @@ class MAEGenerator(nn.Module, IGenerator):
 
         Args:
             x: Input tensor [B, C, H, W, D] or [B, C, H, W]
-            **kwargs: Extra keyword arguments (batch, disable_spatial_masking, etc.)
-                      are accepted but ignored for forward compatibility with
-                      training strategy dispatch.
+            **kwargs: ``disable_spatial_masking=True`` encodes every patch (the
+                      k-space MAE path masks the input itself); other keys from the
+                      strategy dispatch (``batch``, ``iteration``) are ignored.
 
         forward method for MAEGenerator.
 
@@ -725,9 +730,8 @@ class MAEGenerator(nn.Module, IGenerator):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        latent, mask, ids_restore = self.forward_encoder(x, self.mask_ratio)
-        pred = self.forward_decoder(latent, ids_restore)
-        return self.unpatchify(pred)
+        ratio = 0.0 if kwargs.get("disable_spatial_masking", False) else self.mask_ratio
+        return self.generate(x, mask_ratio=ratio)
 
     def generate(
         self,
@@ -738,8 +742,10 @@ class MAEGenerator(nn.Module, IGenerator):
         """Generate reconstruction from input."""
         mask_ratio = mask_ratio if mask_ratio is not None else self.mask_ratio
         latent, mask, ids_restore = self.forward_encoder(x, mask_ratio)
-        pred = self.forward_decoder(latent, ids_restore)
-        return self.unpatchify(pred)
+        pred = self.unpatchify(self.forward_decoder(latent, ids_restore))
+        # A 2-D [B,C,H,W] input is embedded as depth 1; return it at the input's rank so a
+        # loss against the 4-D target does not broadcast to [B,B,H,W,W].
+        return pred.squeeze(-1) if x.dim() == 4 else pred
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         """Get output shape for given input shape."""

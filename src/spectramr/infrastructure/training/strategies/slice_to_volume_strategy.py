@@ -40,16 +40,95 @@ References
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
+from spectramr.data.batch_types import read_batch_field
+from spectramr.data.transforms.slice_profile import (
+    SLICE_PROFILE_RATIO_KEY,
+    SLICE_PROFILE_Z_AXIS_KEY,
+)
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SliceProfileStamp:
+    """Decimation applied by ``slice_profile``, plus the patch z-start when cropped."""
+
+    ratio: int
+    batch_dim: int
+    z_start: torch.Tensor | None  # (B,) patch start along the through-plane axis
+
+
+def _uniform(values: Any, key: str) -> int:
+    vals = {int(v) for v in values} if isinstance(values, (list, tuple)) else {int(values)}
+    if len(vals) != 1:
+        raise ValueError(f"slice_to_volume: batch mixes {key} values {sorted(vals)}")
+    return vals.pop()
+
+
+def read_slice_profile_stamp(batch: Any) -> SliceProfileStamp | None:
+    """Read the transform's stamp from the collated batch (dict or TrainingBatch)."""
+    ratio = read_batch_field(batch, SLICE_PROFILE_RATIO_KEY)
+    if ratio is None:
+        return None
+    ratio = _uniform(ratio, SLICE_PROFILE_RATIO_KEY)
+    z_axis = _uniform(read_batch_field(batch, SLICE_PROFILE_Z_AXIS_KEY), SLICE_PROFILE_Z_AXIS_KEY)
+    loc = read_batch_field(batch, "location")  # torchio.LOCATION, set by every patch sampler
+    # LOCATION is (i0, j0, k0, i1, j1, k1); absent means an uncropped volume (phase 0).
+    z_start = loc[:, z_axis - 1] if isinstance(loc, torch.Tensor) else None
+    return SliceProfileStamp(ratio=ratio, batch_dim=z_axis + 1, z_start=z_start)
+
+
+def replicated_stack_anchor(
+    x_hi: torch.Tensor, x_lo: torch.Tensor, stamp: SliceProfileStamp
+) -> torch.Tensor:
+    """Avg-pool ``x_hi`` over each thick-slice block and compare to that block's value.
+
+    The transform decimated the whole volume from index 0 and replicated each thick
+    slice ``ratio`` times, so a patch starting at ``k0`` has its first full block at
+    ``(-k0) mod ratio``. Only blocks wholly inside the patch enter the term.
+    """
+    r = stamp.ratio
+    if r < 2:
+        raise ValueError(
+            f"slice_to_volume: slice_profile decimation ratio is {r}; with no "
+            "decimation the anchor is an identity MSE. Raise slice_thickness_mm "
+            "above the through-plane spacing."
+        )
+    if x_hi.shape != x_lo.shape:
+        raise ValueError(
+            f"slice_to_volume: a replicated stack needs D_hi == D_lo; got "
+            f"{tuple(x_hi.shape)} vs {tuple(x_lo.shape)}"
+        )
+    hi = x_hi.movedim(stamp.batch_dim, -1)
+    lo = x_lo.movedim(stamp.batch_dim, -1)
+    depth, batch = hi.shape[-1], hi.shape[0]
+    if stamp.z_start is None:
+        phase = torch.zeros(batch, dtype=torch.long, device=hi.device)
+        n_blocks = depth // r
+    else:
+        phase = (-stamp.z_start.to(device=hi.device, dtype=torch.long)) % r
+        n_blocks = (depth - r + 1) // r  # fits every phase without a host sync
+    if n_blocks < 1:
+        raise ValueError(f"slice_to_volume: depth {depth} holds no full block of {r}")
+    starts = phase[:, None] + r * torch.arange(n_blocks, device=hi.device)  # (B, n)
+    win = (starts[:, :, None] + torch.arange(r, device=hi.device)).reshape(batch, -1)
+    lead = hi.shape[1:-1]
+    view = (batch,) + (1,) * len(lead)
+
+    def take(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        return t.gather(-1, idx.view(*view, -1).expand(*t.shape[:-1], idx.shape[-1]))
+
+    pooled = take(hi, win).unflatten(-1, (n_blocks, r)).mean(-1)
+    return F.mse_loss(pooled, take(lo, starts))
 
 
 class SliceToVolumeStrategy(BaseTrainingStrategy):
@@ -83,9 +162,13 @@ class SliceToVolumeStrategy(BaseTrainingStrategy):
         self,
         x_hi: torch.Tensor,
         x_lo: torch.Tensor,
+        stamp: SliceProfileStamp | None = None,
     ) -> torch.Tensor:
         r"""Average-pool the predicted hi-res volume back to the input's
         through-plane resolution and compare to the original.
+
+        ``stamp`` is the decimation the ``slice_profile`` transform applied to an
+        input it replicated back to the target grid (``D_hi == D_lo``).
         """
         # Both should be 5-D: (B, 1, D, H, W)
         if x_hi.dim() != 5 or x_lo.dim() != 5:
@@ -93,10 +176,19 @@ class SliceToVolumeStrategy(BaseTrainingStrategy):
                 f"slice_to_volume expects 5-D tensors; got "
                 f"x_hi {tuple(x_hi.shape)}, x_lo {tuple(x_lo.shape)}"
             )
+        if stamp is not None:
+            return replicated_stack_anchor(x_hi, x_lo, stamp)
         D_hi = x_hi.shape[2]
         D_lo = x_lo.shape[2]
         if D_hi == D_lo:
-            return F.mse_loss(x_hi, x_lo)
+            # Without the decimation stamp the anchor is an identity MSE that pulls
+            # the output back onto the staircase input; refuse it.
+            raise ValueError(
+                "slice_to_volume: input and output share a through-plane depth "
+                f"({D_hi}) but the batch carries no slice_profile decimation stamp, so "
+                "the input plane is unknown. Declare the slice_profile transform with "
+                "decimate: true, or feed a genuinely thick-slice (D_lo < D_hi) stack."
+            )
         # The slice-to-volume upsampler must produce a DENSER through-plane
         # output than its input. A hi-res volume with fewer through-plane
         # samples than the input is a contract violation (pitfall #9) — raise
@@ -122,7 +214,7 @@ class SliceToVolumeStrategy(BaseTrainingStrategy):
         )
         return F.mse_loss(x_hi_pooled, x_lo)
 
-    def _isotropy_consistency(self, x_hi: torch.Tensor) -> torch.Tensor:
+    def _isotropy_consistency(self, x_hi: torch.Tensor, tp_dim: int = 2) -> torch.Tensor:
         r"""Gradient-isotropy prior (audit 2026-06 D3).
 
         The synthesised through-plane detail should carry the same texture
@@ -144,9 +236,8 @@ class SliceToVolumeStrategy(BaseTrainingStrategy):
                 f"slice_to_volume isotropy prior expects a 5-D volume "
                 f"(B, C, D, H, W); got {tuple(x_hi.shape)}"
             )
-        gz = (x_hi[:, :, 1:] - x_hi[:, :, :-1]).abs().mean()  # through-plane (D)
-        gh = (x_hi[:, :, :, 1:] - x_hi[:, :, :, :-1]).abs().mean()  # in-plane (H)
-        gw = (x_hi[..., 1:] - x_hi[..., :-1]).abs().mean()  # in-plane (W)
+        gz = x_hi.diff(dim=tp_dim).abs().mean()  # through-plane
+        gh, gw = (x_hi.diff(dim=d).abs().mean() for d in (2, 3, 4) if d != tp_dim)
         in_plane = 0.5 * (gh + gw)
         return (gz - in_plane).pow(2)
 
@@ -183,11 +274,17 @@ class SliceToVolumeStrategy(BaseTrainingStrategy):
             losses_dict=env_losses,
         )
 
-        # Through-plane consistency anchor
-        tp_loss = self._through_plane_consistency(x_hi, input_batch)
-
-        # Gradient-isotropy prior (audit 2026-06 D3; weight kept as lambda_ortho)
-        iso_loss = self._isotropy_consistency(x_hi)
+        stamp = read_slice_profile_stamp(kwargs.get("batch"))
+        if stamp is not None and not getattr(self, "_stamp_logged", False):
+            logger.info(
+                "SliceToVolumeStrategy: phase-aligned anchor from slice_profile stamp "
+                "(ratio=%d, through-plane batch dim=%d)",
+                stamp.ratio,
+                stamp.batch_dim,
+            )
+            self._stamp_logged = True
+        tp_loss = self._through_plane_consistency(x_hi, input_batch, stamp)
+        iso_loss = self._isotropy_consistency(x_hi, stamp.batch_dim if stamp else 2)
 
         total = (
             loss_output.total + self.lambda_through_plane * tp_loss + self.lambda_ortho * iso_loss
@@ -199,4 +296,4 @@ class SliceToVolumeStrategy(BaseTrainingStrategy):
         return out
 
 
-__all__ = ["SliceToVolumeStrategy"]
+__all__ = ["SliceProfileStamp", "SliceToVolumeStrategy", "read_slice_profile_stamp"]

@@ -1351,15 +1351,13 @@ def campaign_evaluate(args: argparse.Namespace) -> int:
 
         # Load evaluation config from campaign YAML if available
         eval_config = EvaluationConfigSchema()
+        campaign_cfg = None
         if state.campaign_config_path:
-            try:
-                campaign_cfg = CampaignConfigSchema.from_yaml(state.campaign_config_path)
-                eval_config = campaign_cfg.evaluation
-            except Exception as e:
-                logger.warning(f"Could not load campaign config for eval settings: {e}")
+            campaign_cfg = CampaignConfigSchema.from_yaml(state.campaign_config_path)
+            eval_config = campaign_cfg.evaluation
 
         evaluator = CampaignEvaluator(eval_config=eval_config)
-        report = evaluator.evaluate(state)
+        report = evaluator.evaluate(state, campaign=campaign_cfg)
         print(report.summary)
 
         # Generate plots if configured
@@ -1453,15 +1451,13 @@ def campaign_watch(args: argparse.Namespace) -> int:
                 # Auto-evaluate
                 logger.info("\n📊 Starting automated evaluation...\n")
                 eval_config = EvaluationConfigSchema()
+                campaign_cfg = None
                 if state.campaign_config_path:
-                    try:
-                        campaign_cfg = CampaignConfigSchema.from_yaml(state.campaign_config_path)
-                        eval_config = campaign_cfg.evaluation
-                    except Exception as e:
-                        logger.warning(f"Could not load campaign config for eval: {e}")
+                    campaign_cfg = CampaignConfigSchema.from_yaml(state.campaign_config_path)
+                    eval_config = campaign_cfg.evaluation
 
                 evaluator = CampaignEvaluator(eval_config=eval_config)
-                report = evaluator.evaluate(state)
+                report = evaluator.evaluate(state, campaign=campaign_cfg)
                 print(report.summary)
 
                 if eval_config.generate_plots:
@@ -1885,50 +1881,43 @@ def _load_clean_volumes_from_h5(
     contrasts: tuple[str, ...] | None = None,
     device: "torch.device | None" = None,
     assets_out: "dict[str, object] | None" = None,
+    dataset_kind: str = "m4raw",
+    allow_incomplete: bool = False,
+    grid_out: "dict[str, object] | None" = None,
 ) -> "list[tuple[str, 'torch.Tensor']]":
-    """Synthesize pseudo-GT magnitude volumes from M4Raw multi-rep H5 files.
+    """Synthesize pseudo-GT magnitude volumes from the content grid of an H5 tree.
 
-    M4Raw stores files as ``<subject>_<contrast><rep>.h5`` (e.g.
-    ``2022091411_FLAIR01.h5``). The same grouping convention the M4Raw
-    training dataset uses — see
-    :class:`spectramr.data.datasets.m4raw_dataset.M4RawRepetitionDataset` —
-    strips the last 2 chars (rep index) so each group is one
-    ``(subject, contrast)`` pair. This makes meta-evaluation
-    multi-contrast by default (T1 / T2 / FLAIR), matching how the
-    rest of the pipeline treats M4Raw.
-
-    Per-group pseudo-GT is built with
-    :func:`scripts.sim2rank.ground_truth.synthesize_pseudo_gt`
-    (averages reps in k-space, SENSE-adjoint-combines) — the same
-    path used by ``run_meta_eval_all_datasets`` and the sim2rank
-    engine.
+    Contents come from :func:`spectramr.data.datasets.native_grid.discover_native_grid`
+    for ``dataset_kind``: M4Raw groups ``<subject>_<contrast><rep>.h5`` repetitions
+    into one linked ``(subject, contrast)`` content; fastMRI brain keeps one file per
+    exam and is never stem-grouped. ``--contrasts`` / ``--max-contrasts`` are applied
+    by the discovery itself, before any subject cap.
 
     Args:
-        input_dir: Directory of M4Raw H5 files.
-        max_subjects: Distinct subjects to load.
-        max_contrasts: Contrasts per subject (defaults to 3 → T1, T2,
-            FLAIR; matches sim2rank's CLI default).
-        contrasts: Optional whitelist (e.g. ``("T1", "T2")``); applied
-            against the parsed contrast token. ``None`` keeps all.
+        input_dir: Directory of H5 files.
+        max_subjects: Distinct subjects (M4Raw) or exams per contrast (brain).
+        max_contrasts: Contrasts per subject.
+        contrasts: Optional ordered allow-list; every entry must be present.
+        dataset_kind: ``m4raw`` or ``fastmri_brain``.
+        allow_incomplete: M4Raw: drop subjects lacking a grid contrast.
+        grid_out: When given, receives the grid's provenance for the summary.
 
     Returns:
-        ``[(id, tensor), ...]`` where ``id`` is ``"<subject>_<contrast>"``
-        so downstream figures can stratify per contrast.
+        ``[(content_id, tensor), ...]`` with ``content_id`` = ``"<subject>_<contrast>"``.
     """
     import torch
 
-    from spectramr.data.datasets.m4raw_repetition_groups import (
-        discover_repetition_groups,
-    )
-    from spectramr.infrastructure.physics.m4raw_pseudo_gt import synthesize_pseudo_gt
+    from spectramr.data.datasets.native_grid import discover_native_grid
+    from spectramr.data.datasets.pseudo_gt_reference import synthesize_pseudo_gt
 
-    rep_groups = discover_repetition_groups(
+    grid = discover_native_grid(
+        dataset_kind,
         input_dir,
+        contrasts=list(contrasts) if contrasts else None,
         max_subjects=max_subjects,
         max_contrasts=max_contrasts,
+        allow_incomplete=allow_incomplete,
     )
-
-    contrast_whitelist = {c.upper() for c in contrasts} if contrasts is not None else None
 
     # ESPIRiT inside synthesize_pseudo_gt is the heavy step; running it on
     # CUDA saves the bulk of the per-subject cost. We pass ``device`` so the
@@ -1936,15 +1925,8 @@ def _load_clean_volumes_from_h5(
     pseudo_gt_device = device if device is not None else torch.device("cpu")
 
     volumes = []
-    for group in rep_groups:
-        # Group key: e.g. "2022091411_FLAIR01" → strip 2 → "2022091411_FLAIR".
-        base = group[0].name.split(".")[0]
-        tag = base[:-2] if len(base) >= 3 else base
-        parts = tag.split("_")
-        contrast = parts[1].upper() if len(parts) >= 2 else "UNKNOWN"
-        if contrast_whitelist is not None and contrast not in contrast_whitelist:
-            logger.debug("Skipping %s — contrast %r not in whitelist.", tag, contrast)
-            continue
+    for key in grid.keys:
+        group, tag = key.paths, key.content_id
         try:
             coil_images, smaps, x_gt_mag, p99 = synthesize_pseudo_gt(group, device=pseudo_gt_device)
         except Exception as exc:
@@ -1973,6 +1955,20 @@ def _load_clean_volumes_from_h5(
                 )
             except Exception as exc:  # never let asset prep break the load
                 logger.warning("Asset prep failed for %s: %s — synth fallback.", tag, exc)
+    if grid_out is not None:
+        loaded = {tag for tag, _ in volumes}
+        grid_out.update(
+            {
+                "dataset_kind": dataset_kind,
+                "grid_linked": grid.linked,
+                "row_label": grid.row_label,
+                "contrasts": list(grid.contrasts),
+                "dropped_subjects": list(grid.dropped_subjects),
+                "min_reps": grid.min_reps,
+                "contents": [r for r in grid.provenance() if r["content_id"] in loaded],
+                "skipped_content_ids": [k.content_id for k in grid.keys if k.content_id not in loaded],
+            }
+        )
     return volumes
 
 
@@ -1983,6 +1979,9 @@ def _load_clean_volumes(
     contrasts: tuple[str, ...] | None = None,
     device: "torch.device | None" = None,
     assets_out: "dict[str, object] | None" = None,
+    dataset_kind: str = "m4raw",
+    allow_incomplete: bool = False,
+    grid_out: "dict[str, object] | None" = None,
 ) -> "list[tuple[str, 'torch.Tensor']]":
     """Dispatch by file extension. .pt → direct load; .h5 → pseudo-GT.
 
@@ -2013,6 +2012,9 @@ def _load_clean_volumes(
             contrasts=contrasts,
             device=device,
             assets_out=assets_out,
+            dataset_kind=dataset_kind,
+            allow_incomplete=allow_incomplete,
+            grid_out=grid_out,
         )
     else:
         raise RuntimeError(
@@ -2045,10 +2047,31 @@ def _resolve_device(spec: str | None, *, pipeline: str = "evaluate") -> "torch.d
     return torch.device(decision.device)
 
 
+def _damage_yardsticks_arg(value: str) -> tuple[str, ...]:
+    """argparse ``type=`` over core's ``parse_yardsticks``; its message becomes the exit-2 error."""
+    from spectramr.core.metrics.meta_evaluation.damage import parse_yardsticks
+
+    try:
+        return parse_yardsticks(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _severity_axes_setting(args: argparse.Namespace) -> dict[str, Any] | None:
+    """``--severity-axes`` loaded once through the registry-checked loader, or ``None``."""
+    path = getattr(args, "severity_axes", None)
+    if path is None:
+        return None
+    from spectramr.infrastructure.physics.severity_local import load_severity_axes_file
+
+    return dict(load_severity_axes_file(path))
+
+
 def _meta_evaluate_full_harness(
     args: argparse.Namespace,
     clean_volumes: list,
     eval_mode: str,
+    content_grid: dict[str, object] | None = None,
 ) -> int:
     """Run the full §8 NR-metric validation harness and emit per-metric cards.
 
@@ -2082,6 +2105,8 @@ def _meta_evaluate_full_harness(
 
     metrics = tuple(args.metrics) if args.metrics else DEFAULT_NR_BATTERY
     config = NRMetricValidationConfig(
+        severity_axes=_severity_axes_setting(args),
+        damage_yardsticks=tuple(getattr(args, "damage_yardsticks", ())),
         metrics=metrics,
         n_severities_per_family=args.severities,
         seed=args.seed,
@@ -2096,6 +2121,8 @@ def _meta_evaluate_full_harness(
         len(metrics),
     )
     result = NRMetricValidationUseCase(config).run_validation(clean_volumes)
+    if content_grid and isinstance(result, dict):
+        result["content_grid"] = content_grid
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as f:
@@ -2141,6 +2168,62 @@ def _meta_evaluate_full_harness(
     return 0
 
 
+def _blackwell_catalogues() -> dict[str, tuple[Any, Any]]:
+    """``--blackwell-catalogue`` name -> (ranker class, catalogue factory)."""
+    from spectramr.core.metrics.meta_evaluation.blackwell.coil_catalogue import (
+        coil_relation_catalogue,
+    )
+    from spectramr.core.metrics.meta_evaluation.rankers import (
+        BlackwellConsistencyRanker,
+        BlackwellRelationRanker,
+        radial_catalogue,
+    )
+    from spectramr.infrastructure.physics.degradations.diagonal_catalogue import (
+        registry_catalogue,
+    )
+    from spectramr.infrastructure.physics.degradations.garbling_catalogue import (
+        garbling_catalogue,
+    )
+    from spectramr.infrastructure.physics.degradations.nuisance_catalogue import (
+        nuisance_catalogue,
+    )
+
+    return {
+        "radial": (BlackwellConsistencyRanker, radial_catalogue),
+        "registry": (BlackwellConsistencyRanker, registry_catalogue),
+        "multicoil": (BlackwellRelationRanker, coil_relation_catalogue),
+        "nuisance": (BlackwellRelationRanker, nuisance_catalogue),
+        "garbling": (BlackwellRelationRanker, garbling_catalogue),
+    }
+
+
+def _blackwell_block(
+    config: Any, catalogue: str, metric_set: Any, dataset: Any
+) -> dict[str, Any]:
+    """The opt-in Blackwell ranker's summary block; a tie is recorded, not raised."""
+    from spectramr.core.metrics.meta_evaluation.ranking_guards import (
+        DegenerateRankingError,
+        assert_not_degenerate,
+    )
+
+    ranker_cls, factory = _blackwell_catalogues()[catalogue]
+    bw = ranker_cls(config, catalogue_factory=factory).report(metric_set, dataset)
+    degenerate = None
+    try:
+        assert_not_degenerate(list(bw.scores.values()), name=bw.method)
+    except DegenerateRankingError as exc:
+        degenerate = str(exc)
+        logger.warning("blackwell: %s", degenerate)
+    logger.info("blackwell ranks: %s", None if degenerate else bw.ranks)
+    return {
+        "config": config.provenance(),
+        "scores": bw.scores,
+        "ranks": None if degenerate else bw.ranks,
+        "degenerate": degenerate,
+        "diagnostics": bw.diagnostics,
+    }
+
+
 def meta_evaluate(args: argparse.Namespace) -> int:
     """Run the five-method meta-evaluation against a chosen metric set."""
     import json
@@ -2168,6 +2251,7 @@ def meta_evaluate(args: argparse.Namespace) -> int:
     # Real acquisition assets, keyed by content_id, populated from multi-coil
     # .h5 inputs so the NR/physics battery is graded on the true measurement.
     real_assets: dict[str, object] = {}
+    content_grid: dict[str, object] = {}
     if args.input is not None:
         contrasts = tuple(args.contrasts) if args.contrasts else None
         clean_volumes = _load_clean_volumes(
@@ -2177,6 +2261,9 @@ def meta_evaluate(args: argparse.Namespace) -> int:
             contrasts=contrasts,
             device=device,
             assets_out=real_assets,
+            dataset_kind=args.dataset_kind,
+            allow_incomplete=args.allow_incomplete_subjects,
+            grid_out=content_grid,
         )
         logger.info(
             "Loaded %d clean reference volume(s) from %s (max_subjects=%d, max_contrasts=%d)",
@@ -2199,7 +2286,9 @@ def meta_evaluate(args: argparse.Namespace) -> int:
     # NR-battery semantics and reuses the same loaded clean references.
     tiers_arg = getattr(args, "tiers", None)
     if tiers_arg is not None:
-        return _meta_evaluate_full_harness(args, clean_volumes, eval_mode)
+        return _meta_evaluate_full_harness(
+            args, clean_volumes, eval_mode, content_grid=content_grid
+        )
 
     # Resolve the metric set. ``--nr-battery`` defaults to the label-free
     # no-reference battery and drives the sweep with the audited digital-twin
@@ -2249,14 +2338,23 @@ def meta_evaluate(args: argparse.Namespace) -> int:
     use_core = bool(getattr(args, "core_degradations", False))
     sim_families = None
     operator_library = None
+    severity_axes = _severity_axes_setting(args)
+    damage_yardsticks = tuple(getattr(args, "damage_yardsticks", ()))
+    sim_extras: dict[str, Any] = {"damage_yardsticks": damage_yardsticks}
+    if use_core and severity_axes:
+        raise ValueError(
+            "--severity-axes needs the digital-twin degradations; drop --core-degradations"
+        )
     if not use_core:
         from spectramr.application.use_cases.nr_metric_validation_use_case import (
             DEFAULT_FAMILIES,
+            simulator_extras,
             build_physics_operator_library,
         )
 
         sim_families = list(DEFAULT_FAMILIES)
-        operator_library = build_physics_operator_library(sim_families)
+        operator_library = build_physics_operator_library(sim_families, severity_axes)
+        sim_extras = simulator_extras(operator_library, severity_axes, damage_yardsticks)
         logger.info("degradation SSOT: digital-twin families = %s", sim_families)
     else:
         logger.info("degradation SSOT: dependency-free core library (--core-degradations)")
@@ -2265,6 +2363,7 @@ def meta_evaluate(args: argparse.Namespace) -> int:
         n_severities_per_family=args.severities,
         seed=args.seed,
         operator_library=operator_library,
+        **sim_extras,
     )
     # Wire the run-shape knobs (each read → validated → stamped, pitfall #15).
     pipeline.eval_mode = eval_mode
@@ -2281,6 +2380,32 @@ def meta_evaluate(args: argparse.Namespace) -> int:
     pipeline.aggregator = aggregator
     # Pool hygiene: screen clones / broken metrics out of the voting pool.
     pipeline.screen_pool_enabled = bool(getattr(args, "screen_pool", False))
+    # The opt-in Blackwell ranker runs beside the pool, never inside its aggregate. Its
+    # config is built here so an invalid value fails before the sweep.
+    blackwell_config = None
+    blackwell_catalogue = "radial"
+    if getattr(args, "blackwell", False):
+        from spectramr.core.metrics.meta_evaluation.rankers import BlackwellConfig
+
+        blackwell_config = BlackwellConfig(
+            n_draws=int(args.blackwell_draws),
+            q_fdr=float(args.blackwell_q_fdr),
+            max_groups=int(getattr(args, "blackwell_max_groups", 2048)),
+            seed=args.seed,
+            envelope=str(getattr(args, "blackwell_envelope", "gaussian_blur")),
+            max_contents=int(getattr(args, "blackwell_max_contents", 16)),
+        )
+        blackwell_catalogue = str(getattr(args, "blackwell_catalogue", "radial"))
+        if blackwell_catalogue not in _blackwell_catalogues():
+            raise ValueError(
+                f"--blackwell-catalogue must be one of {sorted(_blackwell_catalogues())}, "
+                f"got {blackwell_catalogue!r}"
+            )
+        # Mixed sizes are cropped and volumes sliced inside the ranker; two slices is
+        # the floor for any per-content statistic.
+        n_planes = sum(vol.numel() // (vol.shape[-2] * vol.shape[-1]) for _, vol in clean_volumes)
+        if n_planes < 2:
+            raise ValueError(f"--blackwell needs at least two 2-D slices; got {n_planes}")
     logger.info(
         "meta-evaluate run shape: eval_mode=%s aggregator=%s screen_pool=%s betting=%s%s",
         pipeline.eval_mode,
@@ -2292,9 +2417,18 @@ def meta_evaluate(args: argparse.Namespace) -> int:
     output = pipeline.run(metric_set, clean_volumes, assets_by_content=real_assets or None)
 
     summary = output.to_summary()
+    summary["content_grid"] = content_grid or None
+    summary["blackwell"] = None
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w") as f:
         json.dump(summary, f, indent=2, default=float)
+    if blackwell_config is not None:
+        # The main summary is already on disk, so a failure here cannot lose it.
+        summary["blackwell"] = _blackwell_block(
+            blackwell_config, blackwell_catalogue, metric_set, output.dataset
+        )
+        with args.out.open("w") as f:
+            json.dump(summary, f, indent=2, default=float)
     logger.info("Wrote meta-evaluation summary to %s", args.out)
 
     if getattr(args, "figures", False):
@@ -3434,6 +3568,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Severity grid size per degradation family.",
     )
     meta_parser.add_argument(
+        "--severity-axes",
+        type=Path,
+        default=None,
+        dest="severity_axes",
+        help="YAML of per-degradation physical severity ranges ({axes: {name: {start, end, "
+        "schedule}}}). The Halton count stays global (--severities), so n_steps is rejected.",
+    )
+    meta_parser.add_argument(
+        "--damage-yardsticks",
+        type=_damage_yardsticks_arg,
+        default=_damage_yardsticks_arg("rel_l2,grad_l2"),
+        dest="damage_yardsticks",
+        metavar="NAME[,NAME]",
+        help="Comma list of neutral yardsticks measured per sample into severity['damage_<name>'] "
+        "and stamped into degradation_provenance (default: rel_l2,grad_l2).",
+    )
+    meta_parser.add_argument(
         "--max-subjects",
         type=int,
         default=8,
@@ -3452,7 +3603,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--contrasts",
         nargs="+",
         default=None,
-        help="Whitelist of contrasts to load (e.g. T1 T2). Default: all available.",
+        help="Contrasts to load, in order (e.g. T1 T2); each must be present. "
+        "Default: the --max-contrasts most-populated.",
+    )
+    meta_parser.add_argument(
+        "--dataset-kind",
+        choices=("m4raw", "fastmri_brain"),
+        default="m4raw",
+        dest="dataset_kind",
+        help="H5 grouping law: m4raw NEX-groups <subject>_<contrast><rep> repetitions; "
+        "fastmri_brain keeps one file per exam (never averaged across exams).",
+    )
+    meta_parser.add_argument(
+        "--allow-incomplete-subjects",
+        action="store_true",
+        dest="allow_incomplete_subjects",
+        help="M4Raw: drop subjects lacking a requested contrast instead of raising; "
+        "the dropped list is stamped in the summary's content_grid.",
     )
     meta_parser.add_argument(
         "--synthetic-n",
@@ -3498,6 +3665,70 @@ def build_parser() -> argparse.ArgumentParser:
         dest="betting_alpha",
         help="Mis-coverage budget α for the betting confidence sequence "
         "(only consumed when --betting is set). Must be in (0, 1).",
+    )
+    meta_parser.add_argument(
+        "--blackwell",
+        action="store_true",
+        dest="blackwell",
+        help="Also run the opt-in Blackwell consistency ranker (does each metric respect "
+        "the certified information order of a Fourier-diagonal catalogue?). It reports "
+        "in its own 'blackwell' summary block and never enters the aggregate.",
+    )
+    meta_parser.add_argument(
+        "--blackwell-draws",
+        type=int,
+        default=4,
+        dest="blackwell_draws",
+        help="Noise draws per content and experiment for --blackwell (>= 2: the envelope "
+        "filter is chosen on even draws and scored on odd ones).",
+    )
+    meta_parser.add_argument(
+        "--blackwell-q-fdr",
+        type=float,
+        default=0.1,
+        dest="blackwell_q_fdr",
+        help="e-BH false-discovery level for --blackwell violation counts, in (0, 1).",
+    )
+    meta_parser.add_argument(
+        "--blackwell-catalogue",
+        default="radial",
+        choices=["radial", "registry", "multicoil", "nuisance", "garbling"],
+        dest="blackwell_catalogue",
+        help="Experiments for --blackwell: 'radial' (analytic noise, blur and truncation) or "
+        "'registry' (the audited registry masks and k-space filters, probed at the content "
+        "shape, plus a noise ladder) or 'multicoil' (Cartesian masks on shared synthetic "
+        "coils, with a Lanczos incomparability witness; no probes or coherence LP) or "
+        "'nuisance' (the phase-only registry codes, related to noise alone by unitary "
+        "absorption) or 'garbling' (clipping, quantisation and a CS recon applied to noisy "
+        "data, each dominated by its base). The catalogue's provenance is stamped in the block.",
+    )
+    meta_parser.add_argument(
+        "--blackwell-max-contents",
+        type=int,
+        default=16,
+        dest="blackwell_max_contents",
+        help="Clean 2-D contents --blackwell evaluates (>= 2; a volume gives four central "
+        "slices). e-BH needs about 40 before it can certify a single violation.",
+    )
+    meta_parser.add_argument(
+        "--blackwell-envelope",
+        default="gaussian_blur",
+        choices=["gaussian_blur", "oracle_wiener"],
+        dest="blackwell_envelope",
+        help="Post-filter class for the --blackwell canonicalised rate: Gaussian blurs "
+        "(composition-closed) or the oracle Wiener family, which uses the clean spectrum, "
+        "is exact for squared error, and undoes post-noise low-pass displays. It is not "
+        "closed under composition, so for other metrics the rate is a diagnostic. Diagonal "
+        "catalogues (radial, registry) only.",
+    )
+    meta_parser.add_argument(
+        "--blackwell-max-groups",
+        type=int,
+        default=2048,
+        dest="blackwell_max_groups",
+        help="Coefficient groups above which the --blackwell coherence LP is binned "
+        "(binned infeasibility is reported as inconclusive). Raise it for an exact test "
+        "on small images; the LP grows with it.",
     )
     meta_parser.add_argument(
         "--aggregator",

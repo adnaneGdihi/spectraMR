@@ -189,6 +189,23 @@ class DPMixin:
             sample_rate=self._sample_rate,
         )
 
+    def restore_dp_steps(self, steps: int) -> None:
+        """Compose ``steps`` saved rounds onto a fresh accountant (checkpoint resume).
+
+        Raises:
+            RuntimeError: DP is off or the accountant already holds steps, so the
+                restored ledger would not match the saved one.
+        """
+        held = self.accountant.steps if self._dp_enabled else 0
+        if steps == held:
+            return
+        if not self._dp_enabled or held != 0:
+            raise RuntimeError(
+                f"Cannot restore {steps} DP steps onto an accountant that is "
+                f"{'disabled' if not self._dp_enabled else f'already at {held} steps'}."
+            )
+        self.accountant.step(self._noise_multiplier, self._sample_rate, num_steps=int(steps))
+
     # ------------------------------------------------------------------
     # Diagnostics for the metrics dict
     # ------------------------------------------------------------------

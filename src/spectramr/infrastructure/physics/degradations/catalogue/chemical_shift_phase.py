@@ -42,10 +42,12 @@ def fat_offset_hz(b0_T: float, sigma_ppm: float | None = None) -> float:
     return -chemical_shift_pixels(b0_T, 1.0, sigma)
 
 
-def swept_te_ms(theta: float, b0_T: float, sigma_ppm: float | None = None) -> float:
+def swept_te_ms(
+    theta: float, b0_T: float, sigma_ppm: float | None = None, max_te_sweep: float = 1.0
+) -> float:
     """``TE_in + theta (TE_opp - TE_in)`` in ms, ``TE_in = 1/|df|`` and ``TE_opp = 1.5/|df|``."""
     te_in = 1.0 / abs(fat_offset_hz(b0_T, sigma_ppm))
-    return 1e3 * te_in * (1.0 + 0.5 * float(theta))
+    return 1e3 * te_in * (1.0 + 0.5 * float(theta) * max_te_sweep)
 
 
 def chemical_shift_phase_volume(
@@ -57,6 +59,7 @@ def chemical_shift_phase_volume(
     fat_fraction: float = 0.1,
     fat_map: Tensor | None = None,
     sigma_ppm: float | None = None,
+    max_te_sweep: float = 1.0,
 ) -> Tensor:
     """Voxel-wise fat-water interference of ``x`` ``(B, C, D, H, W)`` in any mode."""
     check_input(x, geometry, "chemical_shift_phase")
@@ -93,9 +96,8 @@ def chemical_shift_phase_volume(
         # One host sync, only for a caller-supplied map: an out-of-range fraction must raise.
         if bool((f.amin() < 0) | (f.amax() > 1)):
             raise ValueError("chemical_shift_phase: fat_map must lie in [0, 1]")
-    phi = (
-        2.0 * math.pi * fat_offset_hz(b0_T, sigma_ppm) * swept_te_ms(theta, b0_T, sigma_ppm) * 1e-3
-    )
+    te_ms = swept_te_ms(theta, b0_T, sigma_ppm, max_te_sweep)
+    phi = 2.0 * math.pi * fat_offset_hz(b0_T, sigma_ppm) * te_ms * 1e-3
     # |(1 - f) + f e^{i phi}| by hypot: stable where the two terms cancel (opposed phase).
     gain = torch.hypot(1.0 - f + f * math.cos(phi), f * math.sin(phi))
     return x * gain

@@ -157,9 +157,9 @@ class BlochParameterBottleneckGenerator(nn.Module):
 
     - ``x``: ``(B, in_channels, H, W)`` input image.
     - ``acquisition_params``: dict with ``TE/TR/TI/contrast_type/alpha``
-      (or numeric ``contrast_type`` int). Required to synthesise an output;
-      otherwise the model returns the *parameter maps* themselves under
-      the contract that the downstream loss is parameter-supervised.
+      (or numeric ``contrast_type`` int), scalars or per-sample ``[B]``
+      tensors. Required: without it the forward raises, and the parameter
+      maps are read through :meth:`predict_parameters` instead.
     - ``contrast_idx``: accepted for capability-flag compatibility and
       forwarded into ``last_acquisition_params`` so the strategy can
       look up per-sample acquisition metadata externally.
@@ -222,16 +222,17 @@ class BlochParameterBottleneckGenerator(nn.Module):
         acquisition_params: dict[str, Any] | None = None,
         contrast_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if acquisition_params is None:
+            # The output is one synthesised contrast; the maps alone are predict_parameters'.
+            raise ValueError(
+                "BlochParameterBottleneckGenerator renders its output through the Bloch "
+                "layer and needs acquisition_params (TE/TR/TI/contrast_type); declare "
+                "data.multi_contrast.enabled with acquisition_params, or call "
+                "predict_parameters() for the (rho, T1, T2) maps."
+            )
+
         params = self.predict_parameters(x)
         self.last_tissue_params = params
-
-        if acquisition_params is None:
-            # Without metadata, we can't synthesise — the loss must be
-            # parameter-supervised in that case. Stack params as channels
-            # so downstream code sees a tensor.
-            self.last_acquisition_params = None
-            return torch.cat([params["rho"], params["t1"], params["t2"]], dim=1)
-
         meta = dict(acquisition_params)
         ct = meta.get("contrast_type")
         if isinstance(ct, str):

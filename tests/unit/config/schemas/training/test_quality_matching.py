@@ -256,6 +256,14 @@ def test_two_axes_for_two_attributes_is_accepted():
         ),
     )
     assert cfg.intensity_percentile == 99.0
+    # On by default (#2411): the relative gap alone passes a fit that misses the target.
+    assert cfg.max_residual == 0.1
+
+
+def test_residual_ceiling_can_be_disabled_explicitly():
+    cfg = QualityMatchingConfig(
+        axes=["complex_gaussian"], target=_target(), match_spacing=False, max_residual=None
+    )
     assert cfg.max_residual is None
 
 

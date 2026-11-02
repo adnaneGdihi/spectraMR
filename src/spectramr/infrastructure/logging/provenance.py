@@ -392,6 +392,12 @@ def count_parameters(model: Any) -> dict[str, Any]:
     solver = getattr(unwrap_model(model), "solver_record", None)
     if solver is not None:
         record["solver"] = dict(solver)
+    mechanism = getattr(unwrap_model(model), "mechanism_record", None)
+    if mechanism is not None:
+        record["mechanism"] = dict(mechanism)
+    cfg_guidance = getattr(unwrap_model(model), "cfg_guidance_record", None)
+    if cfg_guidance is not None:
+        record["cfg_guidance"] = dict(cfg_guidance)
     kan_group = getattr(unwrap_model(model), "kan_param_group_record", None)
     if kan_group is not None:
         record[KAN_PARAM_GROUP_PROVENANCE_KEY] = dict(kan_group)

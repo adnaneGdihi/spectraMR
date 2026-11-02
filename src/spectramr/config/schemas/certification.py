@@ -125,7 +125,59 @@ class PACBayesCertificateConfig(BaseModel):
     delta: float = Field(default=0.05, gt=0.0, lt=1.0)
     tv_tolerance_tau: float = Field(default=0.05, gt=0.0, le=1.0)
     loss_bound_M: float = Field(default=1.0, gt=0.0)
+    checkpoint_path: str | None = Field(
+        default=None,
+        description="Posterior mean w_Q: the checkpoint certified, loaded exactly. Required when enabled.",
+    )
+    prior_checkpoint_path: str | None = Field(
+        default=None,
+        description="Prior mean w_P (data-independent of the bound sample). Required when enabled.",
+    )
+    kl_estimator: Literal["isotropic_gaussian"] = Field(
+        default="isotropic_gaussian",
+        description="KL(Q||P) estimator from the calibration KL registry.",
+    )
+    posterior_sigma: float = Field(
+        default=1.0e-3, gt=0.0, description="sigma_Q of N(w_Q, sigma_Q^2 I)."
+    )
+    prior_sigma: float = Field(
+        default=1.0e-3, gt=0.0, description="sigma_P of N(w_P, sigma_P^2 I)."
+    )
+    n_mc_samples: int = Field(
+        default=8, ge=1, description="Weight draws w ~ Q for the Monte-Carlo Gibbs empirical risk."
+    )
+    mc_delta: float = Field(
+        default=0.01,
+        gt=0.0,
+        lt=1.0,
+        description=(
+            "Confidence spent on the Hoeffding bound of the Monte-Carlo Gibbs risk; the "
+            "McAllester term runs at delta - mc_delta (union bound)."
+        ),
+    )
+    risk_loss: Literal["nmse"] = Field(
+        default="nmse", description="Per-image loss: ||pred - target||^2 / ||target||^2."
+    )
+    loss_out_of_range: Literal["raise", "truncate"] = Field(
+        default="raise",
+        description="A per-image loss above loss_bound_M raises, or is truncated to M (declared loss).",
+    )
+    independence_unit: Literal["subject", "sample"] = Field(
+        default="subject",
+        description="One bound draw per subject (mean loss; n = subjects) or per image (#1707).",
+    )
     output_artefact: str | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def _require_checkpoints(self) -> PACBayesCertificateConfig:
+        if self.mc_delta >= self.delta:
+            raise ValueError("certification.pac_bayes.mc_delta must be smaller than delta.")
+        if self.enabled and not (self.checkpoint_path and self.prior_checkpoint_path):
+            raise ValueError(
+                "certification.pac_bayes needs checkpoint_path (posterior) and "
+                "prior_checkpoint_path (prior) when enabled: KL(Q||P) is measured between them."
+            )
+        return self
 
 
 class DiceRiskCertificateConfig(BaseModel):
@@ -231,12 +283,6 @@ class CertificationConfigSchema(BaseModel):
                 "certification.pathology_recall is not computable: no lesion detector "
                 "produces the empirical_recall it certifies (missing lesion detector, #3041). "
                 "Keep the arm needs_implementation and set enabled: false."
-            )
-        if self.pac_bayes.enabled:
-            raise ValueError(
-                "certification.pac_bayes is not computable: no KL(Q||P) estimator exists "
-                "for the posterior (missing KL(Q||P) estimator, #3041). Keep the arm "
-                "needs_implementation and set enabled: false."
             )
         return self
 

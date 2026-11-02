@@ -160,8 +160,8 @@ def partition_paired_records(
     if split.holdout_site:
         raise ValueError(
             "data.split.holdout_site is site-level and is not applied on the paired-manifest "
-            "route (its records carry subject ids, not sites). Use split.type='loso_subject' "
-            "with holdout_subject or loso_fold."
+            "route (its records carry subject ids, not sites). Hold subjects out with "
+            "split.type='subjects' and val_subjects, or split.type='loso_subject'."
         )
     test_declared = declares_paired_test(data)
     strategy = "random" if split.type == "auto" else split.type

@@ -15,8 +15,8 @@ verdict.
 
 Zero events is deliberately *not* judged here. ``validation_can_fire`` already
 raises when a declared validation can never fire within the budget, and the
-remaining zero-event cases (sanity mode's compressed budget, a wall-clock yield,
-a resume past the last event) are legitimate.
+remaining zero-event cases (sanity mode's compressed budget, a certify-only mode's
+zero budget, a wall-clock yield, a resume past the last event) are legitimate.
 """
 
 from __future__ import annotations

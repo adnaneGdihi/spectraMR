@@ -1047,14 +1047,92 @@ class ParallelMeshConfigSchema(BaseModel):
     model_config = {"extra": "forbid", "frozen": True}
 
     tensor: int = Field(default=1, gt=0, description="Tensor-parallel size (tp).")
-    context: int = Field(default=1, gt=0, description="Context-parallel size (cp).")
+    context: int = Field(
+        default=1,
+        gt=0,
+        description="Context-parallel size (cp): splits the token sequence of a DiT or "
+        "U-ViT trunk across cp ranks. Composes with ddp/fsdp, and with tensor.",
+    )
     spatial: int = Field(default=1, gt=0, description="Spatial (depth) parallel size (sp).")
-    pipeline: int = Field(default=1, gt=0, description="Pipeline-parallel size (pp).")
+    pipeline: int = Field(
+        default=1,
+        gt=0,
+        description="Pipeline-parallel size (pp): the generator's cascades split into this "
+        "many contiguous stages, one per pp rank. Needs a model with pipeline_stages and a "
+        "strategy declaring parallel_compat 'pipelined'.",
+    )
+    pipeline_microbatches: int = Field(
+        default=1,
+        gt=0,
+        description="Microbatches per step under pipeline > 1 (GPipe). The bubble is "
+        "(pp-1)/(m+pp-1); a batch it does not divide runs as fewer equal microbatches "
+        "(logged). Must be 1 for a model with BatchNorm.",
+    )
+
+    @model_validator(mode="after")
+    def _microbatches_need_a_pipeline(self) -> "ParallelMeshConfigSchema":
+        if self.pipeline_microbatches > 1 and self.pipeline == 1:
+            raise ValueError(
+                f"parallel.mesh.pipeline_microbatches={self.pipeline_microbatches} with "
+                "pipeline=1 has no pipeline to fill; set pipeline above 1 or drop the knob."
+            )
+        return self
 
     @property
     def non_dp_size(self) -> int:
         """Ranks that hold one data shard between them: the product of the four axes."""
         return self.tensor * self.context * self.spatial * self.pipeline
+
+    @model_validator(mode="after")
+    def _model_parallel_pairs(self) -> "ParallelMeshConfigSchema":
+        """Every pair of model-parallel axes above 1 must be one the models can compose."""
+        sizes = {
+            "tensor": self.tensor,
+            "context": self.context,
+            "spatial": self.spatial,
+            "pipeline": self.pipeline,
+        }
+        active = [axis for axis, size in sizes.items() if size > 1]
+        for i, first in enumerate(active):
+            for second in active[i + 1 :]:
+                reason = _REFUSED_MODEL_PARALLEL_PAIRS.get((first, second))
+                if reason is not None:
+                    raise ValueError(
+                        f"parallel.mesh combines {first}={sizes[first]}, "
+                        f"{second}={sizes[second]}: {reason}"
+                    )
+        return self
+
+
+#: Model-parallel axis pairs no registered model can use together, and why. Every other
+#: pair (only tensor x context: heads x sequence chunks of one DiT/U-ViT trunk) composes.
+_CASCADES = (
+    "pipeline splits the unrolled cascades with pipeline_stages (unrolled_reconstruction, "
+    "unrolled_list, nc_pdnet, diff_varnet), which are 2-D"
+)
+_REFUSED_MODEL_PARALLEL_PAIRS: dict[tuple[str, str], str] = {
+    ("tensor", "spatial"): (
+        "tensor and spatial parallelism never apply to one model. Tensor parallelism "
+        "splits the TokenAttention of the 2-D DiT, U-ViT and HAT backbones; spatial "
+        "parallelism depth-splits 3-D volumes and refuses LayerNorm. No 3-D model carries "
+        "TokenAttention (the 3-D MAE ViTs use their own attention, which no tensor plan "
+        "covers)."
+    ),
+    ("context", "spatial"): (
+        "context and spatial parallelism never apply to one model. Context parallelism "
+        "splits the token trunk of the 2-D DiT and U-ViT backbones; spatial parallelism "
+        "depth-splits 3-D volumes. No 3-D model has a context-parallel plan."
+    ),
+    ("tensor", "pipeline"): (
+        f"{_CASCADES} with convolutional denoisers and no TokenAttention, so a tensor axis "
+        "would split nothing in them."
+    ),
+    ("context", "pipeline"): (
+        f"{_CASCADES} with convolutional denoisers and no token trunk, so a context axis "
+        "would split nothing in them."
+    ),
+    ("spatial", "pipeline"): f"{_CASCADES} only; spatial parallelism needs a 3-D volume.",
+}
 
 
 class ParallelismConfigSchema(BaseModel):
@@ -1166,16 +1244,10 @@ class ParallelismConfigSchema(BaseModel):
                 "can use parallel.mesh.tensor/context/spatial/pipeline above 1."
             )
         if self.mesh.spatial > 1:
-            if self.strategy != "ddp":
+            if self.strategy == "fsdp" and self.fsdp.sharding_strategy == "no_shard":
                 raise ValueError(
-                    f"parallel.mesh.spatial={self.mesh.spatial} needs parallel.strategy='ddp': "
-                    f"spatial parallelism is not wired under {self.strategy!r} yet."
-                )
-            if self.mesh.tensor > 1 or self.mesh.context > 1 or self.mesh.pipeline > 1:
-                raise ValueError(
-                    "parallel.mesh.spatial cannot be combined with tensor, context or pipeline "
-                    "parallelism yet: the depth slabs and the combined dp x sp group assume "
-                    "those axes are 1."
+                    "parallel.mesh.spatial cannot run under fsdp.sharding_strategy='no_shard': "
+                    "use strategy: ddp for a replicated spatial run."
                 )
             if self.sync_batch_norm:
                 raise ValueError(

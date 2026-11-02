@@ -9,9 +9,10 @@ Refactored to use DiffusionMixin for shared diffusion logic.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -21,9 +22,6 @@ from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 from .mixins import DiffusionMixin
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +105,15 @@ class ColdDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
                 output_activation=None,
             )
         self.denoising_model = denoising_model
+        self._denoiser_takes_time, self._denoiser_takes_cond = _denoiser_capabilities(
+            denoising_model
+        )
+        if not self._denoiser_takes_time:
+            logger.warning(
+                "ColdDiffusionGenerator: denoiser %s ignores the timestep, so every noise "
+                "level is denoised by one time-blind function.",
+                type(denoising_model).__name__,
+            )
 
         # Set device
         # `self.config` is a ColdDiffusionGeneratorConfig, NOT TrainingSettings:
@@ -148,12 +155,10 @@ class ColdDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
 
     @property
     def name(self) -> str:
-        """Return the model name."""
         return "ColdDiffusionGenerator"
 
     @property
     def device(self) -> torch.device:
-        """Return the device of the model."""
         return self.betas.device
 
     # -------------------------------------------------------------------------
@@ -178,12 +183,25 @@ class ColdDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
         )
         return (x_t - sqrt_one_minus_alpha_cumprod * noise) / sqrt_alpha_cumprod
 
+    def _denoise(self, x: Tensor, t: Tensor, cond: Tensor | None = None) -> Tensor:
+        """Call the denoiser with the timestep (and ``cond``) its signature accepts."""
+        if cond is not None and not self._denoiser_takes_cond:
+            raise ValueError(
+                f"denoiser {type(self.denoising_model).__name__} ignores `cond`, so a "
+                "conditional prediction would equal the unconditional one."
+            )
+        if not self._denoiser_takes_time:
+            return self.denoising_model(x)
+        if cond is None:
+            return self.denoising_model(x, t)
+        return self.denoising_model(x, t, cond)
+
     def _model_forward(self, x: Tensor, t: Tensor, **kwargs: Any) -> Tensor:
         """Forward pass of the denoising model.
 
         For Cold Diffusion, we predict x_0 directly (not noise).
         """
-        return self.denoising_model(x)
+        return self._denoise(x, t, kwargs.get("cond"))
 
     # -------------------------------------------------------------------------
     # Cold Diffusion Specific Methods
@@ -212,11 +230,11 @@ class ColdDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
 
         # Predict x_0 directly
         if guidance_scale > 1.0 and cond is not None:
-            uncond_pred = self.denoising_model(x)
-            cond_pred = self.denoising_model(x)
+            uncond_pred = self._denoise(x, t)
+            cond_pred = self._denoise(x, t, cond)
             pred_x_start = uncond_pred + guidance_scale * (cond_pred - uncond_pred)
         else:
-            pred_x_start = self.denoising_model(x)
+            pred_x_start = self._denoise(x, t, cond)
 
         if t_index == 0:
             return pred_x_start
@@ -228,11 +246,14 @@ class ColdDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
     # -------------------------------------------------------------------------
     # IGenerator Interface
     # -------------------------------------------------------------------------
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass for training: add noise and predict x_0.
+    def forward(self, x: Tensor, t: Tensor | None = None, cond: Tensor | None = None) -> Tensor:
+        """Predict x_0, noising ``x`` first unless the caller supplies its own timestep.
 
         Args:
-            x: Input clean image of shape (B, C, H, W).
+            x: Clean image (B, C, H, W) when ``t`` is None; otherwise the caller's
+                already-corrupted x_t (a bridge or interpolant strategy forms its own).
+            t: Optional per-sample timestep of ``x``; passed to the denoiser as given.
+            cond: Optional conditioning passed to a denoiser that accepts it.
 
         Returns:
             Predicted clean image x_0 of shape (B, C, H, W).
@@ -242,25 +263,15 @@ class ColdDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
             msg = f"Expected 4D input tensor (B, C, H, W), got {x.dim()}D"
             raise ValueError(msg)
 
-        # Sample random timesteps
+        if t is not None:
+            return self._denoise(x, t, cond)
+
         t = torch.randint(0, self.timesteps, (x.shape[0],), device=x.device)
-
-        # Forward diffusion via DiffusionMixin
         x_t = self.q_sample(x, t)
-
-        # Predict x_0
-        return self.denoising_model(x_t)
+        return self._denoise(x_t, t, cond)
 
     def generate(self, z: Tensor, **kwargs: Any) -> Tensor:
-        """Generate samples using cold diffusion.
-
-        Args:
-            z: Input tensor (used to determine output shape).
-            **kwargs: Additional arguments (cond, guidance_scale).
-
-        Returns:
-            Generated tensor.
-        """
+        """Sample with the shape of ``z``; ``kwargs`` carry ``cond`` and ``guidance_scale``."""
         return self.p_sample_loop(z.shape, **kwargs)
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -270,3 +281,20 @@ class ColdDiffusionGenerator(DiffusionMixin, IGenerator, nn.Module):
     def get_parameter_count(self) -> int:
         """Count total parameters in the denoising model."""
         return sum(p.numel() for p in self.denoising_model.parameters() if p.requires_grad)
+
+
+def _denoiser_capabilities(model: nn.Module) -> tuple[bool, bool]:
+    """Whether ``model`` uses a timestep and a ``cond``.
+
+    A declared ``consumes_time`` / ``consumes_cond`` wins over the signature, because a
+    forward can accept an argument it discards (UNet takes ``cond`` and drops it).
+    """
+    params = list(inspect.signature(model.forward).parameters.values())
+    positional = [
+        p
+        for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    takes_time = bool(getattr(model, "consumes_time", len(positional) >= 2))
+    takes_cond = bool(getattr(model, "consumes_cond", len(positional) >= 3))
+    return takes_time, takes_cond

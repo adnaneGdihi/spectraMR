@@ -14,6 +14,8 @@ and trajectory for downstream use (e.g. data consistency).
     \hat{x} = \text{AdjNUFFT}(y) = \sum_{j=0}^{M-1} w_j y_j e^{i 2\pi \textbf{k}_j \cdot \textbf{r}}
 """
 
+import copy
+
 import torch
 import torchio as tio
 from torchio.transforms import Transform
@@ -187,7 +189,8 @@ class NonCartesianSimulationTransform(Transform):
 
         # Copy input to target if not present (save GT)
         if "target" not in subject:
-            subject["target"] = subject["input"].copy()
+            # ``Image.copy()`` is ``dict.copy`` and returns a plain dict, which patching drops.
+            subject["target"] = copy.deepcopy(subject["input"])
 
         # Get data: (C, H, W, D) always in TorchIO
         image_tensor = subject["input"].data
@@ -286,5 +289,8 @@ class NonCartesianSimulationTransform(Transform):
         subject["measured_kspace"] = kspace.detach().cpu()  # (D, C, N)
         subject["trajectory"] = trajectory.detach().cpu()  # (2, N)
         subject["dcf"] = dcf.detach().cpu()  # (N,)
+        # Patch sampling copies a subject from its attributes, so keys set by item
+        # assignment alone never reach a training batch.
+        subject.update_attributes()
 
         return subject

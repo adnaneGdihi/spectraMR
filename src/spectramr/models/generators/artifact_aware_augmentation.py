@@ -1,497 +1,164 @@
-"""Artifact-Aware Augmentation Policies for MRI
-=============================================
+"""Artifact-robust reconstruction: train on corrupted inputs, detect the corruption.
 
-Implements augmentation policies that are aware of common MRI artifacts
-and generate more realistic training data for robust super-resolution.
+``ArtifactRobustGenerator`` wraps a U-Net over interleaved multi-coil k-space.
+In training mode every forward corrupts its input with the artifacts declared in
+``model_kwargs.artifact_augmentation`` (:mod:`artifact_corruption`), while the
+loss target stays clean, so the network learns to undo them. A small detector
+reads the coil images and predicts which artifacts are present; its sigmoid
+scores enter the U-Net as constant input planes, and its BCE against the applied
+labels is an auxiliary loss the reconstruction strategy folds into the objective.
+In eval mode the input is left alone unless the strategy's robustness pass forces
+one artifact (:meth:`ArtifactRobustGenerator.forced_artifact`).
 """
 
+from __future__ import annotations
+
+import contextlib
 import logging
-import random
+from collections.abc import Iterator, Sequence
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+from spectramr.core.metrics.coil_manifold import as_interleaved
+from spectramr.models.generators.artifact_corruption import (
+    ArtifactCorruptor,
+    fold_depth,
+    parse_artifact_augmentation,
+    unfold_depth,
+)
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 logger = logging.getLogger(__name__)
 
-
-class MRIArtifactSimulator:
-    """Simulator for common MRI artifacts.
-
-    Generates realistic artifacts that occur in clinical MRI scans.
-    """
-
-    def __init__(self, img_size: tuple[int, int] = (256, 256)):
-        """__init__.
-
-        Args:
-            img_size (tuple[int, int]): Description.
-        """
-        self.img_size = img_size
-
-    def add_rician_noise(
-        self,
-        image: torch.Tensor,
-        sigma: float = 0.05,
-    ) -> torch.Tensor:
-        """Add Rician noise (characteristic of magnitude MRI images).
-
-        Args:
-            image: Input image
-            sigma: Noise standard deviation
-
-        Returns:
-            Image with Rician noise
-
-        """
-        # Generate complex Gaussian noise
-        noise_real = torch.randn_like(image) * sigma
-        noise_imag = torch.randn_like(image) * sigma
-
-        # Add noise to real and imaginary parts
-        real_part = image + noise_real
-        imag_part = noise_imag
-
-        # Compute magnitude (Rician distribution)
-        noisy_image = torch.sqrt(real_part**2 + imag_part**2)
-
-        return noisy_image
-
-    def add_motion_artifact(
-        self,
-        image: torch.Tensor,
-        severity: float = 0.3,
-    ) -> torch.Tensor:
-        """Add motion artifacts by simulating patient movement.
-
-        Args:
-            image: Input image
-            severity: Motion severity (0-1)
-
-        Returns:
-            Image with motion artifacts
-
-        """
-        batch_size, channels, height, width = image.shape
-
-        # Simulate random motion in k-space using canonical centered FFT
-        kspace = fft2c(image)
-
-        # Apply random phase shifts (motion artifact)
-        phase_shifts = torch.randn(batch_size, channels, height, width) * severity
-        motion_kernel = torch.exp(1j * phase_shifts)
-
-        # Apply motion in k-space
-        kspace_motion = kspace * motion_kernel
-
-        # Transform back to image space using canonical centered IFFT
-        motion_image = ifft2c(kspace_motion).real
-
-        return motion_image
-
-    def add_gibbs_ringing(
-        self,
-        image: torch.Tensor,
-        cutoff: float = 0.7,
-    ) -> torch.Tensor:
-        """Add Gibbs ringing artifact from truncated k-space.
-
-        Args:
-            image: Input image
-            cutoff: k-space cutoff fraction
-
-        Returns:
-            Image with Gibbs ringing
-
-        """
-        # Transform to k-space using canonical centered FFT
-        kspace = fft2c(image)
-
-        # Apply k-space truncation
-        h, w = self.img_size
-        center_h, center_w = h // 2, w // 2
-
-        # Create truncation mask
-        y_coords, x_coords = torch.meshgrid(
-            torch.arange(h),
-            torch.arange(w),
-            indexing="ij",
-        )
-        distances = torch.sqrt(
-            ((y_coords - center_h) / (h / 2)) ** 2 + ((x_coords - center_w) / (w / 2)) ** 2,
-        )
-
-        mask = (distances <= cutoff).float()
-        mask = mask.to(image.device)
-
-        # Apply truncation
-        truncated_kspace = kspace * mask.unsqueeze(0).unsqueeze(0)
-
-        # Transform back using canonical centered IFFT
-        gibbs_image = ifft2c(truncated_kspace).real
-
-        return gibbs_image
-
-    def add_bias_field(
-        self,
-        image: torch.Tensor,
-        strength: float = 0.2,
-    ) -> torch.Tensor:
-        """Add intensity bias field artifact.
-
-        Args:
-            image: Input image
-            strength: Bias field strength
-
-        Returns:
-            Image with bias field
-
-        """
-        batch_size, channels, height, width = image.shape
-
-        # Create smooth bias field using low-frequency components
-        bias_field = torch.zeros_like(image)
-
-        for b in range(batch_size):
-            for c in range(channels):
-                # Generate low-frequency bias
-                bias_low = torch.randn(8, 8).to(image.device)
-                bias_low = F.interpolate(
-                    bias_low.unsqueeze(0).unsqueeze(0),
-                    size=(height, width),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze()
-
-                bias_field[b, c] = bias_low * strength
-
-        # Apply bias field
-        biased_image = image * (1 + bias_field)
-
-        return biased_image
-
-    def add_partial_fourier(
-        self,
-        image: torch.Tensor,
-        fraction: float = 0.75,
-    ) -> torch.Tensor:
-        """Add partial Fourier artifact.
-
-        Args:
-            image: Input image
-            fraction: Fraction of k-space acquired
-
-        Returns:
-            Image with partial Fourier artifact
-
-        """
-        # Transform to k-space using canonical centered FFT
-        kspace = fft2c(image)
-
-        # Zero out upper half of k-space
-        h, w = self.img_size
-        kspace[:, :, : int(h * (1 - fraction)), :] = 0
-
-        # Transform back using canonical centered IFFT
-        partial_image = ifft2c(kspace).real
-
-        return partial_image
-
-
-class ArtifactAwareAugmentation:
-    """Artifact-aware augmentation policy for MRI data.
-
-    Applies augmentations that respect the physics of MRI artifacts
-    and improve model robustness.
-    """
-
-    def __init__(
-        self,
-        artifact_simulator: MRIArtifactSimulator,
-        augmentation_config: dict[str, Any] | None = None,
-    ):
-        """__init__.
-
-        Args:
-            artifact_simulator (MRIArtifactSimulator): Description.
-            augmentation_config (Optional[dict[str, Any]]): Description.
-        """
-        self.artifact_simulator = artifact_simulator
-
-        # Default augmentation configuration
-        if augmentation_config is None:
-            augmentation_config = {
-                "rician_noise": {"prob": 0.3, "sigma_range": (0.01, 0.1)},
-                "motion_artifact": {"prob": 0.2, "severity_range": (0.1, 0.5)},
-                "gibbs_ringing": {"prob": 0.15, "cutoff_range": (0.5, 0.8)},
-                "bias_field": {"prob": 0.25, "strength_range": (0.1, 0.3)},
-                "partial_fourier": {"prob": 0.1, "fraction_range": (0.6, 0.9)},
-                "intensity_scaling": {"prob": 0.4, "scale_range": (0.8, 1.2)},
-                "rotation": {"prob": 0.3, "angle_range": (-15, 15)},
-                "elastic_deform": {"prob": 0.2, "strength": 0.1},
-            }
-
-        self.config = augmentation_config
-
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        """Apply artifact-aware augmentations.
-
-        Args:
-            image: Input image
-
-        Returns:
-            Augmented image
-
-        """
-        augmented = image.clone()
-
-        # Apply artifact-based augmentations
-        if random.random() < self.config["rician_noise"]["prob"]:
-            sigma = random.uniform(*self.config["rician_noise"]["sigma_range"])
-            augmented = self.artifact_simulator.add_rician_noise(augmented, sigma)
-
-        if random.random() < self.config["motion_artifact"]["prob"]:
-            severity = random.uniform(*self.config["motion_artifact"]["severity_range"])
-            augmented = self.artifact_simulator.add_motion_artifact(augmented, severity)
-
-        if random.random() < self.config["gibbs_ringing"]["prob"]:
-            cutoff = random.uniform(*self.config["gibbs_ringing"]["cutoff_range"])
-            augmented = self.artifact_simulator.add_gibbs_ringing(augmented, cutoff)
-
-        if random.random() < self.config["bias_field"]["prob"]:
-            strength = random.uniform(*self.config["bias_field"]["strength_range"])
-            augmented = self.artifact_simulator.add_bias_field(augmented, strength)
-
-        if random.random() < self.config["partial_fourier"]["prob"]:
-            fraction = random.uniform(*self.config["partial_fourier"]["fraction_range"])
-            augmented = self.artifact_simulator.add_partial_fourier(augmented, fraction)
-
-        # Apply standard augmentations
-        if random.random() < self.config["intensity_scaling"]["prob"]:
-            scale = random.uniform(*self.config["intensity_scaling"]["scale_range"])
-            augmented = augmented * scale
-
-        if random.random() < self.config["rotation"]["prob"]:
-            angle = random.uniform(*self.config["rotation"]["angle_range"])
-            augmented = self._rotate_image(augmented, angle)
-
-        if random.random() < self.config["elastic_deform"]["prob"]:
-            augmented = self._elastic_deform(
-                augmented,
-                self.config["elastic_deform"]["strength"],
-            )
-
-        return augmented
-
-    def _rotate_image(self, image: torch.Tensor, angle: float) -> torch.Tensor:
-        """Apply rotation augmentation."""
-        # Use affine transformation for rotation
-        theta = torch.tensor(
-            [
-                [
-                    torch.cos(torch.tensor(angle * np.pi / 180)),
-                    -torch.sin(torch.tensor(angle * np.pi / 180)),
-                    0,
-                ],
-                [
-                    torch.sin(torch.tensor(angle * np.pi / 180)),
-                    torch.cos(torch.tensor(angle * np.pi / 180)),
-                    0,
-                ],
-            ],
-            dtype=torch.float,
-        ).unsqueeze(0)
-
-        grid = F.affine_grid(theta, image.shape, align_corners=False)
-        rotated = F.grid_sample(image, grid, align_corners=False)
-
-        return rotated
-
-    def _elastic_deform(self, image: torch.Tensor, strength: float) -> torch.Tensor:
-        """Apply elastic deformation."""
-        batch_size, channels, height, width = image.shape
-
-        # Create random displacement fields
-        dx = torch.randn(batch_size, height, width) * strength
-        dy = torch.randn(batch_size, height, width) * strength
-
-        # Smooth displacement fields
-        dx = F.conv2d(dx.unsqueeze(1), torch.ones(1, 1, 3, 3) / 9, padding=1).squeeze(1)
-        dy = F.conv2d(dy.unsqueeze(1), torch.ones(1, 1, 3, 3) / 9, padding=1).squeeze(1)
-
-        # Create grid
-        y_coords, x_coords = torch.meshgrid(
-            torch.linspace(-1, 1, height),
-            torch.linspace(-1, 1, width),
-            indexing="ij",
-        )
-
-        grid_x = (x_coords + dx).to(image.device)
-        grid_y = (y_coords + dy).to(image.device)
-
-        grid = torch.stack([grid_x, grid_y], dim=-1)
-
-        # Apply deformation
-        deformed = F.grid_sample(image, grid, align_corners=False)
-
-        return deformed
-
-
-class RobustAugmentationDataset(torch.utils.data.Dataset):
-    """Dataset with artifact-aware augmentations for robust training.
-
-    Applies artifact-aware augmentations to improve model robustness
-    to real-world MRI artifacts.
-    """
-
-    def __init__(
-        self,
-        base_dataset: torch.utils.data.Dataset,
-        augmentation_policy: ArtifactAwareAugmentation,
-        augmentation_prob: float = 0.7,
-    ):
-        """__init__.
-
-        Args:
-            base_dataset (torch.utils.data.Dataset): Description.
-            augmentation_policy (ArtifactAwareAugmentation): Description.
-            augmentation_prob (float): Description.
-        """
-        self.base_dataset = base_dataset
-        self.augmentation_policy = augmentation_policy
-        self.augmentation_prob = augmentation_prob
-
-    def __len__(self):
-        """__len__.
-
-        Returns:
-            Any: Description.
-        """
-        return len(self.base_dataset)
-
-    def __getitem__(self, idx):
-        # Get sample from base dataset
-        """__getitem__.
-
-        Args:
-            idx (Any): Description.
-        Returns:
-            Any: Description.
-        """
-        sample = self.base_dataset[idx]
-
-        if isinstance(sample, tuple):
-            image, *rest = sample
-        else:
-            image = sample
-            rest = []
-
-        # Apply augmentations with probability
-        if random.random() < self.augmentation_prob:
-            image = self.augmentation_policy(image)
-
-        # Return augmented sample
-        if rest:
-            return (image, *rest)
-        return image
-
-
-@register_model(name="artifact_robust_generator", training_mode="reconstruction")
+#: The auxiliary loss key this model stamps while training.
+DETECTOR_LOSS_KEY = "artifact_detector_bce"
+
+#: The fixed seed of the robustness pass, so every validation scores one corruption.
+EVAL_SEED = 1234
+
+
+@register_model(
+    name="artifact_robust_generator",
+    training_mode="reconstruction",
+    spatial_dims=(2,),
+    input_domain="kspace",
+    output_domain="kspace",
+    accepts_complex=False,
+    expects_real_imag_interleaved=True,
+    strict_kwargs=True,
+)
 class ArtifactRobustGenerator(nn.Module, IGenerator):
-    """Generator with artifact robustness enhancements.
-
-    Incorporates artifact-aware training to improve robustness
-    to real-world MRI artifacts.
-    """
+    """U-Net trained on artifact-corrupted k-space, conditioned on a learned artifact detector."""
 
     def __init__(
         self,
         in_channels: int = 2,
         out_channels: int = 2,
-        base_generator: IGenerator | None = None,
-        artifact_simulator: MRIArtifactSimulator | None = None,
-        **kwargs,
-    ):
-        """Initialize artifact-robust generator.
+        features: Sequence[int] = (32, 64, 128, 256, 512),
+        artifact_augmentation: dict[str, Any] | None = None,
+    ) -> None:
+        """Build the detector, the corruptor and the U-Net.
 
         Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output channels.
-            base_generator: Optional pre-built generator. If None, builds StandardUNet.
-            artifact_simulator: Optional simulator. If None, builds default.
+            in_channels: Interleaved coil channels of the k-space input (``2C``).
+            out_channels: Interleaved coil channels of the k-space output.
+            features: U-Net widths per level; ``depth = len(features) - 1``.
+            artifact_augmentation: The required corruption block (see
+                :func:`parse_artifact_augmentation`).
         """
         super().__init__()
+        if in_channels % 2:
+            raise ValueError(
+                f"in_channels must be 2 x coils (real/imag interleaved), got {in_channels}."
+            )
         self.in_channels = in_channels
         self.out_channels = out_channels
-
-        # Build base generator if not provided
-        if base_generator is not None:
-            self.base_generator = base_generator
-        else:
-            from spectramr.models.reconstruction.unet import StandardUNet
-
-            self.base_generator = StandardUNet(
-                in_channels=in_channels,
-                out_channels=out_channels,
-            )
-
-        # Build artifact simulator if not provided
-        self.artifact_simulator = artifact_simulator or MRIArtifactSimulator()
-
-        # Artifact detection module
-        self.artifact_detector = self._build_artifact_detector()
-
-    def _build_artifact_detector(self) -> nn.Module:
-        """Build artifact detection module."""
-        return nn.Sequential(
-            nn.Conv2d(self.in_channels, 32, 3, padding=1),
+        self.spec = parse_artifact_augmentation(artifact_augmentation)
+        self.corruptor = ArtifactCorruptor(self.spec)
+        n_artifacts = len(self.spec.artifacts)
+        self.artifact_detector = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 3, padding=1),
             nn.ReLU(),
             nn.Conv2d(32, 64, 3, padding=1),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(64, 5),  # 5 artifact types
-            nn.Sigmoid(),
+            nn.Linear(64, n_artifacts),
         )
+        from spectramr.models.reconstruction.unet import UNet, UNetConfig
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        """Forward pass with artifact awareness.
+        widths = tuple(int(f) for f in features)
+        if len(widths) < 2:
+            raise ValueError(f"features needs at least two widths, got {list(widths)}.")
+        # A UNetConfig, not UNet(features=...): the kwargs path builds its default widths.
+        self.base_generator = UNet(
+            config=UNetConfig(
+                in_channels=in_channels + n_artifacts,
+                out_channels=out_channels,
+                features=widths,
+                depth=len(widths) - 1,
+            )
+        )
+        self._aux: dict[str, torch.Tensor] = {}
+        logger.info("[artifact_robust_generator] artifact_augmentation: %s", self.spec.record())
 
-        forward method for ArtifactRobustGenerator.
+    @contextlib.contextmanager
+    def forced_artifact(self, name: str) -> Iterator[None]:
+        """Corrupt every sample with ``name`` at ``eval_severity``, also in eval mode."""
+        if self.spec.eval_severity is None:
+            raise ValueError(
+                "artifact_augmentation.eval_severity is null; the robustness pass is off."
+            )
+        with self.corruptor.forced(name, self.spec.eval_severity, EVAL_SEED):
+            yield
 
-        Executes PyTorch tensor operations.
+    def robustness_eval_artifacts(self) -> tuple[str, ...]:
+        """The artifacts the strategy scores a corrupted pass for; empty when off."""
+        return () if self.spec.eval_severity is None else self.spec.names
 
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
+    @property
+    def auxiliary_loss_keys(self) -> frozenset[str]:
+        """Loss keys :meth:`auxiliary_losses` stamps during training."""
+        return frozenset({DETECTOR_LOSS_KEY}) if self.spec.detector_loss_weight > 0 else frozenset()
 
-        Returns:
-            torch.Tensor: Output tensor.
+    def auxiliary_losses(self) -> dict[str, torch.Tensor]:
+        """Weighted auxiliary terms from the latest training forward."""
+        return dict(self._aux)
 
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # Generate with base generator
-        output = self.base_generator.forward(x)
-        return output
+    def provenance_record(self) -> dict[str, Any]:
+        """The corruption policy as applied, for the run provenance."""
+        return {"artifact_augmentation": self.spec.record()}
 
-    def generate(self, batch_size: int = 1, **kwargs) -> torch.Tensor:
-        """Generate samples."""
-        return self.base_generator.generate(batch_size=batch_size, **kwargs)
+    def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        """Reconstruct interleaved k-space ``[B, 2C, H, W]`` (or ``[..., D]``).
+
+        Extra strategy kwargs (mask, coil maps) are not read: this model owns no
+        data-consistency layer.
+        """
+        del kwargs
+        x4, layout = fold_depth(x)
+        self._aux = {}
+        corrupt = self.training or self.corruptor.active
+        if corrupt:
+            with torch.no_grad():
+                x4, images, labels = self.corruptor.corrupt(x4)
+        else:
+            images = self.corruptor.coil_images(x4)
+        logits = self.artifact_detector(as_interleaved(images).to(x4.dtype))
+        if self.training and self.spec.detector_loss_weight > 0:
+            bce = F.binary_cross_entropy_with_logits(logits, labels.to(logits.dtype))
+            self._aux[DETECTOR_LOSS_KEY] = self.spec.detector_loss_weight * bce
+        scores = torch.sigmoid(logits)[:, :, None, None].expand(-1, -1, *x4.shape[-2:])
+        out = self.base_generator(torch.cat([x4, scores.to(x4.dtype)], dim=1))
+        return unfold_depth(out, layout)
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
-        """Get output shape."""
-        return self.base_generator.get_output_shape(input_shape)
-
-    def get_parameter_count(self) -> int:
-        """Get total parameter count."""
-        return self.base_generator.get_parameter_count() + sum(
-            p.numel() for p in self.artifact_detector.parameters()
-        )
+        """Same spatial extent, ``out_channels`` channels."""
+        return (input_shape[0], self.out_channels, *input_shape[2:])
 
     @property
     def name(self) -> str:
@@ -499,76 +166,4 @@ class ArtifactRobustGenerator(nn.Module, IGenerator):
         return "artifact_robust_generator"
 
 
-class ArtifactAugmentationFactory:
-    """Factory for creating artifact-aware augmentation components."""
-
-    @staticmethod
-    def create_artifact_simulator(
-        img_size: tuple[int, int] = (256, 256),
-    ) -> MRIArtifactSimulator:
-        """Create MRI artifact simulator."""
-        return MRIArtifactSimulator(img_size)
-
-    @staticmethod
-    def create_augmentation_policy(
-        artifact_simulator: MRIArtifactSimulator,
-        config: dict[str, Any] | None = None,
-    ) -> ArtifactAwareAugmentation:
-        """Create artifact-aware augmentation policy."""
-        return ArtifactAwareAugmentation(artifact_simulator, config)
-
-    @staticmethod
-    def create_robust_dataset(
-        base_dataset: torch.utils.data.Dataset,
-        augmentation_policy: ArtifactAwareAugmentation,
-        augmentation_prob: float = 0.7,
-    ) -> RobustAugmentationDataset:
-        """Create robust augmentation dataset."""
-        return RobustAugmentationDataset(
-            base_dataset,
-            augmentation_policy,
-            augmentation_prob,
-        )
-
-    @staticmethod
-    def create_robust_generator(
-        base_generator: IGenerator,
-        artifact_simulator: MRIArtifactSimulator,
-    ) -> ArtifactRobustGenerator:
-        """Create artifact-robust generator."""
-        return ArtifactRobustGenerator(base_generator, artifact_simulator)
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Create artifact simulator
-    simulator = ArtifactAugmentationFactory.create_artifact_simulator()
-
-    # Create augmentation policy
-    policy = ArtifactAugmentationFactory.create_augmentation_policy(simulator)
-    augmentation_policy = policy
-
-    # Test artifact simulation
-    test_image = torch.randn(1, 1, 256, 256)
-
-    logger.debug("Testing MRI artifact simulation...")
-
-    # Test individual artifacts
-    rician_noisy = simulator.add_rician_noise(test_image)
-    motion_artifact = simulator.add_motion_artifact(test_image)
-    gibbs_ringing = simulator.add_gibbs_ringing(test_image)
-    bias_field = simulator.add_bias_field(test_image)
-    partial_fourier = simulator.add_partial_fourier(test_image)
-
-    logger.debug(f"Original shape: {test_image.shape}")
-    logger.debug(f"Rician noise shape: {rician_noisy.shape}")
-    logger.debug(f"Motion artifact shape: {motion_artifact.shape}")
-    logger.debug(f"Gibbs ringing shape: {gibbs_ringing.shape}")
-    logger.debug(f"Bias field shape: {bias_field.shape}")
-    logger.debug(f"Partial Fourier shape: {partial_fourier.shape}")
-
-    # Test augmentation policy
-    augmented = augmentation_policy(test_image)
-    logger.debug(f"Augmented shape: {augmented.shape}")
-
-    logger.debug("Artifact-aware augmentation implementation complete!")
+__all__ = ["DETECTOR_LOSS_KEY", "ArtifactRobustGenerator"]

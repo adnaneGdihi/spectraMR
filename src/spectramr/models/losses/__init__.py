@@ -130,6 +130,7 @@ from . import (  # noqa: F401  (imported for @register_loss side effects)
     storm_loss,  # manifold smoothness
     style_loss,  # Losses guide §16 — Gram/style loss
     sure_n2self_losses,  # Losses guide §29/§28 — SURE + Noise2Self
+    temporal_consistency_loss,  # cine/dynamic inter-frame difference matching
     topological_loss,
     translation_losses,  # Losses guide §23/§24 — cycle + identity
     tropical_semiring_loss,  # tropical_mrf / tropical_quantitative_maps

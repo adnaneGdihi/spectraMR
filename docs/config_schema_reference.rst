@@ -65,6 +65,13 @@ Top-Level Structure
    # ---- additive blocks ----
    acquisition:    { ... }      # AcquisitionConfigSchema (PILOT codesign, BALD)
    certification:  { ... }      # CertificationConfigSchema (conformal / CHD / PRC / PAC-Bayes)
+   compression:                 # CompressionExportConfigSchema — post-training network export
+     enabled: true              #   re-scores the val pass on the compressed weights and writes
+     quantization:              #   compression_report.json (fp32 vs compressed, model_size_mb,
+       method: int8_weight      #   compression_ratio, weight_sparsity) + compressed_model.pt
+     pruning:                   #   quantization.method: none | int8_weight | int4_weight
+       method: l1_global        #   pruning.method: none | l1_global | l2_filter | random
+       amount: 0.3              #   fraction in (0, 1); refused with EMA enabled
    audit:          { ... }      # AuditConfigSchema (Tier-3 KSD defensibility)
    mrf:            { ... }      # MRFConfigSchema (MR-fingerprinting metadata)
 

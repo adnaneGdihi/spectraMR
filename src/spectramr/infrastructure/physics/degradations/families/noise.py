@@ -32,7 +32,7 @@ ENTRIES = (
         fn=degrade_complex_gaussian_noise,
         description="Complex Gaussian k-space noise (→Rician)",
         severity=SeveritySpec(
-            (_P("snr", "dB", 40.0, 2.0),),
+            (_P("snr", "dB", 40.0, 2.0, endpoint_kwargs=("snr_max_db", "snr_min_db")),),
             notes="k-space AWGN; theta ramps SNR down, so the physical minimum is the "
             "most-degraded end.",
         ),
@@ -47,7 +47,16 @@ ENTRIES = (
         fn=degrade_rician_noise,
         description="Image-space Rician magnitude noise",
         severity=SeveritySpec(
-            (_P("sigma", "fraction of p99 signal", 0.0, 0.3),),
+            (
+                _P(
+                    "sigma",
+                    "fraction of p99 signal",
+                    0.0,
+                    0.3,
+                    endpoint_kwargs=(None, "sigma_max"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="image-space Rician magnitude noise; sigma is scaled by the input's own "
             "p99 so the axis is scale-invariant (p99 not max, so one hot voxel cannot set "
             "the noise floor).",
@@ -63,7 +72,16 @@ ENTRIES = (
         fn=degrade_emi,
         description="Narrowband RF interference tones (unshielded low-field scanner)",
         severity=SeveritySpec(
-            (_P("interference_rms", "x k-space RMS", 0.0, 0.3),),
+            (
+                _P(
+                    "interference_rms",
+                    "x k-space RMS",
+                    0.0,
+                    0.3,
+                    endpoint_kwargs=(None, "max_amp_ratio"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="4 narrowband tones at seeded off-grid readout frequencies, independent "
             "phase per PE line; the summed interference RMS is the declared multiple of the "
             "k-space RMS.",

@@ -163,6 +163,15 @@ class TestTheAXT1PrefixTrap:
         with pytest.raises(ContrastMismatchError, match="2 recognised"):
             acquisition_from_filename("file_brain_AXT1_AXT2_201.h5")
 
+    def test_a_token_outside_the_allow_list_raises(self) -> None:
+        with pytest.raises(ContrastMismatchError, match="not one of"):
+            acquisition_from_filename("file_brain_AXT2FLAIR_201_6002717.h5")
+
+    def test_the_error_type_is_owned_by_the_contrast_grid(self) -> None:
+        from spectramr.data.datasets import contrast_grid
+
+        assert ContrastMismatchError is contrast_grid.ContrastMismatchError
+
 
 def _rec(file_id: str, slice_index: int = 4, boxes=None) -> dict:
     return {

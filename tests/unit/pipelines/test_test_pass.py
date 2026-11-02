@@ -152,7 +152,7 @@ def test_an_arm_without_a_test_set_is_not_scored(tmp_path):
     assert not (tmp_path / "final_eval.json").exists()
 
 
-def _hook(monkeypatch, result, *, sanity=False, declared=True, trigger="train_end"):
+def _hook(monkeypatch, result, *, sanity=False, declared=True, trigger="train_end", strategy=None):
     from spectramr.pipelines import test_pass, train
 
     calls = []
@@ -169,7 +169,7 @@ def _hook(monkeypatch, result, *, sanity=False, declared=True, trigger="train_en
         )
     )
     train._run_held_out_test_pass(
-        None, None, None, cfg, {"run_output_dir": "/tmp/x"}, result, is_sanity_check=sanity
+        None, None, strategy, cfg, {"run_output_dir": "/tmp/x"}, result, is_sanity_check=sanity
     )
     return calls
 
@@ -177,6 +177,13 @@ def _hook(monkeypatch, result, *, sanity=False, declared=True, trigger="train_en
 def test_test_pass_infer_skips_the_end_of_training_pass(monkeypatch):
     result = {"success": True, "best_weights_restored": True, "iterations_completed": 9}
     assert _hook(monkeypatch, result, trigger="infer") == []
+
+
+def test_a_calibration_certificate_owns_its_held_out_split(monkeypatch):
+    """A strategy whose certificate scores the test split gets no metric test pass on it."""
+    result = {"success": True, "best_weights_restored": True, "iterations_completed": 9}
+    owner = SimpleNamespace(calibration_needs_test_loader=True)
+    assert _hook(monkeypatch, result, strategy=owner) == []
 
 
 def test_test_pass_infer_is_scored_by_a_validate_only_run(monkeypatch):

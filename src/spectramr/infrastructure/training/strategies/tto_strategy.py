@@ -48,6 +48,9 @@ class ConcreteTTOStrategy(BaseTrainingStrategy):
         motion_traj: Learnable motion trajectory (the ONLY optimized parameters).
     """
 
+    # #183: the training step never scores train_* metrics; declare none.
+    reports_train_metrics = False
+
     # parallel_compat: Owns the motion trajectory and freezes the wrapped generator.
     parallel_compat = frozenset()
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -34,26 +35,9 @@ try:
 except ImportError:
     JAXTYPING_AVAILABLE = False
 
-    # Fallback decorators
-    def jaxtyped(fn):
-        """jaxtyped.
-
-        Args:
-            fn (Any): Description.
-        Returns:
-            Any: Description.
-        """
-        return fn
-
-    def beartype(fn):
-        """beartype.
-
-        Args:
-            fn (Any): Description.
-        Returns:
-            Any: Description.
-        """
-        return fn
+def _typechecked[F: Callable[..., Any]](fn: F) -> F:
+    """``jaxtyped(beartype(fn))`` when both are installed, else ``fn`` unchanged."""
+    return jaxtyped(beartype(fn)) if JAXTYPING_AVAILABLE else fn  # type: ignore[no-any-return, unused-ignore]
 
 
 try:
@@ -71,7 +55,7 @@ try:  # optional in degraded cluster envs (a REQUIRED dep in pyproject)
 
     SIMPLEITK_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only without SimpleITK
-    sitk = None  # type: ignore[assignment]
+    sitk = None  # type: ignore[assignment, unused-ignore]
     SIMPLEITK_AVAILABLE = False
 
 try:  # optional in degraded cluster envs (a REQUIRED dep in pyproject)
@@ -79,12 +63,12 @@ try:  # optional in degraded cluster envs (a REQUIRED dep in pyproject)
 
     SCIPY_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only without scipy
-    linalg = None  # type: ignore[assignment]
+    linalg = None  # type: ignore[assignment, unused-ignore]
     SCIPY_AVAILABLE = False
 
 # Type aliases for clarity
-FeatureVector = NDArray[np.float64]  # [N_features]
-FeatureMatrix = NDArray[np.float64]  # [N_samples, N_features]
+type FeatureVector = NDArray[np.float64]  # [N_features]
+type FeatureMatrix = NDArray[np.float64]  # [N_samples, N_features]
 
 
 @dataclass(frozen=True)
@@ -250,7 +234,7 @@ class RadiomicFeatureExtractor:
         test about the fall-through branch should patch this, not observe it.
         """
         try:
-            import fastrad  # type: ignore[import-not-found]  # noqa: F401
+            import fastrad  # type: ignore[import-not-found, unused-ignore]  # noqa: F401
         except ImportError:
             return False
         return True
@@ -265,8 +249,7 @@ class RadiomicFeatureExtractor:
             "force2Ddimension": 0,
         }
 
-    @jaxtyped
-    @beartype
+    @_typechecked
     def extract_from_array(
         self,
         image: NDArray[np.floating],
@@ -332,8 +315,7 @@ class RadiomicFeatureExtractor:
             sample_id=f"array_{id(image)}",
         )
 
-    @jaxtyped
-    @beartype
+    @_typechecked
     def extract_from_tensor(
         self,
         image: Float[Tensor, "batch channels height width"],
@@ -417,8 +399,7 @@ class FrechetRadiomicDistance:
         self.device = device
 
     @staticmethod
-    @jaxtyped
-    @beartype
+    @_typechecked
     def _compute_statistics(
         features: FeatureMatrix,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -441,8 +422,7 @@ class FrechetRadiomicDistance:
         return mu, sigma
 
     @staticmethod
-    @jaxtyped
-    @beartype
+    @_typechecked
     def _frechet_distance(
         mu1: NDArray[np.float64],
         sigma1: NDArray[np.float64],
@@ -466,7 +446,7 @@ class FrechetRadiomicDistance:
 
         # Covariance term with matrix square root
         # covmean = (sigma1 @ sigma2)^0.5
-        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+        covmean = linalg.sqrtm(sigma1.dot(sigma2))  # SciPy >= 1.18 removed ``disp``
 
         # Handle numerical instability
         if not np.isfinite(covmean).all():

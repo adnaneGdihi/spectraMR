@@ -14,6 +14,7 @@ These tests are written first (TDD): they fail until
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -371,7 +372,8 @@ class TestSample:
 
 
 def test_it_declares_its_own_loss_ownership() -> None:
-    """Issue #1918: mse_loss(pred, true_velocity) regresses the bridge drift, not the target.
+    """Issue #1918: mse_loss(pred, true_velocity) regresses the drift; declared image losses fold
+    on x1_hat.
 
     Read off ``__dict__``, never the inherited value: this class sits under
     ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
@@ -380,5 +382,45 @@ def test_it_declares_its_own_loss_ownership() -> None:
     PASS every declared ``losses.image_losses`` entry on this strategy's arms
     while the training step discards them.
     """
-    assert BlochSchrodingerBridgeStrategy.__dict__["folds_image_losses"] is False
+    assert BlochSchrodingerBridgeStrategy.__dict__["folds_image_losses"] is True
+    assert BlochSchrodingerBridgeStrategy.__dict__["empty_loss_stack_is_design"] is True
     assert BlochSchrodingerBridgeStrategy.__dict__["inline_losses"] == frozenset()
+
+
+def _bridge_bare(weight: float, losses: dict) -> BlochSchrodingerBridgeStrategy:
+    s = object.__new__(BlochSchrodingerBridgeStrategy)
+    s.device = torch.device("cpu")
+    s.lambda_bloch = 0.0
+    s._sigma = lambda t: torch.zeros_like(t)  # type: ignore[method-assign]
+    s._sigma_dot = lambda t: torch.zeros_like(t)  # type: ignore[method-assign]
+    s._resolve_legacy_batch = lambda input_batch, kwargs: input_batch  # type: ignore[method-assign]
+    entry = SimpleNamespace(name="l1", weight=weight, enabled=True, role="target")
+    s.config = SimpleNamespace(losses=SimpleNamespace(image_losses=[entry]))
+    s.env = SimpleNamespace(generator=lambda x: torch.zeros_like(x), losses=losses)
+    return s
+
+
+def test_bridge_declared_image_loss_is_folded_onto_the_endpoint_estimate() -> None:
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def l1(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        calls.append((pred, target))
+        return (pred - target).abs().mean()
+
+    x0 = torch.randn(2, 1, 8, 8)
+    x1 = torch.randn(2, 1, 8, 8)
+    batch = {"target": x1, "source": x0}
+    weight = 0.5
+
+    torch.manual_seed(2)
+    loss_off = _bridge_bare(weight, {})._compute_losses_impl(input_batch=batch)["loss_total"]
+
+    torch.manual_seed(2)
+    out = _bridge_bare(weight, {"l1": l1})._compute_losses_impl(input_batch=batch)
+
+    assert "loss_l1" in out
+    ((pred, target),) = calls
+    assert torch.equal(target, x1)
+    # x1_hat = x0 + pred, and the generator here returns zeros, so pred is x0 itself.
+    assert torch.equal(pred, x0)
+    assert torch.allclose(out["loss_total"] - loss_off, weight * (pred - x1).abs().mean())

@@ -105,6 +105,7 @@ def sar_limited_flip_volume(
     te_ms: float | None = None,
     t1_ms: float = DEFAULT_T1_MS,
     t2_ms: float = DEFAULT_T2_MS,
+    max_reduction_deg: float = MAX_REDUCTION_DEG,
 ) -> Tensor:
     """Scale each ky line by ``A_n(alpha) / A_n(180)`` of its echo ``n``.
 
@@ -122,7 +123,7 @@ def sar_limited_flip_volume(
     centre_echo = max(1, etl // 2) if te_ms is None else echo_index(te_ms, esp_ms, etl)
     if theta <= 0.0:
         return x
-    w = echo_weights(180.0 - MAX_REDUCTION_DEG * theta, etl, esp_ms, t1_ms, t2_ms)
+    w = echo_weights(180.0 - max_reduction_deg * theta, etl, esp_ms, t1_ms, t2_ms)
     w = w.to(x.device)
     echo = _echo_of_line(x.shape[-2], etl, centre_echo).to(x.device)
     dims = ENCODING_DIMS[geometry.mode]

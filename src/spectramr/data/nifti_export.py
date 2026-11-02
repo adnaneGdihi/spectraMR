@@ -63,7 +63,9 @@ __all__ = [
     "load_export_spacings",
     "parse_ismrmrd_geometry",
     "verify_slice_first_nifti",
+    "verify_slice_last_nifti",
     "write_slice_first_nifti",
+    "write_slice_last_nifti",
     "zooms_from_affine",
 ]
 
@@ -359,6 +361,57 @@ def write_slice_first_nifti(
     out.parent.mkdir(parents=True, exist_ok=True)
     nib.save(img, str(out))
     return out
+
+
+def write_slice_last_nifti(path: str | Path, volume: torch.Tensor, geometry: VoxelGeometry) -> Path:
+    """Write ``[S, H, W]`` float32 on disk as ``(H, W, S)``, the training loaders' layout.
+
+    ``NiftiStrategy.load`` and the paired-NIfTI path take the LAST on-disk axis as depth,
+    so a dataset meant for training is written slice-last; the slice-first writer above is
+    the SynthSeg export's layout and would make a loader cut through the wrong plane. The
+    affine permutes the same columns, so every voxel keeps its millimetre position.
+    """
+    import nibabel as nib
+
+    out = Path(path)
+    if not out.name.endswith((".nii.gz", ".nii")):
+        raise ValueError(f"{out.name}: expected a '.nii.gz' or '.nii' path")
+    if tuple(volume.shape) != (geometry.n_slices, geometry.rows, geometry.cols):
+        raise ValueError(
+            f"volume {tuple(volume.shape)} does not match the geometry it is being "
+            f"written with ({geometry.n_slices}, {geometry.rows}, {geometry.cols})"
+        )
+    array = volume.detach().cpu().to(torch.float32).permute(1, 2, 0).contiguous().numpy()
+    if not np.isfinite(array).all():
+        raise ValueError("volume contains non-finite values")
+    affine = geometry.affine()
+    affine[:, :3] = affine[:, [1, 2, 0]]
+    img = nib.Nifti1Image(array, affine)
+    img.header.set_zooms((geometry.row_mm, geometry.col_mm, geometry.slice_mm))
+    img.header.set_xyzt_units("mm")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(img, str(out))
+    return out
+
+
+def verify_slice_last_nifti(
+    path: str | Path, volume: torch.Tensor, spacing_mm: tuple[float, float, float]
+) -> None:
+    """Read back through ``NiftiStrategy.load_reference_volume`` and assert values and
+    ``(slice, row, col)`` spacing match what was written."""
+    from spectramr.data.io_strategies import NiftiStrategy
+
+    ref = NiftiStrategy.load_reference_volume(path)
+    want = volume.detach().cpu().to(torch.float32)
+    if tuple(ref["data"].shape) != tuple(want.shape) or not torch.equal(ref["data"], want):
+        raise ExportVerificationError(
+            f"{path} read back as {tuple(ref['data'].shape)}, wrote {tuple(want.shape)}; "
+            "the slice axis moved or the values changed."
+        )
+    if not np.allclose(ref["spacing_mm"], spacing_mm, rtol=1e-5):
+        raise ExportVerificationError(
+            f"{path} reads back spacing {ref['spacing_mm']}, wrote {tuple(spacing_mm)}"
+        )
 
 
 def verify_slice_first_nifti(path: str | Path, volume: torch.Tensor) -> None:

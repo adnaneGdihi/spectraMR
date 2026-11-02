@@ -706,3 +706,20 @@ class TestDecoderReceivesTheTimeEmbedding:
         with torch.no_grad():
             model(torch.randn(1, 1, 16, 16), time=torch.tensor([3.0]))
         assert len(calls) == len(model.decoder) == 2
+
+
+class TestUNetDeclaresWhatItConsumes:
+    """``forward`` accepts ``cond`` and ``timesteps`` it may ignore; the declaration says which."""
+
+    def test_cond_is_never_consumed(self):
+        from spectramr.models.reconstruction.unet import UNet
+
+        assert UNet.consumes_cond is False
+
+    def test_time_is_consumed_only_with_a_time_embedding(self):
+        from spectramr.models.reconstruction.unet import UNet
+
+        timed = UNet(in_channels=1, out_channels=1, model_channels=8, channel_mult=(1, 2))
+        blind = UNet(in_channels=1, out_channels=1, depth=1)
+        assert timed.consumes_time is True
+        assert blind.consumes_time is False

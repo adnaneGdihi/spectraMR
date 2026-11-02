@@ -311,7 +311,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "model.trellis_vae.trainer.i_sample",
         "model.trellis_vae.trainer.i_save",
         "mrf.phantom_calibration_path",
-        "mrf.spiral_rotation_schedule",
         # Unmasked by the mixed-case scanner fix, not newly broken: the old
         # identifier pattern was lowercase-only and the old YAML counter matched
         # `^\s*([a-z_][a-z0-9_]*)\s*:`, so a key holding a capital was invisible

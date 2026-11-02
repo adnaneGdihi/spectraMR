@@ -42,6 +42,7 @@ import yaml as pyyaml
 
 from spectramr.config.schemas.loss import LossConfigSchema
 from spectramr.models.losses._legacy_weights import FOLDING_STRATEGIES
+from spectramr.models.losses.build_set import declared_build_set
 from spectramr.models.losses.weights import build_loss_weight_table, canonical_loss_name
 from tests.utils.corpus import tracked_yamls
 from tests.utils.repo_scripts import skip_if_public_export
@@ -112,6 +113,11 @@ REVIVED = {arm for arm, w in BASELINE.items() if all(v == 0.0 for v in w.values(
 #: Every entry cites the commit that made the change and where the decision is
 #: recorded, so the set cannot be used to wave a genuine regression through.
 SUPERSEDED: dict[str, str] = {
+    "experiments/inprogress/promoted/exp_promoted_kspace_inr.yaml": (
+        "c81123411 -- the frozen l1 10.0 never reached the objective: the strategy computed "
+        "a mask-weighted L1 inline (status needs_implementation). The arm now fits a SIREN "
+        "per slice and folds the declared l1 1.0 on RSS(ifft2c(k))."
+    ),
     "experiments/inprogress/novel_2026/breakthrough_resetting_diffusion.yaml": (
         "9a3ddd342 -- the frozen l1 10.0 + resetting_consistency 1.0 objective acted on "
         "the residual of a regression model with no reverse process (LM-06). The arm now "
@@ -530,7 +536,7 @@ def _cannot_start_on_an_empty_stack(arm: Path) -> bool:
         parsed = LossConfigSchema(**doc["losses"])
     except Exception:  # pragma: no cover - covered by the no-op test above
         return False
-    if parsed.get_enabled_losses():
+    if declared_build_set(parsed):
         return False
     strategy_cls = TrainingStrategyFactory().get_strategy_class(TrainingSettings.from_yaml(str(arm)))
     return not declares_inline_objective(strategy_cls)

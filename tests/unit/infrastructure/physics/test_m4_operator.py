@@ -83,3 +83,63 @@ def test_m4_operator_adjoint_property():
 
     # Assert they are close without motion (exact adjoint)
     torch.testing.assert_close(in_prod_1_nomot, in_prod_2_nomot, rtol=1e-3, atol=1e-3)
+
+
+def _cartesian_maps(mask: torch.Tensor | None, hw: tuple[int, int]) -> dict:
+    return {"dK": None, "mask": mask, "im_size": hw}
+
+
+def _line_mask(w: int) -> torch.Tensor:
+    mask = torch.zeros(1, 1, 1, w)
+    mask[..., ::3] = 1.0
+    mask[..., w // 2 - 2 : w // 2 + 2] = 1.0
+    return mask
+
+
+def test_cartesian_forward_is_masked_fft2c() -> None:
+    """#2380: with dK=None the operator is mask * fft2c, flattened row-major."""
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+
+    torch.manual_seed(0)
+    H, W = 12, 10
+    op = Operator_A_m4(im_size=(32, 32))
+    x = torch.randn(2, 1, H, W, dtype=torch.complex64)
+    mask = _line_mask(W)
+    ax = op.forward(x, _cartesian_maps(mask, (H, W)))
+    assert torch.allclose(ax, (fft2c(x) * mask).reshape(2, 1, H * W), atol=1e-6)
+
+
+def test_cartesian_adjoint_and_dc_fixed_point() -> None:
+    """<Ax, y> = <x, A^H y>, and the DC gradient vanishes at the true image."""
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+
+    torch.manual_seed(1)
+    H, W = 12, 10
+    op = Operator_A_m4()
+    maps = _cartesian_maps(_line_mask(W), (H, W))
+    x = torch.randn(1, 1, H, W, dtype=torch.complex64)
+    y = torch.randn(1, 1, H * W, dtype=torch.complex64)
+    lhs = (op.forward(x, maps) * y.conj()).sum()
+    rhs = (x * op.adjoint(y, maps).conj()).sum()
+    assert torch.allclose(lhs, rhs, atol=1e-4)
+
+    y_true = (fft2c(x) * maps["mask"]).reshape(1, 1, H * W)
+    grad = op.adjoint(op.forward(x, maps) - y_true, maps)
+    assert grad.abs().max() < 1e-5
+    full = _cartesian_maps(None, (H, W))
+    assert torch.allclose(op.adjoint(fft2c(x).reshape(1, 1, H * W), full), x, atol=1e-5)
+
+
+def test_cartesian_grid_mismatch_and_missing_dk_raise() -> None:
+    op = Operator_A_m4(im_size=(8, 8))
+    with pytest.raises(ValueError, match="does not match the grid"):
+        op.adjoint(torch.zeros(1, 1, 60, dtype=torch.complex64), {"dK": None})
+    with pytest.raises(KeyError):
+        op.forward(torch.zeros(1, 1, 8, 8, dtype=torch.complex64), {})
+
+
+def test_mask_on_a_nufft_trajectory_raises() -> None:
+    op = Operator_A_m4(im_size=(8, 8))
+    maps = {"dK": torch.zeros(1, 2, 64), "mask": torch.ones(1, 1, 8, 8)}
+    with pytest.raises(ValueError, match="Cartesian grid only"):
+        op.forward(torch.zeros(1, 1, 8, 8, dtype=torch.complex64), maps)

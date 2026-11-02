@@ -176,6 +176,15 @@ def test_kl_weight_follows_the_configured_anneal_end(flow_strategy):
     assert torch.allclose(kl_large, kl_small * 10.0, rtol=1e-4)
 
 
+def test_paired_field_source_refuses_a_missing_target(flow_strategy):
+    """paired_field_stamps has no self-recon fallback: a row without its target raises."""
+    from spectramr.infrastructure.training.strategies.disentangled_vae_physics import PhysicsAxis
+
+    flow_strategy._physics = PhysicsAxis("paired_field_stamps")
+    with pytest.raises(ValueError, match="target image"):
+        flow_strategy._compute_losses_impl(torch.randn(2, 1, 16, 16), None, epoch=0)
+
+
 def test_generator_without_the_contract_api_is_rejected(flow_strategy):
     """Guards the same TypeError the contract suite pins, through this fixture."""
     flow_strategy.env.generator = torch.nn.Conv2d(1, 1, 3, padding=1)
@@ -363,3 +372,99 @@ def test_validation_metric_failure_propagates(val_strategy):
     x = torch.randn(2, 1, 16, 16)
     with pytest.raises(RuntimeError, match="metric exploded"):
         val_strategy.validation_step({"input": x, "target": x}, x, x)
+
+
+# ── 32a and its deterministic twin: one knob, the VAE posterior ───────────
+
+_ARM_32A = "experiments/inprogress/vae_latent/experiment_32a_vae_ulf_to_hf_paired_{}.yaml"
+
+
+def _arm_32a(variant: str):
+    """Declared model kwargs and KL weight, through the production resolvers."""
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.builders.generator_kwargs import (
+        apply_model_field_sweep,
+        resolve_generator_kwargs,
+    )
+    from spectramr.models.losses.weights import build_loss_weight_table, resolve_loss_weight
+
+    cfg = TrainingSettings.from_yaml(_ARM_32A.format(variant))
+    kwargs = apply_model_field_sweep(resolve_generator_kwargs(cfg, device="cpu"), cfg).kwargs
+    return kwargs, resolve_loss_weight(build_loss_weight_table(cfg.losses), "kl_divergence")
+
+
+@pytest.mark.parametrize(("variant", "use_vae"), [("CORRECTED", True), ("deterministic", False)])
+def test_32a_use_vae_reaches_the_built_model(variant, use_vae):
+    """Build only, through GeneratorBuilder: the factory's kwarg filtering keeps the knob."""
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.builders.generator_kwargs import resolve_generator_kwargs
+    from spectramr.infrastructure.builders.leaf.model_builders import GeneratorBuilder
+
+    cfg = TrainingSettings.from_yaml(_ARM_32A.format(variant))
+    builder = (
+        GeneratorBuilder(cfg, "cpu")
+        .with_architecture(cfg.model.model_type)
+        .with_input_channels(cfg.model.in_channels)
+        .with_output_channels(cfg.model.out_channels)
+    )
+    for key, value in resolve_generator_kwargs(cfg, device="cpu").items():
+        builder.with_parameter(key, value)
+    model = builder.validate().build()
+    assert model.use_vae is use_vae
+    assert model.enc_s.use_vae is use_vae
+
+
+@pytest.mark.parametrize(
+    ("variant", "use_vae", "lambda_kl"),
+    [("CORRECTED", True, 1.0e-4), ("deterministic", False, 0.0)],
+)
+def test_32a_arms_differ_only_in_the_vae_posterior(variant, use_vae, lambda_kl):
+    """The registry-built model samples its style code in training only in the treatment."""
+    from spectramr.models.generators.disentangled_mri import PHYSICS_VECTOR_DIM
+    from spectramr.models.registry import get_model_class
+
+    kwargs, weight = _arm_32a(variant)
+    assert kwargs["use_vae"] is use_vae
+    assert weight == pytest.approx(lambda_kl)
+
+    torch.manual_seed(0)
+    model = get_model_class("disentangled_mri")(
+        dim=8, n_res=1, z_dim=kwargs["z_dim"], use_vae=kwargs["use_vae"]
+    ).train()
+    img = torch.rand(2, 1, 16, 16)
+    phys = torch.rand(2, PHYSICS_VECTOR_DIM)
+    first, second = model(img, phys)[0], model(img, phys)[0]
+    assert (not torch.equal(first, second)) is use_vae
+
+
+def test_kl_weight_on_a_deterministic_latent_raises(flow_strategy):
+    flow_strategy.env.generator.use_vae = False
+    img = torch.randn(2, 1, 16, 16)
+    with pytest.raises(ValueError, match="deterministic latent"):
+        flow_strategy._compute_losses_impl(img, img, epoch=0)
+
+
+def test_zero_kl_weight_on_a_deterministic_latent_trains_no_kl(flow_strategy):
+    flow_strategy.env.generator.use_vae = False
+    flow_strategy._get_loss_weight = lambda name, epoch: 0.0
+    img = torch.randn(2, 1, 16, 16)
+    assert float(flow_strategy._compute_losses_impl(img, img, epoch=0)["kl"]) == 0.0
+
+
+def test_32a_treatment_learns_its_style_posterior_variance(flow_strategy):
+    """Production loss path: the KL reaches the logvar head and one step moves logvar off 0."""
+    from spectramr.models.generators.disentangled_mri import PHYSICS_VECTOR_DIM
+    from spectramr.models.registry import get_model_class
+
+    torch.manual_seed(0)
+    model = get_model_class("disentangled_mri")(dim=8, n_res=1, z_dim=16, use_vae=True).train()
+    flow_strategy.env.generator = model
+    flow_strategy._get_loss_weight = lambda name, epoch: 1.0e-4
+    img = torch.rand(2, 1, 16, 16)
+    losses = flow_strategy._compute_losses_impl(img, img, epoch=0)
+    losses["g_total_loss"].backward()
+    head = model.phys_to_style_logvar
+    assert head.weight.grad is not None and head.weight.grad.abs().sum() > 0
+    torch.optim.SGD(head.parameters(), lr=1.0).step()
+    _, _, logvar = model(img, torch.rand(2, PHYSICS_VECTOR_DIM))
+    assert logvar.abs().sum() > 0

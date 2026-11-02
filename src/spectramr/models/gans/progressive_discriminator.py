@@ -8,11 +8,10 @@ newly-added (higher-resolution) input phase as ``alpha`` is annealed
 4x4 block so the discriminator sees an across-batch variability statistic,
 giving it a direct signal for intra-batch mode collapse.
 
-This discriminator is *not* registered via ``@register_model`` (it is a
-critic, not a generator); the progressive YAML wires it through the
-``discriminator_component`` block. It exposes the standard
-``in_channels`` / ``set_phase`` interface so the model factory and the
-progressive strategy can drive it.
+It is registered as the ``progressive_discriminator`` critic, so a YAML
+selects it through ``model.discriminator_component.name``. It exposes the
+``in_channels`` / ``set_phase`` interface that ``ProgressiveGANStrategy``
+requires of the critic.
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from spectramr.models.blocks.progressive import FadeIn, MinibatchStdDev
+from spectramr.models.registry import register_model
 
 
 class _ProGANDiscBlock(nn.Module):
@@ -43,6 +43,12 @@ class _ProGANDiscBlock(nn.Module):
         return F.avg_pool2d(x, kernel_size=2)
 
 
+@register_model(
+    role="discriminator",
+    name="progressive_discriminator",
+    training_mode="gan",
+    input_domain="image",
+)
 class ProgressiveDiscriminator(nn.Module):
     """Progressive-growing GAN discriminator (critic).
 

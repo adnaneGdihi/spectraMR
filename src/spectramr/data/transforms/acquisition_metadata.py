@@ -21,6 +21,10 @@ Sources
   if missing.
 - ``h5_attrs``: reads HDF5 root attributes. Used by the FastMRI-style
   pipeline.
+- ``ismrmrd_header``: parses the ``ismrmrd_header`` XML of an ISMRMRD/M4Raw
+  ``.h5`` (``sequenceParameters`` TE/TR/TI/flipAngle_deg and
+  ``systemFieldStrength_T``). The dataset names the file under the
+  ``source_path`` subject key, since its images are in-memory tensors.
 - ``yaml_inline``: copies ``defaults`` straight through. Use for smoke
   tests and synthetic data where there is no on-disk source.
 
@@ -38,11 +42,12 @@ residuals; surface the failure loudly during training.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import torchio as tio
 
@@ -50,6 +55,7 @@ from spectramr.config.schemas.data import (
     AcquisitionMetadataConfigSchema,
     AcquisitionMetadataSource,
 )
+from spectramr.data.datasets.kspace_volume_stack import read_acquisition_params
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +160,35 @@ def _from_h5_attrs(path: Path) -> dict[str, float]:
     return out
 
 
+#: ``read_acquisition_params`` key -> internal name. TE/TR/TI are already ms.
+_ISMRMRD_KEYMAP: dict[str, str] = {
+    "TE": "TE",
+    "TR": "TR",
+    "TI": "TI",
+    "flip_angle": "FA",
+    "field_strength_T": "B0",
+}
+
+
+@functools.lru_cache(maxsize=4096)
+def _from_ismrmrd_header(path_str: str) -> tuple[tuple[str, float], ...]:
+    """Header values of one file, cached so each sample does not reopen the h5."""
+    parsed = read_acquisition_params(Path(path_str))
+    return tuple(
+        (ours, float(parsed[theirs]))  # type: ignore[arg-type]
+        for theirs, ours in _ISMRMRD_KEYMAP.items()
+        if isinstance(parsed.get(theirs), float)
+    )
+
+
 def _read_metadata(
     source: AcquisitionMetadataSource,
     image_path: Path | None,
     defaults: dict[str, Any],
 ) -> dict[str, Any]:
     """Dispatch to the right reader for the configured source."""
+    if source not in get_args(AcquisitionMetadataSource):
+        raise ValueError(f"Unknown acquisition metadata source: {source}")
     if source == "yaml_inline" or image_path is None:
         return dict(defaults)
     if source == "bids_json":
@@ -177,6 +206,8 @@ def _read_metadata(
         return _from_dicom_path(image_path)
     if source == "h5_attrs":
         return _from_h5_attrs(image_path)
+    if source == "ismrmrd_header":
+        return dict(_from_ismrmrd_header(str(image_path)))
     raise ValueError(f"Unknown acquisition metadata source: {source}")
 
 
@@ -216,8 +247,12 @@ def _find_image_path(subject: tio.Subject) -> Path | None:
     """Return the first on-disk path among the subject's images.
 
     TorchIO stores ``image.path`` (a Path) when the image was constructed
-    from a file. Subjects created from in-memory tensors have no path.
+    from a file. Subjects created from in-memory tensors have no path, so a
+    dataset that builds them names its file under ``source_path`` instead.
     """
+    source_path = subject.get("source_path")
+    if isinstance(source_path, str | Path):
+        return Path(source_path)
     for key in ("input", "mri", "image", "hr", "target"):
         img = subject.get(key)
         if img is None:

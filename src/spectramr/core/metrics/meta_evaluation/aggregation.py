@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .ranking_guards import order_from_scores, ranks_from_scores
 from .types import AggregateRankingResult, DefensibilityCalibration, RankingResult
 
 logger = logging.getLogger(__name__)
@@ -112,13 +113,18 @@ def aggregate(
             fallback_w,
         )
 
-    # Collect z-scored per-method scores.
-    per_method_z: dict[str, dict[str, float]] = {}
-    metrics: set[str] = set()
-    for r in results:
-        z = r.standardize()
-        per_method_z[r.method] = z
-        metrics.update(z.keys())
+    # Collect z-scored per-method scores; a metric any axis scored is placed on all.
+    metrics = sorted({m for r in results for m in r.scores})
+    per_method_z: dict[str, dict[str, float]] = {r.method: r.standardize(metrics) for r in results}
+    # Cells whose z was imputed (no finite score); a crash among them trips the floor.
+    imputed = {
+        r.method: {m for m in metrics if not math.isfinite(r.scores.get(m, math.nan))}
+        for r in results
+    }
+    crashed = {
+        r.method: {m for m in imputed[r.method] if r.scores.get(m, math.nan) != math.inf}
+        for r in results
+    }
 
     # Breadth threshold: absolute when min_positive_axes is set, else a fraction
     # of the ranker pool so it tracks the pool size (#296).
@@ -143,12 +149,12 @@ def aggregate(
             weight_total += w
             if z >= 0:
                 positive_count += 1
-            if z < cfg.floor_z:
+            if z < cfg.floor_z or m in crashed[method]:
                 any_below_floor = True
         final[m] = weighted_sum / max(weight_total, 1e-12)
         flags[m] = positive_count >= required_positive and not any_below_floor
 
-    final_ranks = sorted(final.keys(), key=lambda k: -final[k])
+    final_ranks = order_from_scores(final)
     calibration = None
     if cfg.calibrate:
         calibration = calibrate_defensibility(
@@ -160,6 +166,7 @@ def aggregate(
             alpha=cfg.calibration_alpha,
             n_perm=cfg.n_perm,
             seed=cfg.calibration_seed,
+            imputed=imputed,
         )
     return AggregateRankingResult(
         final_scores=final,
@@ -169,7 +176,14 @@ def aggregate(
         weights=weights,
         calibration=calibration,
         defensibility_semantics="breadth",
+        final_mid_ranks=_mid_ranks(final_ranks, final),
     )
+
+
+def _mid_ranks(order: list[str], scores: dict[str, float]) -> dict[str, float]:
+    """1-indexed mid-ranks of ``scores`` keyed by name; equal scores share a rank."""
+    mid = ranks_from_scores([scores[m] for m in order], names=order)
+    return {m: float(r) for m, r in zip(order, mid, strict=True)}
 
 
 def calibrate_defensibility(
@@ -182,6 +196,7 @@ def calibrate_defensibility(
     alpha: float = 0.05,
     n_perm: int = 1000,
     seed: int = 0,
+    imputed: dict[str, set[str]] | None = None,
 ) -> DefensibilityCalibration:
     """Permutation-calibrate the false-positive rate of the defensibility flag.
 
@@ -195,6 +210,8 @@ def calibrate_defensibility(
     Returns the flag's empirical null false-positive rate, plus a per-metric
     permutation p-value for the breadth-of-agreement statistic (number of
     non-negative axes) and the calibrated flags (raw flag AND ``p <= alpha``).
+    ``imputed`` names, per axis, the cells whose z was placed rather than measured
+    (see :meth:`RankingResult.standardize`); they are masked out of the null.
     """
     methods = list(per_method_z.keys())
     metrics = sorted({m for z in per_method_z.values() for m in z})
@@ -206,12 +223,13 @@ def calibrate_defensibility(
     # (#296): absolute when set, else a fraction of the ranker pool.
     required_positive = _required_positive_methods(n_axes, min_positive_axes, min_positive_frac)
 
-    # z-matrix [axes, metrics]; NaN marks "metric absent on this axis" (neutral).
+    # z-matrix [axes, metrics]; NaN masks a cell with no measured score on that axis.
     z_mat = np.full((n_axes, n_metrics), np.nan)
+    skip = imputed or {}
     for ai, method in enumerate(methods):
         zd = per_method_z[method]
         for ki, m in enumerate(metrics):
-            if m in zd:
+            if m in zd and m not in skip.get(method, ()):
                 z_mat[ai, ki] = zd[m]
 
     present = ~np.isnan(z_mat)
@@ -274,16 +292,24 @@ class KemenyConfig:
 
 
 def _axis_positions(result: RankingResult, metrics: list[str]) -> dict[str, int]:
-    """Position of each metric in one axis's ranking (lower position = better)."""
-    order = [m for m in result.ranks if m in metrics]
+    """Position of each metric in one axis's ranking (lower position = better).
+
+    A metric this axis did not score (absent, NaN or ``-inf``) shares the bottom
+    position, the placement :meth:`RankingResult.standardize` gives the z path.
+    """
+
+    def scored(m: str) -> bool:
+        v = result.scores.get(m, math.nan)
+        return math.isfinite(v) or v == math.inf
+
+    order = [m for m in result.ranks if m in metrics and scored(m)]
     seen = set(order)
-    # metrics this axis scored but did not rank, then the rest, by descending score
-    extra = sorted(
-        (m for m in metrics if m not in seen),
-        key=lambda m: -result.scores.get(m, float("-inf")),
-    )
+    # metrics this axis scored but did not rank, by descending score then name
+    extra = order_from_scores({m: result.scores[m] for m in metrics if scored(m) and m not in seen})
     full = order + extra
-    return {m: i for i, m in enumerate(full)}
+    pos = {m: i for i, m in enumerate(full)}
+    pos.update(dict.fromkeys((m for m in metrics if not scored(m)), len(full)))
+    return pos
 
 
 def _majority_margin(
@@ -351,7 +377,7 @@ def kemeny_consensus(
     cfg = config or KemenyConfig()
     weights = cfg.resolved_weights()
     metrics = sorted({m for r in results for m in r.scores})
-    per_method_z = {r.method: r.standardize() for r in results}
+    per_method_z = {r.method: r.standardize(metrics) for r in results}
     if not metrics:
         return AggregateRankingResult(
             final_scores={},
@@ -373,6 +399,13 @@ def kemeny_consensus(
 
     n = len(order)
     final_scores = {m: float(n - 1 - i) for i, m in enumerate(order)}
+    # Metrics placed identically on every axis are indistinguishable and share a rank.
+    axis_pos = [_axis_positions(r, metrics) for r in results]
+    profile = {m: tuple(p[m] for p in axis_pos) for m in order}
+    tied_scores = dict(final_scores)
+    for i in range(1, n):
+        if profile[order[i]] == profile[order[i - 1]]:
+            tied_scores[order[i]] = tied_scores[order[i - 1]]
     # Condorcet winner: strictly positive margin against every opponent. Requires
     # at least two metrics — for a singleton pool ``all(<empty>)`` is vacuously
     # True, which would spuriously certify the lone metric a "Condorcet winner".
@@ -387,4 +420,5 @@ def kemeny_consensus(
         weights=weights,
         calibration=None,
         defensibility_semantics="condorcet",
+        final_mid_ranks=_mid_ranks(order, tied_scores),
     )

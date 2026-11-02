@@ -19,12 +19,16 @@ References:
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor
 
 from spectramr.config.schemas.enums import Regime
 from spectramr.core.metrics.evaluation_metrics import BaseMetric
+from spectramr.core.metrics.monai_compat import call_surface_metric
 from spectramr.core.metrics.registry import register_metric
+from spectramr.core.metrics.tissue_segmentation import _otsu_thresholds
 
 
 @register_metric("hd95", aliases=["HD95", "hausdorff_95"])
@@ -45,7 +49,7 @@ class HD95Metric(BaseMetric):
         super().__init__(device=device)
         self._monai_metric = None
 
-    def _get_monai_metric(self):
+    def _get_monai_metric(self) -> Any:
         """Lazy-load MONAI metric to avoid import-time overhead."""
         if self._monai_metric is None:
             from monai.metrics import HausdorffDistanceMetric
@@ -59,42 +63,24 @@ class HD95Metric(BaseMetric):
 
     @staticmethod
     def _otsu_threshold(img: Tensor) -> Tensor:
-        """Binarize a grayscale image via Otsu's method.
+        """Binarize a grayscale image via Otsu's method over its own intensity range.
+
+        The histogram spans the tensor's [min, max], so ``[-1, 1]``-normalised arms
+        threshold the same anatomy as ``[0, 1]`` ones (#174). A constant image has no
+        threshold and yields an empty mask, which the caller scores as the penalty.
 
         Args:
-            img: ``(B, C, H, W)`` float tensor in [0, 1].
+            img: ``(B, C, H, W)`` float tensor, any intensity range.
 
         Returns:
             Binary mask ``(B, C, H, W)`` with dtype float32.
         """
-        flat = img.flatten()
-        # Remove near-zero background for stable histogram
-        flat = flat[flat > 1e-6]
-        if flat.numel() < 10:
-            return (img > 0.5).float()
+        thresholds = _otsu_thresholds(img, n_classes=2)
+        if thresholds is None:
+            return torch.zeros_like(img, dtype=torch.float32)
+        return (img > thresholds[0]).float()
 
-        n_bins = 256
-        hist = torch.histc(flat, bins=n_bins, min=0.0, max=1.0)
-        bin_edges = torch.linspace(0.0, 1.0, n_bins + 1, device=img.device)
-        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-        total = hist.sum()
-        cum_sum = torch.cumsum(hist, dim=0)
-        cum_mean = torch.cumsum(hist * bin_centers, dim=0)
-        global_mean = cum_mean[-1]
-
-        # Between-class variance
-        w0 = cum_sum / total
-        w1 = 1.0 - w0
-        mu0 = cum_mean / cum_sum.clamp(min=1e-8)
-        mu1 = (global_mean - cum_mean) / w1.clamp(min=1e-8) / total
-
-        variance = w0 * w1 * (mu0 - mu1) ** 2
-        threshold = bin_centers[variance.argmax()].item()
-
-        return (img > threshold).float()
-
-    def compute_metric(self, preds: Tensor, target: Tensor, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Tensor, target: Tensor, **kwargs: Any) -> Tensor:
         """Compute HD95 between binarized prediction and target.
 
         Args:
@@ -124,21 +110,7 @@ class HD95Metric(BaseMetric):
             diag = (pred_mask.shape[-2] ** 2 + pred_mask.shape[-1] ** 2) ** 0.5
             return torch.tensor(diag, device=self.device)
 
-        metric = self._get_monai_metric()
-        # MONAI 1.5+ emits a noisy FutureWarning from its internal
-        # ``get_mask_edges(always_return_as_numpy=...)`` call (the option
-        # is a no-op now and will be removed in 1.7). Silence it here so
-        # validation logs aren't flooded — the deprecation lives inside
-        # MONAI itself, not in our call site.
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                category=FutureWarning,
-                message=r".*always_return_as_numpy.*",
-            )
-            hd95_val = metric(y_pred=pred_mask, y=gt_mask)
+        hd95_val = call_surface_metric(self._get_monai_metric(), y_pred=pred_mask, y=gt_mask)
 
         # MONAI returns (B, C) → take mean
         result = hd95_val[hd95_val.isfinite()].mean()
@@ -169,7 +141,7 @@ class QI1Metric(BaseMetric):
         Mortamet, B. et al. (2009). MRM, 62(2), 365-372.
     """
 
-    def compute_metric(self, preds: Tensor, target: Tensor, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Tensor, target: Tensor, **kwargs: Any) -> Tensor:
         """Compute QI1 artifact ratio.
 
         The background region is defined **spatially** as the four
@@ -275,7 +247,7 @@ class WM2MaxMetric(BaseMetric):
         Esteban, O. et al. (2017). PLoS ONE, 12(9), e0184661.
     """
 
-    def compute_metric(self, preds: Tensor, target: Tensor, **kwargs) -> Tensor:
+    def compute_metric(self, preds: Tensor, target: Tensor, **kwargs: Any) -> Tensor:
         """Compute WM2Max ratio.
 
         In the absence of tissue segmentation, we approximate the WM

@@ -13,46 +13,9 @@ from pathlib import Path
 import pytest
 import torch
 
+import spectramr.data.datasets.kspace_volume_stack as kio
+import spectramr.data.datasets.pseudo_gt_reference as pgt
 import spectramr.infrastructure.physics.coil_sensitivity as csm_mod
-import spectramr.infrastructure.physics.m4raw_pseudo_gt as pgt
-from spectramr.infrastructure.physics.m4raw_pseudo_gt import extract_contrast_label
-
-
-class TestExtractContrastLabel:
-    """``extract_contrast_label`` must handle both naming schemes (issue #307)."""
-
-    @pytest.mark.parametrize(
-        ("stem", "expected"),
-        [
-            # fastMRI brain — the AX* acquisition token.
-            ("file_brain_AXT1_201_2010294", "AXT1"),
-            ("file_brain_AXT2_200_2000250", "AXT2"),
-            ("file_brain_AXT2FLAIR_201_6002670", "AXT2FLAIR"),
-            ("file_brain_AXFLAIR_200_6002462", "AXFLAIR"),
-            ("file_brain_AXT1POST_205_2050017", "AXT1POST"),
-            ("file_brain_AXT1PRE_205_2050017", "AXT1PRE"),
-            # M4Raw — trailing <letters><rep> (must keep working).
-            ("2022091411_T101", "T1"),
-            ("2022091411_T202", "T2"),
-            ("2022091411_FLAIR03", "FLAIR"),
-        ],
-    )
-    def test_known_schemes(self, stem: str, expected: str) -> None:
-        assert extract_contrast_label(Path(f"{stem}.h5")) == expected
-
-    def test_fastmri_brain_is_not_returned_as_whole_stem(self) -> None:
-        # Pre-fix regression: the AX* stem fell through to ``return stem``.
-        label = extract_contrast_label(Path("file_brain_AXT2FLAIR_201_6002670.h5"))
-        assert label == "AXT2FLAIR"
-        assert "file_brain" not in label
-
-    def test_unknown_scheme_falls_back_to_stem_with_warning(self, caplog) -> None:
-        with caplog.at_level("WARNING", logger=pgt.logger.name):
-            label = extract_contrast_label(Path("mystery_volume.h5"))
-        assert label == "mystery_volume"
-        assert any(
-            "Could not extract contrast" in r.getMessage() for r in caplog.records
-        )
 
 
 @pytest.fixture()
@@ -126,7 +89,7 @@ def test_espirit_failure_warns_not_silent(fake_kspace, monkeypatch, caplog) -> N
         raise RuntimeError("linalg: cusolver unavailable")
 
     monkeypatch.setattr(csm_mod, "estimate_csm_espirit", _boom)
-    with caplog.at_level("ERROR", logger=pgt.logger.name):
+    with caplog.at_level("ERROR", logger="spectramr"):
         _ci, smaps, x_gt_mag, _p99 = pgt.synthesize_pseudo_gt(
             [Path("r1.h5"), Path("r2.h5")]
         )
@@ -200,7 +163,7 @@ class TestEspiritOomKeepsOneGroundTruth:
         self, fake_kspace, monkeypatch, caplog
     ) -> None:
         self._oom_once(monkeypatch)
-        with caplog.at_level("WARNING", logger=pgt.logger.name):
+        with caplog.at_level("WARNING", logger="spectramr"):
             pgt.synthesize_pseudo_gt([Path("r1.h5")])
 
         msgs = [r.getMessage() for r in caplog.records]
@@ -278,7 +241,7 @@ def _stub_h5(monkeypatch, load_full):
 
     ``synthesize_pseudo_gt`` probes each rep's shape from the HDF5 header and
     then reads only the target slice (#616), so a stub that patches only
-    ``_load_kspace_from_h5`` leaves the probe hitting the real filesystem —
+    ``load_kspace_from_h5`` leaves the probe hitting the real filesystem —
     which is what these tests did before the two-pass read landed. Deriving
     both seams from one function keeps them consistent by construction rather
     than by two stubs that agree until someone edits one.
@@ -291,12 +254,12 @@ def _stub_h5(monkeypatch, load_full):
         volume = load_full(path)
         return volume if slice_index is None else volume[slice_index]
 
-    monkeypatch.setattr(pgt, "_kspace_shape_from_h5", _shape)
-    monkeypatch.setattr(pgt, "_load_kspace_from_h5", _load)
+    monkeypatch.setattr(kio, "kspace_shape_from_h5", _shape)
+    monkeypatch.setattr(kio, "load_kspace_from_h5", _load)
 
 
 def _per_path_loader(coils_by_stem: dict[str, int], h: int = 8, w: int = 8, s: int = 3):
-    """Build a ``_load_kspace_from_h5`` stub returning a per-file coil count.
+    """Build a ``load_kspace_from_h5`` stub returning a per-file coil count.
 
     Genuine NEX repetitions share one receive array, so a group whose reps carry
     *different* coil counts is not a valid NEX set. This lets a test feed exactly
@@ -330,7 +293,7 @@ def test_heterogeneous_reps_keep_majority_subset_and_warn(monkeypatch, caplog) -
         return torch.ones_like(kspace)
 
     monkeypatch.setattr(csm_mod, "estimate_csm_espirit", _fake_espirit)
-    with caplog.at_level("WARNING", logger=pgt.logger.name):
+    with caplog.at_level("WARNING", logger="spectramr"):
         coil_images, smaps, x_gt_mag, _p99 = pgt.synthesize_pseudo_gt(
             [Path("r1.h5"), Path("r2.h5"), Path("r3.h5"), Path("r4.h5")]
         )
@@ -361,7 +324,7 @@ def test_two_reps_different_coils_no_crash(monkeypatch, caplog) -> None:
         "estimate_csm_espirit",
         lambda kspace, num_coils, **_: torch.ones_like(kspace),
     )
-    with caplog.at_level("WARNING", logger=pgt.logger.name):
+    with caplog.at_level("WARNING", logger="spectramr"):
         coil_images, _smaps, x_gt_mag, _p99 = pgt.synthesize_pseudo_gt(
             [Path("r1.h5"), Path("r2.h5")]
         )
@@ -387,209 +350,3 @@ def test_low_coil_count_keeps_default_acs(monkeypatch) -> None:
     monkeypatch.setattr(csm_mod, "estimate_csm_espirit", _fake_espirit)
     pgt.synthesize_pseudo_gt([Path("r1.h5")])
     assert seen["acs_size"] == 24
-
-
-class TestReadAcquisitionParams:
-    """TR/TE/TI were in the data all along; nothing parsed them (#606).
-
-    ``brc`` and ``qvcr`` reported ``needs acq_params`` and
-    ``phys_residual_consistency`` raised *"requires acquisition (TR/TE/TI in ms)"* on
-    files whose ``ismrmrd_header`` states ``TR=7500, TE=98, TI=1655, flipAngle=160``
-    outright — three metrics declared inapplicable for want of a parser.
-    """
-
-    @staticmethod
-    def _write(tmp_path, header: str | None):
-        import h5py
-        import numpy as np
-
-        path = tmp_path / "acq.h5"
-        with h5py.File(path, "w") as f:
-            f.create_dataset("kspace", data=np.zeros((1, 2, 4, 4), dtype=np.complex64))
-            if header is not None:
-                f.create_dataset("ismrmrd_header", data=np.bytes_(header.encode()))
-        return path
-
-    def test_parses_the_namespaced_tags_m4raw_writes(self, tmp_path) -> None:
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            read_acquisition_params,
-        )
-
-        path = self._write(
-            tmp_path,
-            "<ns0:ismrmrdHeader><ns0:sequenceParameters>"
-            "<ns0:TR>7500.0</ns0:TR><ns0:TE>98.0</ns0:TE><ns0:TI>1655.0</ns0:TI>"
-            "<ns0:flipAngle_deg>160.0</ns0:flipAngle_deg>"
-            "<ns0:sequence_type>FLAIR_TRA</ns0:sequence_type>"
-            "</ns0:sequenceParameters></ns0:ismrmrdHeader>",
-        )
-        got = read_acquisition_params(path)
-        assert got["TR"] == 7500.0
-        assert got["TE"] == 98.0
-        assert got["TI"] == 1655.0
-        assert got["flip_angle"] == 160.0
-        assert got["sequence_type"] == "FLAIR_TRA"
-
-    def test_parses_an_unnamespaced_header_too(self, tmp_path) -> None:
-        """Other vendors write bare ``<TR>``; the regex must not require a prefix."""
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            read_acquisition_params,
-        )
-
-        path = self._write(tmp_path, "<ismrmrdHeader><TR>2500</TR></ismrmrdHeader>")
-        assert read_acquisition_params(path)["TR"] == 2500.0
-
-    def test_absent_tag_is_omitted_not_defaulted(self, tmp_path) -> None:
-        """A fabricated TR is worse than a missing one — the metric must see the gap."""
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            read_acquisition_params,
-        )
-
-        path = self._write(tmp_path, "<ismrmrdHeader><TE>98.0</TE></ismrmrdHeader>")
-        got = read_acquisition_params(path)
-        assert got == {"TE": 98.0}
-        assert "TR" not in got
-
-    def test_no_header_returns_the_honest_empty(self, tmp_path) -> None:
-        """Keeps the metric ``not_applicable`` rather than feeding it invented physics."""
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            read_acquisition_params,
-        )
-
-        assert read_acquisition_params(self._write(tmp_path, None)) == {}
-
-    def test_reads_echo_spacing_train_length_and_encoded_geometry(self, tmp_path) -> None:
-        """The series-gain gate and the EPG forward model need these beside TR/TE/TI."""
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            read_acquisition_params,
-        )
-
-        path = self._write(
-            tmp_path,
-            "<ns0:ismrmrdHeader><ns0:encoding><ns0:encodedSpace><ns0:matrixSize>"
-            "<ns0:x>256</ns0:x><ns0:y>256</ns0:y><ns0:z>1</ns0:z></ns0:matrixSize>"
-            "<ns0:fieldOfView_mm><ns0:x>240</ns0:x><ns0:y>240</ns0:y><ns0:z>5</ns0:z>"
-            "</ns0:fieldOfView_mm></ns0:encodedSpace><ns0:reconSpace><ns0:matrixSize>"
-            "<ns0:x>512</ns0:x><ns0:y>512</ns0:y><ns0:z>1</ns0:z></ns0:matrixSize>"
-            "</ns0:reconSpace><ns0:echoTrainLength>16</ns0:echoTrainLength></ns0:encoding>"
-            "<ns0:sequenceParameters><ns0:TR>4000</ns0:TR><ns0:TE>100</ns0:TE>"
-            "<ns0:echo_spacing>12.5</ns0:echo_spacing></ns0:sequenceParameters>"
-            "</ns0:ismrmrdHeader>",
-        )
-        got = read_acquisition_params(path)
-        assert got["echo_spacing"] == 12.5
-        assert got["echo_train_length"] == 16.0
-        assert got["encoded_matrix"] == (256, 256)  # not the reconSpace 512
-        assert got["fov_mm"] == (240.0, 240.0, 5.0)
-
-    def test_echo_spacing_with_a_unit_suffix_is_a_number_and_na_is_absent(self, tmp_path) -> None:
-        """M4Raw writes ``16.3ms`` on its TSE series and ``N/A`` on its single-echo SE T1."""
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            read_acquisition_params,
-        )
-
-        tse = self._write(tmp_path, "<ismrmrdHeader><echo_spacing>16.3ms</echo_spacing></ismrmrdHeader>")
-        assert read_acquisition_params(tse)["echo_spacing"] == 16.3
-        se = self._write(tmp_path, "<ismrmrdHeader><echo_spacing>N/A</echo_spacing></ismrmrdHeader>")
-        assert "echo_spacing" not in read_acquisition_params(se)
-
-    def test_echo_spacing_in_an_unknown_unit_raises(self, tmp_path) -> None:
-        """A silently mis-scaled echo spacing would put the TSE echo at the wrong index."""
-        import pytest
-
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            read_acquisition_params,
-        )
-
-        path = self._write(tmp_path, "<ismrmrdHeader><echo_spacing>0.0163s</echo_spacing></ismrmrdHeader>")
-        with pytest.raises(ValueError, match="echo_spacing"):
-            read_acquisition_params(path)
-
-    def test_geometry_is_omitted_when_the_header_has_none(self, tmp_path) -> None:
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            read_acquisition_params,
-        )
-
-        got = read_acquisition_params(self._write(tmp_path, "<ismrmrdHeader><TR>1</TR></ismrmrdHeader>"))
-        assert "encoded_matrix" not in got and "fov_mm" not in got
-
-
-class TestSliceOnlyRepReads:
-    """#616 (audit D5). Pseudo-GT averages ONE slice across every repetition.
-
-    The target slice is derived from the slice count, so the old single pass
-    loaded every rep in FULL to learn a number, held them all resident, then
-    used one slice each. On an M4Raw multi-slice multi-coil acquisition that is
-    the whole volume per repetition, times the number of repetitions.
-    """
-
-    @staticmethod
-    def _write_rep(path, n_slices=5, n_coils=4, h=8, w=8, seed=0):
-        h5py = pytest.importorskip("h5py")
-        import numpy as np
-
-        rng = np.random.default_rng(seed)
-        data = rng.standard_normal((n_slices, n_coils, h, w, 2)).astype("float32")
-        with h5py.File(path, "w") as f:
-            f.create_dataset("kspace", data=data)
-        return data
-
-    def test_the_header_probe_reports_the_shape_without_reading(self, tmp_path):
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            _kspace_shape_from_h5,
-        )
-
-        path = tmp_path / "rep0.h5"
-        self._write_rep(path)
-        assert _kspace_shape_from_h5(path) == (5, 4, 8, 8, 2)
-
-    def test_a_slice_read_equals_the_same_slice_of_a_full_read(self, tmp_path):
-        """The equivalence that makes the optimisation safe. Asserted against
-        the FULL read rather than against a literal, so a change to the complex
-        coercion cannot pass here while breaking one path."""
-        import torch
-
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            _load_kspace_from_h5,
-        )
-
-        path = tmp_path / "rep0.h5"
-        self._write_rep(path, n_slices=5)
-
-        full = _load_kspace_from_h5(path)
-        for idx in range(5):
-            partial = _load_kspace_from_h5(path, slice_index=idx)
-            assert torch.equal(partial, full[idx]), f"slice {idx} diverged"
-
-    def test_the_partial_read_drops_the_leading_axis(self, tmp_path):
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            _load_kspace_from_h5,
-        )
-
-        path = tmp_path / "rep0.h5"
-        self._write_rep(path, n_slices=5, n_coils=4)
-        assert _load_kspace_from_h5(path).shape == (5, 4, 8, 8)
-        assert _load_kspace_from_h5(path, slice_index=2).shape == (4, 8, 8)
-
-    def test_a_missing_kspace_key_still_raises_keyerror_on_the_probe(self, tmp_path):
-        """The per-rep error handling now spans both passes; the probe must
-        raise the same class the loader did so the caller's except arms fire."""
-        h5py = pytest.importorskip("h5py")
-
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            _kspace_shape_from_h5,
-        )
-
-        path = tmp_path / "empty.h5"
-        with h5py.File(path, "w") as f:
-            f.create_dataset("something_else", data=[1, 2, 3])
-        with pytest.raises(KeyError):
-            _kspace_shape_from_h5(path)
-
-    def test_a_missing_file_raises_filenotfounderror_on_the_probe(self, tmp_path):
-        from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-            _kspace_shape_from_h5,
-        )
-
-        with pytest.raises(FileNotFoundError):
-            _kspace_shape_from_h5(tmp_path / "nope.h5")

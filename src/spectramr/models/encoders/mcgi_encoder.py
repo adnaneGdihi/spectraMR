@@ -29,6 +29,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from spectramr.config.schemas.training.mcgi import MCGIConfig
 from spectramr.models.blocks.rank_normalize import RankNormalize2d
 from spectramr.models.registry import register_model
 
@@ -50,6 +51,9 @@ def _conv_backbone(
     return nn.Sequential(*layers)
 
 
+_DEFAULTS = {name: field.default for name, field in MCGIConfig.model_fields.items()}
+
+
 @register_model(
     name="mcgi_encoder",
     training_mode="supervised",
@@ -57,36 +61,51 @@ def _conv_backbone(
     input_domain="image",
     output_domain="image",
     supports_contrast_conditioning=False,
+    strict_kwargs=True,
 )
 class MCGIEncoder(nn.Module):
     r"""Monotone-contrast-group-invariant encoder :math:`\Phi = \Psi \circ R`.
+
+    The MCGI knobs are validated by
+    :class:`~spectramr.config.schemas.training.mcgi.MCGIConfig`, which owns their
+    defaults and legal values; the resolved model is kept as ``self.config``.
 
     Args:
         in_channels: Input image channels.
         hidden_channels: Backbone hidden width.
         out_channels: Output feature channels.
-        depth: Number of conv blocks in the backbone.
+        depth: Number of conv layers in the backbone.
+        rank_transform: Apply :math:`R` before the backbone. ``False`` gives the
+            non-invariant one-knob control (same backbone on raw intensities).
         symmetrize_order_reversal: Pool over :math:`\sigma:\mathbf x\mapsto-\mathbf
             x` to extend invariance to :math:`G_+\rtimes\mathbb Z_2`.
-        soft_rank_temperature: Soft-rank temperature used in training mode.
-        hard_rank_eval: Use the exact hard rank at inference (the guarantee).
+        hard_rank_eval: Must be ``True`` (#2409).
     """
 
     def __init__(
         self,
         in_channels: int = 1,
-        hidden_channels: int = 16,
+        hidden_channels: int = _DEFAULTS["hidden_channels"],
         out_channels: int = 1,
-        depth: int = 3,
+        depth: int = _DEFAULTS["depth"],
         *,
-        symmetrize_order_reversal: bool = True,
-        soft_rank_temperature: float = 0.05,
-        hard_rank_eval: bool = True,
+        rank_transform: bool = _DEFAULTS["rank_transform"],
+        symmetrize_order_reversal: bool = _DEFAULTS["symmetrize_order_reversal"],
+        hard_rank_eval: bool = _DEFAULTS["hard_rank_eval"],
     ) -> None:
         super().__init__()
-        self.symmetrize_order_reversal = bool(symmetrize_order_reversal)
-        self.rank = RankNormalize2d(temperature=soft_rank_temperature, hard_eval=hard_rank_eval)
-        self.backbone = _conv_backbone(in_channels, hidden_channels, out_channels, depth)
+        self.config = MCGIConfig(
+            hidden_channels=hidden_channels,
+            depth=depth,
+            rank_transform=rank_transform,
+            symmetrize_order_reversal=symmetrize_order_reversal,
+            hard_rank_eval=hard_rank_eval,
+        )
+        self.symmetrize_order_reversal = self.config.symmetrize_order_reversal
+        self.rank: nn.Module = RankNormalize2d() if self.config.rank_transform else nn.Identity()
+        self.backbone = _conv_backbone(
+            in_channels, self.config.hidden_channels, out_channels, self.config.depth
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.backbone(self.rank(x))

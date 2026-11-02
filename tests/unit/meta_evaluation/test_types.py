@@ -41,23 +41,28 @@ def test_standardize_basic_zscore() -> None:
 def test_standardize_nan_score_does_not_poison_others() -> None:
     # crash→NaN contract: one NaN-scored metric must not turn every z-score NaN.
     z = _rr({"a": float("nan"), "b": 1.0, "c": 0.5}).standardize()
-    # The crashed metric carries no signal -> omitted (treated as absent on this axis).
-    assert "a" not in z
+    # The crashed metric is placed one unit below the worst finite z.
+    assert z["a"] == pytest.approx(-2.0)
     # The finite metrics keep their correct, finite z-scores.
     assert math.isfinite(z["b"]) and math.isfinite(z["c"])
     assert z["b"] == pytest.approx(1.0)
     assert z["c"] == pytest.approx(-1.0)
 
 
-def test_standardize_inf_score_omitted() -> None:
+def test_standardize_inf_score_is_kept_as_best() -> None:
     z = _rr({"a": float("inf"), "b": 2.0, "c": 0.0}).standardize()
-    assert "a" not in z
+    assert z["a"] == pytest.approx(2.0)
     assert all(math.isfinite(v) for v in z.values())
 
 
-def test_standardize_all_nonfinite_returns_empty() -> None:
-    # A ranker that produced no finite score has nothing to standardize.
-    assert _rr({"a": float("nan"), "b": float("inf")}).standardize() == {}
+def test_standardize_places_universe_metrics_absent_from_scores_as_worst() -> None:
+    z = _rr({"b": 1.0, "c": 0.5}).standardize(["b", "c", "gone"])
+    assert z["gone"] == pytest.approx(-2.0)
+
+
+def test_standardize_all_nonfinite_keeps_inf_above_nan() -> None:
+    # No finite score to standardize: +inf still outranks a crash.
+    assert _rr({"a": float("nan"), "b": float("inf")}).standardize() == {"a": -1.0, "b": 1.0}
 
 
 def test_standardize_degenerate_constant_unchanged() -> None:

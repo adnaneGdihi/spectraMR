@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, PositiveInt, field_validator,
 from spectramr.config.schemas.augmentation import AugmentationConfigSchema
 from spectramr.config.schemas.collation import CollationConfigSchema
 from spectramr.config.schemas.data_acquisition import DataAcquisitionSchema
+from spectramr.config.schemas.flow_synthetic import FlowSyntheticConfigSchema
 from spectramr.config.schemas.m4raw_triplet import M4RawTripletConfigSchema
 from spectramr.shared.utils.path_normalizer import PathNormalizer
 
@@ -93,6 +94,7 @@ CANONICAL_DATASET_TYPES: tuple[str, ...] = (
     "mrixfields",
     "fmri",
     "m4raw_triplet",
+    "flow_synthetic",
 )
 
 #: Legacy spellings folded to a canonical type BEFORE dispatch. Because the fold
@@ -903,6 +905,7 @@ AcquisitionMetadataSource = Literal[
     "bids_json",  # Sibling .json sidecars (BIDS-style)
     "dicom",  # DICOM headers (TE = DICOM tag (0018, 0081), etc.)
     "h5_attrs",  # HDF5 root attributes (FastMRI-style)
+    "ismrmrd_header",  # ISMRMRD XML header of an .h5 (M4Raw)
     "yaml_inline",  # Explicit dict on the config (smoke / synthetic / unit-test)
 ]
 
@@ -1014,7 +1017,7 @@ class PhaseContrastConfigSchema(BaseModel):
     ``training.flow`` is already taken by ``FlowConfig`` (an ODE sampler), and
     there are ``models/blocks/flow/``, ``flow_matching_losses.py``,
     ``physics/rectified_flow.py`` and ``field_flow_strategy.py``. This block is
-    named for its physics, matching the registered ``phase_contrast`` operator
+    named for its physics, matching the registered ``phase_contrast`` signal model
     and ``PhaseContrastVelocityLoss``, so the two can never be confused.
 
     When ``enabled=true`` the dataset yields a batch dict like::
@@ -1057,10 +1060,10 @@ class PhaseContrastConfigSchema(BaseModel):
     )
     encoding_scheme: Literal["four_point_reference"] = Field(
         default="four_point_reference",
-        description="Velocity-encoding scheme. A closed Literal: only "
-        "'four_point_reference' is implemented (flow_encoding."
-        "four_point_reference_encode/decode), so 'hadamard' raises at config "
-        "load rather than silently degrading (pitfall #9).",
+        description="Velocity-encoding scheme, read by PhaseContrastFlowStrategy to "
+        "size its input (encodings) and output (directions) through "
+        "flow_encoding.encoding_directions. A closed Literal, so 'hadamard' "
+        "raises at config load rather than silently degrading (pitfall #9).",
     )
     through_plane_axis: Literal["x", "y", "z"] = Field(
         default="z",
@@ -1250,7 +1253,8 @@ class AcquisitionMetadataConfigSchema(BaseModel):
         description="Where to read scan parameters from. ``bids_json`` looks "
         "for a sibling ``.json`` next to each image file (BIDS spec). "
         "``dicom`` reads DICOM headers (TE / TR / FA tags). ``h5_attrs`` reads "
-        "HDF5 root attributes (FastMRI-style). ``yaml_inline`` uses the "
+        "HDF5 root attributes (FastMRI-style). ``ismrmrd_header`` parses the "
+        "ISMRMRD XML header of an ``.h5`` (M4Raw). ``yaml_inline`` uses the "
         "``defaults`` dict below — primarily for smoke tests and synthetic data.",
     )
     fields: list[_ScanField] = Field(
@@ -1447,6 +1451,7 @@ DomainBalancingStrategy = Literal[
     "round_robin",  # Alternate batches: src, tgt, src, tgt, ...
     "stratified",  # Each batch contains samples from both domains
     "concat",  # No balancing — just zip the loaders
+    "domain_labelled",  # One flat batch from both domains + per-sample domain_label
 ]
 
 
@@ -1501,7 +1506,7 @@ class MultiDomainConfigSchema(BaseModel):
     )
     balancing: DomainBalancingStrategy = Field(
         default="round_robin",
-        description="How to compose batches: round_robin / stratified / concat.",
+        description="How to compose batches: round_robin / stratified / concat / domain_labelled.",
     )
     target_supervised: bool = Field(
         default=False,
@@ -1520,6 +1525,11 @@ class MultiDomainConfigSchema(BaseModel):
             names = [d.name for d in self.domains]
             if len(set(names)) != len(names):
                 raise ValueError(f"multi_domain.domains names must be unique. Got: {names}")
+            if self.balancing == "domain_labelled" and len(self.domains) != 2:
+                raise ValueError(
+                    "multi_domain.balancing='domain_labelled' stamps a binary domain_label "
+                    f"and needs exactly 2 domains. Got {len(self.domains)}."
+                )
         return self
 
 
@@ -2503,6 +2513,18 @@ class DataPairingConfigSchema(BaseModel):
             "through model.model_kwargs.reference_channels. 'target_only' serves "
             "the same target without the source: the no-prior control on the "
             "same pairs."
+        ),
+    )
+
+    stacked_combine: Literal["joint", "per_contrast"] = Field(
+        default="joint",
+        description=(
+            "M4Raw cross-contrast route with source_layout: stacked and "
+            "coils.processing_mode: rss_image only: how the coil combine treats the "
+            "stacked source and target coils. 'joint' takes one RSS over every coil of "
+            "both contrasts (one channel that mixes them). 'per_contrast' takes one RSS "
+            "per contrast, so input and target carry one channel per contrast "
+            "(source first)."
         ),
     )
 
@@ -3660,14 +3682,14 @@ class DataConfigSchema(BaseModel):
             )
             data["dataset_type"] = "m4raw"
 
-        # S5: M4Raw preset defaults — inject only if not explicitly set by user.
+        # S5: M4Raw preset defaults — inject only if not explicitly set by user. No coil
+        # mode: the preset's former "svd" is refused on this route (#392).
         # Seeded at the CANONICAL path via `default_knob`: three of these four
         # are folded names, and writing the legacy spelling beside a migrated
         # arm's canonical one made the arm unloadable ("two spellings disagree").
         if data.get("dataset_type") in ("m4raw", "m4raw_multicoil"):
             m4raw_defaults = {
                 "use_repetitions": True,
-                "coil_processing_mode": "svd",
                 "normalize_kspace": True,
                 "kspace_percentile": 0.99,
             }
@@ -4003,19 +4025,6 @@ class DataConfigSchema(BaseModel):
             "the masked input would return. A file with another width raises."
         ),
     )
-    coil_maps_reference_root: str | None = Field(
-        default=None,
-        description=(
-            "M4Raw single-contrast route only. A coil-map store (all-repetitions "
-            "recipe, per-scan default calibration) whose maps are published on the "
-            "VALIDATION split only, under `reference_sensitivity_complex`, for the "
-            "SENSE image metrics (sense_psnr, sense_ssim, the sense_magnitude "
-            "transform) to combine with, so arms that train on different maps are "
-            "scored on one map set (#2664). No operator, loss or training input "
-            "reads that key: maps averaged over every repetition contain the "
-            "leave-one-out reference (#2510). A missing or mismatched file raises."
-        ),
-    )
     noise_fit_support_policy: Literal["band", "acs"] = Field(
         default="band",
         description=(
@@ -4138,7 +4147,7 @@ class DataConfigSchema(BaseModel):
             reasons.append("the cross-contrast route serves repetition 0 of each contrast")
         if self.nex_target_exclude_input:
             reasons.append("the leave-one-out target excludes repetition 0, not the drawn input")
-        if self.coil_maps_root is not None or self.coil_maps_reference_root is not None:
+        if self.coil_maps_root is not None:
             reasons.append("coil maps sit in repetition 0's coil phase frame")
         if reasons:
             raise ValueError(
@@ -4333,17 +4342,18 @@ class DataConfigSchema(BaseModel):
                 f"route (dataset_type={self.dataset_type!r}, "
                 f"single_contrast={self.pairing.single_contrast!r})."
             )
-        if self.coil_maps_reference_root is not None and (
-            self.dataset_type != "m4raw"
-            or not self.pairing.single_contrast
-            or self.coils.processing_mode != "none"
+        if self.pairing.stacked_combine != "joint" and not (
+            on_cross_route
+            and self.pairing.source_layout == "stacked"
+            and self.coils.processing_mode == "rss_image"
         ):
             raise ValueError(
-                "data.coil_maps_reference_root holds maps of the PHYSICAL coils and is "
-                "read only by the m4raw single-contrast route with coils.processing_mode: "
-                f"none (dataset_type={self.dataset_type!r}, single_contrast="
-                f"{self.pairing.single_contrast!r}, processing_mode="
-                f"{self.coils.processing_mode!r})."
+                "data.pairing.stacked_combine is read only by the m4raw cross-contrast "
+                "route with source_layout: stacked and coils.processing_mode: rss_image "
+                f"(dataset_type={self.dataset_type!r}, "
+                f"single_contrast={self.pairing.single_contrast!r}, "
+                f"source_layout={self.pairing.source_layout!r}, "
+                f"processing_mode={self.coils.processing_mode!r})."
             )
         if self.coil_maps_root is not None:
             if self.dataset_type != "m4raw" or not self.pairing.single_contrast:
@@ -4405,6 +4415,32 @@ class DataConfigSchema(BaseModel):
         else:
             return self
         raise ValueError(f"data.emit_alternate_input: true is unread here: {reason}.")
+
+    @model_validator(mode="after")
+    def _triplet_route_serves_phase_aligned_mean(self) -> "DataConfigSchema":
+        """``m4raw_triplet`` serves the registered NEX averages, which are phase-aligned
+        means by construction (``nex_averaging.AVERAGE_MODE``), so any other declared
+        ``target_mode`` would name a target the route never builds."""
+        if self.dataset_type == "m4raw_triplet" and self.target_mode != "phase_aligned_mean":
+            raise ValueError(
+                "data.dataset_type 'm4raw_triplet' serves phase_aligned_mean NEX averages; "
+                f"data.target_mode={self.target_mode!r} is not built there. Declare "
+                "target_mode: phase_aligned_mean."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _m4raw_route_refuses_svd(self) -> "DataConfigSchema":
+        """The M4Raw repetition dataset applies no SVD compression and raises on ``svd`` at
+        construction; refusing it here moves that failure from train time to load time."""
+        if self.dataset_type == "m4raw" and self.coils.processing_mode == "svd":
+            raise ValueError(
+                "data.dataset_type 'm4raw' applies no SVD coil compression; "
+                "coils.processing_mode 'svd' (also derived from "
+                "physics.coil_processing.compression.method: svd) is wired only on "
+                "dataset_type 'kspace'. Use 'none' or 'rss_image' here, or dataset_type 'kspace'."
+            )
+        return self
 
     @model_validator(mode="after")
     def _n2n_pairing_matches_its_target(self) -> "DataConfigSchema":
@@ -4540,6 +4576,11 @@ class DataConfigSchema(BaseModel):
         default_factory=PhaseContrastConfigSchema,
         description="Phase-contrast / 4D-flow velocity encoding (venc, scheme, "
         "flux masks). NOT flow matching — see the schema docstring.",
+    )
+    flow_synthetic: FlowSyntheticConfigSchema = Field(
+        default_factory=FlowSyntheticConfigSchema,
+        description="Analytic 4D-flow phantom served by dataset_type='flow_synthetic'; "
+        "its venc and encoding scheme come from data.phase_contrast.",
     )
     perfusion: PerfusionConfigSchema = Field(
         default_factory=PerfusionConfigSchema,

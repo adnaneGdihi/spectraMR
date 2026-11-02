@@ -235,7 +235,6 @@ training:
     guidance_scale: 1.0
     type: cold
     prediction_type: sample
-    degradation: kspace_mask
     enable_diffusion_amp: false
     enforce_output_range: false
     lambda_mse: 0.0

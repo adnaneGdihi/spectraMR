@@ -864,7 +864,7 @@ class LatentLossesConfig(BaseModel):
         description=(
             "Latent regulariser selected via the loss registry (dispatched in "
             "UnifiedVAELossComputer). One of: kl_divergence (default), "
-            "latent_regularization, mmd, vq_kl, beta_tc_vae."
+            "latent_regularization, mmd."
         ),
     )
 
@@ -872,15 +872,15 @@ class LatentLossesConfig(BaseModel):
     @classmethod
     def _validate_latent_loss_type(cls, v: str) -> str:
         # NN#3: reject an unsupported latent loss at load time rather than at the
-        # first training step (it is dispatched through the loss registry).
+        # first training step. vq_kl and beta_tc_vae are refused here, not at runtime:
+        # the continuous VAE path has no quantised latent for vq_kl, and beta_tc_vae owns
+        # its KL through the losses dict, not the latent slot (#2280).
         supported = {
             "kl_divergence",
             "kl",
             "latent_regularization",
             "mmd",
             "maximum_mean_discrepancy",
-            "vq_kl",
-            "beta_tc_vae",
         }
         if v.lower() not in supported:
             raise ValueError(
@@ -1020,6 +1020,19 @@ class PhysicsLossesConfig(BaseModel):
         ge=0,
         description="Weight for the velocity unwrap-consistency hinge, which "
         "penalises |v| > venc (where the phase aliases).",
+    )
+    lambda_phase_contrast_image_nmse: float = Field(
+        default=0.0,
+        ge=0,
+        description="Weight for the per-encoding complex-image NMSE that "
+        "PhaseContrastReconStrategy trains against the reference images. Must be "
+        "> 0: the phasor term alone can fall by shrinking the image.",
+    )
+    lambda_phase_contrast_phasor: float = Field(
+        default=0.0,
+        ge=0,
+        description="Weight for the phasor loss on the velocity-encoded phase "
+        "(wrap- and background-free 1 - cos of the phase error).",
     )
 
     # --- Tracer kinetics / DCE perfusion (regime: mri_perfusion) -----------
@@ -1729,7 +1742,7 @@ class LossConfigSchema(BaseModel):
         deliberately kept OUT of those lists — the pma_02 / direct_ulf_to_hf_sr
         pattern, where a declarative entry's per-term weight is ignored for the
         total, so l1/ssim are routed through ``reconstruction.lambda_*``
-        instead. Mirrors the ``reconstruction`` branch of ``get_enabled_losses``.
+        instead. The build set that consumes this is ``declared_build_set`` (models/losses/build_set.py).
         """
         recon = self.reconstruction
         if recon is None:
@@ -1751,215 +1764,3 @@ class LossConfigSchema(BaseModel):
             if cfg.get(enable_field, False) and isinstance(value, (int, float)) and value > 0:
                 managed.add(name)
         return managed
-
-    def get_enabled_losses(self) -> dict[str, float]:
-        """Get all enabled losses with their weights across all paradigms.
-
-        Returns a dictionary mapping loss names to their weights (lambda values).
-        Only includes losses that are explicitly enabled.
-
-        Returns:
-            dict[str, float]: Mapping of loss name to weight.
-                Example: {'l1': 10.0, 'perceptual': 10.0, 'ssim': 1.0, 'adversarial': 1.0}
-
-        Note:
-            - Returns only enabled losses (enable_* field must be True)
-            - Respects disable_default_losses list
-            - Only includes paradigm losses if that paradigm config is not None
-            - Global loss_scaling is NOT applied (caller should apply if needed)
-        """
-        enabled_losses = {}
-
-        # Helper function to extract enabled losses from a config
-        def extract_from_config(config: BaseModel | None, paradigm: str) -> dict[str, float]:
-            """Extract enabled losses from a paradigm-specific config.
-
-            Only includes losses that are enabled AND have weight > 0.
-            """
-            losses: dict[str, float] = {}
-            if config is None:
-                return losses
-
-            # Use model_dump to safely iterate over configuration fields (SSOT compliant)
-            config_dict = config.model_dump() if hasattr(config, "model_dump") else {}
-
-            # Iterate through all fields in the config dictionary
-            for field_name, field_value in config_dict.items():
-                # Special cases for GAN
-                if paradigm == "gan":
-                    if field_name == "lambda_adv":
-                        loss_name = "adversarial"
-                        enable_field = "enable_adversarial"
-                    elif field_name == "lambda_gp":
-                        loss_name = "gradient_penalty"
-                        enable_field = "enable_gradient_penalty"
-                    elif field_name == "feature_matching":
-                        loss_name = "feature_matching"
-                        enable_field = "enable_feature_matching"
-                    elif field_name == "lambda_r1":
-                        loss_name = "r1"
-                        enable_field = "enable_r1"
-                    elif field_name.startswith("lambda_"):
-                        loss_name = field_name[7:]
-                        enable_field = f"enable_{loss_name}"
-                    else:
-                        continue
-                # Special cases for Diffusion
-                elif paradigm == "diffusion":
-                    if field_name == "lambda_mse":
-                        loss_name = "mse"
-                        enable_field = "enable_diffusion"
-                    elif field_name.startswith("lambda_"):
-                        loss_name = field_name[7:]
-                        enable_field = f"enable_{loss_name}"
-                    else:
-                        continue
-                # Special cases for Latent
-                elif paradigm == "latent":
-                    if field_name == "lambda_recon":
-                        loss_name = "reconstruction"
-                        enable_field = "enable_reconstruction"
-                    elif field_name == "lambda_kl":
-                        loss_name = "kl"
-                        enable_field = "enable_kl"
-                    elif field_name == "lambda_commit":
-                        loss_name = "commitment"
-                        enable_field = "enable_commitment"
-                    elif field_name.startswith("lambda_"):
-                        loss_name = field_name[7:]
-                        enable_field = f"enable_{loss_name}"
-                    else:
-                        continue
-                elif paradigm == "registration":
-                    if field_name == "lambda_sim":
-                        loss_name = "sim"
-                        enable_field = "enable_lncc"
-                    elif field_name == "lambda_smooth":
-                        loss_name = "smooth"
-                        enable_field = "enable_smoothness"
-                    elif field_name.startswith("lambda_"):
-                        loss_name = field_name[7:]
-                        enable_field = f"enable_{loss_name}"
-                    else:
-                        continue
-                else:
-                    # Generic case for all paradigms
-                    if not field_name.startswith("lambda_"):
-                        continue
-
-                    # Extract loss name: lambda_l1 → l1, lambda_ms_ssim → ms_ssim
-                    loss_name = field_name[7:]  # Remove "lambda_" prefix
-
-                    # Special cases for names that don't match enable flags directly
-                    if paradigm == "reconstruction" and loss_name == "recon":
-                        # lambda_recon pairs with enable_recon (the disentangled-VAE
-                        # "general reconstruction loss"); enable_l1 is its own pair.
-                        enable_field = "enable_recon"
-                    elif paradigm == "reconstruction" and loss_name == "marker":
-                        enable_field = "enable_marker_loss"
-                    elif paradigm == "reconstruction" and loss_name == "prior":
-                        enable_field = "enable_prior_loss"
-                    else:
-                        enable_field = f"enable_{loss_name}"
-
-                # Check if this loss is enabled AND has non-zero weight
-                is_enabled = config_dict.get(enable_field, False)
-
-                if is_enabled and field_value > 0 and not is_disabled(f"{paradigm}_{loss_name}"):
-                    losses[loss_name] = field_value
-
-            return losses
-
-        def is_disabled(loss_identifier: str) -> bool:
-            """Check if a loss is in the disable_default_losses list."""
-            # Check both full identifier (e.g., "gan_adversarial") and short name
-            short_name = loss_identifier.rsplit("_", maxsplit=1)[-1]
-            return (
-                loss_identifier in self.policy.exclude_defaults
-                or short_name in self.policy.exclude_defaults
-            )
-
-        def is_active(component: "LossComponentConfig") -> bool:
-            """Single owner for "is this declared component active?".
-
-            The ``composed`` block and every list in ``LOSS_LIST_DOMAINS`` hold
-            the same type (``LossComponentConfig``), so they must answer this
-            question identically. They did not: the ``composed`` loop honoured
-            neither ``enabled`` nor ``weight > 0``, so ``enabled: false`` --
-            the spelling ``ComposedLossConfig``'s own docstring advertises as
-            the way to switch a component off -- was silently ignored and the
-            component stayed in the returned dict. Non-negotiable 17: one owner
-            per invariant, and the loser's copy is deleted rather than kept in
-            sync.
-            """
-            return component.enabled and component.weight > 0 and not is_disabled(component.name)
-
-        # Extract losses from each paradigm
-        if self.reconstruction is not None:
-            # If using list-based losses, only extract legacy reconstruction if explicitly defined
-            # This prevents Pydantic's default_factory from triggering a ConfigurationError
-            if not self.uses_list_based_losses or bool(self.reconstruction.model_fields_set):
-                enabled_losses.update(extract_from_config(self.reconstruction, "reconstruction"))
-
-        if self.gan is not None:
-            # Similarly, don't extract default GAN if using list-based (though default is None)
-            if not self.uses_list_based_losses or bool(self.gan.model_fields_set):
-                enabled_losses.update(extract_from_config(self.gan, "gan"))
-
-        if self.diffusion is not None:
-            if not self.uses_list_based_losses or bool(self.diffusion.model_fields_set):
-                enabled_losses.update(extract_from_config(self.diffusion, "diffusion"))
-
-        if self.latent is not None:
-            if not self.uses_list_based_losses or bool(self.latent.model_fields_set):
-                enabled_losses.update(extract_from_config(self.latent, "latent"))
-
-        if self.physics is not None:
-            if not self.uses_list_based_losses or bool(self.physics.model_fields_set):
-                enabled_losses.update(extract_from_config(self.physics, "physics"))
-
-        if self.registration is not None:
-            if not self.uses_list_based_losses or bool(self.registration.model_fields_set):
-                enabled_losses.update(extract_from_config(self.registration, "registration"))
-
-        if self.pinn is not None:
-            if not self.uses_list_based_losses or bool(self.pinn.model_fields_set):
-                enabled_losses.update(extract_from_config(self.pinn, "pinn"))
-
-        if self.ssl is not None:
-            if not self.uses_list_based_losses or bool(self.ssl.model_fields_set):
-                enabled_losses.update(extract_from_config(self.ssl, "ssl"))
-
-        if self.evidential is not None:
-            if not self.uses_list_based_losses or bool(self.evidential.model_fields_set):
-                enabled_losses.update(extract_from_config(self.evidential, "evidential"))
-
-        if self.spatial is not None:
-            if not self.uses_list_based_losses or bool(self.spatial.model_fields_set):
-                enabled_losses.update(extract_from_config(self.spatial, "spatial"))
-
-        # Handle composed losses if present
-        if self.composed is not None:
-            for component in self.composed.components:
-                if is_active(component):
-                    enabled_losses[component.name] = component.weight
-
-        # Handle domain-aware list-based losses
-        # These are included in the same dict so strategies can iterate uniformly.
-        # The LossBuilder handles the bridging logic separately.
-        #
-        # EVERY list must appear here, from LOSS_LIST_DOMAINS rather than a
-        # hand-written tuple. `LossBuilder._build_all_dynamic` early-returns
-        # when this dict is empty, and that return sits BEFORE the branch that
-        # calls `_build_list_based_losses` -- so a list missing from this loop
-        # is not merely under-reported, it disables the whole list-based path
-        # for any arm that declares nothing else. `latent_losses` was added to
-        # the builder and to the schema without being added here, which made it
-        # exactly the inert mechanism it was introduced to remove.
-        for name in LOSS_LIST_DOMAINS:
-            loss_list = getattr(self, name)
-            for component in loss_list:
-                if is_active(component):
-                    enabled_losses[component.name] = component.weight
-
-        return enabled_losses

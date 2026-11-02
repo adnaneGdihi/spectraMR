@@ -225,11 +225,18 @@ def test_existence_only_prior_fields_are_refused_with_the_issue(
         cls(**{key: "x"})
 
 
-@pytest.mark.parametrize("key", ["tissue_prior_checkpoint", "corruption_calibration_checkpoint"])
-def test_pmps_prior_fields_are_refused_on_the_training_block(key: str) -> None:
+@pytest.mark.parametrize(
+    "key, live",
+    [
+        ("tissue_prior_checkpoint", "training.tissue_prior.checkpoint"),
+        ("corruption_calibration_checkpoint", "training.corruption.checkpoint"),
+    ],
+)
+def test_pmps_prior_fields_are_refused_on_the_training_block(key: str, live: str) -> None:
     # `TrainingConfigCorruptionCalibration` / `TrainingConfigPairedSynthesis` are unreachable from
     # `TrainingSettings`; `training:` is validated by `TrainingStrategyConfigSchema`.
     from spectramr.config.schemas.training.base import TrainingStrategyConfigSchema
 
-    with pytest.raises(ValidationError, match="#647"):
+    with pytest.raises(ValidationError, match="#647") as exc:
         TrainingStrategyConfigSchema(**{key: "x"})
+    assert live in str(exc.value)

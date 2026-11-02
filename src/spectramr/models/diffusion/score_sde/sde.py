@@ -97,6 +97,10 @@ class VESDE(SDE):
         """
         return 1.0
 
+    def sigma(self, t: Tensor) -> Tensor:
+        """Noise level sigma(t) = sigma_min * (sigma_max / sigma_min) ** t, same shape as ``t``."""
+        return self.sigma_min * (self.sigma_max / self.sigma_min) ** t
+
     def sde(
         self, x: Float[Tensor, "B C D H W"], t: Float[Tensor, B]
     ) -> tuple[Float[Tensor, "B C D H W"], Float[Tensor, "B C D H W"]]:
@@ -108,7 +112,7 @@ class VESDE(SDE):
         Returns:
             tuple[Float[Tensor, 'B C D H W'], Float[Tensor, 'B C D H W']]: Description.
         """
-        sigma = self.sigma_min * (self.sigma_max / self.sigma_min) ** t
+        sigma = self.sigma(t)
         drift = torch.zeros_like(x)
 
         # g(t) = sigma(t) * sqrt(2 log(sigma_max/sigma_min))
@@ -141,7 +145,7 @@ class VESDE(SDE):
             tuple[Float[Tensor, 'B C D H W'], Float[Tensor, 'B C D H W']]: Description.
         """
         t = t.to(x.device)
-        std = self.sigma_min * (self.sigma_max / self.sigma_min) ** t
+        std = self.sigma(t)
 
         # Broadcast
         view_shape = [t.shape[0]] + [1] * (x.ndim - 1)

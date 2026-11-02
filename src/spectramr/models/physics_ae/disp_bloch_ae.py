@@ -17,12 +17,14 @@ field, so a latent fit at 0.3 T predicts 3 T without retraining -- the property
 that distinguishes DL-BAE from a field-conditioned encoder, which only
 interpolates the fields it saw.
 
-Identifiability is a hard constraint, not a hope: a :math:`P`-pool model has
-:math:`2P+1` free constants per rate, so it needs :math:`M \ge 2P+1` distinct
-fields. Below that the fit is rank-deficient and the recovered latent is
-meaningless, so :meth:`DispersionBlochAutoencoder.__init__` raises rather than
-training to a degenerate optimum (pitfall #9), and the Tier-1
-``dispersion_identifiability`` check catches it at audit time.
+Identifiability is a hard constraint, not a hope: the stack gives one magnitude
+per field, and the latent has :math:`2P+3` constants per voxel
+(:func:`~spectramr.infrastructure.physics.dispersion.magnitude_stack_unknowns`),
+so it needs :math:`M \ge 2P+3` distinct fields (#2417). Below that the fit is
+rank-deficient and the recovered latent is meaningless, so
+:meth:`DispersionBlochAutoencoder.__init__` raises rather than training to a
+degenerate optimum (pitfall #9), and the Tier-1 ``dispersion_identifiability``
+check catches it at audit time.
 
 Scope (honest): the render below is a spoiled-gradient-echo/spin-echo magnitude
 approximation, adequate for the multi-field data-consistency objective this model
@@ -41,13 +43,37 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from spectramr.infrastructure.physics.dispersion import dispersion_rates_voxelwise
+from spectramr.infrastructure.physics.dispersion import (
+    dispersion_rates_voxelwise,
+    magnitude_stack_unknowns,
+)
 from spectramr.models.registry import register_model
 
 
 def _softplus_positive(x: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
     """Map an unconstrained head to a strictly positive quantity."""
     return nn.functional.softplus(x) + floor
+
+
+def _per_field_times(name: str, values: object, n_fields: int) -> tuple[float, ...]:
+    """Validate a per-field TR or TE declaration: one positive time per field."""
+    if values is None:
+        raise ValueError(
+            f"DL-BAE requires model_kwargs.{name}: one time (s) per entry of "
+            "fields_present. The render depends on it, so there is no default (#1712)."
+        )
+    times = tuple(float(v) for v in values)  # type: ignore[attr-defined]
+    if len(times) != n_fields or any(t <= 0.0 for t in times):
+        raise ValueError(
+            f"{name} must name one positive time (s) per field ({n_fields}); got {times!r}."
+        )
+    return times
+
+
+def _as_channel(value: float | torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """A scalar or ``[M']`` time as a ``[1, M', 1, 1]`` tensor on ``like``'s device."""
+    t = torch.as_tensor(value, dtype=like.dtype, device=like.device)
+    return t.view(1, -1, 1, 1) if t.ndim == 1 else t
 
 
 @register_model(
@@ -71,11 +97,15 @@ class DispersionBlochAutoencoder(nn.Module):
         depth: Number of encoder conv blocks.
         init_tau_c: Initial correlation time (s), used to bias the tau head.
         tau_c_bounds: Physiological ``(min, max)`` clamp for :math:`\tau_c` (s).
+        repetition_times_s: TR (s) of each field's acquisition, in
+            ``fields_present`` order. Required: the render depends on it.
+        echo_times_s: TE (s) of each field's acquisition, in ``fields_present`` order.
 
     Raises:
-        ValueError: when the arm is under-determined (:math:`M < 2P+1`), when
-            ``fields_present`` is empty/non-positive/duplicated, or when
-            ``tau_c_bounds`` is not a positive ordered interval.
+        ValueError: when the arm is under-determined (:math:`M < 2P+3`), when
+            ``fields_present`` is empty/non-positive/duplicated, when
+            ``tau_c_bounds`` is not a positive ordered interval, or when the
+            per-field TR/TE are missing, non-positive or not one per field.
     """
 
     def __init__(
@@ -86,6 +116,8 @@ class DispersionBlochAutoencoder(nn.Module):
         depth: int = 3,
         init_tau_c: float = 1e-8,
         tau_c_bounds: tuple[float, float] = (1e-11, 1e-6),
+        repetition_times_s: tuple[float, ...] | list[float] | None = None,
+        echo_times_s: tuple[float, ...] | list[float] | None = None,
     ) -> None:
         super().__init__()
         fields = tuple(float(b) for b in fields_present)
@@ -103,14 +135,15 @@ class DispersionBlochAutoencoder(nn.Module):
         n_pools = int(n_pools)
         if n_pools < 1:
             raise ValueError(f"n_pools must be >= 1; got {n_pools}.")
-        required = 2 * n_pools + 1
+        required = magnitude_stack_unknowns(n_pools)
         if len(fields) < required:
             raise ValueError(
-                f"DL-BAE is under-determined: a {n_pools}-pool BPP model has "
-                f"{required} free constants per rate and needs M >= {required} "
-                f"distinct fields, but fields_present names only {len(fields)} "
-                f"({fields!r}). Reduce n_pools to {(len(fields) - 1) // 2} or add fields."
+                f"DL-BAE is under-determined: a {n_pools}-pool latent has {required} "
+                f"unknowns per voxel and one magnitude per field supplies {len(fields)} "
+                f"({fields!r}); it needs M >= {required} distinct fields."
             )
+        tr = _per_field_times("repetition_times_s", repetition_times_s, len(fields))
+        te = _per_field_times("echo_times_s", echo_times_s, len(fields))
         low, high = (float(tau_c_bounds[0]), float(tau_c_bounds[1]))
         if not (0.0 < low < high):
             raise ValueError(f"tau_c_bounds must satisfy 0 < min < max; got {tau_c_bounds!r}.")
@@ -118,6 +151,9 @@ class DispersionBlochAutoencoder(nn.Module):
         self.n_pools = n_pools
         self.tau_c_min, self.tau_c_max = low, high
         self.register_buffer("fields", torch.tensor(fields, dtype=torch.float32))
+        # [M] protocol per field, broadcast over [B, M, H, W] in decode.
+        self.register_buffer("tr_s", torch.tensor(tr, dtype=torch.float32).view(1, -1, 1, 1))
+        self.register_buffer("te_s", torch.tensor(te, dtype=torch.float32).view(1, -1, 1, 1))
 
         # Encoder: multi-field stack -> shared trunk -> per-quantity heads.
         layers: list[nn.Module] = []
@@ -206,8 +242,8 @@ class DispersionBlochAutoencoder(nn.Module):
         latent: dict[str, torch.Tensor],
         fields: torch.Tensor | None = None,
         *,
-        tr_s: float = 0.5,
-        te_s: float = 0.015,
+        tr_s: float | torch.Tensor | None = None,
+        te_s: float | torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Render the multi-field stack from the latent through the dispersion law.
 
@@ -217,30 +253,46 @@ class DispersionBlochAutoencoder(nn.Module):
         Args:
             latent: Output of :meth:`encode`.
             fields: Field strengths (T) to render at; defaults to ``fields_present``.
-            tr_s: Repetition time (s).
-            te_s: Echo time (s).
+            tr_s: Repetition time (s), scalar or ``[M']``. Defaults to the per-field
+                TRs declared at construction when ``fields`` is ``None``; required
+                with explicit ``fields``, whose protocol the model cannot know.
+            te_s: Echo time (s), as ``tr_s``.
 
         Returns:
             Rendered stack ``[B, M', H, W]``.
+
+        Raises:
+            ValueError: when ``fields`` is given without both ``tr_s`` and ``te_s``.
         """
         t1, t2 = self.relaxation_maps(latent, fields)
-        return latent["rho"] * (1.0 - torch.exp(-tr_s / t1)) * torch.exp(-te_s / t2)
+        if fields is None:
+            tr = self.tr_s if tr_s is None else _as_channel(tr_s, t1)
+            te = self.te_s if te_s is None else _as_channel(te_s, t1)
+        elif tr_s is None or te_s is None:
+            raise ValueError(
+                "decode() at explicit fields needs tr_s and te_s for those fields; the "
+                "declared per-field protocol covers fields_present only."
+            )
+        else:
+            tr, te = _as_channel(tr_s, t1), _as_channel(te_s, t1)
+        tr, te = tr.to(t1.dtype), te.to(t1.dtype)
+        return latent["rho"] * (1.0 - torch.exp(-tr / t1)) * torch.exp(-te / t2)
 
     def forward(
         self,
         x: torch.Tensor,
         fields: torch.Tensor | None = None,
         *,
-        tr_s: float = 0.5,
-        te_s: float = 0.015,
+        tr_s: float | torch.Tensor | None = None,
+        te_s: float | torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Encode then decode.
 
         Args:
             x: Multi-field stack ``[B, M, H, W]``.
             fields: Optional render fields (defaults to ``fields_present``).
-            tr_s: Repetition time (s).
-            te_s: Echo time (s).
+            tr_s: Repetition time (s); see :meth:`decode`.
+            te_s: Echo time (s); see :meth:`decode`.
 
         Returns:
             ``(reconstruction, latent)``.

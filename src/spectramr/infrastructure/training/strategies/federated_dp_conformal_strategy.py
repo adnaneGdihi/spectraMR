@@ -1,59 +1,41 @@
-"""Federated DP-Conformal ULF Strategy (idea 5 / PR-7 H5).
+"""Federated DP-Conformal ULF Strategy: DP-SGD on the reconstruction loop.
 
-Plan: TODO/integration_plan_ulf_cheap_fast_mri.md §5
-      and TODO/backlog_paradigm_expansion_roadmap.md §PR-7.
+Conformal calibration runs after training in
+:class:`~spectramr.infrastructure.training.strategies.conformal_calibration_strategy.ConformalCalibrationStrategy`.
+DP knobs come from the typed ``config.privacy`` block; the sample rate
+``q = batch_size / dataset_size`` uses the live train dataset length. An
+absent block, an out-of-range knob or an unknown dataset size raises. The live
+budget (``dp/epsilon``, ``dp/steps``, ``q``, dataset and batch size) is merged into
+the step metrics after every noised step, so it reaches the training CSV, and
+the accountant's step count is checkpointed so a resume continues the ledger.
 
-Wires three previously-shipped primitives into one trainable strategy:
-
-1. :class:`DPMixin` — per-sample gradient clipping + Gaussian noise on
-   every optimiser update with a Rényi-DP accountant.
-2. The parent :class:`ReconstructionTrainingStrategy` — supplies the
-   reconstruction loss machinery.
-3. Conformal calibration (cross-site Cauchy aggregation) is performed
-   *after* training by
-   :class:`spectramr.infrastructure.training.strategies.conformal_calibration_strategy.ConformalCalibrationStrategy`,
-   so this strategy only owns the DP-SGD part of the loop.
-
-The strategy reads its DP knobs from the typed
-``config.privacy.{noise_multiplier, max_grad_norm, target_delta}`` block
-(a :class:`~spectramr.config.schemas.training.privacy.PrivacyConfig` mounted
-on :class:`~spectramr.config.settings.TrainingSettings`) and derives the DP
-sample rate ``q = batch_size / dataset_size`` from the *live*
-``self.env.train_loader.dataset`` length (falling back to
-``config.privacy.dataset_size`` then ``config.data.dataset_size``).  There
-is **no silent fallback**: an absent ``privacy`` block, an out-of-range
-knob, or an unresolvable dataset size each raises at construction, because
-a DP strategy must never train without an honest privacy guarantee
-(pitfalls #9, #10, #15).  The resolved budget is stamped into the run log
-and into the per-step ``dp_metrics`` snapshot.
-
-DP-SGD post-processing is wired into the *actual* optimiser-step path
-by overriding :meth:`_clip_and_log_gradients` — the gradient hook the
-``StepExecutor`` invokes after the backward pass + AMP-unscale and **before**
-``opt_g.step()`` (see
-``spectramr.infrastructure.training.step_executor.StepExecutor.execute_step`` →
-``amp_policy.backward_and_step(gradient_clipping_fn=...)``).  At that
-seam every parameter already carries an unscaled ``.grad``; the override
-(1) rescales the aggregate gradient L2 norm to ``max_grad_norm``,
-(2) adds isotropic Gaussian noise with
-``std = noise_multiplier * max_grad_norm / batch_size`` via
-:func:`add_gaussian_noise`, and (3) advances the privacy accountant via
-:meth:`record_dp_step`.  This is a batch-level (not per-sample)
-Gaussian mechanism — minimal but a *real* privacy transform that is
-actually applied to the gradients the optimiser steps with.  For
-production-grade per-sample gradients use ``opacus.PrivacyEngine``.
+DP-SGD follows Abadi et al. 2016: :meth:`_compute_losses` runs the loss one
+example at a time, clips each example's gradient to ``max_grad_norm``
+(:mod:`spectramr.infrastructure.services.privacy.per_sample_clipping`) and
+returns a surrogate loss whose gradient is the mean clipped gradient. The
+``StepExecutor`` backpropagates it unchanged, then calls
+:meth:`_clip_and_log_gradients` before ``opt_g.step()``; that hook adds
+``N(0, (noise_multiplier * max_grad_norm / batch_size)^2)`` noise and advances
+the accountant. The hook raises if the step did not go through the per-sample
+path, so the reported ``(epsilon, delta)`` always matches the applied mechanism.
+Site partitioning and federated aggregation are not part of this strategy.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
 from spectramr.config.schemas.training.privacy import PrivacyConfig
 from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.services.privacy.dp_sgd import add_gaussian_noise
+from spectramr.infrastructure.services.privacy.per_sample_clipping import (
+    accumulate_clipped_gradient,
+    gradient_surrogate,
+    slice_sample,
+)
 
 from .mixins.dp_mixin import DPMixin
 from .reconstruction import ReconstructionTrainingStrategy
@@ -64,34 +46,29 @@ logger = logging.getLogger(__name__)
 class FederatedDPConformalULFStrategy(DPMixin, ReconstructionTrainingStrategy):
     """Federated reconstruction with DP-SGD + post-hoc conformal."""
 
-    # Sampled per training step; the strategy is NOT an nn.Module so we
-    # keep DP runtime state as plain attrs (no register_buffer).
+    # Resolved in _configure_from_settings; plain attrs since a strategy is not an nn.Module.
     _dp_batch_size: int = 4
-    # Resolved DP provenance — stamped in _configure_from_settings so the
-    # reported (epsilon, delta) budget is traceable to the real dataset.
     _dp_dataset_size: int = 0
     _dp_sample_rate: float = 0.0
+    # Set by the per-sample loss path, consumed by the noise hook.
+    _dp_per_sample_clipped: bool = False
+    _dp_step_examples: int = 1
+    # Restored in order: the two sizes fix q, so check_strategy_state refuses a mismatch first.
+    checkpointed_counters: ClassVar[tuple[str, ...]] = (
+        "_dp_dataset_size",
+        "_dp_batch_size",
+        "_dp_accountant_steps",
+    )
+    _DP_METRIC_KEYS: ClassVar[frozenset[str]] = frozenset(
+        ("dp/epsilon", "dp/delta", "dp/steps", "dp/noise_multiplier", "dp/max_grad_norm")
+    ) | frozenset(("dp/sample_rate", "dp/dataset_size", "dp/batch_size"))
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._configure_from_settings()
 
     def _resolve_dataset_size(self, priv: PrivacyConfig, data: Any) -> int:
-        """Resolve the DP dataset size *honestly* (no magic 1000 fallback).
-
-        Preference order, so the accountant's reported ``(ε, δ)`` is tied to
-        the real run:
-
-        1. ``len(self.env.train_loader.dataset)`` — the live dataset the
-           optimiser actually iterates over;
-        2. ``config.privacy.dataset_size`` — the value the YAML declared;
-        3. ``config.data.dataset_size`` — the data-block fallback.
-
-        Raises:
-            ConfigurationError: when none of the above is available, so the
-                sample rate (hence the privacy budget) can never be silently
-                derived from a meaningless literal.
-        """
+        """DP dataset size: live loader length, else privacy/data ``dataset_size``; else raise."""
         env = getattr(self, "env", None)
         loader = getattr(env, "train_loader", None) if env is not None else None
         dataset = getattr(loader, "dataset", None) if loader is not None else None
@@ -116,25 +93,7 @@ class FederatedDPConformalULFStrategy(DPMixin, ReconstructionTrainingStrategy):
         )
 
     def _configure_from_settings(self) -> None:
-        """Read + validate the DP knobs from the SSOT ``config``; fail loudly.
-
-        The ``privacy`` block is a typed
-        :class:`~spectramr.config.schemas.training.privacy.PrivacyConfig`
-        mounted on :class:`~spectramr.config.settings.TrainingSettings`, so the
-        nested fields are *real attributes* read directly — never via
-        ``getattr``-with-literal-default, which silently discarded a YAML-set
-        value when the block was absent / untyped.
-
-        A strategy named ``federated_dp_conformal`` MUST NOT train without a
-        privacy guarantee (pitfall #10), so:
-
-        * an absent ``privacy`` block raises (no silent defaults);
-        * out-of-range knobs propagate :meth:`DPMixin.configure_dp`'s
-          ``ValueError`` instead of being swallowed into a warning;
-        * the sample rate is derived from the *real* dataset length (not a
-          magic ``1000``), and the resolved budget is stamped into the run's
-          provenance (pitfall #15).
-        """
+        """Read and validate the DP knobs from ``config``; raise rather than default."""
         config = getattr(self, "config", None)
         priv = getattr(config, "privacy", None) if config is not None else None
         data = getattr(config, "data", None) if config is not None else None
@@ -155,13 +114,7 @@ class FederatedDPConformalULFStrategy(DPMixin, ReconstructionTrainingStrategy):
         nm = priv.noise_multiplier
         mgn = priv.max_grad_norm
         delta = priv.target_delta
-        # The DP sample rate -- and therefore the privacy accounting -- is
-        # computed from this. The old `getattr(data, "batch_size", 4)` silently
-        # substituted 4 for the arm's real batch size once the key folded to
-        # `data.loader.batch_size`, which invalidates epsilon without any
-        # symptom. Read the canonical path, and refuse rather than guess if the
-        # caller handed us an untyped `data` (this file already coerces such a
-        # mapping for `privacy`, so it is a shape that reaches here).
+        # The sample rate (hence epsilon) depends on the real batch size: never guess it.
         if data is None:
             bs = 4
         else:
@@ -191,12 +144,13 @@ class FederatedDPConformalULFStrategy(DPMixin, ReconstructionTrainingStrategy):
             sample_rate=sample_rate,
             target_delta=delta,
         )
+        self._require_per_sample_compatible_optimisation(config)
 
         # Stamp the resolved budget into provenance (one-time, structured).
         logger.info(
             "[FederatedDPConformalULF] DP configured from config.privacy: "
             "noise_multiplier=%.4f, max_grad_norm=%.4f, target_delta=%.2e, "
-            "batch_size=%d, dataset_size=%d, sample_rate=%.6f",
+            "batch_size=%d, dataset_size=%d, sample_rate=%.6f, clipping=per_sample",
             nm,
             mgn,
             delta,
@@ -205,18 +159,61 @@ class FederatedDPConformalULFStrategy(DPMixin, ReconstructionTrainingStrategy):
             sample_rate,
         )
 
+    def _require_per_sample_compatible_optimisation(self, config: Any) -> None:
+        """Raise on settings under which per-sample clipping would be silently wrong."""
+        opt = getattr(config, "optimization", None)
+        precision = getattr(opt, "precision", None)
+        if precision is not None and precision.enabled:
+            raise ConfigurationError(
+                "federated_dp_conformal clips per-sample gradients without a loss "
+                "scaler, so fp16 underflow would zero them; set "
+                "optimization.precision.enabled: false."
+            )
+        gradient = getattr(opt, "gradient", None)
+        accum = getattr(gradient, "accumulation_steps", 1)
+        if accum != 1:
+            raise ConfigurationError(
+                "federated_dp_conformal adds noise once per optimiser step, calibrated "
+                f"to one batch; optimization.gradient.accumulation_steps={accum} "
+                "would break the privacy accounting. Set it to 1."
+            )
+
+    def _compute_losses(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        epoch: int,
+        **kwargs: Any,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Per-example loss + clipped gradient; returns the DP-SGD surrogate loss."""
+        if not (self._dp_enabled and torch.is_grad_enabled()):
+            return super()._compute_losses(input_batch, target_batch, epoch, **kwargs)
+        params = [p for p in self.generator_model.parameters() if p.requires_grad]
+        n = int(input_batch.shape[0])
+        acc = [torch.zeros_like(p) for p in params]
+        sums: dict[str, Any] = {}
+        # One backward per example is inherent to per-sample clipping; batch 2 here.
+        for i in range(n):
+            losses, metrics = super()._compute_losses(
+                slice_sample(input_batch, i, n),
+                slice_sample(target_batch, i, n),
+                epoch,
+                **slice_sample(kwargs, i, n),
+            )
+            accumulate_clipped_gradient(losses["g_total_loss"], params, self._max_grad_norm, acc)
+            for k, v in losses.items():
+                v = v.detach() if isinstance(v, torch.Tensor) else v
+                sums[k] = v if k not in sums else sums[k] + v
+        out = {k: v / n for k, v in sums.items()}
+        mean_grads = torch._foreach_div(acc, float(n))
+        out["g_total_loss"] = gradient_surrogate(params, mean_grads, out["g_total_loss"])
+        self._dp_per_sample_clipped = True
+        self._dp_step_examples = n
+        return out, metrics
+
     @torch.no_grad()
     def _param_grad_norms(self) -> torch.Tensor:
-        """Return the per-*parameter* gradient L2 norms (diagnostic only).
-
-        One scalar L2 value per parameter tensor of ``self.env.generator`` —
-        i.e. ``len(result) == #params-with-grad``, NOT one norm per sample.
-        The live DP path is :meth:`_apply_dp_to_grads` (batch-level clip +
-        Gaussian noise); this helper is purely a gradient-health probe and is
-        deliberately not on that path. For genuine per-sample DP use
-        :meth:`DPMixin.dp_post_process_per_sample_grads` with
-        ``torch.func.vmap``-computed per-sample gradients.
-        """
+        """Per-*parameter* gradient L2 norms (a diagnostic, not on the DP path)."""
         gen = getattr(self.env, "generator", None)
         if gen is None:
             return torch.zeros(1)
@@ -227,33 +224,19 @@ class FederatedDPConformalULFStrategy(DPMixin, ReconstructionTrainingStrategy):
 
     @torch.no_grad()
     def _apply_dp_to_grads(self, model: torch.nn.Module) -> None:
-        """Clip the aggregate gradient norm to ``C`` then add Gaussian noise.
-
-        Applied in-place to ``model.parameters()[*].grad`` so the
-        optimiser steps with the privatised gradient. Noise std follows
-        the canonical DP-SGD mechanism
-        ``noise_multiplier * max_grad_norm / batch_size``.
-        """
+        """Add ``N(0, (sigma * C / B)^2)`` to the mean clipped gradient, in place."""
         if not self._dp_enabled:
             return
-
         grads = [p.grad for p in model.parameters() if p.grad is not None]
-        if not grads:
-            return
-
-        # 1. Bound the L2 sensitivity: rescale the *whole* gradient vector
-        #    so its global L2 norm ≤ max_grad_norm (only shrink).
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=self._max_grad_norm)
-
-        # 2. Gaussian mechanism: add N(0, (σ·C/B)²) to every grad tensor.
         for g in grads:
-            noised = add_gaussian_noise(
-                g,
-                noise_multiplier=self._noise_multiplier,
-                max_grad_norm=self._max_grad_norm,
-                batch_size=self._dp_batch_size,
+            g.copy_(
+                add_gaussian_noise(
+                    g,
+                    noise_multiplier=self._noise_multiplier,
+                    max_grad_norm=self._max_grad_norm,
+                    batch_size=self._dp_step_examples,
+                )
             )
-            g.copy_(noised)
 
     def _clip_and_log_gradients(
         self,
@@ -262,32 +245,50 @@ class FederatedDPConformalULFStrategy(DPMixin, ReconstructionTrainingStrategy):
         step: int,
         model_name: str = "model",
     ) -> float | None:
-        """DP-SGD gradient hook (called by the Trainer pre ``opt_g.step()``).
+        """DP-SGD noise hook, called by ``StepExecutor`` after backward, before ``opt_g.step()``.
 
-        The base ``Trainer.execute_step`` wires this method as the
-        ``gradient_clipping_fn`` for the generator optimiser
-        (``self.env.opt_g``), invoking it after the backward pass +
-        AMP-unscale and before the optimiser step.  We privatise the
-        gradients here (clip → noise), advance the privacy accountant,
-        then delegate to the base implementation for logging/anomaly
-        bookkeeping.
+        Raises when DP is on and the step's gradient did not come from the
+        per-sample path, since the accountant would then report a false budget.
         """
+        if self._dp_enabled and not self._dp_per_sample_clipped:
+            raise RuntimeError(
+                "federated_dp_conformal: the gradient was not produced by the "
+                "per-sample clipping path, so the DP accountant would misreport "
+                "(epsilon, delta). Refusing to step."
+            )
+        self._dp_per_sample_clipped = False
         self._apply_dp_to_grads(model)
-        # One DP-SGD round has been executed for this optimiser step.
         self.record_dp_step()
+        # Host floats from the accountant, no device sync; the loop reads these via get_last_metrics.
+        self._last_step_metrics = {**getattr(self, "_last_step_metrics", {}), **self.post_step()}
         return super()._clip_and_log_gradients(model, epoch, step, model_name)
 
-    def post_step(self) -> dict[str, float]:
-        """Optimiser-step hook: return current privacy metrics.
+    def declared_metric_keys(self) -> frozenset[str]:
+        """The ``dp/*`` budget columns, stamped on every noised step when DP is on."""
+        keys = super().declared_metric_keys()
+        return keys | self._DP_METRIC_KEYS if self._dp_enabled else keys
 
-        The accountant is advanced inside :meth:`_clip_and_log_gradients`
-        (the real step path); this method only snapshots the live
-        ``(ε, δ)`` budget plus the resolved sample-rate / dataset-size
-        provenance for the metrics CSV.
-        """
+    # Read by strategy_state_dict, written back on resume through restore_dp_steps.
+    _dp_accountant_steps = property(
+        lambda self: int(self.accountant.steps) if self._dp_enabled else 0,
+        lambda self, steps: self.restore_dp_steps(steps),
+    )
+
+    def check_strategy_state(self, state: dict[str, Any] | None) -> None:
+        """Refuse a resume whose saved q differs, since the replayed epsilon would be wrong."""
+        super().check_strategy_state(state)
+        counters = (state or {}).get("counters", {})
+        live = {"_dp_dataset_size": self._dp_dataset_size, "_dp_batch_size": self._dp_batch_size}
+        saved = {k: counters.get(k) for k in (*live, "_dp_accountant_steps")}
+        if saved.pop("_dp_accountant_steps") is None or saved != live:
+            raise RuntimeError(
+                f"federated_dp_conformal: checkpoint DP ledger {counters} lacks the accountant "
+                f"steps or differs from the live q inputs {live}; epsilon would be misreported."
+            )
+
+    def post_step(self) -> dict[str, float]:
+        """Live ``(ε, δ)`` budget plus the q / dataset / batch size it was computed from."""
         snapshot = {k: float(v) for k, v in self.dp_metrics().items()}
-        # Stamp the resolved budget provenance so the (ε, δ) is traceable to
-        # the real dataset rather than a hidden literal (pitfall #15).
         snapshot["dp/sample_rate"] = float(self._dp_sample_rate)
         snapshot["dp/dataset_size"] = float(self._dp_dataset_size)
         snapshot["dp/batch_size"] = float(self._dp_batch_size)

@@ -2,7 +2,7 @@
 
 The guard's own message says it refuses to train an arm whose declared supervision
 would be silently skipped (CLAUDE.md #9/#10). It could not do that, because its
-only input was ``losses.get_enabled_losses()`` — which keeps a ``lambda_<name>``
+only input was ``declared_build_set(losses)`` — which keeps a ``lambda_<name>``
 only when ``enable_<name>`` is true, and every ``enable_*`` defaults ``False``.
 A weight declared *only* as a lambda therefore resolved in
 ``build_loss_weight_table`` and was built by nothing, with no error.
@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import pytest
 import torch
+
+from spectramr.models.losses.build_set import declared_build_set
 
 # ---------------------------------------------------------------------------
 # Fixtures, frozen from the producer
@@ -240,8 +242,7 @@ class TestGuardScopeIsDeclaredNotAssumed:
 
     The guard runs inside ``_build_list_based_losses``, which ``_build_all_dynamic``
     reaches only when ``uses_list_based_losses`` is true — and ``_build_all_dynamic``
-    returns even earlier when ``get_enabled_losses()`` is empty, which it is for a
-    lambda-only arm (every ``enable_*`` defaults ``False``).
+    returns even earlier when the build set is empty.
 
     So an arm that has *not started* migrating — no domain lists at all — is not
     guarded here. That is a scope boundary, not an oversight: widening it makes
@@ -259,7 +260,9 @@ class TestGuardScopeIsDeclaredNotAssumed:
         }
         settings = _settings(block)
         assert settings.losses.uses_list_based_losses is False
-        assert settings.losses.get_enabled_losses() == {}
+        # The weight table owns the build set (#1966): written lambdas are declarations even
+        # without an enable flag, so this lambda-only arm does build what it declares.
+        assert declared_build_set(settings.losses) == {"complex_l1": 1.0, "log_spectral": 0.1}
         _build(block)  # documents the boundary; must not raise
 
     def test_one_list_entry_is_enough_to_arm_the_guard(self):

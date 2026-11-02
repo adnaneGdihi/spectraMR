@@ -31,6 +31,8 @@ KSPACE_DATASET_TYPES: frozenset[str] = frozenset(
         "fastmri_knee",
         "fastmri_cardiac",
         "fastmri_multicoil",
+        # Phase-contrast slices: input/target are multicoil k-space per encoding.
+        "flow_synthetic",
     }
 )
 

@@ -21,11 +21,16 @@ point inward). The CLI ``spectramr meta-evaluate --nr-battery`` delegates here.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+from spectramr.config.schemas.severity_axes import SeverityAxis
+
+if TYPE_CHECKING:
+    from spectramr.infrastructure.physics.severity_local import LocalSeverity
 
 # Default physics degradation families (digital-twin keys) mapped to the §8.1
 # campaign axes: noise / motion / gibbs / aliasing / bias / blur.
@@ -86,9 +91,28 @@ DEFAULT_NR_BATTERY: tuple[str, ...] = (
 )
 
 
+class PhysicsOperatorLibrary(dict[str, Any]):
+    """The simulator's ``name -> op`` mapping, plus each family's resolved local severity."""
+
+    local: dict[str, LocalSeverity]
+
+    def severity_provenance(self) -> dict[str, dict[str, object]]:
+        """Per-family declared-vs-applied axis records, JSON-serialisable."""
+        return {n: loc.provenance() for n, loc in self.local.items()}
+
+    def severity_annotators(self) -> dict[str, Callable[[float], dict[str, float]]]:
+        """Per-family ``theta_local -> {"physical", "native"}`` callables for the core simulator."""
+
+        def _annotator(loc: LocalSeverity) -> Callable[[float], dict[str, float]]:
+            return lambda t: {"physical": loc.physical(t), "native": loc.native_theta(t)}
+
+        return {n: _annotator(loc) for n, loc in self.local.items()}
+
+
 def build_physics_operator_library(
     families: Iterable[str],
-) -> dict[str, Any]:
+    severity_axes: Mapping[str, SeverityAxis] | None = None,
+) -> PhysicsOperatorLibrary:
     """Adapt the digital-twin ``apply_degradation`` oracle to the simulator's
     ``(clean, theta, generator) -> tensor`` operator contract.
 
@@ -96,8 +120,14 @@ def build_physics_operator_library(
     ``torch.Generator`` so the ``(theta, seed)`` reproducibility contract of the
     twin holds end-to-end. Unknown family names raise (the twin's
     ``apply_degradation`` validates against its registry — no silent fallback).
+
+    The simulator's theta is each family's *local* theta in [0, 1]; ``severity_axes``
+    give a family its own physical range, and an absent or restating axis passes theta
+    through unchanged. This path sweeps one global Halton count (``--severities``), so
+    an axis that sets ``n_steps`` raises. The cross-family aggregate stays unbanded here.
     """
     from spectramr.infrastructure.physics.degradations import apply_degradation, list_degradations
+    from spectramr.infrastructure.physics.severity_local import resolve_axes
 
     known = set(list_degradations())
     families = list(families)
@@ -106,15 +136,26 @@ def build_physics_operator_library(
         raise ValueError(
             f"unknown degradation families {unknown}; valid digital-twin keys: {sorted(known)}"
         )
+    settings = dict(severity_axes or {})
+    stepped = sorted(n for n, ax in settings.items() if ax.n_steps is not None)
+    if stepped:
+        raise ValueError(
+            f"severity axis {stepped[0]!r} sets n_steps, but meta-evaluate sweeps one global "
+            "Halton grid; drop n_steps from the axis and use --severities"
+        )
+    local = resolve_axes(families, settings)
 
     def _make(name: str):
+        loc = local[name]
+        kwargs = loc.degrader_kwargs()
+
         def _op(clean: torch.Tensor, theta: float, generator: torch.Generator) -> torch.Tensor:
             seed = int(generator.initial_seed()) & 0xFFFFFFFF
             x = clean
             squeeze_to = x.dim()
             while x.dim() < 4:
                 x = x.unsqueeze(0)
-            out = apply_degradation(name, x, float(theta), seed=seed)
+            out = apply_degradation(name, x, float(loc.native_theta(theta)), seed=seed, **kwargs)
             while out.dim() > squeeze_to:
                 out = out.squeeze(0)
             # twin may return complex; the magnitude sweep keeps the input dtype.
@@ -124,7 +165,22 @@ def build_physics_operator_library(
 
         return _op
 
-    return {name: _make(name) for name in families}
+    library = PhysicsOperatorLibrary({name: _make(name) for name in families})
+    library.local = local
+    return library
+
+
+def simulator_extras(
+    library: PhysicsOperatorLibrary,
+    severity_axes: Mapping[str, SeverityAxis] | None,
+    damage_yardsticks: tuple[str, ...],
+) -> dict[str, Any]:
+    """``SimulatorConfig`` kwargs for local severity and damage; empty in the default case."""
+    extras: dict[str, Any] = {"damage_yardsticks": tuple(damage_yardsticks)}
+    if severity_axes:
+        extras["severity_annotators"] = library.severity_annotators()
+        extras["severity_provenance"] = library.severity_provenance()
+    return extras
 
 
 # The §8 label-free validation tiers the full harness can run. Each maps to a
@@ -170,6 +226,10 @@ class NRMetricValidationConfig:
     # during a normal validation run unless explicitly asked.
     register_aggregator: bool = False
     run_redundancy_gate: bool = True
+    # Local severity ranges (physical units) per family, and the damage yardsticks measured
+    # into each sample; both are stamped into the run provenance.
+    severity_axes: Mapping[str, SeverityAxis] | None = None
+    damage_yardsticks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         unknown = tuple(t for t in self.tiers if t not in HARNESS_TIERS)
@@ -215,7 +275,9 @@ class NRMetricValidationUseCase:
         from spectramr.core.metrics.meta_evaluation.types import MetricSet
 
         metric_set = MetricSet(**build_safe_metric_set(list(self.config.metrics)))
-        operator_library = build_physics_operator_library(self.config.families)
+        operator_library = build_physics_operator_library(
+            self.config.families, self.config.severity_axes
+        )
 
         pipeline = MetaEvaluationPipeline.from_defaults()
         pipeline.eval_mode = self.config.eval_mode
@@ -225,6 +287,9 @@ class NRMetricValidationUseCase:
             n_severities_per_family=self.config.n_severities_per_family,
             seed=self.config.seed,
             operator_library=operator_library,
+            **simulator_extras(
+                operator_library, self.config.severity_axes, self.config.damage_yardsticks
+            ),
         )
         output = pipeline.run(metric_set, clean_volumes)
         return output.to_summary()
@@ -234,7 +299,7 @@ class NRMetricValidationUseCase:
         self,
         clean_volumes: list[tuple[str, torch.Tensor]],
         metric_names: list[str],
-        operator_library: dict[str, Any],
+        operator_library: PhysicsOperatorLibrary,
         *,
         seed: int,
     ) -> Any:
@@ -262,6 +327,9 @@ class NRMetricValidationUseCase:
             n_severities_per_family=self.config.n_severities_per_family,
             seed=seed,
             operator_library=operator_library,
+            **simulator_extras(
+                operator_library, self.config.severity_axes, self.config.damage_yardsticks
+            ),
         )
         samples = run_simulator(clean_volumes, sim_cfg)
         metric_set = build_safe_metric_set(metric_names)
@@ -309,7 +377,10 @@ class NRMetricValidationUseCase:
         from spectramr.core.metrics.meta_evaluation.pipeline import (
             MetaEvaluationPipeline,
         )
-        from spectramr.core.metrics.meta_evaluation.simulator import SimulatorConfig
+        from spectramr.core.metrics.meta_evaluation.simulator import (
+            SEED_SCHEME,
+            SimulatorConfig,
+        )
         from spectramr.core.metrics.meta_evaluation.types import MetricSet
 
         clean_volumes = list(clean_volumes)
@@ -326,7 +397,9 @@ class NRMetricValidationUseCase:
         )
         sweep_metric_names = list(dict.fromkeys([*nr_names, *fr_names]))
 
-        operator_library = build_physics_operator_library(self.config.families)
+        operator_library = build_physics_operator_library(
+            self.config.families, self.config.severity_axes
+        )
 
         # Primary sweep + Tier 5 ranking (the pipeline builds the dataset we reuse).
         metric_set = MetricSet(**build_safe_metric_set(sweep_metric_names))
@@ -338,6 +411,9 @@ class NRMetricValidationUseCase:
             n_severities_per_family=self.config.n_severities_per_family,
             seed=self.config.seed,
             operator_library=operator_library,
+            **simulator_extras(
+                operator_library, self.config.severity_axes, self.config.damage_yardsticks
+            ),
         )
         output = pipeline.run(metric_set, clean_volumes)
         dataset_a = output.dataset
@@ -425,9 +501,14 @@ class NRMetricValidationUseCase:
             "aggregator_model": aggregator_model,
             "provenance": {
                 "seed": self.config.seed,
+                "seed_scheme": SEED_SCHEME,
                 "families": list(self.config.families),
                 "n_severities_per_family": self.config.n_severities_per_family,
                 "retest_seed_offset": self.config.retest_seed_offset,
+                "damage_yardsticks": list(self.config.damage_yardsticks),
+                "severity_axes": operator_library.severity_provenance()
+                if self.config.severity_axes
+                else None,
                 "thresholds": {
                     "concordance_rho": self.config.concordance_rho_threshold,
                     "fr_proxy_rho": self.config.fr_proxy_rho_threshold,

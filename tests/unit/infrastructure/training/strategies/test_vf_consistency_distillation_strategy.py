@@ -330,7 +330,8 @@ def test_it_declares_its_own_loss_ownership() -> None:
     PASS every declared ``losses.image_losses`` entry on this strategy's arms
     while the training step discards them.
     """
-    assert VFConsistencyDistillationStrategy.__dict__["folds_image_losses"] is False
+    assert VFConsistencyDistillationStrategy.__dict__["folds_image_losses"] is True
+    assert VFConsistencyDistillationStrategy.__dict__["empty_loss_stack_is_design"] is True
     assert VFConsistencyDistillationStrategy.__dict__["inline_losses"] == frozenset()
 
 
@@ -363,3 +364,42 @@ def test_the_ema_teacher_copies_the_inner_module_of_a_wrapper() -> None:
     teacher = strat._ensure_ema_teacher(nn.DataParallel(gen))
     assert not any(k.startswith("module.") for k in teacher.state_dict())
     strat._update_ema(nn.DataParallel(gen))
+
+
+def _image_cfg(weight: float) -> SimpleNamespace:
+    entry = SimpleNamespace(name="l1", weight=weight, enabled=True, role="target")
+    return SimpleNamespace(losses=SimpleNamespace(image_losses=[entry]))
+
+
+class _RecordingLoss:
+    """Image loss that records what it was asked to compare."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        self.calls.append((pred, target))
+        return (pred - target).abs().mean()
+
+
+def test_declared_image_loss_is_folded_onto_the_student_clean_estimate():
+    weight = 0.5
+    batch = _batch()
+
+    torch.manual_seed(3)
+    off, _ = _make_strategy(beta0=0.5)
+    off.config = _image_cfg(weight)
+    off.env.losses = {}
+    loss_off = off._compute_losses_impl(input_batch=batch)["loss_total"]
+
+    torch.manual_seed(3)
+    on, _ = _make_strategy(beta0=0.5)
+    on.config = _image_cfg(weight)
+    l1 = _RecordingLoss()
+    on.env.losses = {"l1": l1}
+    out = on._compute_losses_impl(input_batch=batch)
+
+    assert "loss_l1" in out
+    ((pred, target),) = l1.calls
+    assert torch.equal(target, batch["target"]), "the clean estimate is compared with x0"
+    assert torch.allclose(out["loss_total"] - loss_off, weight * (pred - target).abs().mean())

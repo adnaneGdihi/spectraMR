@@ -392,13 +392,9 @@ def test_load_clean_volumes_from_h5_populates_real_assets(monkeypatch, tmp_path)
     x_gt_mag = torch.ones(1, 1, h, w)
     p99 = torch.tensor(1.0)
 
+    (tmp_path / "2022091411_T201.h5").write_bytes(b"")
     monkeypatch.setattr(
-        "spectramr.data.datasets.m4raw_repetition_groups.discover_repetition_groups",
-        lambda *a, **k: [[_Path("2022091411_T201.h5")]],
-        raising=True,
-    )
-    monkeypatch.setattr(
-        "spectramr.infrastructure.physics.m4raw_pseudo_gt.synthesize_pseudo_gt",
+        "spectramr.data.datasets.pseudo_gt_reference.synthesize_pseudo_gt",
         lambda *a, **k: (coil_images, smaps, x_gt_mag, p99),
         raising=True,
     )

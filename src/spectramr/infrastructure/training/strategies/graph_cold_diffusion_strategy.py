@@ -16,6 +16,7 @@ References:
 - This implementation adapts Cold Diffusion for Non-Cartesian MRI reconstruction.
 """
 
+import inspect
 import logging
 from typing import Any, ClassVar
 
@@ -641,20 +642,23 @@ class GraphColdDiffusionStrategy(BaseTrainingStrategy):
         measurement's support in validation. It reaches only a model whose
         geometry planes read it, and such a model raises without it.
         """
-        from .mixins.utils import _callable_accepts_kwarg
+        from .mixins.utils import _callable_accepts_kwarg, timestep_kwarg_for
 
         forward_kwargs = {}
 
-        # Only add timesteps if model accepts it
         # Safely get the underlying model to check its forward signature
         _inner_gen = unwrap_model(self.env.generator)
         underlying_model = getattr(_inner_gen, "model", _inner_gen)
 
-        if _callable_accepts_kwarg(underlying_model.forward, "timesteps"):
-            forward_kwargs["timesteps"] = t
-        elif _callable_accepts_kwarg(underlying_model.forward, "time"):
-            forward_kwargs["time"] = t
-        # If model doesn't accept any timestep arg, skip it
+        # The call goes to the outer generator: an inner `.model` decides only when
+        # the outer forward is a bare `**kwargs` delegator naming no time parameter.
+        time_kwarg = timestep_kwarg_for(_inner_gen.forward)
+        if time_kwarg == "timesteps" and underlying_model is not _inner_gen:
+            names = inspect.signature(_inner_gen.forward).parameters
+            if "timesteps" not in names:
+                time_kwarg = timestep_kwarg_for(underlying_model.forward)
+        if time_kwarg is not None:
+            forward_kwargs[time_kwarg] = t
 
         # Trajectory for graph construction (only if model accepts it)
         if trajectory is not None:

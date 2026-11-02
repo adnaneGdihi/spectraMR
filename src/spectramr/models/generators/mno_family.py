@@ -30,10 +30,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
+from spectramr.models.blocks.topology_linearizer import arc_length_steps
 from spectramr.models.generators.cs_mno_operator import CSMNOOperator
 from spectramr.models.registry import register_model
 
@@ -494,15 +494,11 @@ class GMNOOperator(nn.Module):
         # MetricSFCLinearizer's inverse_idx uses -1 sentinels for background
         # voxels. With an all-ones mask none remain, but clamp to be safe.
         inverse_idx = linearizer.inverse_idx.clone().clamp_min_(0)
-        # Per-token physical Δt from the ordered geodesic coordinates.
-        d_coords, h_coords, w_coords = np.unravel_index(
-            linearizer.forward_idx.cpu().numpy(), (D, H, W)
+        # Steps in construction-grid units, so validation extents keep the training step (#2365).
+        delta = arc_length_steps(
+            linearizer.forward_idx.cpu().numpy(), (D, H, W), self.spatial_shape
         )
-        ord_coords = np.stack([d_coords, h_coords, w_coords], axis=1).astype(np.float32)
-        ord_coords = ord_coords / np.array([D, H, W], dtype=np.float32)
-        steps = np.linalg.norm(np.diff(ord_coords, axis=0), axis=1)
-        delta = np.concatenate([[0.0], steps]).astype(np.float32)
-        return forward_idx, inverse_idx, torch.from_numpy(delta)
+        return forward_idx, inverse_idx, delta
 
     def _linearization_for(
         self, spatial_shape: tuple[int, ...], device: torch.device

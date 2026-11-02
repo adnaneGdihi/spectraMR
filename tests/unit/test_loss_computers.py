@@ -26,6 +26,20 @@ from spectramr.models.losses.computers.unified_vae import (
 from spectramr.models.losses.loss_key_registry import LossKeyRegistry, LossKeyValidator
 
 
+def _mse_only_config():
+    """A config whose only declared loss is an image-domain mse at weight 1.0."""
+    from types import SimpleNamespace
+
+    from spectramr.config.schemas.loss import LossComponentConfig, LossConfigSchema
+
+    return SimpleNamespace(
+        losses=LossConfigSchema(
+            output_domain="image",
+            image_losses=[LossComponentConfig(name="mse", weight=1.0)],
+        )
+    )
+
+
 def real_settings(**losses_reconstruction):
     """A REAL frozen ``TrainingSettings`` -- the config the computers expect.
 
@@ -585,13 +599,8 @@ class TestUnifiedVAELossComputer:
 
     @pytest.fixture
     def setup(self):
-        """Setup for VAE tests.
-
-        ``config=None`` — the sanctioned minimal-fallback path. See the GAN
-        setup above: the old ``MockConfig`` never built via ``LossBuilder`` and
-        silently fell back to L1 (a bare ``except`` removed 2026-07-01).
-        """
-        computer = UnifiedVAELossComputer(config=None, device=torch.device("cpu"))
+        """Setup for VAE tests: a declared mse, since an undeclared reconstruction raises."""
+        computer = UnifiedVAELossComputer(config=_mse_only_config(), device=torch.device("cpu"))
 
         batch_size, channels, height, width = 2, 2, 32, 32
         pred = torch.randn(batch_size, channels, height, width, requires_grad=True)
@@ -604,6 +613,20 @@ class TestUnifiedVAELossComputer:
     def test_vae_loss(self, setup):
         """Test VAE loss computation."""
         computer, pred, target, mu, logvar = setup
+
+        from torch import nn
+
+        from spectramr.config.schemas.loss import LossComponentConfig, LossConfigSchema
+        from spectramr.models.losses.weights import build_loss_weight_table
+
+        # The declared reconstruction term (#2280): an author-written mse at weight 1.0.
+        computer.reconstruction_name, computer.reconstruction_loss_fn = "l2", nn.MSELoss()
+        computer._loss_weight_table = build_loss_weight_table(
+            LossConfigSchema(
+                output_domain="image",
+                image_losses=[LossComponentConfig(name="mse", weight=1.0)],
+            )
+        )
 
         loss_output = computer.compute(pred=pred, target=target, mu=mu, logvar=logvar, epoch=0)
 
@@ -622,19 +645,8 @@ class TestUnifiedVQVAELossComputer:
 
     @pytest.fixture
     def setup(self):
-        """Setup for VQ-VAE tests."""
-        config = MockConfig()
-        config.training.training_mode = "vqvae"
-        config.losses.vqvae = type(
-            "obj",
-            (object,),
-            {
-                "beta_commitment": 0.25,
-                "lambda_recon": 1.0,
-            },
-        )()
-
-        computer = UnifiedVQVAELossComputer(config=config, device=torch.device("cpu"))
+        """Setup for VQ-VAE tests: a declared mse, since an undeclared reconstruction raises."""
+        computer = UnifiedVQVAELossComputer(config=_mse_only_config(), device=torch.device("cpu"))
 
         batch_size, channels, height, width = 2, 2, 32, 32
         pred = torch.randn(batch_size, channels, height, width, requires_grad=True)
@@ -647,6 +659,20 @@ class TestUnifiedVQVAELossComputer:
     def test_vqvae_loss(self, setup):
         """Test VQ-VAE loss computation."""
         computer, pred, target, z_q, z_e = setup
+
+        from torch import nn
+
+        from spectramr.config.schemas.loss import LossComponentConfig, LossConfigSchema
+        from spectramr.models.losses.weights import build_loss_weight_table
+
+        # The declared reconstruction term (#2280): an author-written mse at weight 1.0.
+        computer.reconstruction_name, computer.reconstruction_loss_fn = "l2", nn.MSELoss()
+        computer._loss_weight_table = build_loss_weight_table(
+            LossConfigSchema(
+                output_domain="image",
+                image_losses=[LossComponentConfig(name="mse", weight=1.0)],
+            )
+        )
 
         loss_output = computer.compute(pred=pred, target=target, z_q=z_q, z_e=z_e, epoch=0)
 

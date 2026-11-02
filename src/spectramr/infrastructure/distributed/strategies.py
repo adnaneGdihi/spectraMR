@@ -84,9 +84,10 @@ def _tensor_size(ctx: ParallelContext) -> int:
 
 
 def _apply_tensor_parallel(models: dict[str, Any], ctx: ParallelContext) -> None:
-    """Split the generator across the mesh's tensor dim (Stage A, before the DDP wrap).
+    """Split the generator across the mesh's tensor dim (Stage A, before the DDP/FSDP wrap).
 
-    DDP then syncs over ``dp_group()``, which pairs ranks holding the same shard.
+    DDP syncs, and FSDP shards, over the data-parallel dims only, which pair ranks
+    holding the same tensor slice.
     """
     if _tensor_size(ctx) <= 1:
         return
@@ -95,6 +96,160 @@ def _apply_tensor_parallel(models: dict[str, Any], ctx: ParallelContext) -> None
     group = ctx.mesh.device_mesh["tp"].get_group()
     names = parallelize_tensor(models["generator"], group)
     logger.info("[Parallel] tensor-parallel over %d ranks: %d block(s)", _tensor_size(ctx), len(names))
+
+
+def _split_ema_like_generator(ema: Any, models: dict[str, Any], ctx: ParallelContext) -> None:
+    """Split the EMA shadow (a pre-split copy) like the generator, so its blend stays local."""
+    if _tensor_size(ctx) <= 1 or ema is None or models.get("generator") is None:
+        return
+    from spectramr.infrastructure.distributed.tensor_parallel import split_like
+
+    split_like(ema.module, models["generator"])
+    logger.info("[Parallel] Split the EMA shadow like the tensor-parallel generator")
+
+
+def _tensor_parallel_provenance(models: dict[str, Any], ctx: ParallelContext) -> dict[str, Any]:
+    from spectramr.core.module_utils import unwrap_model
+    from spectramr.infrastructure.distributed.tensor_parallel import TP_PLAN_ATTR
+
+    generator = models.get("generator")
+    plan = getattr(unwrap_model(generator), TP_PLAN_ATTR, None) if generator is not None else None
+    if plan is None:
+        return {}
+    return {
+        "tensor_parallel": {
+            "size": _tensor_size(ctx),
+            "blocks": len(plan.blocks),
+            "split_parameters": len(plan.sharded),
+            # tp is applied first; the data-parallel wrap never spans the tensor dim.
+            "order": "_then_".join(
+                ["tp", *(["cp"] if _context_size(ctx) > 1 else []), ctx.parallel.strategy]
+            ),
+        }
+    }
+
+
+def _context_size(ctx: ParallelContext) -> int:
+    mesh = getattr(ctx, "mesh", None)
+    return int(mesh.shape.get("cp", 1)) if mesh is not None else 1
+
+
+def _apply_context_parallel(models: dict[str, Any], ctx: ParallelContext) -> None:
+    """Split the generator's token trunk across the mesh's context dim (Stage A).
+
+    Gated against an unsplit copy before training (``context_parallel/gate.py``). The
+    gradient is then averaged over dp x cp by DDP or FSDP (``ParallelMesh.grad_group``).
+    """
+    if _context_size(ctx) <= 1:
+        return
+    from spectramr.infrastructure.distributed.context_parallel import parallelize_context
+    from spectramr.infrastructure.training.builders.compile_apply import compile_is_enabled
+
+    if compile_is_enabled(ctx.config):
+        raise RuntimeError(
+            "parallel.mesh.context cannot run under torch.compile: the sequence collectives "
+            "inside the compiled graph are not verified. Disable optimization.compile."
+        )
+    if models.get("generator") is None:
+        raise RuntimeError("parallel.mesh.context needs a generator to split")
+    plan = parallelize_context(models["generator"], ctx.mesh.context_group)
+    if torch.distributed.get_rank() != 0:  # one record per run, from global rank 0
+        return
+    logger.info(
+        "[Parallel] context-parallel over %d ranks: %d attention layer(s) in %s (gate worst "
+        "relative error %.1e)",
+        plan.size,
+        plan.attentions,
+        list(plan.backbones),
+        plan.worst_relative_error,
+    )
+
+
+def _grad_process_group(ctx: ParallelContext) -> Any:
+    """The group gradients are averaged over: dp x cp x sp with context or spatial peers, else dp."""
+    grad_group = getattr(getattr(ctx, "mesh", None), "grad_group", None)
+    return grad_group if grad_group is not None else dp_group()
+
+
+def _context_parallel_provenance(models: dict[str, Any], ctx: ParallelContext) -> dict[str, Any]:
+    from spectramr.core.module_utils import unwrap_model
+    from spectramr.infrastructure.distributed.context_parallel import CP_PLAN_ATTR
+
+    generator = models.get("generator")
+    plan = getattr(unwrap_model(generator), CP_PLAN_ATTR, None) if generator is not None else None
+    if plan is None:
+        return {}
+    return {
+        "context_parallel": {
+            "size": plan.size,
+            "backbones": list(plan.backbones),
+            "attention_layers": plan.attentions,
+            # Under tensor x context each peer exchanges only its own heads' keys and values.
+            "tensor_split_attention_layers": plan.tensor_split_attentions,
+            "kv_exchange": "all_gather_then_reduce_scatter",
+            "grad_reduce_group": "dp x cp",
+            "gate_worst_relative_error": plan.worst_relative_error,
+        }
+    }
+
+
+def _refuse_untested_fsdp_model_parallel(ctx: ParallelContext, axis: str, size: int) -> None:
+    """FSDP x tp or cp runs without CPU offload or compile; mixed precision is verified."""
+    from spectramr.infrastructure.training.builders.compile_apply import compile_is_enabled
+
+    refused = []
+    if ctx.parallel.fsdp.cpu_offload:
+        # Offloaded grads put the clip's tensor-group norm reduce on host tensors, which
+        # NCCL cannot reduce; a gloo test cannot tell offload from none, so it is unproven.
+        refused.append("fsdp.cpu_offload")
+    if compile_is_enabled(ctx.config):
+        refused.append("optimization.compile")
+    if refused:
+        raise RuntimeError(
+            f"parallel.mesh.{axis}={size} with strategy 'fsdp' is verified without CPU "
+            f"offload or compile only; refusing {', '.join(refused)}."
+        )
+
+
+def _pipelined(ctx: ParallelContext) -> bool:
+    from spectramr.infrastructure.distributed.pipeline_parallel.plugin import pipeline_size
+
+    return pipeline_size(ctx) > 1
+
+
+def _split_for_pipeline(models: dict[str, Any], ctx: ParallelContext) -> Any:
+    """Stage A under ``parallel.mesh.pipeline > 1``: this rank keeps its own stage."""
+    from spectramr.infrastructure.distributed.pipeline_parallel.plugin import (
+        split_generator_for_pipeline,
+    )
+
+    return split_generator_for_pipeline(models, ctx) if _pipelined(ctx) else None
+
+
+def _pipeline_step_policy(ctx: ParallelContext) -> Any:
+    if not _pipelined(ctx):
+        return None
+    from spectramr.infrastructure.distributed.pipeline_parallel.step_policy import (
+        PipelineStepPolicy,
+    )
+
+    return PipelineStepPolicy
+
+
+def _pipeline_adapter(adapter: Any, ctx: ParallelContext) -> Any:
+    if not _pipelined(ctx):
+        return adapter
+    from spectramr.infrastructure.distributed.pipeline_parallel.checkpoint import (
+        PipelineCheckpointAdapter,
+    )
+
+    return PipelineCheckpointAdapter(adapter)
+
+
+def _pipeline_provenance(models: dict[str, Any]) -> dict[str, Any]:
+    from spectramr.infrastructure.distributed.pipeline_parallel.plugin import pipeline_provenance
+
+    return pipeline_provenance(models)
 
 
 def _wrap_with_distributed_samplers(loaders: dict[str, Any]) -> dict[str, Any]:
@@ -276,6 +431,15 @@ def _wrap_generator_spatially(models, ctx):
     logger.info("[Parallel] Depth-split generator over sp=%d", ctx.mesh.shape["sp"])
 
 
+def _spatial_provenance(models, ctx, grad_reduce_group: str) -> dict[str, Any]:
+    """The composition record: spatial size, the gradient reduce group, and the gate's report."""
+    return {
+        "mesh_spatial": ctx.parallel.mesh.spatial,
+        "grad_reduce_group": grad_reduce_group,
+        **getattr(models.get("generator"), "gate_report", {}),
+    }
+
+
 class DDPStrategy(_BaseStrategy):
     """``DistributedDataParallel`` — one process per device."""
 
@@ -286,17 +450,34 @@ class DDPStrategy(_BaseStrategy):
         if ctx.parallel.sync_batch_norm:
             _convert_sync_batchnorm(models)
         _apply_tensor_parallel(models, ctx)
+        _apply_context_parallel(models, ctx)
         if ctx.parallel.mesh.spatial > 1:
             _wrap_generator_spatially(models, ctx)
+        _split_for_pipeline(models, ctx)
         return models
+
+    def prepare_ema(self, ema, models, ctx):
+        _split_ema_like_generator(ema, models, ctx)
 
     def adopt(self, models, optimizers, schedulers, ctx):
         _require_process_group(self.name)
-        spatial = ctx.parallel.mesh.spatial > 1
-        # Depth slabs make each sp peer's gradient a partial, so the average runs over
-        # dp x sp: that is the unsplit gradient, in the one bucketed collective (see
-        # spatial/wrapper.py). Samplers and metrics keep the data-parallel group.
-        process_group = ctx.mesh.grad_group if spatial else dp_group()
+        if _pipelined(ctx):
+            # The pipeline step policy averages the stage's gradients over dp itself.
+            return ParallelizationResult(
+                models=models,
+                optimizers=optimizers,
+                schedulers=schedulers,
+                step_policy=_pipeline_step_policy(ctx),
+                provenance={**self.provenance(ctx), **_pipeline_provenance(models)},
+            )
+        record = {
+            **self.provenance(ctx),
+            **_tensor_parallel_provenance(models, ctx),
+            **_context_parallel_provenance(models, ctx),
+        }
+        # Context and spatial peers each hold a partial gradient of one sample, so DDP
+        # averages over dp x cp x sp; samplers and metrics keep the data-parallel group.
+        process_group = _grad_process_group(ctx)
         wrapped = dict(models)
         for name, module in models.items():
             if module is None:
@@ -305,13 +486,9 @@ class DDPStrategy(_BaseStrategy):
                 module, ctx.parallel, ctx.device, process_group=process_group
             )
             logger.info("[Parallel] Wrapped %s with DDP", name)
-        provenance = self.provenance(ctx)
-        if spatial:
-            provenance["spatial"] = {
-                "mesh_spatial": ctx.parallel.mesh.spatial,
-                "grad_reduce_group": "dp x sp",
-                **getattr(models.get("generator"), "gate_report", {}),
-            }
+        provenance = record
+        if ctx.parallel.mesh.spatial > 1:
+            provenance["spatial"] = _spatial_provenance(models, ctx, "dp x sp")
         return ParallelizationResult(
             models=wrapped,
             optimizers=optimizers,
@@ -321,6 +498,9 @@ class DDPStrategy(_BaseStrategy):
 
     def prepare_data_loaders(self, loaders, ctx):
         return _wrap_with_distributed_samplers(loaders)
+
+    def checkpoint_adapter(self, ctx):
+        return _pipeline_adapter(super().checkpoint_adapter(ctx), ctx)
 
     def provenance(self, ctx):
         record = super().provenance(ctx)
@@ -340,8 +520,13 @@ class FSDPStrategy(_BaseStrategy):
 
     Parameters become DTensor shards in place. An optimizer built beforehand
     would hold full-size moment buffers against shard-shaped parameters, so the
-    shard must precede it. No step policy is supplied: ``clip_grad_norm_`` over
-    DTensor gradients already reduces the norm across shards.
+    shard must precede it. No step policy is supplied: ``clip_grad_norm_global_``
+    reduces the norm across shards, and across the tensor group when there is one.
+
+    With ``parallel.mesh.tensor > 1`` the generator is split across the tensor dim
+    first, then sharded over the data-parallel dims of the same mesh. With
+    ``parallel.mesh.context > 1`` its token trunk is split along the sequence, and
+    every model shards over dp x cp (``fsdp_wrap.fsdp_shard_mesh``).
     """
 
     name = "fsdp"
@@ -351,14 +536,30 @@ class FSDPStrategy(_BaseStrategy):
         _require_process_group(self.name)
         from spectramr.infrastructure.distributed.fsdp_wrap import maybe_wrap_with_fsdp
 
-        if _tensor_size(ctx) > 1:
-            raise RuntimeError(
-                "parallel.mesh.tensor > 1 composes with strategy 'ddp' only: FSDP over "
-                "tensor-parallel blocks needs DTensor plans, which are not implemented."
-            )
+        for axis, size in (("tensor", _tensor_size(ctx)), ("context", _context_size(ctx))):
+            if size > 1:
+                _refuse_untested_fsdp_model_parallel(ctx, axis, size)
 
         if ctx.parallel.sync_batch_norm:
             _convert_sync_batchnorm(models)
+        _apply_tensor_parallel(models, ctx)
+        _apply_context_parallel(models, ctx)
+        if ctx.parallel.mesh.spatial > 1:
+            # Converted and gated unsharded; every model then shards over dp x sp.
+            _wrap_generator_spatially(models, ctx)
+        pipelined = _split_for_pipeline(models, ctx)
+        if pipelined is not None:
+            # Shard the stage, not the wrapper: FSDP2's backward hooks must sit on the
+            # tensors each microbatch backward actually reaches.
+            maybe_wrap_with_fsdp(
+                pipelined.stage,
+                ctx.parallel,
+                ctx.config.optimization.precision,
+                ctx.device,
+                mesh=ctx.mesh.device_mesh,
+            )
+            logger.info("[Parallel] Sharded the pipeline stage with FSDP2")
+            return models
         for name in list(models):
             if models[name] is not None:
                 models[name] = maybe_wrap_with_fsdp(
@@ -376,16 +577,25 @@ class FSDPStrategy(_BaseStrategy):
         # validation swap stay shard-local (a plain shadow cannot blend DTensors).
         from spectramr.infrastructure.distributed.fsdp_wrap import shard_like
 
+        _split_ema_like_generator(ema, models, ctx)
         if ema is not None and models.get("generator") is not None:
             shard_like(ema.module, models["generator"])
             logger.info("[Parallel] Sharded the EMA shadow like the generator")
 
     def adopt(self, models, optimizers, schedulers, ctx):
+        provenance = {
+            **self.provenance(ctx),
+            **_tensor_parallel_provenance(models, ctx),
+            **_context_parallel_provenance(models, ctx),
+        }
+        if ctx.parallel.mesh.spatial > 1:
+            provenance["spatial"] = _spatial_provenance(models, ctx, "dp x sp (fsdp shard mesh)")
         return ParallelizationResult(
             models=models,
             optimizers=optimizers,
             schedulers=schedulers,
-            provenance=self.provenance(ctx),
+            step_policy=_pipeline_step_policy(ctx),
+            provenance={**provenance, **_pipeline_provenance(models)},
         )
 
     def prepare_data_loaders(self, loaders, ctx):
@@ -398,7 +608,7 @@ class FSDPStrategy(_BaseStrategy):
             FSDPCheckpointAdapter,
         )
 
-        return FSDPCheckpointAdapter()
+        return _pipeline_adapter(FSDPCheckpointAdapter(), ctx)
 
     def provenance(self, ctx):
         from spectramr.infrastructure.distributed.fsdp_wrap import resolve_fsdp_precision

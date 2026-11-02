@@ -124,6 +124,13 @@ class SheafConsistencyLoss(nn.Module):
 
         batch = prediction.shape[0]
         num_cells = prediction.shape[1]
+        if self.laplacian_weight > 0 and num_cells < 2:
+            raise ValueError(
+                f"sheaf_consistency needs >= 2 cover cells (channels) for its Laplacian term; "
+                f"got C={num_cells}, so the term would be identically zero. Serve one channel "
+                "per cell (e.g. data.pairing.stacked_combine: per_contrast) or set "
+                "laplacian_weight: 0."
+            )
         # Per sample: (C cells, n=stalk dim) where n = product of spatial dims.
         pred_flat = prediction.reshape(batch, num_cells, -1)
         tgt_flat = target.reshape(batch, num_cells, -1)

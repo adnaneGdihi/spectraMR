@@ -190,7 +190,6 @@ class TestKSpaceColdDiffusionGenerator:
             condition_with_smaps=False,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=False,  # Test standard path first
             attention_type="none",  # 'unet' backbone supports none/channel/spatial
         )
 
@@ -221,7 +220,6 @@ class TestKSpaceColdDiffusionGenerator:
             condition_with_smaps=False,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=False,
             attention_type="none",  # 'unet' backbone supports none/channel/spatial
         )
         x = torch.randn(2, 2, 32, 32)
@@ -247,7 +245,6 @@ class TestKSpaceColdDiffusionGenerator:
                 out_channels=2,
                 base_channels=8,
                 num_layers=2,
-                use_complex_conv=False,
                 attention_type="none",
                 output_kspace_clip_ratio=0.0,
                 kspace_log_scaled=False,
@@ -273,7 +270,6 @@ class TestKSpaceColdDiffusionGenerator:
             condition_with_smaps=False,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=False,
             attention_type="none",
         )
         x = torch.randn(2, 2, 32, 32)
@@ -310,7 +306,6 @@ class TestKSpaceColdDiffusionGenerator:
             condition_with_smaps=False,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=False,
             attention_type="none",
             output_kspace_clip_ratio=1.3,
             kspace_log_scaled=False,
@@ -364,7 +359,6 @@ class TestKSpaceColdDiffusionGenerator:
             condition_with_smaps=False,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=False,
             attention_type="none",
             kspace_log_scaled=False,
             dc_method="none",
@@ -394,7 +388,6 @@ class TestKSpaceColdDiffusionGenerator:
             out_channels=2,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=False,
             timesteps=28,
             attention_type="none",  # 'unet' backbone supports none/channel/spatial
         )
@@ -409,7 +402,6 @@ class TestKSpaceColdDiffusionGenerator:
                 out_channels=2,
                 base_channels=8,
                 num_layers=2,
-                use_complex_conv=False,
                 num_timesteps=500,
                 timesteps=28,
             )
@@ -423,18 +415,18 @@ class TestKSpaceColdDiffusionGenerator:
                 out_channels=2,
                 base_channels=8,
                 num_layers=2,
-                use_complex_conv=False,
                 num_timesteps=1000,
                 timesteps=28,
             )
 
     def test_forward_pass_complex_conv(self):
         """Test with complex convolutions enabled."""
-        # Note: KSpaceColdDiffusionGenerator assumes input is (B, C, H, W)
-        # but treats channels as Real/Imag pairs if use_complex_conv is True
-        # Usually requires C to be even.
+        # The unet backbone is real unless force_pure_kspace builds PureKSpaceUNet
+        # (complex) or use_complex_conv builds the complex bridge (#1359).
+        # Channels are Real/Imag pairs, so C must be even.
 
         model = KSpaceColdDiffusionGenerator(
+            force_pure_kspace=True,
             in_channels=2,
             out_channels=2,
             # This case exercises shape/scale/conditioning behaviour, not S-map
@@ -446,7 +438,6 @@ class TestKSpaceColdDiffusionGenerator:
             condition_with_smaps=False,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=True,
             activation="complex",
             attention_type="none",  # 'unet' backbone supports none/channel/spatial
         )
@@ -526,7 +517,6 @@ class TestKSpaceColdDiffusionGenerator:
             num_layers=2,
             backbone_type="complex_unet",
             attention_type="dual_domain",
-            use_complex_conv=True,
         )
 
         x = torch.randn(2, 2, 32, 32)
@@ -572,7 +562,6 @@ class TestKSpaceColdDiffusionDCBlobRegression:
             base_channels=8,
             num_layers=2,
             attention_type=attention_type,
-            use_complex_conv=True,
             activation="complex",
             backbone_type="complex_unet",
             force_pure_kspace=True,
@@ -749,7 +738,6 @@ class TestChannelAdapterWidthContract:
             "num_layers": 2,
             "backbone_type": "complex_unet",
             "attention_type": "none",
-            "use_complex_conv": True,
             "timesteps": 4,
             "kspace_log_scaled": False,
         }
@@ -1071,7 +1059,6 @@ class TestInternalDCBackboneSmapChannels:
             # channel-doubling behaviour under test unchanged. complex_unet (the
             # scope-guard case below) is k-space-native and unaffected either way.
             force_pure_kspace=False,
-            use_complex_conv=True,
             timesteps=28,
         )
 
@@ -1360,7 +1347,6 @@ class TestFeatureDomainDerivation:
             attention_type="kan_dual_domain",
             backbone_type="complex_unet",
             force_pure_kspace=True,
-            use_complex_conv=True,
             activation="complex",
             time_embedding_dim=64,
             timesteps=28,
@@ -1377,7 +1363,6 @@ class TestFeatureDomainDerivation:
             attention_type="dual_domain",
             backbone_type="complex_unet",
             force_pure_kspace=False,
-            use_complex_conv=True,
             activation="complex",
             time_embedding_dim=64,
             timesteps=28,
@@ -1396,7 +1381,6 @@ class TestFeatureDomainDerivation:
                 attention_type="self",
                 backbone_type="unet",
                 force_pure_kspace=True,
-                use_complex_conv=True,
                 activation="complex",
                 time_embedding_dim=64,
                 timesteps=28,
@@ -1411,7 +1395,6 @@ class TestFeatureDomainDerivation:
             attention_type="none",
             backbone_type="unet",
             force_pure_kspace=True,
-            use_complex_conv=True,
             activation="complex",
             time_embedding_dim=64,
             timesteps=28,
@@ -1664,7 +1647,6 @@ class TestKSpaceFeatureNormPlumbing:
             out_channels=2,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=True,
             attention_type="none",
             force_pure_kspace=True,
             backbone_type="complex_unet",
@@ -1682,7 +1664,6 @@ class TestKSpaceFeatureNormPlumbing:
                 out_channels=2,
                 base_channels=8,
                 num_layers=2,
-                use_complex_conv=False,
                 attention_type="none",
                 backbone_type="unet",
                 kspace_feature_norm="rms",
@@ -1703,7 +1684,6 @@ class TestKSpaceFeatureNormPlumbing:
                 out_channels=2,
                 base_channels=8,
                 num_layers=2,
-                use_complex_conv=True,
                 attention_type="none",
                 force_pure_kspace=True,
                 backbone_type="unet",
@@ -1717,7 +1697,6 @@ class TestKSpaceFeatureNormPlumbing:
             out_channels=2,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=True,
             attention_type="none",
             force_pure_kspace=True,
             backbone_type="complex_unet",
@@ -1742,7 +1721,6 @@ def test_both_block_dispatches_wrap_attention_identity_at_init() -> None:
     down = KSpaceDownsampleBlock(
         in_channels=16,
         out_channels=16,
-        use_complex_conv=True,
         activation="modrelu",
         time_embedding_dim=64,
         attention_type="channel",
@@ -1751,7 +1729,6 @@ def test_both_block_dispatches_wrap_attention_identity_at_init() -> None:
     up = KSpaceUpsampleBlock(
         in_channels=16,
         out_channels=16,
-        use_complex_conv=True,
         activation="modrelu",
         time_embedding_dim=64,
         attention_type="channel",
@@ -1774,7 +1751,6 @@ def test_attention_type_none_is_not_wrapped() -> None:
     blk = KSpaceDownsampleBlock(
         in_channels=16,
         out_channels=16,
-        use_complex_conv=True,
         activation="modrelu",
         time_embedding_dim=64,
         attention_type="none",
@@ -1862,7 +1838,6 @@ def _tiny(**kw):
         out_channels=2,
         base_channels=8,
         num_layers=2,
-        use_complex_conv=False,
         timesteps=28,
         **kw,
     )
@@ -2189,7 +2164,6 @@ def test_the_projection_refuses_to_guess_the_kspace_domain() -> None:
         num_layers=2,
         backbone_type="complex_unet",
         attention_type="none",
-        use_complex_conv=True,
         timesteps=4,
         condition_with_smaps=False,
     ).eval()
@@ -2236,14 +2210,19 @@ class TestTheOneWidthResolver:
     def _first_conv_width(model) -> int:
         """What the backbone actually accepts -- read off the built module.
 
-        Asserting against the attribute would be circular; this reads the real
-        first weighted layer, so a wrong answer is a wrong *number*.
+        ComplexUNet's stem is a complex conv that stores complex channels, so its
+        real width is twice the stored count. Other backbones publish the width
+        they were built with. The bridge's repetition fusion is not on this path:
+        the old search reached it first and read its width by accident.
         """
-        for _name, mod in model.named_modules():
-            width = getattr(mod, "in_channels", None)
-            if isinstance(width, int) and getattr(mod, "weight", None) is not None:
-                return width
-        raise AssertionError("no weighted layer with in_channels found")
+        backbone = model.backbone.backbone
+        stem = getattr(backbone, "initial_conv", None)
+        if stem is not None:
+            return 2 * stem.in_channels
+        width = getattr(backbone, "in_channels", None)
+        if isinstance(width, int):
+            return width
+        raise AssertionError("backbone publishes no input width")
 
     @pytest.mark.parametrize(
         ("backbone_type", "doubled"),
@@ -2468,7 +2447,6 @@ class TestForcePureKSpaceDomainGuard:
             attention_type="none",
             backbone_type=backbone_type,
             force_pure_kspace=True,
-            use_complex_conv=True,
             activation="complex",
             time_embedding_dim=64,
             timesteps=28,
@@ -3014,7 +2992,6 @@ def test_dispatch_attention_trains_off_its_identity_init(attention_type: str) ->
         64,
         64,
         attention_type=attention_type,
-        use_complex_conv=True,
         time_embedding_dim=256,
         feature_domain="kspace",
     )
@@ -3068,7 +3045,6 @@ def test_dispatch_opts_the_three_blocks_out_of_their_own_zero_init() -> None:
             block = builder(
                 *args,
                 attention_type=attention_type,
-                use_complex_conv=True,
                 time_embedding_dim=256,
                 feature_domain="kspace",
             )
@@ -3105,7 +3081,6 @@ def _null_space_generator(size: int = 32):
         attention_type="null_space_dual_domain",
         backbone_type="complex_unet",
         force_pure_kspace=True,
-        use_complex_conv=True,
         activation="complex",
         time_embedding_dim=64,
         timesteps=8,
@@ -3188,7 +3163,6 @@ _BAND_BASE = {
     "out_channels": 4,
     "base_channels": 8,
     "num_layers": 2,
-    "use_complex_conv": True,
     "attention_type": "none",
     "force_pure_kspace": True,
     "backbone_type": "complex_unet",
@@ -3593,7 +3567,6 @@ class TestContrastEmbeddingRows:
             condition_with_smaps=False,
             base_channels=8,
             num_layers=2,
-            use_complex_conv=False,
             attention_type="none",
             num_contrasts=3,
             dc_method="none",
@@ -3895,7 +3868,6 @@ def _contrast_model(**extra):
         condition_with_smaps=False,
         base_channels=8,
         num_layers=2,
-        use_complex_conv=False,
         attention_type="none",
         num_contrasts=3,
         **extra,
@@ -3996,3 +3968,187 @@ class TestForwardNoiseKnob:
         mask[..., ::2] = 1.0
         model.sample(measurement * mask, mask)
         assert calls["n"] > 0, "the reverse loop never re-noised its denoiser input"
+
+
+class TestBackboneKwargsDefectsReachability:
+    """Pure-function planted violations for the #1461 and #1463 rules (CLAUDE.md #15)."""
+
+    @staticmethod
+    def _defects(**kw) -> list[str]:
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            backbone_kwargs_defects,
+        )
+
+        return backbone_kwargs_defects(kw)
+
+    @pytest.mark.parametrize(
+        ("backbone", "fpk", "declared", "fires"),
+        [
+            ("unet", False, True, False),  # declared complex: ComplexUNet in the bridge (#1359)
+            ("unet", True, False, True),  # PureKSpaceUNet is complex, no real-valued path
+            ("unet", False, False, False),  # real bridge UNet, the flag is honoured
+            ("unet", True, True, False),  # PureKSpaceUNet, complex as declared
+            ("complex_unet", True, False, True),  # complex blocks regardless of the flag
+            ("complex_unet", True, True, True),
+            ("complex_unet", False, True, True),
+            ("swin_diff_rec", False, True, False),  # SwinDiffRec reads the flag
+            ("swin_diff_rec", False, False, True),  # and has no real-valued path
+            ("swin_diff_rec_kan", True, False, True),
+            ("diff_varnet", False, True, True),  # absorbs **kwargs
+            ("nafnet", False, True, False),  # reads the flag
+            ("mamba_unet", True, False, False),
+        ],
+    )
+    def test_use_complex_conv_must_match_the_backbone(
+        self, backbone: str, fpk: bool, declared: bool, fires: bool
+    ) -> None:
+        defects = self._defects(
+            backbone_type=backbone, force_pure_kspace=fpk, use_complex_conv=declared
+        )
+        assert bool(
+            [d for d in defects if "use_complex_conv" in d]
+        ) is fires, defects
+
+    def test_unset_use_complex_conv_is_never_a_defect(self) -> None:
+        assert not [d for d in self._defects(backbone_type="diff_varnet") if "use_complex_conv" in d]
+
+    def test_num_repetitions_is_a_defect_until_the_layout_is_decided(self) -> None:
+        defects = self._defects(backbone_type="unet", num_repetitions=3)
+        assert [d for d in defects if "num_repetitions" in d and "#1463" in d]
+        assert not self._defects(backbone_type="unet")
+
+
+class TestRealChannelLiftAndDeclaredBridge:
+    """#1359: a single real channel is lifted, a declared complex conv runs, and the
+    unused repetition fusion is built only when declared."""
+
+    @staticmethod
+    def _tiny(**kw):
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSpaceColdDiffusionGenerator,
+        )
+
+        base = {
+            "in_channels": 1,
+            "out_channels": 1,
+            "timesteps": 4,
+            "features": [8, 16],
+            "image_size": 32,
+        }
+        base.update(kw)
+        return KSpaceColdDiffusionGenerator(**base)
+
+    def test_single_real_channel_builds_and_returns_the_declared_width(self) -> None:
+        model = self._tiny()
+        x = torch.randn(1, 1, 32, 32)
+        out = model(
+            x,
+            timesteps=torch.zeros(1, dtype=torch.long),
+            mask=torch.ones(1, 1, 32, 32),
+            kspace_measured=x,
+        )
+        out = out[0] if isinstance(out, tuple) else out
+        assert tuple(out.shape) == (1, 1, 32, 32)
+        assert torch.isfinite(out).all()
+
+    def test_declared_complex_unet_runs_the_complex_backbone(self) -> None:
+        from spectramr.models.generators.complex_unet import ComplexUNet
+        from spectramr.models.reconstruction.unet import UNet
+
+        complex_model = self._tiny(in_channels=2, out_channels=2, use_complex_conv=True)
+        real_model = self._tiny(in_channels=2, out_channels=2, use_complex_conv=False)
+        assert isinstance(complex_model.backbone.backbone, ComplexUNet)
+        assert isinstance(real_model.backbone.backbone, UNet)
+
+    def test_default_bridge_builds_no_repetition_fusion(self) -> None:
+        model = self._tiny(in_channels=2, out_channels=2)
+        assert model.backbone.rep_fusion is None
+        assert not [k for k in model.state_dict() if "rep_fusion" in k]
+
+    def test_declared_repetitions_build_the_fusion_at_the_declared_width(self) -> None:
+        from spectramr.models.blocks.pseudo_3d_kspace import RepetitionFusion
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            FourierBridgeNetwork,
+        )
+        from spectramr.models.reconstruction.unet import UNetConfig
+
+        config = UNetConfig(in_channels=2, out_channels=2, features=(8, 16), depth=2)
+        bridge = FourierBridgeNetwork(config, backbone_type="unet", num_repetitions=3)
+        assert isinstance(bridge.rep_fusion, RepetitionFusion)
+        assert bridge.rep_fusion.num_reps == 3
+        assert bridge.rep_fusion.fusion_blocks[0].conv.in_channels == 2
+
+    def test_stale_rep_fusion_keys_load_with_a_named_warning(self, caplog) -> None:
+        model = self._tiny(in_channels=2, out_channels=2)
+        state = model.state_dict()
+        stale_key = "backbone.rep_fusion.fusion_blocks.0.conv.weight"
+        state[stale_key] = torch.zeros(2, 2, 3, 1, 1)
+        with caplog.at_level("WARNING"):
+            model.load_state_dict(state, strict=True)
+        assert stale_key in caplog.text
+
+    def test_legacy_layout_rebuilds_the_pre_3363_fusion_in_its_slot(self) -> None:
+        """A pre-#3363 checkpoint resumes under ZeRO only if the parameter list matches:
+        same module, same shape, registered before the backbone."""
+        from spectramr.models.blocks.pseudo_3d_kspace import RepetitionFusion
+
+        model = self._tiny(in_channels=2, out_channels=2, legacy_rep_fusion=True)
+        bridge = model.backbone
+        assert isinstance(bridge.rep_fusion, RepetitionFusion)
+        assert bridge.rep_fusion.num_reps == 18
+        assert bridge.rep_fusion_declared is False
+        names = [n for n, _ in bridge.named_parameters()]
+        first_fusion = next(i for i, n in enumerate(names) if n.startswith("rep_fusion."))
+        first_backbone = next(i for i, n in enumerate(names) if n.startswith("backbone."))
+        assert first_fusion < first_backbone
+
+    def test_legacy_layout_matches_the_pre_3363_parameter_list(self) -> None:
+        """Pinned from c911f2a (the build job 8961744's checkpoints were written by): the
+        legacy layout is the current one with these six tensors first, nothing else."""
+        from spectramr.models.generators.kspace_cold_diffusion_generator import (
+            KSpaceColdDiffusionGenerator,
+        )
+
+        kw = {
+            "in_channels": 8,
+            "out_channels": 8,
+            "timesteps": 4,
+            "image_size": 32,
+            "base_channels": 8,
+            "num_layers": 2,
+            "backbone_type": "complex_unet",
+            "condition_with_smaps": False,
+        }
+        legacy = [
+            (n, tuple(p.shape))
+            for n, p in KSpaceColdDiffusionGenerator(**kw, legacy_rep_fusion=True).named_parameters()
+        ]
+        current = [(n, tuple(p.shape)) for n, p in KSpaceColdDiffusionGenerator(**kw).named_parameters()]
+        assert legacy[:6] == [
+            ("backbone.rep_fusion.fusion_blocks.0.conv.weight", (20, 20, 3, 1, 1)),
+            ("backbone.rep_fusion.fusion_blocks.1.conv.weight", (20, 20, 3, 1, 1)),
+            ("backbone.rep_fusion.rep_attention_scorer.1.weight", (10, 20, 1, 1, 1)),
+            ("backbone.rep_fusion.rep_attention_scorer.1.bias", (10,)),
+            ("backbone.rep_fusion.rep_attention_scorer.3.weight", (1, 10, 1, 1, 1)),
+            ("backbone.rep_fusion.rep_attention_scorer.3.bias", (1,)),
+        ]
+        assert legacy[6:] == current
+
+    def test_legacy_layout_loads_the_old_keys_instead_of_dropping_them(self, caplog) -> None:
+        old = self._tiny(in_channels=2, out_channels=2, legacy_rep_fusion=True)
+        model = self._tiny(in_channels=2, out_channels=2, legacy_rep_fusion=True)
+        with caplog.at_level("WARNING"):
+            model.load_state_dict(old.state_dict(), strict=True)
+        assert "ignoring" not in caplog.text
+
+    def test_unet_self_attention_needs_the_complex_bridge(self) -> None:
+        with pytest.raises(ValueError, match="ConfigurableResidualBlock"):
+            self._tiny(in_channels=2, out_channels=2, attention_type="self")
+        model = self._tiny(
+            in_channels=2,
+            out_channels=2,
+            attention_type="self",
+            use_complex_conv=True,
+            condition_with_smaps=False,
+        )
+        assert model.backbone.backbone.__class__.__name__ == "ComplexUNet"

@@ -33,8 +33,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .enums import AccelerationSchedule
+from .enums import AccelerationSchedule, reject_log_schedule
 from .renames import reject_renamed_keys
+from .severity_axes import SeverityAxis, reject_severity_overlap
 
 
 class DataConsistencyConfig(BaseModel):
@@ -937,6 +938,11 @@ class DigitalTwinConfig(BaseModel):
             "static at full strength, so a schedule on it could never fire."
         ),
     )
+    @field_validator("degradation_schedule", "degradation_schedules")
+    @classmethod
+    def _no_log_schedule(cls, v: Any) -> Any:
+        return reject_log_schedule(v)
+
     degradation_schedule_power: float = Field(
         default=2.0,
         gt=0.0,
@@ -945,6 +951,27 @@ class DigitalTwinConfig(BaseModel):
             "mirroring undersampling.schedule_power. Read only by those two."
         ),
     )
+    severity_axes: dict[str, SeverityAxis] = Field(
+        default_factory=dict,
+        description=(
+            "Per-axis severity range in PHYSICAL units for DEGRADATION_REGISTRY axes "
+            "the twin applies as standalone operators (e.g. cartesian_undersamp: "
+            "{start: 2, end: 16, schedule: log}), resolved by the same LocalSeverity "
+            "Sim2Rank sweeps. For that axis the SeverityAxis schedule replaces "
+            "degradation_schedule. The axis must appear in progressive_degradations and "
+            "must not be a native twin axis, nor be keyed in degradation_ranges or "
+            "degradation_schedules (one owner per axis); the simulator raises otherwise."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _severity_axes_have_one_owner(self) -> "DigitalTwinConfig":
+        reject_severity_overlap(
+            self.severity_axes,
+            degradation_ranges=self.degradation_ranges,
+            degradation_schedules=self.degradation_schedules,
+        )
+        return self
 
     # ── Marker configuration ──
     @model_validator(mode="after")
@@ -1002,9 +1029,12 @@ class DigitalTwinConfig(BaseModel):
                 )
         return self
 
-    marker_type: Literal["gaussian", "cross"] = Field(
+    marker_type: Literal["gaussian", "cross", "none"] = Field(
         default="gaussian",
-        description="Marker shape: 'gaussian' (smooth blobs) or 'cross' (sharp crosshairs)",
+        description=(
+            "Marker shape: 'gaussian' (smooth blobs), 'cross' (sharp crosshairs), or "
+            "'none' (no fiducials embedded; the no-marker control of a marker-anchored arm)"
+        ),
     )
     corner_offset: float = Field(
         default=0.8,

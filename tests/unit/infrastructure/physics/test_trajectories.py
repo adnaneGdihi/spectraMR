@@ -231,3 +231,15 @@ class TestDispatcher:
     def test_unknown_kind_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="Unknown trajectory type"):
             get_trajectory(trajectory_type="not_a_thing")  # type: ignore[arg-type]
+
+
+def test_spiral_readout_times_restart_on_every_interleave():
+    from spectramr.infrastructure.physics.trajectories import SPIRAL_DWELL_S, spiral_readout_times
+
+    traj, _ = get_trajectory("spiral", im_size=(16, 16), num_arms=3)
+    times = spiral_readout_times((16, 16), traj.shape[-1])
+    assert times.shape == (traj.shape[-1],)
+    assert times[0] == 0 and times[32] == 0
+    assert math.isclose(float(times[31]), 31 * SPIRAL_DWELL_S, rel_tol=1e-6)
+    with pytest.raises(ValueError, match="interleaves"):
+        spiral_readout_times((16, 16), traj.shape[-1] + 1)

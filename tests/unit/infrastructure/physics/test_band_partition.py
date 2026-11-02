@@ -25,6 +25,9 @@ from spectramr.infrastructure.physics.band_partition import (  # noqa: E402
     super_nyquist_band_indices,
 )
 from spectramr.infrastructure.physics.subpixel_registration import (  # noqa: E402
+    centred_fft,
+    centred_freqs,
+    centred_ifft,
     fourier_shift,
 )
 from spectramr.infrastructure.physics.virtual_fiducial import (  # noqa: E402
@@ -268,3 +271,48 @@ def test_super_nyquist_gain_separates_recovery_from_fabrication() -> None:
     # quoted without it.
     assert 0.2 < gain(floor) < 0.95
     assert gain(solved) > gain(floor) + 0.2
+
+
+# ── passband geometry: a Cartesian frame measures a box, not a disc ───────────
+
+
+def _measured_square(h: int, s: int) -> torch.Tensor:
+    f = (2 * s * centred_freqs(h, torch.device("cpu"), torch.float64)).abs()
+    return torch.maximum(f.view(h, 1), f.view(1, h)) < 1.0
+
+
+@pytest.mark.parametrize(("geometry", "leaks"), [("cartesian", False), ("radial", True)])
+def test_super_nyquist_bands_hold_no_measured_cartesian_bin(geometry: str, leaks: bool) -> None:
+    """#2413: radial bands above 1 contain the corners of the pooled frame's square."""
+    h, s = 64, 2
+    edges = band_edges(2, 2, 2.0)
+    masks = band_masks(acquisition_rho((h, h), sr_scale=s, geometry=geometry), edges)
+    sup = list(super_nyquist_band_indices(edges))
+    overlap = float((masks[sup].bool() & _measured_square(h, s)).sum())
+    assert (overlap > 0) is leaks
+
+
+def test_zero_filled_frame_carries_no_super_nyquist_energy() -> None:
+    """A frame with no content outside its measured square must score nothing there."""
+    h, s = 64, 2
+    m = VirtualFiducial(im_size=(h, h), grid_spacing=8, sigma=1.0, jitter=0.35, seed=0)(1).real.double()
+    zf = centred_ifft(centred_fft(m) * _measured_square(h, s).to(torch.complex128)).real
+    edges = band_edges(2, 2, 2.0)
+    masks = band_masks(acquisition_rho((h, h), sr_scale=s, dtype=torch.float64), edges)
+    sup = list(super_nyquist_band_indices(edges))
+    bands = band_partition(zf, masks)[:, :, sup]
+    assert float(bands.pow(2).sum()) < 1e-10 * float(band_partition(m, masks)[:, :, sup].pow(2).sum())
+
+
+def test_rho_is_the_per_axis_maximum_on_a_cartesian_grid() -> None:
+    rho = acquisition_rho((32, 32), voxel_mm=(0.5, 0.5), effective_voxel_mm=(1.0, 2.0))
+    radial = acquisition_rho(
+        (32, 32), voxel_mm=(0.5, 0.5), effective_voxel_mm=(1.0, 2.0), geometry="radial"
+    )
+    assert torch.all(rho <= radial + 1e-6)
+    assert float(rho.max()) == pytest.approx(4.0)  # thin axis: 2 * (2.0 / 0.5) * 0.5
+
+
+def test_rho_rejects_an_unknown_geometry() -> None:
+    with pytest.raises(ValueError, match="geometry"):
+        acquisition_rho((32, 32), sr_scale=2, geometry="spiral")  # type: ignore[arg-type]

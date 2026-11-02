@@ -575,6 +575,7 @@ def privileged_learning_loss(
     alpha: float = 1.0,  # weight on student-vs-target
     beta: float = 0.5,  # weight on student-vs-teacher distillation
     gamma: float = 0.1,  # weight on FitNet-style hint losses
+    sample_weight: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     r"""Privileged-learning loss for marker-supervised teacher → student
     knowledge transfer (synth-marker plan §4.3, Vapnik & Izmailov 2015).
@@ -598,13 +599,31 @@ def privileged_learning_loss(
         teacher_features: optional list of intermediate teacher features
                           aligned with ``student_features``.
         alpha, beta, gamma: scalar weights per the spec equation above.
+        sample_weight:   optional ``(B,)`` per-sample weight on the recon and
+                         distill terms (0 drops a sample, e.g. an unlabelled
+                         target-domain sample in a mixed batch). ``None`` is the
+                         plain batch mean.
 
     Returns:
         Dict with keys ``g_total_loss`` (scalar) and per-component
         diagnostics (``recon``, ``distill``, ``hint``).
     """
-    recon = (student_pred - target).pow(2).mean()
-    distill = (student_pred - teacher_pred).pow(2).mean()
+    if sample_weight is None:
+        recon = (student_pred - target).pow(2).mean()
+        distill = (student_pred - teacher_pred).pow(2).mean()
+    else:
+        if sample_weight.shape != student_pred.shape[:1]:
+            raise ValueError(
+                f"sample_weight must be ({student_pred.shape[0]},); got {tuple(sample_weight.shape)}"
+            )
+        w = sample_weight.to(student_pred.dtype)
+        denom = w.sum().clamp_min(torch.finfo(student_pred.dtype).tiny)
+
+        def _weighted(err: torch.Tensor) -> torch.Tensor:
+            return (err.reshape(err.shape[0], -1).mean(dim=1) * w).sum() / denom
+
+        recon = _weighted((student_pred - target).pow(2))
+        distill = _weighted((student_pred - teacher_pred).pow(2))
 
     if student_features is not None and teacher_features is not None:
         if len(student_features) != len(teacher_features):

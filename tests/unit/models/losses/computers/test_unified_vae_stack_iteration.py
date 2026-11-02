@@ -59,8 +59,8 @@ _PERCEPTUAL = {
 
 
 def _computer(cls: type, losses: dict) -> UnifiedVAELossComputer | UnifiedVQVAELossComputer:
-    """Built config-less so ``LossBuilder`` loads no VGG; the weights are the config's."""
-    computer = cls(config=None)
+    """Built on an mse-only config so ``LossBuilder`` loads no VGG; the weights are ``losses``'."""
+    computer = cls(config=_settings({"image_losses": [{"name": "mse", "weight": 1.0}]}))
     computer.config = _settings(losses)
     return computer
 
@@ -68,6 +68,7 @@ def _computer(cls: type, losses: dict) -> UnifiedVAELossComputer | UnifiedVQVAEL
 @pytest.mark.parametrize("cls", [UnifiedVAELossComputer, UnifiedVQVAELossComputer])
 def test_a_warmup_gated_term_counts_once_the_gate_opens(cls) -> None:
     computer = _computer(cls, _PERCEPTUAL)
+    computer.reconstruction_name = "l2"  # the declared mse (_PERCEPTUAL)
     computer.reconstruction_loss_fn = _Constant(5.0)
     computer.perceptual_loss_fn = _Constant(2.0)
     pred, target = _pair()
@@ -81,6 +82,7 @@ def test_a_warmup_gated_term_counts_once_the_gate_opens(cls) -> None:
 @pytest.mark.parametrize("cls", [UnifiedVAELossComputer, UnifiedVQVAELossComputer])
 def test_inside_the_warmup_window_the_gated_term_is_absent(cls) -> None:
     computer = _computer(cls, _PERCEPTUAL)
+    computer.reconstruction_name = "l2"  # the declared mse (_PERCEPTUAL)
     computer.reconstruction_loss_fn = _Constant(5.0)
     computer.perceptual_loss_fn = _Constant(2.0)
     pred, target = _pair()
@@ -105,6 +107,7 @@ def test_the_kl_term_is_weighted_at_the_annealed_beta() -> None:
             },
         )
     )
+    computer.reconstruction_name = "l2"  # the declared mse (_PERCEPTUAL)
     computer.reconstruction_loss_fn = _Constant(5.0)
     pred, target = _pair()
     mu = torch.ones(2, 4, requires_grad=True)

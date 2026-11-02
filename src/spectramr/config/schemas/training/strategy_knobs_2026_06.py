@@ -136,6 +136,18 @@ class ScoreFieldTomographyTrainingConfigSchema(BaseModel):
         default=1.0, gt=0.0, description="Maximum score-matching noise scale sigma_max."
     )
     cond_dim: int = Field(default=5, ge=1, description="Conditioning vector dimensionality.")
+    val_num_levels: int = Field(
+        default=10, ge=2, description="Annealed-Langevin noise levels (geometric sigma_max→sigma_min)."
+    )
+    val_steps_per_level: int = Field(
+        default=5, ge=1, description="Langevin steps per noise level in validation sampling."
+    )
+    val_step_size: float = Field(
+        default=0.2,
+        gt=0.0,
+        lt=2.0,
+        description="Langevin epsilon; the step at level i is epsilon * sigma_i**2 (stable below 2).",
+    )
 
 
 class SyntheticPathologyAugTrainingConfigSchema(BaseModel):
@@ -280,6 +292,11 @@ class MAEPretrainingTrainingConfigSchema(BaseModel):
     )
     mask_domain: Literal["image", "kspace"] = Field(
         default="image", description="Domain in which masking is applied."
+    )
+    patch_size: int = Field(
+        default=16,
+        ge=1,
+        description="Side in pixels of the square patch masked when mask_domain is 'image'.",
     )
 
 

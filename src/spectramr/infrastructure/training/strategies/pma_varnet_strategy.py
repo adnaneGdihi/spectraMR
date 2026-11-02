@@ -22,6 +22,21 @@ from spectramr.models.losses.m4_losses import PMAGlobalLoss
 logger = logging.getLogger(__name__)
 
 
+def cartesian_maps(mask: torch.Tensor | None, im_size: tuple[int, int]) -> dict[str, Any]:
+    """Operator maps for ``Operator_A_m4`` on the ``fft2c`` grid with the twin's sampling mask."""
+    return {
+        "alpha": None,
+        "T_kin": None,
+        "B0": None,
+        "S_map": None,
+        "Psi": None,
+        "dK": None,
+        "dcf": None,
+        "mask": mask,
+        "im_size": im_size,
+    }
+
+
 class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
     """Training strategy for the unrolled PMA-VarNet architecture.
 
@@ -98,7 +113,7 @@ class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
 
         # 1. Run Digital Twin Simulator
         with torch.no_grad():
-            corrupted_complex, marker_prior, _joint_clean = self.simulator(target_complex)
+            corrupted_complex, _marker_prior, _joint_clean = self.simulator(target_complex)
             # The simulator returns (corrupted_image, marker_prior, joint_clean);
             # the binary marker ROI mask is a separate attribute (as in
             # vf_admm / virtual_fiducial). The old 3-tuple unpack mislabeled
@@ -125,44 +140,23 @@ class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
         # Flatten spatial dims to conceptualize non-Cartesian N_k for the forward operator
         y_meas = y_meas_cartesian.view(B, target_complex.shape[1], 1, H * W)  # [B, N_con, 1, N_k]
 
-        # 3. Construct Analytical Parameter Maps (Phase 1 extracted fields)
-        # In a complete pipeline, these come from Task 3 extractors.
-        # Here we initialize identity maps so the analytical operator functions properly.
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-0.5, 0.5, H, device=self.device),
-            torch.linspace(-0.5, 0.5, W, device=self.device),
-            indexing="ij",
-        )
-        dK = torch.stack([grid_x.ravel(), grid_y.ravel()], dim=0).unsqueeze(0).expand(B, 2, H * W)
-
-        maps_dict = {
-            "alpha": None,
-            "T_kin": None,
-            "B0": None,
-            "S_map": None,
-            "Psi": None,
-            "dK": dK,
-            "dcf": None,
-        }
+        # 3. The measurement is the twin's masked Cartesian k-space, so the DC operator is
+        # mask * fft2c on the same grid (#2380). No field map is passed: arm 02 declares that
+        # the network gets no B0 input.
+        maps_dict = cartesian_maps(self.simulator.last_undersampling_mask, (H, W))
 
         # 4. Execute VarNet K-Cascades
-        # Generator signature requires y_meas passed down
-        reconstructed = self.generator_model(
-            x=y_meas,
-            y_meas=y_meas,
-            maps_dict=maps_dict,
-            marker_mask=marker_mask,
-            marker_prior=marker_prior,
-        )
+        reconstructed = self.generator_model(x=y_meas, y_meas=y_meas, maps_dict=maps_dict)
 
         joint_clean, _ = self.simulator.embedder(target_complex)
 
-        # 5. Evaluate the global M4 Objective
+        # 5. Evaluate the global M4 Objective. The marker term pins the marker region to the
+        # target the L1 term uses, so the two terms never disagree on it (#2381).
         total_loss = self.pma_loss(
             prediction=reconstructed,
             target=joint_clean,
             marker_mask=marker_mask,
-            marker_prior=marker_prior,
+            marker_prior=joint_clean,
         )
 
         self._last_prediction = reconstructed.detach()
@@ -223,4 +217,4 @@ class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
         return out
 
 
-__all__ = ["ConcretePMAVarNetStrategy"]
+__all__ = ["ConcretePMAVarNetStrategy", "cartesian_maps"]

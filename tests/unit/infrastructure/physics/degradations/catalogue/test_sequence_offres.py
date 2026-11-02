@@ -158,3 +158,13 @@ def test_multislice_shares_one_field_and_a_volume_has_its_own_per_slice():
 
 def test_real_input_returns_a_complex_image():
     assert _apply(torch.rand(1, 1, H, W), 0.5).is_complex()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_runs_on_cuda_and_matches_cpu():
+    # A supplied map: the seeded field is drawn per device, so only this path is comparable.
+    x = _x()
+    yy = torch.linspace(-1, 1, H).view(1, 1, H, 1).expand(1, 1, H, W)
+    out = _apply(x.cuda(), 0.5, b0_map_hz=yy.cuda())
+    assert out.device.type == "cuda"
+    torch.testing.assert_close(out.cpu(), _apply(x, 0.5, b0_map_hz=yy), rtol=1e-3, atol=1e-3)

@@ -32,6 +32,9 @@ import torch.nn.functional as F
 from spectramr.models.blocks.progressive import FadeIn, PixelNorm
 from spectramr.models.registry import register_model
 
+#: Side of the pooled grid the conditioning image is reduced to before the latent projection.
+_COND_GRID = 8
+
 
 class _ProGANPhaseBlock(nn.Module):
     """One resolution phase: 2x upsample + two 3x3 convs with pixel norm.
@@ -118,6 +121,12 @@ class ProgressiveGAN(nn.Module):
 
         self.fade_in = FadeIn()
 
+        # Image conditioning keeps a coarse spatial layout (a mean-pooled input made the
+        # output invariant to pixel permutations, #2384) and is built here so an
+        # optimizer constructed before the first forward owns its parameters.
+        self.cond_pool = nn.AdaptiveAvgPool2d(_COND_GRID)
+        self.cond_proj = nn.Linear(in_channels * _COND_GRID * _COND_GRID, z_dim)
+
         # Mutated by ProgressiveGANStrategy (0 == 4x4 base only).
         self.current_phase: int = self.num_phases - 1
         self.alpha: float = 1.0
@@ -153,9 +162,10 @@ class ProgressiveGAN(nn.Module):
         """Coerce a forward input into a ``[B, z_dim]`` latent vector.
 
         Accepts a flat latent (``[B, z_dim]`` / ``[B, z_dim, 1, 1]``) or a
-        conditioning image (``[B, C, H, W]``), which is globally pooled and
-        linearly mapped so the generator can run under image-conditioned
-        ``gan`` training as well as pure latent sampling.
+        conditioning image (``[B, in_channels, H, W]``), which is average-pooled to
+        a ``_COND_GRID x _COND_GRID`` grid and linearly mapped to the latent, so
+        the generator runs under image-conditioned ``gan`` training as well as
+        pure latent sampling.
         """
         if x.dim() == 2:
             if x.shape[1] != self.z_dim:
@@ -165,12 +175,11 @@ class ProgressiveGAN(nn.Module):
             b, c = x.shape[0], x.shape[1]
             if c == self.z_dim and x.shape[2] == 1 and x.shape[3] == 1:
                 return x.reshape(b, self.z_dim)
-            # Conditioning image -> pooled feature -> latent.
-            pooled = F.adaptive_avg_pool2d(x, 1).reshape(b, c)
-            if not hasattr(self, "_cond_proj") or self._cond_proj.in_features != c:
-                # Lazily build the conditioning projection on the input's device.
-                self._cond_proj = nn.Linear(c, self.z_dim).to(x.device)
-            return self._cond_proj(pooled)
+            if c != self.in_channels:
+                raise ValueError(
+                    f"conditioning image has {c} channels, expected in_channels={self.in_channels}"
+                )
+            return self.cond_proj(self.cond_pool(x).reshape(b, -1))
         raise ValueError(f"Unsupported forward input rank {x.dim()} for ProgressiveGAN")
 
     # ------------------------------------------------------------------ #

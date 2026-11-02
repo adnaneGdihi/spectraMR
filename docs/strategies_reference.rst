@@ -1031,6 +1031,21 @@ DisentangledVAETrainingStrategy
 **Purpose:** VAE-based cross-physics anatomy disentanglement with
 KL regularization on both content and style latent spaces.
 
+**Physics axis** (``training.disentangled_vae.physics_source``):
+
+- ``fixed_t1w_64mt_3t`` (default): every row is conditioned on the T1w 64 mT
+  (input) and 3 T (target) physics vectors, whatever the data holds.
+- ``paired_field_stamps``: each row's physics vector comes from its stamped
+  ``field_strength_source_t`` / ``field_strength_t`` and the declared
+  ``data.input_contrast`` / ``data.target_contrast``. It needs
+  ``dataset_type: contrast_aware_paired`` with ``data.expose.field_strength_pair:
+  true``. Validation adds ``val_content_field_leak`` (a held-out linear probe
+  reading the field from the content code), ``val_swap_content_distance`` and
+  ``val_field_swap_error_ratio`` (below 1 when the target-field physics code
+  moves the render toward the target).
+- ``single_field``: self-reconstruction with an image-derived style; the
+  translation and anatomy-consistency terms are off.
+
 
 ---
 

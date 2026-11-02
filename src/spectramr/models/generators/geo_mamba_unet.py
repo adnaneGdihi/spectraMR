@@ -207,13 +207,13 @@ class GeoMambaUNet(nn.Module):
             volume: ``(B, in_channels, D, H, W)`` distorted/unwarped
                 input volume.
             mask: ``(B, 1, D, H, W)`` or ``(D, H, W)`` foreground
-                mask. Required if no linearizer was injected at init.
+                mask; the scan covers its voxels. Defaults to ``|volume| > 1e-3``.
             contrast_id: ``(B,)`` long tensor of contrast indices in
                 ``[0, n_contrasts)``. Defaults to all-zeros.
             intensity_template: ``(D, H, W)`` reference intensity
                 volume for the metric SFC. Used only when no
                 linearizer is available; falls back to the
-                first-batch mean if not provided.
+                first batch's first volume if not provided.
 
         Returns:
             ``(B, out_channels, D, H, W)`` predicted volume with
@@ -226,6 +226,7 @@ class GeoMambaUNet(nn.Module):
             raise ValueError(f"Input has {C} channels; model was built for {self.in_channels}")
 
         linearizer = self._resolve_linearizer(volume, mask, intensity_template)
+        order = self._scan_order(linearizer, volume, mask)
 
         if contrast_id is None:
             contrast_id = torch.zeros(B, dtype=torch.long, device=volume.device)
@@ -234,17 +235,17 @@ class GeoMambaUNet(nn.Module):
         # Lift to token embedding.
         embedded = self.input_proj(volume)  # (B, d_model, D, H, W)
 
-        # Permute to SFC tokens: (B, d_model, N_F) → (B, N_F, d_model).
-        tokens = linearizer(embedded).transpose(1, 2)
+        # Scan this batch's foreground along the curve: (B, d_model, N_F) → (B, N_F, d_model).
+        flat = embedded.reshape(B, self.d_model, -1)
+        tokens = flat[:, :, order].transpose(1, 2)
+        if tokens.shape[1] > 0:  # an all-air patch has nothing to scan
+            for block in self.blocks:
+                tokens = tokens + block(tokens, contrast_emb)  # residual
 
-        for block in self.blocks:
-            tokens = tokens + block(tokens, contrast_emb)  # residual
-
-        # Reverse permute back to (B, d_model, D, H, W); use the
-        # input embedding as the background to keep non-foreground
-        # information unchanged through the network.
-        spatial_tokens = tokens.transpose(1, 2)  # (B, d_model, N_F)
-        restored = linearizer.reverse(spatial_tokens, background=embedded)
+        # Re-embed; background voxels keep their input embedding.
+        restored_flat = flat.clone()
+        restored_flat[:, :, order] = tokens.transpose(1, 2)
+        restored = restored_flat.reshape(B, self.d_model, D, H, W)
 
         # Project to output channels.
         out = self.output_proj(restored)
@@ -295,6 +296,36 @@ class GeoMambaUNet(nn.Module):
         ).view(1, 3, 1, 1, 1)
         return warped, disp_norm * scale
 
+    def _scan_order(
+        self, linearizer: MetricSFCLinearizer, volume: torch.Tensor, mask: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The curve restricted to this batch's foreground (union over the batch).
+
+        Without a mask the foreground is ``|volume| > 1e-3`` (channel mean). A curve
+        over a sub-grid (an injected or pre-#2375 checkpoint curve) raises when the
+        batch has foreground outside it, rather than leaving those voxels unmixed.
+        """
+        B, _, D, H, W = volume.shape
+        if linearizer.spatial_shape != (D, H, W):
+            raise ValueError(
+                f"Input spatial shape mismatch: expected {linearizer.spatial_shape}, got {(D, H, W)}"
+            )
+        if mask is None:
+            fg = volume.abs().mean(dim=1, keepdim=True) > 1e-3
+        else:
+            fg = self._broadcast_mask(mask, B, D, H, W) > 0
+        fg_flat = fg.reshape(fg.shape[0], -1).any(dim=0)
+        if linearizer.n_foreground < fg_flat.numel():
+            outside = fg_flat & (linearizer.inverse_idx < 0)
+            if bool(outside.any()):
+                raise ValueError(
+                    f"{int(outside.sum())} foreground voxels lie outside the stored scan curve "
+                    f"({linearizer.n_foreground} of {fg_flat.numel()} voxels); it predates the "
+                    "full-grid curve (#2375). Re-train, or inject a full-grid linearizer."
+                )
+        curve = linearizer.forward_idx
+        return curve[fg_flat[curve]]  # the one host sync: the scan length varies per batch
+
     def _resolve_linearizer(
         self,
         volume: torch.Tensor,
@@ -303,40 +334,18 @@ class GeoMambaUNet(nn.Module):
     ) -> MetricSFCLinearizer:
         if self._linearizer is not None:
             return self._linearizer
-        if mask is None:
-            # Auto-generate a foreground mask from the input volume when no
-            # explicit mask is supplied. The SFC linearizer needs a mask to
-            # define which voxels participate in the traversal; for typical
-            # MRI inputs background is ≈ 0 and any small positive threshold
-            # cleanly separates anatomy from air. The earlier hard ``raise``
-            # broke every GeoMamba-ULF training arm
-            # (``geomamba_ulf_v0`` / ``v0_synthetic`` / ``v0_multicontrast`` /
-            # ``v1_p2`` / ``v1_p3`` / 5 ablations / 3 specialists in the
-            # 2026-05-05 cluster smoke) because the dataloader did not stash
-            # a separate ``mask`` field. The cached linearizer below makes
-            # this O(once-per-shape) — same cost as if a mask were provided.
-            logger.info(
-                "[GeoMambaUNet] no mask provided — auto-generating "
-                "foreground mask from |volume| > 1e-3 (channel-mean)."
-            )
-            # ``volume`` is (B, C, D, H, W); reduce channels then threshold.
-            vol_mag = volume.abs().mean(dim=1, keepdim=True)
-            mask = (vol_mag > 1e-3).to(vol_mag.dtype)
-        # Use the first sample of the batch as the template if no
-        # explicit one was provided. Keeps the v0 path simple.
+        # The curve covers the whole grid, so every batch's own foreground is a
+        # sub-sequence of it (#2375); the template only sets the metric's intensity term.
         template: torch.Tensor = (
             intensity_template if intensity_template is not None else volume[0, 0]
         )
-        mask_3d = mask[0, 0] if mask.ndim == 5 else mask
+        mask_3d = torch.ones(volume.shape[-3:], device=volume.device, dtype=volume.dtype)
 
-        # Build ONCE from the first batch and keep it: the curve is a fixed
-        # template-bound permutation, persisted with the weights (see
-        # _install_linearizer) so a fresh model reloads the same order.
+        # Build ONCE and persist with the weights (see _install_linearizer).
         if _distributed_world_size() > 1:
             # Every replica must share rank 0's curve.
             template = _broadcast_from_rank0(template.detach())
-            mask_3d = _broadcast_from_rank0(mask_3d.detach())
-        self._install_linearizer(template.detach(), mask_3d.detach(), device=volume.device)
+        self._install_linearizer(template.detach(), mask_3d, device=volume.device)
         assert self._linearizer is not None
         logger.info(
             "[GeoMambaUNet] built lazy MetricSFCLinearizer (shape=%s, fg=%d)",

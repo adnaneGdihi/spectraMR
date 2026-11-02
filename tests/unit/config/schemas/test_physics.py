@@ -9,6 +9,8 @@ both sides, so the claim is checked here.
 
 from __future__ import annotations
 
+import pytest
+
 from spectramr.config.schemas.physics import DigitalTwinConfig
 
 
@@ -199,3 +201,59 @@ class TestApplyAtPredict:
         assert "eval_noise_level" in text, "the noise-not-added rule must be stated"
         assert "DC_SSOT_KEYS" in text, "it is not a generator kwarg; say so"
         assert "raises" in text, "missing inputs raise, never skip"
+
+
+class TestSeverityAxes:
+    """``severity_axes`` gives a registry axis a physical range; one owner per axis."""
+
+    def test_default_is_empty(self) -> None:
+        assert DigitalTwinConfig().severity_axes == {}
+
+    def test_dict_entries_validate_as_severity_axis(self) -> None:
+        from spectramr.config.schemas.severity_axes import SeverityAxis
+
+        cfg = DigitalTwinConfig(
+            progressive_degradations=["cartesian_undersamp"],
+            severity_axes={"cartesian_undersamp": {"start": 2, "end": 16, "schedule": "log"}},
+        )
+        assert isinstance(cfg.severity_axes["cartesian_undersamp"], SeverityAxis)
+
+    def test_bad_shape_raises(self) -> None:
+        with pytest.raises(ValueError, match="start and end must differ"):
+            DigitalTwinConfig(severity_axes={"rician": {"start": 1.0, "end": 1.0}})
+
+    @pytest.mark.parametrize("field", ["degradation_ranges", "degradation_schedules"])
+    def test_overlap_with_degradation_ranges_raises(self, field: str) -> None:
+        other = {"rician": (0.2, 1.0)} if field == "degradation_ranges" else {"rician": "step"}
+        with pytest.raises(ValueError, match=rf"rician.*{field}"):
+            DigitalTwinConfig(
+                progressive_degradations=["rician"],
+                severity_axes={"rician": {"start": 0.01, "end": 0.2}},
+                **{field: other},
+            )
+
+
+class TestMarkerTypeAdvertisedSet:
+    """``marker_type`` admits exactly the shapes the embedder builds, ``none`` included."""
+
+    def test_schema_matches_the_embedder_builders(self) -> None:
+        import typing
+
+        from spectramr.infrastructure.physics.digital_twin_simulator import _MARKER_BUILDERS
+
+        advertised = set(typing.get_args(DigitalTwinConfig.model_fields["marker_type"].annotation))
+        assert advertised == set(_MARKER_BUILDERS)
+
+    def test_none_embeds_no_marker(self) -> None:
+        import torch
+
+        from spectramr.infrastructure.physics.digital_twin_simulator import (
+            CornerFiducialEmbedder,
+        )
+
+        assert DigitalTwinConfig(marker_type="none").marker_type == "none"
+        emb = CornerFiducialEmbedder(im_size=(16, 16), marker_type="none")
+        anatomy = torch.randn(2, 3, 16, 16, dtype=torch.complex64)
+        joint, _ = emb(anatomy)
+        assert emb.marker_mask.sum() == 0
+        assert torch.equal(joint, anatomy)

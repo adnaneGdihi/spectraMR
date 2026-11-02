@@ -62,6 +62,29 @@ class TestApplyEpiDistortion:
         # assert the output still has comparable dynamic range to the input.
         assert out.std().item() > 0.5 * img.std().item()
 
+    @pytest.mark.parametrize("slope", [0.1, 0.3, 0.5, -0.3])
+    def test_constant_gradient_field_conserves_column_mass(self, slope: float) -> None:
+        # #2364: the EPI signal equation conserves signal along each phase-encode
+        # line. Pure resampling gave a column-mass ratio of 1/(1+d') instead of 1.
+        h = w = 128
+        t_esp = 0.5e-3
+        yy = torch.arange(h, dtype=torch.float64).view(1, 1, h, 1).expand(1, 1, h, w)
+        img = torch.exp(-0.5 * ((yy - 64) / 10) ** 2)
+        db0 = slope / (t_esp * h) * (yy - 64)  # d' = slope exactly
+        out = apply_epi_distortion(img, db0, t_esp=t_esp)
+        ratio = out.sum(-2) / img.sum(-2)
+        assert torch.allclose(ratio, torch.ones_like(ratio), atol=1e-2)
+
+    def test_transverse_axis_conserves_row_mass(self) -> None:
+        h = w = 96
+        t_esp = 0.5e-3
+        xx = torch.arange(w, dtype=torch.float64).view(1, 1, 1, w).expand(1, 1, h, w)
+        img = torch.exp(-0.5 * ((xx - 48) / 8) ** 2)
+        db0 = 0.3 / (t_esp * w) * (xx - 48)
+        out = apply_epi_distortion(img, db0, t_esp=t_esp, phase_encode_axis=-1)
+        ratio = out.sum(-1) / img.sum(-1)
+        assert torch.allclose(ratio, torch.ones_like(ratio), atol=1e-2)
+
 
 @pytest.mark.physics
 class TestBeltramiFromB0:

@@ -126,3 +126,36 @@ class TestCrossAttentionOracleUNet:
     def test_latent_dim_attribute(self, model: CrossAttentionOracleUNet) -> None:
         """latent_dim attribute exposed for distillation."""
         assert model.latent_dim == 64
+
+
+class TestUseMarkerOff:
+    """``use_marker: false`` is the marker-off control for experiment_vf_method_a."""
+
+    @staticmethod
+    def _net(use_marker: bool) -> CrossAttentionOracleUNet:
+        torch.manual_seed(0)
+        return CrossAttentionOracleUNet(
+            features=[4, 8], embed_dim=16, num_heads=2, use_marker=use_marker
+        )
+
+    def test_off_builds_no_marker_branch(self) -> None:
+        off, on = self._net(False), self._net(True)
+        assert not hasattr(off, "cross_attention") and hasattr(on, "cross_attention")
+        names = {n for n, _ in off.named_parameters()}
+        assert not any(n.startswith(("token_proj", "from_tokens")) for n in names)
+
+    def test_off_ignores_a_supplied_marker(self) -> None:
+        net = self._net(False)
+        x = torch.randn(1, 2, 16, 16)
+        blind = net(x)
+        with_marker = net(x, marker_residual=torch.randn(1, 2, 16, 16))
+        assert torch.equal(blind, with_marker)
+
+    def test_on_responds_to_the_marker(self) -> None:
+        net = self._net(True)
+        x = torch.randn(1, 2, 16, 16)
+        assert not torch.allclose(net(x), net(x, marker_residual=torch.randn(1, 2, 16, 16)))
+
+    def test_rejects_a_non_bool(self) -> None:
+        with pytest.raises(TypeError, match="use_marker"):
+            CrossAttentionOracleUNet(features=[4, 8], embed_dim=16, num_heads=2, use_marker="no")

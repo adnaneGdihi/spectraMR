@@ -470,3 +470,34 @@ into a skip.
 Note that the published tree does not carry the experiment corpus at all (see
 the first entry on this page), so most of these tests have no subject here even
 in a clone.
+
+Metric meta-evaluation
+======================
+
+The Blackwell ranker checks consistency on simulated catalogues, not clinical validity
+--------------------------------------------------------------------------------------
+
+``spectramr meta-evaluate --blackwell`` checks whether a metric respects the
+information order of experiments simulated on the run's clean references. It does not
+measure diagnostic quality, and each catalogue certifies only some pairs:
+
+* **Coverage.** The diagonal catalogues (``radial``, ``registry``) cover single-coil
+  Fourier-diagonal operators. ``multicoil`` uses one shared synthetic coil set rather
+  than each subject's maps. ``nuisance`` covers only unit-modulus phase codes, which
+  excludes ``chemical_shift``. ``garbling`` certifies only ``b >= K o b`` and its
+  transitive consequences. ``pi_residual_aliasing`` is in no catalogue.
+* **Uncertified pairs.** They are reported, never guessed. The task-free fraction counts
+  them in its denominator, so it is a lower bound.
+* **Statistics.** e-BH counts use sign e-values over contents. Below about 40 contents a
+  single rejection is out of reach (``relations_certifiable`` is false), so a certified
+  count of 0 does not mean "no violation". The coherence LP screens its preferences with
+  a paired t-rule, so an infeasible system is a diagnostic, not a falsification, and
+  the incoherence certificate is sound but not complete.
+* **Envelopes.** The ``oracle_wiener`` envelope uses the clean spectrum and is not closed
+  under composition. It is exact for squared error and a diagnostic for other metrics.
+* **Inputs.** Contents of mixed sizes are centre-cropped to the smallest shape, and a
+  3-D volume contributes four central slices.
+* **Small images.** On 64 x 64 phantoms the channelised Hotelling observer
+  (``task_based_detectability``) violated 16 to 36% of the certified relations. At
+  128 x 128 that fell to under 1%: its patch ensemble is too small on small images. Read
+  a CHO result only at real resolution.

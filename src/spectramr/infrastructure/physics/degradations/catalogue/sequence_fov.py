@@ -65,14 +65,18 @@ def object_extent(x: Tensor, dim: int) -> tuple[Tensor, Tensor]:
 
 
 def fold_axis(
-    x: Tensor, dim: int, theta: float, support: tuple[Tensor, Tensor] | None = None
+    x: Tensor,
+    dim: int,
+    theta: float,
+    support: tuple[Tensor, Tensor] | None = None,
+    max_reduction: float = MAX_REDUCTION,
 ) -> Tensor:
     """Fold ``x`` along ``dim`` at FOV' = E (1 - 0.5 theta) pixels (per sample), window centred on the support."""
     n = x.shape[dim]
     if n == 1:
         return x
     centre, ext = object_extent(x, dim) if support is None else support
-    fov = ext * (1.0 - MAX_REDUCTION * theta)  # [B]
+    fov = ext * (1.0 - max_reduction * theta)  # [B]
     xm = x.movedim(dim, -1)
     view = (-1,) + (1,) * (xm.dim() - 1)
     f = centred_freqs(3 * n, x.device)
@@ -88,7 +92,13 @@ def fold_axis(
 
 
 def fov_foldover_volume(
-    x: Tensor, theta: float, seed: int, geometry: AcquisitionGeometry, *, axes: str = "pe"
+    x: Tensor,
+    theta: float,
+    seed: int,
+    geometry: AcquisitionGeometry,
+    *,
+    axes: str = "pe",
+    max_reduction: float = MAX_REDUCTION,
 ) -> Tensor:
     check_input(x, geometry, "fov_foldover")
     if axes not in _AXES:
@@ -102,10 +112,14 @@ def fov_foldover_volume(
         return x
     supports = {dim: object_extent(x, dim) for dim in _AXES[axes]}
     for dim in _AXES[axes]:
-        x = fold_axis(x, dim, theta, supports[dim])
+        x = fold_axis(x, dim, theta, supports[dim], max_reduction)
     return x
 
 
-def degrade_fov_foldover(x: Tensor, theta: float, seed: int = 0, *, axes: str = "pe") -> Tensor:
+def degrade_fov_foldover(
+    x: Tensor, theta: float, seed: int = 0, *, axes: str = "pe", max_reduction: float = MAX_REDUCTION
+) -> Tensor:
     """2-D slice ``(B, C, H, W)``: fold along phase encode (dim -2)."""
-    return run_as_volume(fov_foldover_volume, x, theta, seed, axes=axes)
+    return run_as_volume(
+        fov_foldover_volume, x, theta, seed, axes=axes, max_reduction=max_reduction
+    )

@@ -999,3 +999,43 @@ def test_convert_metrics_to_floats_reduces_through_the_shared_reducer(monkeypatc
     out = MetricsMixin._convert_metrics_to_floats({"a": torch.tensor([1.0, 3.0]), "b": 4})
     assert out == {"b": 4.0, "a": 2.0}
     assert seen == ["a", "b"]
+
+
+def test_score_training_views_scores_untransformed_views_with_the_train_prefix():
+    """#183: the views go to the computer as given, phase pair included."""
+    from spectramr.infrastructure.training.utils.metric_views import MetricViews
+
+    seen: dict = {}
+
+    class _Computer:
+        def compute(self, pred, target, **kwargs):
+            seen.update(pred=pred, target=target, **kwargs)
+            return {"psnr": 1.0}
+
+    host = _Mixin()
+    host.config = SimpleNamespace()
+    host._training_computer = _Computer()
+    c = torch.complex(torch.rand(1, 1, 4, 4), torch.rand(1, 1, 4, 4))
+    out = host._score_training_views(MetricViews(c.abs(), c.abs(), c, c))
+    assert out == {"train_psnr": 1.0}
+    assert torch.equal(seen["pred"], c.abs()) and seen["complex_pair"][0] is c
+
+
+def test_default_validation_step_scores_the_generator_forward_hook():
+    """The default ``validation_step`` routes its forward through the overridable hook."""
+    class _Host(_Mixin):
+        validation_metrics_computer = SimpleNamespace(get_metric_names=lambda: ["psnr"])
+
+    host = _Host.__new__(_Host)
+    calls: list[torch.Tensor] = []
+
+    def hook(x: torch.Tensor) -> torch.Tensor:
+        calls.append(x)
+        return x
+
+    host._validation_generator_forward = hook
+    host.env = SimpleNamespace(generator=torch.nn.Identity())
+    host.device = torch.device("cpu")
+    host._score_validation_output = lambda out, tgt: {"seen": float(out.shape[0])}
+    assert host.validation_step(torch.zeros(2, 1, 4, 4), torch.zeros(2, 1, 4, 4)) == {"seen": 2.0}
+    assert len(calls) == 1

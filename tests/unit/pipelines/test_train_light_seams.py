@@ -361,6 +361,7 @@ class TestSelectValidationExtraFields:
             "field_strength_target",
             "contrast_id",
             "sources",
+            "source_field_strengths",
         ):
             assert key in _VALIDATION_FORWARD_FIELDS
 

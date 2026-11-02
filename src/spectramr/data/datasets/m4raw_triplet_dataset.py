@@ -19,7 +19,7 @@ import torchio as tio
 from torch.utils.data import Dataset
 
 from spectramr.data.m4raw_noise_units import complex_kspace, noise_unit_rss, scan_noise_power
-from spectramr.infrastructure.physics.m4raw_pseudo_gt import read_acquisition_params
+from spectramr.data.datasets.kspace_volume_stack import read_acquisition_params
 
 CONTRASTS = ("T1", "T2", "FLAIR")
 
@@ -69,6 +69,12 @@ def _nex(path: Path) -> int | None:
     return None if n is None else int(n)
 
 
+def _nex_mode(path: Path) -> str | None:
+    with h5py.File(path, "r") as f:
+        m = f.attrs.get("nex_average_mode")
+    return None if m is None else (m.decode() if isinstance(m, bytes) else str(m))
+
+
 class M4RawTripletDataset(Dataset):
     """One item per valid slice of each registered subject: ``input``/``target`` (3, H, W, 1)."""
 
@@ -98,6 +104,10 @@ class M4RawTripletDataset(Dataset):
             nex = [_nex(p) for p in paths]
             if None in nex:
                 self.excluded[subject] = "missing nex_average_count"
+                continue
+            modes = [_nex_mode(p) for p in paths]
+            if any(m != "phase_aligned_mean" for m in modes):
+                self.excluded[subject] = f"averages not phase_aligned_mean: {modes}"
                 continue
             # Noise fitted once here (central slices, source support for registered
             # copies, #2613), not per item: it pickles into the loader workers.

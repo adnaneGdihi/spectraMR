@@ -11,7 +11,11 @@ import math
 import torch
 from torch import Tensor
 
-from spectramr.infrastructure.physics.degradations._common import _ensure_complex, _generator
+from spectramr.infrastructure.physics.degradations._common import (
+    _ensure_complex,
+    _generator,
+    reject_override_with_endpoint,
+)
 from spectramr.infrastructure.physics.degradations.geometry import AcquisitionGeometry
 from spectramr.infrastructure.physics.fft_ops import centred_freqs, fftnc, ifftnc
 from spectramr.infrastructure.physics.per_sample_rng import per_sample_randn
@@ -27,7 +31,12 @@ def _check_5d(x: Tensor, name: str) -> None:
 
 
 def gibbs_volume(
-    x: Tensor, theta: float, seed: int, geometry: AcquisitionGeometry, **kw: float
+    x: Tensor,
+    theta: float,
+    seed: int,
+    geometry: AcquisitionGeometry,
+    min_truncation_radius: float = 0.085,
+    **kw: float,
 ) -> Tensor:
     """D9 in 3-D: keep k-space where ``r_n <= truncation``, ``r_n = |k_n| / sqrt(3)``.
 
@@ -36,7 +45,13 @@ def gibbs_volume(
     window is an ellipsoid in physical k when voxel sizes differ.
     """
     _check_5d(x, "gibbs")
-    trunc = float(kw.get("truncation_fraction", 1.0 - float(theta) * 0.915))
+    reject_override_with_endpoint(
+        "gibbs", "truncation_fraction", kw.get("truncation_fraction"),
+        "min_truncation_radius", min_truncation_radius, 0.085,
+    )
+    trunc = float(
+        kw.get("truncation_fraction", 1.0 - float(theta) * (1.0 - min_truncation_radius))
+    )
     if trunc >= 1.0:
         return x
     x = _ensure_complex(x)
@@ -61,7 +76,12 @@ def _eddy_coefficients(
 
 
 def eddy_volume(
-    x: Tensor, theta: float, seed: int, geometry: AcquisitionGeometry, **kw: float
+    x: Tensor,
+    theta: float,
+    seed: int,
+    geometry: AcquisitionGeometry,
+    linear_phase_scale: float = 5.0,
+    **kw: float,
 ) -> Tensor:
     """D14 in 3-D: per-(kz, ky)-line phase ``pi * sum_axis(alpha * u + beta * u^2)``.
 
@@ -69,7 +89,10 @@ def eddy_volume(
     is an exact circular shift of alpha voxels along that axis; the readout is untouched.
     """
     _check_5d(x, "eddy")
-    strength = float(kw.get("strength", float(theta) * 5.0))
+    reject_override_with_endpoint(
+        "eddy", "strength", kw.get("strength"), "linear_phase_scale", linear_phase_scale, 5.0
+    )
+    strength = float(kw.get("strength", float(theta) * float(linear_phase_scale)))
     if strength == 0.0:
         return x
     x = _ensure_complex(x)
