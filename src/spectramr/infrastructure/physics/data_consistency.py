@@ -8,6 +8,7 @@ multi-coil sensitivity maps.
 from __future__ import annotations
 
 import logging
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -99,6 +100,9 @@ class NoiseSimulatingDataConsistency(nn.Module):
     r"""
     Physics-Informed Data Consistency Layer with Realistic Noise Simulation.
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(
         self,
@@ -218,6 +222,9 @@ from .implementations.fft_operator import MultiCoilFFTOperator
 
 class AdaptiveDataConsistency(nn.Module):
     """Adaptive Data Consistency with learnable noise weighting."""
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self):
         """__init__."""
@@ -508,6 +515,9 @@ class SimpleDataConsistency(AdaptiveDataConsistency):
 class HardDataConsistency(nn.Module):
     """Hard Data Consistency Layer."""
 
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
+
     def __init__(
         self,
         mask=None,
@@ -665,6 +675,9 @@ class HardDataConsistency(nn.Module):
 class SoftDataConsistency(nn.Module):
     """Soft Data Consistency Layer."""
 
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
+
     def __init__(
         self, lambda_init: float = 10.0, learnable: bool = True, log_scaled: bool = False
     ):
@@ -821,6 +834,9 @@ class NoiseAdaptiveDataConsistency(nn.Module):
     DC layers but is unused: this closed-form layer is coil-wise (each coil's
     k-space is made consistent independently), which needs no SENSE operator.
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(
         self,
@@ -1181,6 +1197,9 @@ class TargetAwareFSDC(nn.Module):
     * Chung et al., "Score-based diffusion models for accelerated MRI",
       Med. Image Anal. (2022).
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(
         self,
@@ -1569,6 +1588,9 @@ class ConformalDataConsistency(nn.Module):
         [3] L. V. Ahlfors, *Complex Analysis*, 3rd ed., McGraw-Hill, 1979.
         [4] Driscoll & Trefethen, *Schwarz-Christoffel Mapping*, CUP, 2002.
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self, alpha: float = 1.0) -> None:
         super().__init__()

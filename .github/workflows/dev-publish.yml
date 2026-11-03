@@ -40,6 +40,8 @@ jobs:
       publish: ${{ steps.gate.outputs.publish }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Upload only a build of the commit public dev names right now
         # The COMMIT, not the ref, licenses an upload: a tag push carries a tag ref,

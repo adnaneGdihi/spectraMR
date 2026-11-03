@@ -308,6 +308,7 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Validate with deterministic degradation and image quality metrics."""
@@ -341,6 +342,7 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
                     input_batch=target,
                     target_batch=target,
                     step=batch_idx,
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(target, target, epoch=0)

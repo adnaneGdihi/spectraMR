@@ -974,3 +974,27 @@ def test_infer_test_split_refuses_a_checkpoint_outside_a_run(tmp_path):
     )
     with pytest.raises(SystemExit, match="checkpoints/"):
         args.func(args)
+
+
+@pytest.mark.parametrize(
+    ("argv", "flag"),
+    [
+        (["--compare", "--no-qc"], "--qc"),
+        (["--compare", "--task", "gan"], "--task"),
+        (["--contrast-pairs", "vs_baseline", "--labels", "a,b"], "--labels"),
+        (["--contrast-pairs", "vs_baseline", "-c", "a.yaml"], "--config"),
+    ],
+)
+def test_report_cross_run_modes_refuse_flags_they_do_not_read(tmp_path, capsys, argv, flag):
+    args = build_parser().parse_args(["report", "-e", str(tmp_path), *argv])
+    assert args.func(args) == 2
+    assert flag in capsys.readouterr().out
+
+
+def test_report_dashboard_builds_the_site_and_refuses_render_flags(tmp_path, capsys):
+    args = build_parser().parse_args(["report", "-e", str(tmp_path), "--dashboard", "--compare"])
+    assert args.func(args) == 2
+    assert "--compare" in capsys.readouterr().out
+    args = build_parser().parse_args(["report", "-e", str(tmp_path), "--dashboard"])
+    assert args.func(args) == 0
+    assert (tmp_path / "index.html").exists()

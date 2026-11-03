@@ -597,3 +597,35 @@ def test_build_generator_passes_its_device_to_kwarg_resolution(monkeypatch) -> N
         mb.build_generator()
 
     assert seen.get("device") == torch.device("cuda")
+
+
+# ── model_kwargs.backbone_checkpoint (frozen_backbone_with_head) ──
+
+
+def _backbone_builder(path) -> ModelBuilder:
+    config = SimpleNamespace(
+        model=SimpleNamespace(checkpoint_path=None, model_kwargs={"backbone_checkpoint": path})
+    )
+    builder = _builder_with_config(config)
+    builder._device = torch.device("cpu")
+    return builder
+
+
+def test_backbone_checkpoint_reaches_the_models_loader(tmp_path) -> None:
+    seen = {}
+
+    class _Stage2(torch.nn.Module):
+        def load_backbone_state(self, state, *, source):
+            seen.update(state=state, source=source)
+
+    weights_ = {"w": torch.ones(2)}
+    ckpt = write_run_state(tmp_path / "stage1.safetensors", {"generator": weights_})
+    _backbone_builder(str(ckpt))._warm_start(_Stage2())
+    torch.testing.assert_close(seen["state"]["w"], weights_["w"])
+    assert seen["source"] == str(ckpt)
+
+
+def test_backbone_checkpoint_on_a_model_without_a_loader_raises(tmp_path) -> None:
+    ckpt = write_run_state(tmp_path / "stage1.safetensors", {"generator": {"w": torch.ones(2)}})
+    with pytest.raises(ValueError, match="load_backbone_state"):
+        _backbone_builder(str(ckpt))._warm_start(torch.nn.Conv2d(1, 1, 1))

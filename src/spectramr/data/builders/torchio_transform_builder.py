@@ -52,6 +52,7 @@ from typing import Any
 import torchio as tio
 
 from spectramr.config.schemas.augmentation import AugmentationConfigSchema
+from spectramr.data.transforms.traced_compose import TracedCompose
 from spectramr.data.signal_domain import is_kspace_dataset_type
 from spectramr.data.transforms.augmentation_factory import TorchIOAugmentationFactory
 
@@ -140,7 +141,8 @@ def _compose_copying_once(transforms: list[tio.Transform]) -> tio.Compose:
     A torchio transform's default ``copy=True`` deep-copies the whole subject on
     entry, so an N-member chain made N+1 copies of every sample's multi-coil
     k-space; profiled at ~10% of a self_supervised run (sabine, 2026-10-21). The
-    Compose keeps its own copy, which protects a cached or prefetched subject.
+    Compose keeps its own copy, which protects a cached or prefetched subject. It is
+    a :class:`TracedCompose`, so a snapshot step records each member's output.
     """
     stack: list[Any] = list(transforms)
     while stack:
@@ -152,7 +154,7 @@ def _compose_copying_once(transforms: list[tio.Transform]) -> tio.Compose:
             stack.extend(member.transforms)
         elif isinstance(member, tio.OneOf):
             stack.extend(member.transforms_dict)
-    return tio.Compose(transforms)
+    return TracedCompose(transforms)
 
 
 class _ValDebugStats(tio.Transform):

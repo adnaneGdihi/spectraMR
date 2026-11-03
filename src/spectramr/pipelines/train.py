@@ -20,6 +20,7 @@ import time
 import traceback
 import weakref
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -3121,54 +3122,62 @@ def _run_validation(
 
                 _sink = getattr(strategy, "_per_case_metric_sink", None)
                 _sink_mark = getattr(_sink, "n_observed", 0)
-                # Dispatch based on strategy's validation_step signature
-                # (_vs_params resolved once before the loop — PIPE-3).
-                # Pattern A: (input_batch, target_batch, **kwargs) — 13 strategies
-                # Pattern B: (batch, **kwargs) or (val_batch, batch_idx) — 5 strategies
-                # Pattern C: (batch, input_batch=None, target_batch=None) — 3 strategies
-                if (
-                    _val_input is not None
-                    and _val_target is not None
-                    and len(_vs_params) >= 3  # self + 2 positional
-                    and "target_batch" in _vs_params
-                    and "batch" not in _vs_params[:2]  # exclude Pattern C
-                ):
-                    # Pattern A: two-tensor signature. Gated extra: pass a real
-                    # reference field (e.g. b0_map) ONLY to strategies that
-                    # declare it (the VF real-reference seam) — no effect on the
-                    # other Pattern-A strategies.
-                    _vs_extra: dict[str, Any] = {"batch_idx": i}
-                    # Gated per-sample field seam (b0_map/b1_map/trajectory_*,
-                    # field_strength[_target], contrast_id): forward each field ONLY
-                    # to a strategy whose validation_step declares it AND when the
-                    # batch carries it. Extracted to select_validation_extra_fields
-                    # (testable; single source of truth). Previously this was inline
-                    # and gated on isinstance(val_batch, dict) — ALWAYS False after
-                    # the TrainingBatch conversion above, so the seam was DEAD; the
-                    # VF real-reference + MRIxFields cross-field arms self-graded on
-                    # the wrong field. The double gate also prevents the
-                    # batch_context/kwargs collision in the field-conditioned arms.
-                    _vs_extra.update(select_validation_extra_fields(val_batch, _vs_params))
-                    metrics = strategy.validation_step(_val_input, _val_target, **_vs_extra)
-                elif "batch" in _vs_params or "val_batch" in _vs_params:
-                    # Pattern B/C: whole-batch signature
-                    if "input_batch" in _vs_params:
-                        # Pattern C: batch + optional keyword tensors
-                        metrics = strategy.validation_step(
-                            val_batch,
-                            input_batch=_val_input,
-                            target_batch=_val_target,
-                        )
-                    elif "batch_idx" in _vs_params:
-                        metrics = strategy.validation_step(val_batch, batch_idx=i)
+                # The first batch of each validation pass is a ``val`` snapshot step.
+                _snapshots = getattr(strategy, "snapshot_session", None)
+                _val_snap = (
+                    _snapshots.step("val", iteration, val_batch)
+                    if _snapshots is not None and i == 0
+                    else nullcontext()
+                )
+                with _val_snap:
+                    # Dispatch based on strategy's validation_step signature
+                    # (_vs_params resolved once before the loop — PIPE-3).
+                    # Pattern A: (input_batch, target_batch, **kwargs) — 13 strategies
+                    # Pattern B: (batch, **kwargs) or (val_batch, batch_idx) — 5 strategies
+                    # Pattern C: (batch, input_batch=None, target_batch=None) — 3 strategies
+                    if (
+                        _val_input is not None
+                        and _val_target is not None
+                        and len(_vs_params) >= 3  # self + 2 positional
+                        and "target_batch" in _vs_params
+                        and "batch" not in _vs_params[:2]  # exclude Pattern C
+                    ):
+                        # Pattern A: two-tensor signature. Gated extra: pass a real
+                        # reference field (e.g. b0_map) ONLY to strategies that
+                        # declare it (the VF real-reference seam) — no effect on the
+                        # other Pattern-A strategies.
+                        _vs_extra: dict[str, Any] = {"batch_idx": i}
+                        # Gated per-sample field seam (b0_map/b1_map/trajectory_*,
+                        # field_strength[_target], contrast_id): forward each field ONLY
+                        # to a strategy whose validation_step declares it AND when the
+                        # batch carries it. Extracted to select_validation_extra_fields
+                        # (testable; single source of truth). Previously this was inline
+                        # and gated on isinstance(val_batch, dict) — ALWAYS False after
+                        # the TrainingBatch conversion above, so the seam was DEAD; the
+                        # VF real-reference + MRIxFields cross-field arms self-graded on
+                        # the wrong field. The double gate also prevents the
+                        # batch_context/kwargs collision in the field-conditioned arms.
+                        _vs_extra.update(select_validation_extra_fields(val_batch, _vs_params))
+                        metrics = strategy.validation_step(_val_input, _val_target, **_vs_extra)
+                    elif "batch" in _vs_params or "val_batch" in _vs_params:
+                        # Pattern B/C: whole-batch signature
+                        if "input_batch" in _vs_params:
+                            # Pattern C: batch + optional keyword tensors
+                            metrics = strategy.validation_step(
+                                val_batch,
+                                input_batch=_val_input,
+                                target_batch=_val_target,
+                            )
+                        elif "batch_idx" in _vs_params:
+                            metrics = strategy.validation_step(val_batch, batch_idx=i)
+                        else:
+                            metrics = strategy.validation_step(val_batch)
                     else:
-                        metrics = strategy.validation_step(val_batch)
-                else:
-                    # Fallback: try two-tensor if we have both
-                    if _val_input is not None and _val_target is not None:
-                        metrics = strategy.validation_step(_val_input, _val_target)
-                    else:
-                        metrics = strategy.validation_step(val_batch, batch_idx=i)
+                        # Fallback: try two-tensor if we have both
+                        if _val_input is not None and _val_target is not None:
+                            metrics = strategy.validation_step(_val_input, _val_target)
+                        else:
+                            metrics = strategy.validation_step(val_batch, batch_idx=i)
 
                 # A strategy that could not produce a prediction returns the sentinel instead of
                 # raising; it is a failed batch, not a scored one (#2750 counts every failure).

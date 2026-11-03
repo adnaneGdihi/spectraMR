@@ -108,11 +108,6 @@ class RiemannianMRFDiffusionStrategy(BaseTrainingStrategy):
     metric there.
     """
 
-    # Debug-snapshot contract (non-negotiable 14): the model is fed a noised
-    # tensor, not the prepared input; declared here and emitted under the tag.
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
-
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         cfg = getattr(self.config.training, "riemannian_mrf_diffusion", None)

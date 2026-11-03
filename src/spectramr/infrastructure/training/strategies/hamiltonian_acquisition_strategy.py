@@ -329,6 +329,7 @@ class HamiltonianAcquisitionStrategy(BaseTrainingStrategy, KspaceMixin, Reconstr
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Validate: recompute the surrogate recon and report PSNR + diagnostics."""
@@ -352,6 +353,7 @@ class HamiltonianAcquisitionStrategy(BaseTrainingStrategy, KspaceMixin, Reconstr
                     input_batch=target_batch,
                     target_batch=target_batch,
                     step=int(kwargs.get("batch_idx", 0) or 0),
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(target_batch, target_batch, epoch=0)

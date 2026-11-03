@@ -34,7 +34,6 @@ def _bare(recorder: dict) -> EDMTrainingStrategy:
     s._edm_schedule = SimpleNamespace(
         sample_sigma=lambda b, device: torch.full((b,), 1.5, device=device)
     )
-    s._declared_model_input = None
 
     def _gen(x: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
         recorder["model_saw"] = x
@@ -44,17 +43,17 @@ def _bare(recorder: dict) -> EDMTrainingStrategy:
     return s
 
 
-def test_edm_declares_the_preconditioned_input_not_the_noised_one() -> None:
+def test_edm_declares_the_preconditioned_input_not_the_noised_one(declared) -> None:
     recorder: dict = {}
     s = _bare(recorder)
     clean = torch.randn(2, 1, 8, 8)
 
     s._compute_losses_impl(input_batch={"target": clean}, target_batch=clean, epoch=0)
 
-    assert s._declared_model_input is not None, (
-        "EDM inherits the carve-out, so it owes the wrapper a declaration"
+    assert declared() is not None, (
+        "EDM builds its model input inside the step, so it names it for the snapshot"
     )
-    tensors, extra, in_kspace_keys = s._declared_model_input
+    tensors, extra, _in_kspace_keys = declared()
 
     # The contract: what was declared IS what the network received.
     assert torch.equal(tensors["model_input"], recorder["model_saw"])
@@ -67,7 +66,7 @@ def test_edm_declares_the_preconditioned_input_not_the_noised_one() -> None:
     assert extra["model_input_key"] == "model_input"
 
 
-def test_edm_names_kspace_keys_explicitly() -> None:
+def test_edm_names_kspace_keys_explicitly(declared) -> None:
     """`None` would fall back to a `"kspace"` substring match over key names.
 
     That fallback misses `target` entirely (findings booklet VIS-1). An empty
@@ -82,7 +81,7 @@ def test_edm_names_kspace_keys_explicitly() -> None:
 
     s._compute_losses_impl(input_batch={"target": clean}, target_batch=clean, epoch=0)
 
-    _tensors, _extra, in_kspace_keys = s._declared_model_input
+    _tensors, _extra, in_kspace_keys = declared()
     assert in_kspace_keys == set(), "must be explicit, not None"
 
 

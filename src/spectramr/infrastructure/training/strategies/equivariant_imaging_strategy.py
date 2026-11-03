@@ -108,9 +108,6 @@ class EquivariantImagingStrategy(ReconstructionTrainingStrategy):
     #: The multi-coil operator raises without the batch's coil maps (#2326).
     validates_on_batch_context: ClassVar[bool] = True
     checkpointed_streams: ClassVar[tuple[str, ...]] = ("_rng",)
-    #: The network is fed ``A^H y`` (or ``y``) built inside the step (#2508).
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "ei_model_input"
     # The validation forward reads y from the context (MulticoilEIOperator.prepare).
     validation_reads_context_measurement = True
 

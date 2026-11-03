@@ -3,11 +3,16 @@
 Plan: TODO/backlog_multi_contrast_remaining.md §Item 1.
 
 InfoNCE / SimCLR-style contrastive loss where positives are co-registered
-contrasts of the same subject and negatives are different subjects.
+contrasts of the same slice (``view_a``/``view_b``, e.g. ``m4raw_triplet`` with
+``contrastive_views``). Under ``data.multi_contrast.negative_sampling:
+cross_subject`` in-batch pairs from the same subject are masked out of the
+negatives (the batch's ``subject_index``); ``cross_volume`` keeps every other
+sample. Validation reports the InfoNCE loss and top-1 view retrieval.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Any, ClassVar
 
@@ -16,9 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from spectramr.core.module_utils import unwrap_model
+from spectramr.data.batch_types import read_batch_field
+from spectramr.models.capabilities import StrategyCapabilities
 
 from .base import BaseTrainingStrategy
-from .mixins.utils import pick_present
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +37,10 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
     parallel_compat = frozenset({"replicated"})
     #: The momentum warm-up schedule reads ``_step``; a resume must continue it.
     checkpointed_counters: ClassVar[tuple[str, ...]] = ("_step",)
+    capabilities: ClassVar[StrategyCapabilities] = dataclasses.replace(
+        BaseTrainingStrategy.capabilities,
+        emitted_metrics=frozenset({"infonce", "view_retrieval_top1"}),
+    )
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -40,39 +50,21 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
 
     @staticmethod
     def _resolve_mc_knobs(config: Any) -> dict[str, Any]:
-        """Resolve + validate the multi-contrast contrastive knobs from the SSOT.
+        """Resolve + validate ``config.training.ssl.multi_contrast_contrastive``; no defaults.
 
-        Reads ONLY the declared nested home
-        (``config.training.ssl.multi_contrast_contrastive``). There is no flat
-        ``config.ssl`` fallback (it never existed on ``TrainingSettings``) and
-        no ``getattr`` defaults — an absent block raises so a misconfigured run
-        fails at startup instead of silently using stand-in defaults that ignore
-        the YAML (CLAUDE.md non-negotiables #8 / pitfalls #9, #15).
-
-        Note:
-            ``config.training.ssl`` is declared as ``dict[str, Any] | None`` on
-            ``TrainingConfigSchema`` (``schemas/training/core.py``), so at
-            runtime it is a plain dict (the nested block is a dict too) — NOT an
-            ``SSLConfigSchema`` object. We coerce the block into
-            ``MultiContrastContrastiveConfigSchema`` here so the schema's own
-            validation (``temperature>0``, ``momentum∈[0,1]``,
-            ``extra='forbid'``) actually runs at strategy startup regardless of
-            whether ``ssl`` arrives as a dict or an already-typed object.
+        ``training.ssl`` arrives as a dict at runtime, so the block is coerced through
+        ``MultiContrastContrastiveConfigSchema`` for its field validation.
 
         Raises:
-            ValueError: if the nested block is absent, ``temperature`` is not
-                positive, or ``symmetrize`` and ``use_momentum`` are both True
-                (a gradient-frozen momentum target makes the symmetric second
-                InfoNCE direction a silent no-op — reject rather than degrade).
+            ValueError: the block is absent, ``temperature`` is not positive, or
+                ``symmetrize`` and ``use_momentum`` are both on (the second InfoNCE
+                direction through a gradient-frozen momentum target is a no-op).
         """
         from spectramr.config.schemas.base import (
             MultiContrastContrastiveConfigSchema,
         )
 
-        # ``ssl`` lives only on the SSL paradigm variant of the training
-        # schema, so keep a single (leaf-level) getattr — direct access would
-        # AttributeError for non-SSL configs. ``config.training`` is a
-        # guaranteed top-level section.
+        # ``ssl`` exists only on the SSL training schema variant.
         ssl_cfg = getattr(config.training, "ssl", None)
         if isinstance(ssl_cfg, dict):
             raw = ssl_cfg.get("multi_contrast_contrastive")
@@ -86,8 +78,6 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
                 "It is absent — refusing to fall back to defaults that would "
                 "silently ignore the YAML."
             )
-        # Coerce a raw dict (the runtime form) through the schema so its
-        # field-level validation runs; pass an already-typed object through.
         if isinstance(raw, MultiContrastContrastiveConfigSchema):
             mc_cfg = raw
         else:
@@ -99,11 +89,6 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
             )
         symmetrize = bool(mc_cfg.symmetrize)
         use_momentum = bool(mc_cfg.use_momentum)
-        # ``symmetrize`` is incompatible with a momentum target encoder: the
-        # target is gradient-frozen, so the second (symmetric) InfoNCE
-        # direction routed through it carries no gradient and the advertised
-        # ``symmetrize=True`` would silently no-op (audit: dropped knob).
-        # Raise rather than degrade (pitfall #9) — the YAML must turn one off.
         if symmetrize and use_momentum:
             raise ValueError(
                 "multi_contrast_contrastive: symmetrize=True is incompatible "
@@ -129,16 +114,23 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
         self._momentum = knobs["momentum"]
         # Warm-up steps before momentum encoder fully tracks.
         self._warmup_steps = knobs["warmup_steps"]
+        mc = getattr(getattr(config, "data", None), "multi_contrast", None)
+        if mc is None:  # a config without the block carries the schema's default
+            from spectramr.config.schemas.data import MultiContrastConfigSchema
+
+            mc = MultiContrastConfigSchema()
+        self._negative_sampling = mc.negative_sampling
         # Stamp the resolved effective knobs into the run log so the
         # provenance reflects what actually ran (pitfall #15).
         logger.info(
             "multi_contrast_contrastive knobs: temperature=%s symmetrize=%s "
-            "use_momentum=%s momentum=%s warmup_steps=%s",
+            "use_momentum=%s momentum=%s warmup_steps=%s negative_sampling=%s",
             self._temperature,
             self._symmetrize,
             self._use_momentum,
             self._momentum,
             self._warmup_steps,
+            self._negative_sampling,
         )
 
     def _ensure_momentum_encoder(self) -> None:
@@ -187,19 +179,54 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
 
     @staticmethod
     def _info_nce(
-        z1: torch.Tensor, z2: torch.Tensor, tau: float, pos_offset: int = 0
+        z1: torch.Tensor,
+        z2: torch.Tensor,
+        tau: float,
+        pos_offset: int = 0,
+        same_subject: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Symmetric InfoNCE: cross-entropy with positives on the diagonal.
+        """InfoNCE: cross-entropy with positives at ``pos_offset + i``.
 
-        ``pos_offset`` shifts the positive column for the local block when
-        ``z2`` is a DDP-gathered tensor (local samples sit at columns
-        ``rank*B``); 0 in single-process runs.
+        ``pos_offset`` places the local block inside a DDP-gathered ``z2`` (columns
+        ``rank*B``). ``same_subject`` ``[B, N]`` marks non-positive columns from the
+        same subject; they are removed from the negatives.
         """
-        z1 = F.normalize(z1, dim=-1)
-        z2 = F.normalize(z2, dim=-1)
-        logits = z1 @ z2.t() / tau
+        logits = F.normalize(z1, dim=-1) @ F.normalize(z2, dim=-1).t() / tau
         labels = torch.arange(z1.shape[0], device=z1.device) + pos_offset
+        if same_subject is not None:
+            logits = logits.masked_fill(same_subject, float("-inf"))
         return F.cross_entropy(logits, labels)
+
+    def _views(self, batch: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        view_a, view_b = (read_batch_field(batch, k) for k in ("view_a", "view_b"))
+        missing = [k for k, v in (("view_a", view_a), ("view_b", view_b)) if v is None]
+        if missing:
+            raise RuntimeError(
+                f"multi_contrast_contrastive needs co-registered contrast views; the batch has no "
+                f"{missing}. Serve them with data.m4raw_triplet.contrastive_views."
+            )
+        subject = read_batch_field(batch, "subject_index")
+        if self._negative_sampling == "cross_subject" and subject is None:
+            raise RuntimeError(
+                "negative_sampling 'cross_subject' needs the batch's subject_index to mask "
+                "same-subject negatives"
+            )
+        return view_a, view_b, subject if self._negative_sampling == "cross_subject" else None
+
+    @staticmethod
+    def _projection(z: Any) -> torch.Tensor:
+        return z["projection"] if isinstance(z, dict) else z
+
+    def _same_subject(self, subject: torch.Tensor | None, offset: int) -> torch.Tensor | None:
+        """``[B, N]`` mask of same-subject, non-positive pairs against the gathered batch."""
+        if subject is None:
+            return None
+        local = subject.reshape(-1)
+        gathered = self._ddp_gather(local)
+        rows = torch.arange(local.numel(), device=local.device)
+        cols = torch.arange(gathered.numel(), device=local.device)
+        positive = cols[None, :] == (rows + offset)[:, None]  # elementwise: no index_put sync
+        return (local[:, None] == gathered[None, :]) & ~positive
 
     def _compute_losses_impl(
         self,
@@ -208,80 +235,52 @@ class MultiContrastContrastiveStrategy(BaseTrainingStrategy):
         epoch: int,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
-        """Canonical signature; reads the dict-batch from kwargs (audit F1)."""
+        """Canonical signature; the views come from the batch (``kwargs``)."""
         self._ensure_momentum_encoder()
-        # ``self.env.generator`` instead of ``self.context.generator``
-        # (audit F3 silent-fallback fix).
         gen = self.env.generator
         if gen is None:
             raise RuntimeError("multi_contrast_contrastive strategy: env.generator is None")
-
-        # Resolve the dict batch through the SSOT helper, then enforce the
-        # contrast-view contract: a dict batch MUST carry both co-registered
-        # views. Previously a missing key passed ``None`` straight into the
-        # generator (``gen(None)``) producing an obscure crash with no
-        # diagnostic — raise descriptively instead (audit F1; pitfall #9).
-        batch = self._resolve_legacy_batch(input_batch, kwargs)
-        if isinstance(batch, dict):
-            missing = [k for k in ("view_a", "view_b") if batch.get(k) is None]
-            if missing:
-                raise RuntimeError(
-                    "multi_contrast_contrastive requires co-registered contrast "
-                    f"views but the batch is missing {missing}. Expected keys "
-                    "'view_a' and 'view_b' (e.g. two contrasts of the same "
-                    "subject). No producer under src/spectramr/data/ currently "
-                    "emits these keys — wire a multi-contrast dataset/transform "
-                    "before running this strategy end-to-end."
-                )
-            view_a = batch["view_a"]
-            view_b = batch["view_b"]
-        else:
-            # Non-dict batch: a single tensor view is treated as both branches
-            # (degenerate single-view contrastive). pick_present keeps tensor
-            # operands intact (never ``a or b`` on tensors).
-            view_a = view_b = pick_present(batch, input_batch)
-            if view_a is None:
-                raise RuntimeError(
-                    "multi_contrast_contrastive received no usable batch: both "
-                    "the resolved batch and input_batch are None."
-                )
-
-        z_a = gen(view_a)
-        # Use momentum encoder for the second view if available.
+        view_a, view_b, subject = self._views(self._resolve_legacy_batch(input_batch, kwargs))
+        z_a = self._projection(gen(view_a))
         if self._target_encoder is not None:
             with torch.no_grad():
-                z_b = self._target_encoder(view_b)
+                z_b = self._projection(self._target_encoder(view_b))
         else:
-            z_b = gen(view_b)
-
-        if isinstance(z_a, dict):
-            z_a = z_a.get("projection", next(iter(z_a.values())))
-        if isinstance(z_b, dict):
-            z_b = z_b.get("projection", next(iter(z_b.values())))
-
-        # DDP gather so negatives span the full world-size batch. The local
-        # block sits at columns rank*B in the gathered tensor, so the positive
-        # labels must be offset by rank*B (the old arange(B) was correct only
-        # on rank 0).
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            pos_offset = torch.distributed.get_rank() * z_a.shape[0]
-        else:
-            pos_offset = 0
-        z_b_neg = self._ddp_gather(z_b)
-
-        loss = self._info_nce(z_a, z_b_neg, self._temperature, pos_offset)
-        if self._symmetrize:
-            # ``symmetrize`` is honored unconditionally here: __init__ has
-            # already rejected the symmetrize + use_momentum combination, so
-            # when we reach this branch ``_target_encoder`` is guaranteed None
-            # and both views went through the same (online) encoder — the
-            # second InfoNCE direction has a real gradient path. (Previously
-            # this was gated on ``_target_encoder is None``, which silently
-            # dropped the term whenever a momentum encoder was active.)
+            z_b = self._projection(gen(view_b))
+        # The local block sits at columns rank*B of the gathered negatives.
+        dist = torch.distributed
+        offset = (
+            dist.get_rank() * z_a.shape[0] if dist.is_available() and dist.is_initialized() else 0
+        )
+        same = self._same_subject(subject, offset)
+        loss = self._info_nce(z_a, self._ddp_gather(z_b), self._temperature, offset, same)
+        if self._symmetrize:  # __init__ refused symmetrize with a momentum target
             loss = 0.5 * (
-                loss + self._info_nce(z_b, self._ddp_gather(z_a), self._temperature, pos_offset)
+                loss + self._info_nce(z_b, self._ddp_gather(z_a), self._temperature, offset, same)
             )
-
         self._step += 1
         self._ema_update()
         return {"loss_total": loss, "loss_contrastive": loss.detach()}
+
+    @torch.no_grad()
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        *,
+        batch_data: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, torch.Tensor]:
+        """InfoNCE and top-1 view retrieval of the online encoder on the validation pairs."""
+        view_a, view_b, subject = self._views(batch_data)
+        gen = self.env.generator
+        z_a, z_b = self._projection(gen(view_a)), self._projection(gen(view_b))
+        same = self._same_subject(subject, 0)
+        logits = F.normalize(z_a, dim=-1) @ F.normalize(z_b, dim=-1).t()
+        if same is not None:
+            logits = logits.masked_fill(same, float("-inf"))
+        hits = logits.argmax(dim=1) == torch.arange(z_a.shape[0], device=z_a.device)
+        return {
+            "infonce": self._info_nce(z_a, z_b, self._temperature, 0, same),
+            "view_retrieval_top1": hits.float().mean(),
+        }

@@ -159,6 +159,7 @@ conftest.py
 !tests/unit/test_sim2rank_method_robustness.py
 !tests/unit/test_sim2rank_metric_health.py
 !tests/unit/test_sim2rank_metric_scales.py
+!tests/unit/test_sim2rank_metric_selection.py
 !tests/unit/test_sim2rank_mosaics.py
 !tests/unit/test_sim2rank_odm_correctness.py
 !tests/unit/test_sim2rank_odm_invariants.py

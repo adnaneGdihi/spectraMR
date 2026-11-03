@@ -33,17 +33,13 @@ def test_unknown_model_kwarg_raises_instead_of_being_swallowed():
         SwinV2UNet(use_fed_bn=True, **TINY)
 
 
-def test_registered_and_resolved_through_the_cross_field_wrapper():
+def test_registered_and_wrapped_by_the_cross_field_model():
+    from spectramr.models.generators.cross_field_fm import CrossFieldFM
     from spectramr.models.init_registry import populate_model_registry
     from spectramr.models.registry import MODEL_REGISTRY
 
     populate_model_registry()
     assert MODEL_REGISTRY.get("swin_v2_unet")["class"] is SwinV2UNet
-    wrapper = MODEL_REGISTRY.get("cross_field_fm")["class"](
-        in_channels=1,
-        out_channels=1,
-        spatial_dims=2,
-        model_kwargs={"backbone": "swin_v2_unet", **TINY},
-    )
-    assert isinstance(wrapper.backbone, SwinV2UNet)
-    assert wrapper(torch.randn(1, 1, 16, 16)).shape == (1, 1, 16, 16)
+    model = CrossFieldFM(field_conditioning=False, **TINY)
+    assert isinstance(model.backbone, SwinV2UNet)
+    assert model(torch.randn(1, 1, 16, 16)).shape == (1, 1, 16, 16)

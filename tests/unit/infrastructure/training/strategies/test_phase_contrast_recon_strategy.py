@@ -169,3 +169,22 @@ def test_velocity_error_cancels_a_shared_background_and_wraps() -> None:
     expected = torch.zeros_like(err)
     expected[:, 1] = shift * venc[:, 1, None, None, None] / math.pi
     assert torch.allclose(err, expected, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("markers", "expected"),
+    [
+        ({"kspace_normalized": torch.tensor([True])}, {"input_raw", "input_prepared"}),
+        ({"kspace_normalized": torch.tensor([False])}, set()),
+        ({}, set()),
+    ],
+)
+def test_the_snapshot_decompresses_the_input_only_after_a_normalizing_loader(markers, expected):
+    """``input_raw`` is the loader's k-space: compressed exactly when its transform ran."""
+    strategy = object.__new__(PhaseContrastReconStrategy)
+    seen: dict = {}
+    strategy.save_debug_snapshot = lambda tensors, **kwargs: seen.update(kwargs)
+    volume = torch.rand(1, 2, 3, 4, 4)
+    batch = SimpleNamespace(input=torch.rand(1, 2, 4, 4), **markers)
+    strategy._snapshot(batch, volume, volume, step=0)
+    assert seen["log_scaled_keys"]() == expected

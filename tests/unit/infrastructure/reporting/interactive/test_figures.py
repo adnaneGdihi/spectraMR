@@ -11,6 +11,7 @@ import importlib.util
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from spectramr.infrastructure.reporting.interactive import figures as figs
 
@@ -118,3 +119,21 @@ def test_learning_curve_pairs_prefixed_val_metric():
         assert "proposed train loss" in div and "proposed val loss" in div
     else:
         assert div is None
+
+
+def test_large_case_sets_keep_exact_boxes_but_thin_the_dots():
+    pytest.importorskip("plotly")
+
+    from spectramr.infrastructure.reporting.interactive import figures as F
+
+    n = 5000
+    vals = [30.0 + (i % 100) / 100 for i in range(n)] + [10.0]  # one far outlier
+    df = pd.DataFrame({"case_id": [f"c{i}" for i in range(n + 1)], "psnr": vals})
+    div = F.group_iqm_div(per_call_df=df)
+    assert "c5000" in div  # the outlier is always drawn
+    import re
+
+    assert len(re.findall(r'"c\d+"', div)) == F.MAX_POINTS + 1  # sample + the outlier, not all 5001
+    assert f"a random {F.MAX_POINTS}" in div
+    st = F._box_stats(pd.Series(vals))
+    assert st["median"] == pytest.approx(pd.Series(vals).median())

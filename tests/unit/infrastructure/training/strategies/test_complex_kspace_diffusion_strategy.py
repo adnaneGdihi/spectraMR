@@ -67,7 +67,6 @@ def _bare(config: SimpleNamespace | None = None) -> ComplexKspaceDiffusionStrate
     s.num_timesteps = T
     s.beta_schedule = "linear"
     s.scheduler = DiffusionScheduler(num_timesteps=T, device=torch.device("cpu"))
-    s._declared_model_input = None
     s._resolve_legacy_batch = lambda input_batch, kwargs: input_batch  # type: ignore[method-assign]
     s._resolve_validation_sampling_steps = lambda: 5  # type: ignore[method-assign]
     s._resolved_kspace_diffusion = s._resolve_settings()
@@ -84,7 +83,7 @@ def test_factory_resolves_the_short_name() -> None:
     assert _resolved_class() is ComplexKspaceDiffusionStrategy
 
 
-def test_training_feeds_the_noised_kspace_and_regresses_epsilon() -> None:
+def test_training_feeds_the_noised_kspace_and_regresses_epsilon(declared) -> None:
     s = _bare()
     k0, y = _kspace(), _kspace()
     out = s._compute_losses_impl(input_batch={"target": k0, "input": y})
@@ -93,7 +92,7 @@ def test_training_feeds_the_noised_kspace_and_regresses_epsilon() -> None:
     assert horizon == T, "the horizon must reach complex_unet's timestep embedding"
     assert seen.shape == (2, 2, 8, 8)
     assert not torch.equal(seen, flat_rows(k0) / measurement_scale(flat_rows(y)))
-    tensors, extra, keys = s._declared_model_input
+    tensors, extra, keys = declared()
     assert torch.equal(tensors["model_input"], seen)
     assert extra["provenance"]["dc_method"] == "hard"
     assert keys == {"model_input", "target"}

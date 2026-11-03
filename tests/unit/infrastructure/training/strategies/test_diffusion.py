@@ -1129,41 +1129,6 @@ def test_the_cold_snapshot_gate_is_not_derived_from_the_logging_interval() -> No
     )
 
 
-@pytest.mark.unit
-def test_save_debug_snapshots_forwards_extra_under_the_diffusion_tag() -> None:
-    """`degradation_source` belongs in the artifact that shows its result.
-
-    The snapshot shows a zero-filled tensor; which tensor was zero-filled — the
-    single-repetition measurement or the NEX-averaged target (#536) — is not
-    recoverable from the pixels, so it rides `extra` rather than forcing a
-    cross-reference to `resolved_config.json`.
-    """
-    mock = MagicMock()
-    tensors = {"noisy_kspace": torch.zeros(1, 2, 4, 4), "mask": torch.ones(1, 1, 4, 4)}
-
-    DiffusionTrainingStrategy._save_debug_snapshots(
-        mock, tensors, 1, extra={"degradation_source": "input"}
-    )
-
-    _, kwargs = mock.save_debug_snapshot.call_args
-    assert kwargs["tag"] == "diffusion_step"
-    assert kwargs["extra"] == {"degradation_source": "input"}
-    assert "noisy_kspace" in kwargs["in_kspace_keys"]
-    assert "mask" not in kwargs["in_kspace_keys"]
-
-
-@pytest.mark.unit
-def test_extra_is_optional_so_other_callers_are_unaffected() -> None:
-    mock = MagicMock()
-
-    DiffusionTrainingStrategy._save_debug_snapshots(
-        mock, {"noisy_kspace": torch.zeros(1, 2, 4, 4)}, 1
-    )
-
-    _, kwargs = mock.save_debug_snapshot.call_args
-    assert kwargs["extra"] is None
-
-
 # ---------------------------------------------------------------------------
 # Validation no longer clamps the prediction to the target's range (2026-08-18)
 #
@@ -1688,11 +1653,10 @@ def test_the_model_input_key_follows_whether_smaps_were_concatenated() -> None:
 
 
 def test_both_cold_emitters_answer_through_the_same_rule() -> None:
-    """The declaring path and the direct `diffusion_step` emitter must agree.
+    """The declaring path answers 'which key is the model input' through the shared rule.
 
-    They are in different methods 2000 lines apart. Written out twice, one of
-    them gets a later fix the other misses -- which is #697, and #1298 is what a
-    snapshot disagreeing with its own label costs.
+    Written out by hand, a later fix misses one copy -- which is #697, and #1298 is
+    what a snapshot disagreeing with its own label costs.
     """
     import inspect
 
@@ -1700,10 +1664,7 @@ def test_both_cold_emitters_answer_through_the_same_rule() -> None:
         DiffusionTrainingStrategy,
     )
 
-    for method in (
-        DiffusionTrainingStrategy._prepare_diffusion_inputs,
-        DiffusionTrainingStrategy._save_debug_snapshots,
-    ):
+    for method in (DiffusionTrainingStrategy._prepare_diffusion_inputs,):
         src = inspect.getsource(method)
         assert "cold_model_input_key(" in src, (
             f"{method.__name__} answers 'which key is the model input' without "
@@ -4164,29 +4125,6 @@ def test_the_clamp_statistics_reach_the_training_metrics_as_device_tensors():
     assert "float(clip_stats" not in src and ".item()" not in src.split("clip_stats = ")[1][:400]
 
 
-def test_the_output_snapshot_also_fires_at_each_validation_step():
-    """The early cadence spends its budget mid-curriculum; a second tag covers validation."""
-    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
-
-    s = object.__new__(DiffusionTrainingStrategy)
-    s._cached_log_interval = 5000
-    s._cached_val_interval = 10000
-    due = DiffusionTrainingStrategy._output_snapshot_tags_due
-    assert due(s, 500) == ("model_output_dc",)
-    assert due(s, 10000) == ("model_output_dc", "model_output_dc_validation")
-    assert due(s, 10250) == ()
-    assert due(s, 0) == ("model_output_dc",)
-
-
-def test_no_validation_tag_when_validation_is_off():
-    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
-
-    s = object.__new__(DiffusionTrainingStrategy)
-    s._cached_log_interval = 5000
-    s._cached_val_interval = 0
-    assert DiffusionTrainingStrategy._output_snapshot_tags_due(s, 10000) == ("model_output_dc",)
-
-
 def test_the_t0_probe_drops_the_metrics_a_fully_sampled_mask_leaves_undefined():
     """At t=0 there is no unmeasured band: those columns were nan in every row of 59 runs."""
     from spectramr.infrastructure.training.strategies.diffusion import (
@@ -4807,14 +4745,13 @@ def test_realised_acceleration_is_unknown_without_a_line_axis():
         assert DiffusionTrainingStrategy._snapshot_realised_acceleration(s, None, None) is None
 
 
-def test_the_output_snapshot_extras_are_deferred_and_name_their_rung_and_cadence():
+def test_the_output_snapshot_extras_are_deferred_and_name_their_rung():
     """Wiring: the model_output_dc emitter passes callables, so no sync runs unless written."""
     from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
 
     src = inspect.getsource(DiffusionTrainingStrategy._compute_losses_impl)
     assert '"timesteps": lambda: timesteps.detach().flatten().tolist()' in src
     assert "lambda: self._snapshot_realised_acceleration(" in src
-    assert '"train_step_at_val_cadence"' in src and '"train_step_at_log_cadence"' in src
 
 
 def test_cascade_val_8x_is_emitted_for_the_8x_rung_on_the_first_batch_under_val_source():
@@ -4866,17 +4803,18 @@ def test_cascade_val_8x_is_gated_to_the_8x_first_batch_before_the_metrics_pop_th
     assert emit < src.index("level_metrics = self._compute_validation_metrics(")
 
 
-def test_cascade_val_8x_writes_nothing_when_snapshots_are_disabled(tmp_path):
-    """Real writer, disabled config: no directory, and the control run with snapshots on writes one."""
-    s_off = _bare_diffusion_for_snapshots(tmp_path / "off", enabled=False)
+def test_cascade_val_8x_records_only_inside_a_snapshot_step(tmp_path):
+    """No active trace (snapshots off, or a step the schedule skipped): nothing is recorded."""
+    from spectramr.core import snapshot_trace as st
+    from spectramr.infrastructure.training.snapshot.policy import ViewPolicy
     from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 
-    s_off.save_debug_snapshot = BaseTrainingStrategy.save_debug_snapshot.__get__(s_off)
+    s = _bare_diffusion_for_snapshots(tmp_path)
+    s._snapshot_view_policy = ViewPolicy()
+    s.save_debug_snapshot = BaseTrainingStrategy.save_debug_snapshot.__get__(s)
     hr = torch.rand(1, 1, 4, 8)
-    s_off._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
-    assert not list((tmp_path / "off").rglob("cascade_val_8x*"))
-
-    s_on = _bare_diffusion_for_snapshots(tmp_path / "on", enabled=True)
-    s_on.save_debug_snapshot = BaseTrainingStrategy.save_debug_snapshot.__get__(s_on)
-    s_on._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
-    assert list((tmp_path / "on").rglob("cascade_val_8x*")), "control run wrote nothing"
+    s._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
+    trace = st.SnapshotTrace(phase="val", step=0)
+    with st.active(trace):
+        s._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
+    assert [(x.group, x.name) for x in trace.stages] == [("strategy", "cascade_val_8x")]

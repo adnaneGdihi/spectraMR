@@ -42,7 +42,7 @@ from typing import Any
 
 import torch
 
-from spectramr.infrastructure.training.debug_snapshot import _tensor_report
+from spectramr.infrastructure.training.snapshot.stats import tensor_report as _tensor_report
 
 __all__ = [
     "ArmEnergyReport",

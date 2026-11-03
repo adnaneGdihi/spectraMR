@@ -65,6 +65,8 @@ _BLOCK_SCHEMAS: dict[str, str] = {
     "temporal": "TemporalConfigSchema",
     # Always present on the real schema (enabled=False by default).
     "augmentation": "AugmentationConfigSchema",
+    # Always present on the real schema; the m4raw route reads its vendor_map.
+    "multi_contrast": "MultiContrastConfigSchema",
 }
 
 # Legacy flat kwarg -> (sub-block, canonical leaf). Mirrors the `fold` records in

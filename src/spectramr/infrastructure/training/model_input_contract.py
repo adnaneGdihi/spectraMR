@@ -1,34 +1,12 @@
-"""Does the recorded model-input snapshot describe the tensor the model was fed?
+"""Does the tensor a model was fed match the input width its backbone declares?
 
-Non-negotiable 14's carve-out lets a strategy that degrades its input INSIDE the
-step point a reader at a second snapshot (``snapshot_model_input_tag``). Until
-#1298 the enforcement checked only that the snapshot ARRIVED, so it was
-satisfied by one naming the wrong tensor: ``diffusion.py`` stamped
-``model_input_key = "noisy_kspace"`` unconditionally while the backbone was fed
-the 16-channel ``cat([noisy_images, smaps])``. The recorded snapshot did not
-contain the model input at all -- it held the 8-channel k-space half -- and
-every contract test passed, because presence was the whole test.
+The snapshot session's forward hooks record the real model input; this module
+compares its channel count with the backbone's declared width. It WARNS and stamps
+rather than raises, because the width is a heuristic read (a complex tensor
+legitimately feeds a real-view conv of twice its channel count), and reports an
+unresolved width as ``unresolved`` rather than dropping the check (pitfall #16).
 
-This module is the content half, in two tiers that follow the same static /
-artifact split :meth:`_snapshot_declared_model_input` already draws:
-
-* **naming** -- ``model_input_key`` must be present and must name a key that is
-  actually in the snapshot. Both are wrong before any run starts, so the caller
-  RAISES (:func:`require_model_input_key`).
-* **width** -- the named tensor's channel count against the backbone's declared
-  input width. This one WARNS and stamps (:func:`verify_model_input`), because
-  the resolution is a heuristic: a model whose first layer is neither conv nor
-  linear leaves the width unresolved, and a complex tensor legitimately feeds a
-  real-view conv of twice its channel count. Aborting a training run over a
-  diagnostic's false positive is the worse failure.
-
-An unresolved width is reported as ``unresolved``, never dropped -- a check that
-silently declines to run is indistinguishable from one that passed (pitfall
-#16), which is the exact shape of the defect this module exists to close.
-
-Everything here is pure and shape-only: no ``.item()``, no host copy, no forward
-pass. The channel-axis convention is NCHW/NCDHW, matching every other
-channel-aware consumer in this package.
+Everything here is shape-only: no ``.item()``, no host copy, no forward pass.
 """
 
 from __future__ import annotations
@@ -62,7 +40,7 @@ class ModelInputVerdict(NamedTuple):
     detail: str
 
     def as_record(self) -> dict[str, Any]:
-        """The nested block stamped into ``snapshot.json`` / ``snapshot.txt``."""
+        """The nested block stamped into the snapshot manifest."""
         return {
             "model_input_key": self.model_input_key,
             "declared": {
@@ -78,40 +56,6 @@ class ModelInputVerdict(NamedTuple):
             "status": self.status,
             "detail": self.detail,
         }
-
-
-def require_model_input_key(
-    *,
-    strategy_name: str,
-    tag: str,
-    tensors: Mapping[str, Any],
-    model_input_key: str | None,
-) -> str:
-    """Return the key naming the model input, or RAISE if the naming is broken.
-
-    Raises rather than warns because both failures are static: a class that
-    never names its model input, and one that names a key it does not emit, are
-    both wrong before a single batch is loaded. The message names the tag so a
-    reader lands on the right emitter rather than on the base wrapper.
-    """
-    if not model_input_key:
-        raise ValueError(
-            f"{strategy_name} emits the model-input snapshot {tag!r} without "
-            "naming which of its tensors the model is actually fed. The tag "
-            "tells a reader 'the real model input is in here'; without a key "
-            f"they must guess between {sorted(tensors)!r}, and a guess is what "
-            "let #1298's mislabel stand. Pass model_input_key=<one of those "
-            "keys> to save_debug_snapshot (or put it in the extra dict handed "
-            "to _declare_model_input)."
-        )
-    if model_input_key not in tensors:
-        raise ValueError(
-            f"{strategy_name} names {model_input_key!r} as the model input of "
-            f"snapshot {tag!r}, but that snapshot holds {sorted(tensors)!r}. "
-            "The artifact points at a tensor it does not contain, so nothing "
-            "in it records what the model was fed (non-negotiable 14)."
-        )
-    return model_input_key
 
 
 def resolve_model_in_channels(module: Any) -> tuple[int | None, str]:
@@ -182,10 +126,8 @@ def verify_model_input(
     Accepting only ``C`` would make every complex-input arm report a mismatch,
     and a check that cries wolf on a whole paradigm gets muted rather than read.
 
-    Takes the ALREADY-RESOLVED width rather than the module: the caller runs on
-    every training step and :func:`resolve_model_in_channels` walks ``modules()``,
-    so the resolution is cached there once (non-negotiable 9) and this function
-    stays pure over its arguments.
+    Takes the already-resolved width: :func:`resolve_model_in_channels` walks
+    ``modules()``, so the session resolves it once per run.
     """
     tensor = tensors.get(model_input_key)
     source = in_channels_source
@@ -268,7 +210,6 @@ __all__ = [
     "STATUS_MISMATCH",
     "STATUS_UNRESOLVED",
     "ModelInputVerdict",
-    "require_model_input_key",
     "resolve_model_in_channels",
     "verify_model_input",
 ]

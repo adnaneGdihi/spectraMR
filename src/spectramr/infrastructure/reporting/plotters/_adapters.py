@@ -1,6 +1,6 @@
 r"""Registry adapters for figures whose callable is not ``make(df, out_path, **kw)``.
 
-Certificate and learnable-acquisition modules expose ``render_*(out_path, ...)``;
+Certificate modules expose ``render_*(out_path, ...)``;
 each adapter soft-skips (returns ``None``) until its payload is routed, via
 ``report_artifacts/`` or an explicit caller kwarg, so they can sit in the
 registry without breaking data-less runs.
@@ -11,7 +11,7 @@ through ``batch``, which imports ``pipeline``, which imports the registry.
 
 from __future__ import annotations
 
-from . import certificate_summary, ksd_certificate, learnable_acquisition_pareto
+from . import certificate_summary, ksd_certificate
 
 
 def _save_kw(kw: dict) -> dict:
@@ -32,14 +32,6 @@ def _ksd_certificate(df, out_path, *, ksd_result=None, metadata=None, **kw):
         return None
     return ksd_certificate.render_ksd_certificate(
         out_path, result=ksd_result, metadata=metadata, **_save_kw(kw)
-    )
-
-
-def _learnable_acquisition_pareto(df, out_path, *, acquisition_arms=None, **kw):
-    if not acquisition_arms:
-        return None
-    return learnable_acquisition_pareto.render_learnable_acquisition_pareto(
-        out_path, acquisition_arms, **_save_kw(kw)
     )
 
 
@@ -76,7 +68,6 @@ def _cmp_phase_metrics(df, out_path, **kwargs):
 ADAPTERS = {
     "certificate_summary": _certificate_summary,
     "ksd_certificate": _ksd_certificate,
-    "learnable_acquisition_pareto": _learnable_acquisition_pareto,
     "cmp_mosaic": _cmp_mosaic,
     "cmp_metric_bars": _cmp_metric_bars,
     "cmp_phase_metrics": _cmp_phase_metrics,

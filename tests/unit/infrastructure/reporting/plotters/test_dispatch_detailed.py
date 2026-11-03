@@ -112,3 +112,19 @@ class TestDispatchDelegatesRatherThanDuplicating:
         src = inspect.getsource(dispatch)
         assert "dispatch_detailed(" in src
         assert "try:" not in src, "dispatch grew its own error handling again"
+
+
+def test_a_plotter_restyling_matplotlib_leaves_rcparams_as_found(df, tmp_path, monkeypatch):
+    import matplotlib as mpl
+
+    from spectramr.infrastructure.reporting.style import use_default_style
+
+    def _restyle(d, p, **k):
+        use_default_style("ieee")
+        mpl.rcParams["lines.linewidth"] = 9.0
+        return None
+
+    monkeypatch.setattr(plotters, "get", lambda fid: _restyle)
+    before = dict(mpl.rcParams)
+    dispatch_detailed(df, ["fig_pretend"], tmp_path)
+    assert dict(mpl.rcParams) == before

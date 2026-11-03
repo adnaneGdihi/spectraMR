@@ -215,7 +215,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "data.use_async_dataloader",
         "data.known_dataset",
         "data.multi_contrast.negative_sampling",
-        "data.multi_contrast.positive_sampling",
         "data.test_split",
         # Nothing in src/ names `adaptation_rate` at all. It looked consumed
         # until #1294 only because `TrainingState.initialize_ema` listed it in
@@ -638,7 +637,6 @@ class TestReachabilityAwareConsumption:
     #: once it is triaged it moves to the rg-debt ledger with a citation.
     NO_READ_AT_ALL: frozenset[str] = frozenset(
         {
-            "backend_acceleration.cosim_bridge_addr",
             "data.caching",
             "losses.gan.enable_gradient_penalty",
             "metrics.compute_precision_recall",

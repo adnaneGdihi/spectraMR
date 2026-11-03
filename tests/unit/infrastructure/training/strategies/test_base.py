@@ -23,38 +23,30 @@ def test_get_last_metrics_on_a_strategy_that_published_nothing(empty_metrics_is_
 
 
 def _capture_snapshot_kwargs(monkeypatch, tmp_path, tensors, domains=(True, True), **call_kwargs):
-    """Drive `BaseTrainingStrategy.save_debug_snapshot` and return what it forwarded.
+    """Drive `BaseTrainingStrategy.save_debug_snapshot` under a trace; report the views it chose.
 
-    Everything the method touches is stubbed onto a bare instance: it resolves
-    `run_dir`/`config` off `self` and imports its collaborators at call time, so
-    patching the module attributes is enough — no strategy construction needed.
+    ``domains`` is the config SSOT's (predictions, targets) k-space declaration; the
+    targets half is what turns on the authoritative (veto-bypassing) key set.
     """
     from types import SimpleNamespace
 
-    from spectramr.infrastructure.training import debug_snapshot as ds
+    from spectramr.core import snapshot_trace as st
     from spectramr.infrastructure.training.utils import domain_inference as di
 
-    seen: dict = {}
-
-    def _fake_save(**kwargs):
-        seen.update(kwargs)
-        return None
-
-    monkeypatch.setattr(ds, "save_debug_snapshot", _fake_save)
-    # ``domains`` is the config SSOT's (predictions, targets) k-space declaration;
-    # the targets half is what turns on the authoritative (veto-bypassing) key set.
     monkeypatch.setattr(di, "needs_ifft_for_visualization", lambda _cfg: domains)
-
     strategy = BaseTrainingStrategy.__new__(BaseTrainingStrategy)
     strategy.env = SimpleNamespace(run_output_dir=str(tmp_path))
-    strategy.config = SimpleNamespace(
-        training=SimpleNamespace(output_dir=str(tmp_path)),
-        logging=None,
-        data=SimpleNamespace(processing=DataProcessingConfigSchema()),
-    )
-    strategy._model_output_snapshot_done = False
-    BaseTrainingStrategy.save_debug_snapshot(strategy, tensors, **call_kwargs)
-    return seen
+    strategy.config = SimpleNamespace(data=SimpleNamespace(processing=DataProcessingConfigSchema()))
+    trace = st.SnapshotTrace(phase="train", step=0)
+    with st.active(trace):
+        BaseTrainingStrategy.save_debug_snapshot(strategy, tensors, **call_kwargs)
+    (stage,) = trace.stages
+    prefix = f"strategy/{stage.name}."
+    return {
+        "authoritative_kspace_keys": {k for k, v in stage.views.items() if v.authoritative},
+        "in_kspace_keys": {k for k, v in stage.views.items() if v.kspace},
+        "extra": {k[len(prefix) :]: v for k, v in trace.extra.items() if k.startswith(prefix)},
+    }
 
 
 def test_cold_diffusion_degraded_keys_bypass_the_spectrum_veto(monkeypatch, tmp_path):
@@ -74,7 +66,6 @@ def test_cold_diffusion_degraded_keys_bypass_the_spectrum_veto(monkeypatch, tmp_
             "noisy_images": torch.zeros(1, 2, 4, 4),
             "mask": torch.ones(1, 1, 4, 4),
         },
-        step=1,
         tag="diffusion_step",
         in_kspace_keys={"noisy_kspace"},
     )
@@ -95,7 +86,7 @@ def test_cold_diffusion_degraded_keys_bypass_the_spectrum_veto(monkeypatch, tmp_
 def _model_output_snapshot(monkeypatch, tmp_path, domains, **call_kwargs):
     tensors = {name: torch.zeros(1, 2, 4, 4) for name in ("model_output", "target", "input")}
     return _capture_snapshot_kwargs(
-        monkeypatch, tmp_path, tensors, domains=domains, step=1, tag="model_output", **call_kwargs
+        monkeypatch, tmp_path, tensors, domains=domains, tag="model_output", **call_kwargs
     )
 
 
@@ -132,7 +123,6 @@ def test_extra_context_reaches_the_snapshot_writer(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         {"noisy_kspace": torch.zeros(1, 2, 4, 4)},
-        step=1,
         tag="diffusion_step",
         extra={"degradation_source": "input"},
     )
@@ -147,65 +137,6 @@ def _bare_strategy(tmp_path, **env_kwargs):
     strategy.env = SimpleNamespace(run_output_dir=str(tmp_path), **env_kwargs)
     strategy.config = SimpleNamespace(data=None)
     return strategy
-
-
-class TestCanonicalKeyContract:
-    """`first_steps/input_prepared` must never silently claim to be the model
-    input. It is captured BEFORE the forward pass, so for a strategy that
-    degrades further inside the step it is the clean tensor — the exact reading
-    that made an accelerated cold-diffusion arm look fully sampled."""
-
-    def test_the_default_strategy_asserts_prepared_is_the_model_input(self, tmp_path) -> None:
-        strategy = _bare_strategy(tmp_path)
-        extra = BaseTrainingStrategy._first_steps_extra(strategy, epoch=3)
-        assert extra == {"epoch": 3, "prepared_equals_model_input": True}
-
-    def test_a_deferring_strategy_names_where_the_real_input_lives(self, tmp_path) -> None:
-        """ "This is not the model input" alone sends the reader back to the
-        code; the artifact must say where to look instead."""
-        strategy = _bare_strategy(tmp_path)
-        strategy.snapshot_prepared_is_model_input = False
-        strategy.snapshot_model_input_tag = "diffusion_step"
-        extra = BaseTrainingStrategy._first_steps_extra(strategy, epoch=0)
-        assert extra["prepared_equals_model_input"] is False
-        assert extra["model_input_snapshot_tag"] == "diffusion_step"
-
-    def test_the_first_steps_snapshot_records_the_realised_acceleration(self, tmp_path) -> None:
-        """#2382: a declared R4 mask realises R 3.241 at 256 lines, and the
-        snapshot must carry the realised value off the batch the loader built."""
-        tio = pytest.importorskip("torchio")
-        from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
-        from spectramr.infrastructure.training.debug_snapshot import _resolve_deferred_extra
-
-        subjects = [
-            tio.Subject(kspace=tio.ScalarImage(tensor=torch.randn(2, 256, 4, 1))) for _ in range(2)
-        ]
-        dataset = tio.SubjectsDataset(
-            subjects, transform=PhysicsInformedMasking(acceleration=4, center_fraction=0.08)
-        )
-        batch = next(iter(tio.SubjectsLoader(dataset, batch_size=2)))
-
-        strategy = _bare_strategy(tmp_path)
-        extra = BaseTrainingStrategy._first_steps_extra(strategy, epoch=0, batch=batch)
-        assert _resolve_deferred_extra(extra)["realised_acceleration"] == 3.241
-
-    def test_train_step_hands_its_batch_to_the_first_steps_extra(self) -> None:
-        """Wiring: the record is inert unless the production step passes the batch."""
-        import inspect
-
-        source = inspect.getsource(BaseTrainingStrategy.train_step)
-        assert "_first_steps_extra(epoch, batch=batch)" in source
-
-    def test_the_diffusion_family_declares_the_carve_out(self) -> None:
-        """Pins the contract at the class that needs it: `q_sample` degrades
-        inside the step for every diffusion arm, cold or noise."""
-        from spectramr.infrastructure.training.strategies.diffusion import (
-            DiffusionTrainingStrategy,
-        )
-
-        assert DiffusionTrainingStrategy.snapshot_prepared_is_model_input is False
-        assert DiffusionTrainingStrategy.snapshot_model_input_tag == "diffusion_step"
-        assert BaseTrainingStrategy.snapshot_prepared_is_model_input is True
 
 
 class TestProvenanceIsBuiltOncePerStrategy:
@@ -269,7 +200,6 @@ class TestStrategyMaskGeneratorReachesTheSnapshot:
     the production snapshot must carry its record, not only the builder."""
 
     def _write(self, tmp_path, *, pattern=None):
-        import json
         from types import SimpleNamespace
 
         from spectramr.infrastructure.training.utils.kspace_masks import KSpaceMaskGenerator
@@ -280,17 +210,13 @@ class TestStrategyMaskGeneratorReachesTheSnapshot:
             logging=None,
             data=SimpleNamespace(processing=DataProcessingConfigSchema()),
         )
-        strategy._model_output_snapshot_done = False
         strategy.mask_generator = KSpaceMaskGenerator(
             num_timesteps=8, default_pattern="variable_density", accelerator_kwargs={"seed": 5}
         )
         if pattern is not None:
             strategy._snapshot_mask_pattern = lambda: pattern
-        BaseTrainingStrategy.save_debug_snapshot(
-            strategy, {"input_raw": torch.rand(1, 1, 8, 8)}, step=0, tag="first_steps"
-        )
-        (snap,) = Path(tmp_path).rglob("snapshot.json")
-        return json.loads(snap.read_text())["provenance"]["applied"]["mask_generator"]
+        # The session stamps exactly this record into every manifest's ``provenance``.
+        return strategy._snapshot_provenance("train")["applied"]["mask_generator"]
 
     def test_the_written_snapshot_names_the_family_the_strategy_used(self, tmp_path) -> None:
         record = self._write(tmp_path)
@@ -389,74 +315,6 @@ class _SyncCountingTensor:
 
     def __getattr__(self, name: str):
         return getattr(self._real, name)
-
-
-class TestModelOutputScaleContextIsDeferred:
-    """`_snapshot_model_output` must not price its own diagnostic (#1188).
-
-    This emitter is the widest one in the codebase: every strategy routed
-    through `_compute_losses` reaches it once per training step. Its `extra`
-    is `_model_output_scale_context`, which does TWO `float(tensor)` device
-    syncs -- so building it eagerly cost two syncs per step for the whole run
-    while `max_calls` suppressed the write after the eighth. Same shape as the
-    `vf_twin` defect #1188 names, in the path that carries far more traffic.
-    """
-
-    @staticmethod
-    def _strategy(tmp_path, max_calls: int):
-        from types import SimpleNamespace
-
-        from tests.utils.block_config_stub import LoggingConfigStub
-
-        strategy = BaseTrainingStrategy.__new__(BaseTrainingStrategy)
-        strategy.env = SimpleNamespace(run_output_dir=str(tmp_path))
-        strategy.config = SimpleNamespace(
-            training=SimpleNamespace(output_dir=str(tmp_path)),
-            logging=LoggingConfigStub(snapshots={"max_calls": max_calls}),
-            data=None,
-        )
-        strategy._model_output_snapshot_done = False
-        return strategy
-
-    def test_the_scale_reduction_is_not_paid_once_the_budget_is_spent(self, tmp_path):
-        import torch
-
-        strategy = self._strategy(tmp_path, max_calls=1)
-        target = torch.zeros(1, 1, 4, 4)
-
-        # Step 0 writes, burning the single allowance.
-        strategy._last_generator_output = torch.ones(1, 1, 4, 4)
-        strategy._snapshot_model_output(input_batch=target, target_batch=target, step=0)
-        assert (tmp_path / "debug_snapshots" / "model_output_step_000000").is_dir()
-
-        probes = []
-        for step in (1, 2, 3):
-            probe = _SyncCountingTensor(torch.ones(1, 1, 4, 4))
-            probes.append(probe)
-            # `_compute_losses` clears this per step; the emitter's own early
-            # return on it would otherwise mask which gate did the suppressing.
-            strategy._model_output_snapshot_done = False
-            strategy._last_generator_output = probe
-            strategy._snapshot_model_output(input_batch=target, target_batch=target, step=step)
-        assert [p.syncs for p in probes] == [0, 0, 0]
-
-    def test_the_scale_context_still_reaches_a_written_snapshot(self, tmp_path):
-        """Deferring must not cost the diagnostic — #587's whole point."""
-        import json
-
-        import torch
-
-        strategy = self._strategy(tmp_path, max_calls=8)
-        strategy._last_generator_output = torch.full((1, 1, 4, 4), 3.0)
-        strategy._snapshot_model_output(
-            input_batch=torch.zeros(1, 1, 4, 4),
-            target_batch=torch.full((1, 1, 4, 4), 12.0),
-            step=0,
-        )
-        snap = tmp_path / "debug_snapshots" / "model_output_step_000000"
-        extra = json.loads((snap / "snapshot.json").read_text())["extra"]
-        assert extra["abs_max_model_output"] == 3.0
-        assert extra["abs_max_target"] == 12.0
 
 
 class TestDeclaredMetricKeys:
@@ -800,3 +658,54 @@ def test_every_class_the_retired_substrings_matched_declares_the_capability():
         if not cls.synthesises_model_input:
             undeclared.append(path)
     assert not undeclared, undeclared
+
+
+# --- prepare stage: input/target compression follows the loader's marker ------
+
+
+def _first_steps_log_keys(batch_markers: dict) -> set[str]:
+    """Drive ``train_step`` under a trace; return the prepared tensors marked log-compressed."""
+    import types
+
+    import torch
+    from torch import nn
+
+    from spectramr.core import snapshot_trace as snap
+    from spectramr.infrastructure.training.snapshot.policy import ViewPolicy
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+
+    st = object.__new__(ReconstructionTrainingStrategy)
+    st.config = types.SimpleNamespace(
+        model=types.SimpleNamespace(model_type="configurable_unet", in_channels=2, out_channels=2),
+        training=types.SimpleNamespace(strategy_class=None),
+    )
+    st.adapter_chains = {}
+    st.env = types.SimpleNamespace(discriminator=None, generator=nn.Conv2d(2, 2, 1), opt_g=None)
+    st._prepare_model_input = lambda x: x
+    st._snapshot_view_policy = ViewPolicy(log_scaled=True)
+    st.device = torch.device("cpu")
+    inp, tgt = torch.rand(1, 2, 8, 8), torch.rand(1, 2, 8, 8)
+    batch = {"input": inp, "target": tgt, **batch_markers}
+    trace = snap.SnapshotTrace(phase="train", step=1)
+    with snap.active(trace):
+        st.train_step(batch, epoch=0, input_batch=inp, target_batch=tgt, iteration=1)
+    (stage,) = [s for s in trace.stages if s.name == "input_prepared"]
+    return {k for k, v in stage.views.items() if v.log_scaled}
+
+
+def test_first_steps_decompresses_a_loader_normalized_batch():
+    import torch
+
+    keys = _first_steps_log_keys(
+        {"kspace_normalized": torch.tensor([True]), "kspace_scale": torch.tensor([224.4])}
+    )
+    assert keys == {"input_prepared", "target"}
+
+
+def test_first_steps_leaves_a_raw_batch_alone():
+    import torch
+
+    assert _first_steps_log_keys({}) == set()
+    assert _first_steps_log_keys({"kspace_normalized": torch.tensor([False])}) == set()

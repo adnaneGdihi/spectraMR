@@ -100,7 +100,10 @@ def bottomley_t1_tensor(b0_T: torch.Tensor, tissue: TissueClass | str) -> torch.
     if cls not in _BOTTOMLEY_TABLE:
         valid = sorted(t.value for t in TissueClass)
         raise ValueError(f"Unknown tissue class {tissue!r}. Valid options: {valid}")
-    if bool((b0_T <= 0.0).any()):  # match the scalar bottomley_t1: raise, don't silently clamp (#9)
+    # Match the scalar bottomley_t1: raise, don't clamp (#9). Host-checked on CPU only: on
+    # CUDA the read would sync every training step, and b0 <= 0 gives a NaN/inf the
+    # step's non-finite loss guard refuses.
+    if not b0_T.is_cuda and bool((b0_T <= 0.0).any()):
         raise ValueError(f"b0_T must be > 0 T; got min={float(b0_T.min()):.4g}.")
     c = _BOTTOMLEY_TABLE[cls]
     return c.a * b0_T**c.alpha + c.b

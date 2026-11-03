@@ -420,24 +420,22 @@ def _twin_snapshot_self(tmp_path, max_calls: int = 8):
         logging=LoggingConfigStub(snapshots={"max_calls": max_calls}),
         data=None,
     )
-    s._model_output_snapshot_done = False
-    # `vf_twin` IS this class's `snapshot_model_input_tag`, so the wrapper runs
-    # the model-input contract on it (#1298) and reads the state `__init__`
-    # sets. A bare-instance fixture has to mirror the constructor, and the cost
-    # of not doing so is invisible here: `_snapshot_twin_outputs` swallows every
-    # exception, so a missing attribute reads as "no snapshot was written".
-    s._model_input_snapshot_done = False
-    s._model_input_width = None
-    s._model_input_contract_warned = False
+    from spectramr.infrastructure.training.snapshot.policy import ViewPolicy
+
+    s._snapshot_view_policy = ViewPolicy()
     return s
 
 
-def _twin_extra(tmp_path, step: int) -> dict:
-    """The ``extra`` block of the vf_twin snapshot actually written for ``step``."""
-    import json
+def _twin_traced(s, **kwargs):
+    """Run ``_snapshot_twin_outputs`` inside a snapshot step; return its stage and resolved extra."""
+    from spectramr.core import snapshot_trace as st
+    from spectramr.infrastructure.training.snapshot.stats import resolve_deferred_extra
 
-    snap = tmp_path / "debug_snapshots" / f"vf_twin_step_{step:06d}" / "snapshot.json"
-    return json.loads(snap.read_text())["extra"]
+    trace = st.SnapshotTrace(phase="train", step=kwargs["step"])
+    with st.active(trace):
+        s._snapshot_twin_outputs(**kwargs)
+    (stage,) = [x for x in trace.stages if x.name == "vf_twin"]
+    return stage, resolve_deferred_extra(dict(trace.extra))["strategy/vf_twin.extra"]
 
 
 class _SyncCountingTensor:
@@ -467,7 +465,8 @@ def _cplx(*shape):
 def test_twin_snapshot_captures_outputs_and_flags_firing(tmp_path) -> None:
     s = _twin_snapshot_self(tmp_path)
     marker_res = _cplx(2, 1, 8, 8) + 0.1  # non-zero ⇒ mechanism fired
-    s._snapshot_twin_outputs(
+    stage, extra = _twin_traced(
+        s,
         step=1,
         epoch=0,
         clean_norm=_cplx(2, 1, 8, 8),
@@ -475,17 +474,12 @@ def test_twin_snapshot_captures_outputs_and_flags_firing(tmp_path) -> None:
         marker_residual=marker_res,
         marker_prior_norm=_cplx(2, 1, 8, 8),
     )
-    snap_dir = tmp_path / "debug_snapshots" / "vf_twin_step_000001"
-    assert snap_dir.is_dir()
-    report = (snap_dir / "snapshot.txt").read_text()
-    for key in (
+    assert set(stage.tensors) == {
         "twin_target_clean",
         "twin_corrupted_input",
         "twin_marker_residual",
         "twin_marker_prior",
-    ):
-        assert key in report
-    extra = _twin_extra(tmp_path, 1)
+    }
     assert extra["marker_mechanism_fired"] is True
     assert extra["marker_residual_abs_max"] > 0.0
 
@@ -493,7 +487,8 @@ def test_twin_snapshot_captures_outputs_and_flags_firing(tmp_path) -> None:
 def test_twin_snapshot_flags_inert_marker_when_residual_zero(tmp_path) -> None:
     """A zero marker residual (inert mechanism) must be flagged, not hidden."""
     s = _twin_snapshot_self(tmp_path)
-    s._snapshot_twin_outputs(
+    _, extra = _twin_traced(
+        s,
         step=1,
         epoch=0,
         clean_norm=torch.zeros(1, 1, 4, 4, dtype=torch.complex64),
@@ -501,7 +496,6 @@ def test_twin_snapshot_flags_inert_marker_when_residual_zero(tmp_path) -> None:
         marker_residual=torch.zeros(1, 1, 4, 4, dtype=torch.complex64),
         marker_prior_norm=torch.zeros(1, 1, 4, 4, dtype=torch.complex64),
     )
-    extra = _twin_extra(tmp_path, 1)
     assert extra["marker_mechanism_fired"] is False
     assert extra["marker_residual_abs_max"] == 0.0
 
@@ -509,29 +503,11 @@ def test_twin_snapshot_flags_inert_marker_when_residual_zero(tmp_path) -> None:
 def test_the_marker_reduction_is_never_paid_on_a_suppressed_step(tmp_path) -> None:
     """#1188: the twin's ``.item()`` must not touch the warm training loop.
 
-    ``_snapshot_twin_outputs`` runs unconditionally from
-    ``_compute_losses_impl``, i.e. on EVERY training step, and VF arms leave
-    ``interval_steps`` at 0 -- so ``max_calls`` is the only gate. It lives
-    inside ``save_debug_snapshot``, downstream of where the reduction used to be
-    computed, and therefore suppressed the write while the sync was paid
-    forever. Removing this method's own private budget for #706 is what exposed
-    that: the private budget had been the only thing upstream of the sync.
-
-    The probed steps below are budget-suppressed. Pre-fix this reads ``[1, 1, 1]``.
+    ``_snapshot_twin_outputs`` runs on EVERY training step; only a step the snapshot
+    schedule selected has an active trace, and only there may the reduction run.
     """
-    s = _twin_snapshot_self(tmp_path, max_calls=1)
+    s = _twin_snapshot_self(tmp_path)
     zeros = torch.zeros(1, 1, 4, 4, dtype=torch.complex64)
-    # Burn the single allowance with a real tensor.
-    s._snapshot_twin_outputs(
-        step=0,
-        epoch=0,
-        clean_norm=zeros,
-        corrupted_norm=zeros,
-        marker_residual=zeros + 0.1,
-        marker_prior_norm=zeros,
-    )
-    assert (tmp_path / "debug_snapshots" / "vf_twin_step_000000").is_dir()
-
     probes = []
     for step in (1, 2, 3):
         probe = _SyncCountingTensor(zeros + 0.1)
@@ -545,8 +521,6 @@ def test_the_marker_reduction_is_never_paid_on_a_suppressed_step(tmp_path) -> No
             marker_prior_norm=zeros,
         )
     assert [p.syncs for p in probes] == [0, 0, 0]
-    # ...and nothing was written for them either -- the budget still holds.
-    assert not (tmp_path / "debug_snapshots" / "vf_twin_step_000003").exists()
 
 
 def test_the_twin_docstring_does_not_claim_a_gate_it_does_not_own() -> None:
@@ -563,105 +537,6 @@ def test_the_twin_docstring_does_not_claim_a_gate_it_does_not_own() -> None:
     doc = inspect.getdoc(ConcreteVirtualFiducialStrategy._snapshot_twin_outputs) or ""
     assert "DEFERRED" in doc
     assert "debug_snapshot_max_calls" not in doc
-
-
-# ── 2026-08-17: the DECLARATION half of the same contract (non-negotiable 14) ──
-# The two tests above pin the EMISSION: `_snapshot_twin_outputs` writes `vf_twin`.
-# What was never pinned is the class-level declaration that tells an artifact
-# reader to go looking for it. VFS inherited `BaseTrainingStrategy`'s default
-# `snapshot_prepared_is_model_input = True` while the comment right above its own
-# twin call said the opposite -- the base captured the PRE-twin input and
-# labelled it "the model input", so every artifact asserted the twin had not
-# fired (pitfall #16, in machine-readable form contradicting the prose beside it).
-#
-# The assertion that matters is not either half alone; it is that they AGREE.
-
-
-def test_declared_model_input_tag_matches_the_tag_actually_emitted(tmp_path) -> None:
-    """Bind the declaration to the emission so they cannot drift apart.
-
-    Asserting `snapshot_model_input_tag == "vf_twin"` on its own would only pin
-    a string against itself. Comparing it to what `_snapshot_twin_outputs`
-    really writes is what makes a future rename of either half fail loud.
-
-    Read off DISK, not off a recorder. `save_debug_snapshot` names the directory
-    `<tag>_step_<n>`, so the artifact itself carries the tag -- whereas a spy
-    only ever shows the argument that was passed, and #1188 is precisely the
-    case where the passed arguments and the written artifact disagreed. A
-    dangling `snapshot_model_input_tag` is a pointer into the filesystem, so the
-    filesystem is where it has to be resolved.
-    """
-    s = _twin_snapshot_self(tmp_path)
-    step = 1
-    s._snapshot_twin_outputs(
-        step=step,
-        epoch=0,
-        clean_norm=_cplx(1, 1, 4, 4),
-        corrupted_norm=_cplx(1, 1, 4, 4),
-        marker_residual=_cplx(1, 1, 4, 4),
-        marker_prior_norm=_cplx(1, 1, 4, 4),
-    )
-
-    assert ConcreteVirtualFiducialStrategy.snapshot_prepared_is_model_input is False
-
-    tag = ConcreteVirtualFiducialStrategy.snapshot_model_input_tag
-    written = sorted(p.name for p in (tmp_path / "debug_snapshots").iterdir() if p.is_dir())
-    assert f"{tag}_step_{step:06d}" in written, (
-        f"the declared tag {tag!r} names no artifact on disk; found {written} -- "
-        "the carve-out points at a snapshot that was never written"
-    )
-
-
-def test_the_twin_snapshot_names_the_tensor_the_model_is_fed(tmp_path) -> None:
-    """#1298: pointing at the right FILE is not pointing at the right TENSOR.
-
-    `vf_twin` carries four tensors -- the clean twin, the corrupted input and
-    the two marker halves. Only `twin_corrupted_input` reaches the network. The
-    class docstring has always said so; this makes it a property of the
-    artifact, so a future reordering of the dict cannot quietly relabel it.
-    """
-    import json
-
-    s = _twin_snapshot_self(tmp_path)
-    s._snapshot_twin_outputs(
-        step=1,
-        epoch=0,
-        clean_norm=_cplx(1, 1, 4, 4),
-        corrupted_norm=_cplx(1, 1, 4, 4),
-        marker_residual=_cplx(1, 1, 4, 4),
-        marker_prior_norm=_cplx(1, 1, 4, 4),
-    )
-
-    payload = json.loads(
-        (tmp_path / "debug_snapshots" / "vf_twin_step_000001" / "snapshot.json").read_text()
-    )
-    verdict = payload["model_input_contract"]
-    assert verdict["model_input_key"] == "twin_corrupted_input"
-    # No generator on this bare instance, so the width half cannot be read --
-    # and says so rather than reading as a pass.
-    assert verdict["status"] == "unresolved"
-
-
-def test_the_carve_out_is_declared_not_inherited_from_base() -> None:
-    """The default is `True`; VFS must override it, not receive it.
-
-    `ConcreteVirtualFiducialStrategy` extends `BaseTrainingStrategy` directly,
-    so nothing upstream sets the carve-out for it — which is precisely how the
-    false `True` survived. Reading the attribute off the class dict (rather than
-    via inheritance) is what distinguishes "declared" from "happened to be".
-    """
-    for klass in ConcreteVirtualFiducialStrategy.__mro__:
-        if "snapshot_prepared_is_model_input" in vars(klass):
-            owner = klass
-            break
-    else:  # pragma: no cover - the attribute exists on BaseTrainingStrategy
-        raise AssertionError("snapshot_prepared_is_model_input is unset entirely")
-
-    assert owner is ConcreteVirtualFiducialStrategy, (
-        f"the carve-out is inherited from {owner.__name__}, not declared here; "
-        "an inherited value is what made every VF artifact claim the pre-twin "
-        "input was the model input"
-    )
 
 
 # `test_twin_snapshot_skipped_past_call_cap` lived here and was red on `dev` (#826).
@@ -809,14 +684,10 @@ def test_phase_models_expose_last_field_estimate():
 
 
 def test_the_twin_snapshot_is_emitted_unconditionally() -> None:
-    """VF satisfies non-negotiable 14 through a SIDE CHANNEL, so this matters.
+    """The snapshot schedule alone decides when ``vf_twin`` is recorded.
 
-    Every other carve-out strategy calls ``_declare_model_input`` and the wrapper
-    emits. VF instead relies on ``_snapshot_twin_outputs`` already writing the
-    ``vf_twin`` tag, which sets the satisfaction flag inside
-    ``save_debug_snapshot``. That only holds while the call is UNCONDITIONAL: put
-    it behind ``if self.config...:`` and, on an arm with snapshots enabled and
-    that branch false, the wrapper raises on a perfectly healthy run.
+    Put the call behind ``if self.config...:`` and a snapshot step with that branch
+    false records no twin stage, with nothing saying why.
 
     The sibling test above calls ``_snapshot_twin_outputs`` directly, so it pins
     the tag but would stay green through exactly that regression. Asserting the

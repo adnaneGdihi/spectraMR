@@ -128,13 +128,21 @@ class DataBuilder(Builder):
                 )
                 # Validation stays single-corpus: the balancer has no val half,
                 # and a domain-tagged val set would make metrics incomparable
-                # across arms. Built from the parent config unchanged.
-                _, val_loader = director.build_dataloaders(
-                    num_workers=num_workers,
-                    pin_memory=pin_memory,
-                    val_shuffle=val_shuffle,
-                    val_batch_size=_val_bs,
-                )
+                # across arms. Built from the parent config unchanged -- except for
+                # a balancer that scores each site on its own split (FedBN).
+                if getattr(train_loader, "per_domain_validation", False):
+                    val_loader = director.build_multi_domain_val_loader(
+                        num_workers=num_workers,
+                        pin_memory=pin_memory,
+                        val_batch_size=_val_bs,
+                    )
+                else:
+                    _, val_loader = director.build_dataloaders(
+                        num_workers=num_workers,
+                        pin_memory=pin_memory,
+                        val_shuffle=val_shuffle,
+                        val_batch_size=_val_bs,
+                    )
             else:
                 train_loader, val_loader = director.build_dataloaders(
                     num_workers=num_workers,

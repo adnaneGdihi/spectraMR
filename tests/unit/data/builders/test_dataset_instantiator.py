@@ -1601,6 +1601,7 @@ def test_m4raw_triplet_builds_train_and_val_from_their_splits(monkeypatch) -> No
         train_split="tr",
         val_split="va",
         raw_repetition_root=None,
+        contrastive_views=False,
     )
     cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block)
     assert DatasetInstantiator._create_m4raw_triplet(cfg, None, None) == ("tr", "va")
@@ -1623,6 +1624,7 @@ def test_m4raw_triplet_with_a_repetition_root_serves_independent_repetitions(mon
         train_split="tr",
         val_split="va",
         raw_repetition_root="R",
+        contrastive_views=False,
     )
     cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block)
     assert DatasetInstantiator._create_m4raw_triplet(cfg, None, None) == ("tr", "va")
@@ -1739,3 +1741,41 @@ def test_fastmri_route_receives_staged_records_when_staging_is_on(monkeypatch, t
     )
     assert all(r[0]["primary_path"].startswith(str(tmp_path / "local")) for r in seen)
     assert [r[0]["slice_index"] for r in seen] == [2, 5]
+
+
+def test_m4raw_triplet_contrastive_views_read_the_multi_contrast_block(monkeypatch) -> None:
+    import spectramr.data.datasets.m4raw_triplet_dataset as mod
+
+    seen = []
+    monkeypatch.setattr(
+        mod, "M4RawTripletDataset", lambda t2, flair, split, views: seen.append(views) or split
+    )
+    block = SimpleNamespace(
+        t2_registered_root="A",
+        flair_registered_root="B",
+        train_split="tr",
+        val_split="va",
+        raw_repetition_root=None,
+        contrastive_views=True,
+    )
+    mc = SimpleNamespace(
+        contrast_map={"T1": 0, "T2": 1, "FLAIR": 2}, positive_sampling="co_registered_subject"
+    )
+    cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block, multi_contrast=mc)
+    assert DatasetInstantiator._create_m4raw_triplet(cfg, None, None) == ("tr", "va")
+    assert [v.deterministic for v in seen] == [False, True]
+    assert seen[0].ids.tolist() == [0, 1, 2]
+
+
+def test_m4raw_triplet_contrastive_views_refuse_the_repetition_route() -> None:
+    block = SimpleNamespace(
+        t2_registered_root="A",
+        flair_registered_root="B",
+        train_split="tr",
+        val_split="va",
+        raw_repetition_root="R",
+        contrastive_views=True,
+    )
+    cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block)
+    with pytest.raises(ValueError, match="raw_repetition_root"):
+        DatasetInstantiator._create_m4raw_triplet(cfg, None, None)

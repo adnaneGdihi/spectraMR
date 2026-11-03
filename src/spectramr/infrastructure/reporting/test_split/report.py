@@ -19,6 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from spectramr.infrastructure.reporting.style import save_plot
 from spectramr.infrastructure.reporting.test_split.slice_writer import (
     ERROR_WINDOW_FRACTION,
 )
@@ -67,19 +68,18 @@ def plot_distributions(long: pd.DataFrame, out_path: Path) -> Path | None:
     for ax in list(axes.flat)[len(metrics) :]:
         ax.set_visible(False)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=110)
+    saved = save_plot(fig, out_path, dpi=110)
     plt.close(fig)
-    return out_path
+    return saved
 
 
 def _summary_html(summary: pd.DataFrame) -> str:
-    blocks = []
-    for grouping, part in summary.groupby("grouping", sort=False):
-        table = part.drop(columns="grouping").to_html(
-            index=False, float_format=lambda v: f"{v:.4g}", na_rep="", border=0
-        )
-        blocks.append(f"<h3>{html.escape(str(grouping))}</h3>{table}")
-    return "\n".join(blocks)
+    from ..dashboard.shell import table_html
+
+    return "\n".join(
+        f"<h3>{html.escape(str(grouping))}</h3>" + table_html(part.drop(columns="grouping"))
+        for grouping, part in summary.groupby("grouping", sort=False)
+    )
 
 
 def _gallery_html(table: pd.DataFrame) -> str:
@@ -104,10 +104,10 @@ def _gallery_html(table: pd.DataFrame) -> str:
             if m in row and pd.notna(row[m])
         )
         rows.append(
-            f"<figure><figcaption>{html.escape(ident)}<br><small>{html.escape(cells)}</small>"
-            f"</figcaption><img loading='lazy' src='{html.escape(row['image'])}'></figure>"
+            f"<figure><img loading='lazy' src='{html.escape(row['image'])}' alt='{html.escape(ident)}'>"
+            f"<figcaption><span>{html.escape(ident)}</span><span>{html.escape(cells)}</span></figcaption></figure>"
         )
-    return "\n".join(rows)
+    return f"<div class='gallery'>{''.join(rows)}</div>"
 
 
 def write_test_report(test_dir: Path, summary_json: Path | None = None) -> Path | None:
@@ -118,24 +118,22 @@ def write_test_report(test_dir: Path, summary_json: Path | None = None) -> Path 
         return None
     figure = plot_distributions(long, test_dir / DISTRIBUTIONS_PNG)
     meta = json.loads(summary_json.read_text()) if summary_json and summary_json.is_file() else {}
-    header = ", ".join(
-        f"{k}: {html.escape(str(meta[k]))}"
-        for k in ("manifest", "n_cases", "weights", "weights_iteration")
-        if k in meta
-    )
-    page = f"""<!doctype html><html><head><meta charset="utf-8"><title>Test split</title>
-<style>body{{font-family:sans-serif;margin:16px}}table{{border-collapse:collapse;font-size:12px}}
-td,th{{padding:2px 8px;text-align:right}}figure{{margin:8px 0}}img{{max-width:100%}}
-figcaption{{font-size:12px}}</style></head><body>
-<h1>Held-out test split</h1><p>{header}</p>
-<h2>Summary</h2>{_summary_html(summary)}
-<h2>Distributions</h2>{f"<img src='{figure.name}'>" if figure else "<p>No finite values.</p>"}
-<h2>Every slice</h2><p>Panels: input | prediction | target | |prediction - target|, on the
-target's 99.5th-percentile window; the error panel uses {ERROR_WINDOW_FRACTION:g} of it.</p>
-{_gallery_html(table)}
-</body></html>"""
+    from ..dashboard.shell import Section, figure_html, render_page
+
     out = test_dir / REPORT_HTML
-    out.write_text(page)
+    dist = figure_html(figure, out, caption="Metric distributions", wide=True) if figure else None
+    sections = [
+        Section("summary", "Summary", _summary_html(summary)),
+        Section("distributions", "Distributions",
+                f"<div class='gallery'>{dist}</div>" if dist else "<p class='empty'>No finite values.</p>"),
+        Section("slices", "Every slice", _gallery_html(table),
+                note="Panels: input, prediction, target and |prediction - target|, on the target's "
+                f"99.5th-percentile window; the error panel uses {ERROR_WINDOW_FRACTION:g} of it."),
+    ]
+    prov = {k.replace("_", " ").capitalize(): meta[k]
+            for k in ("manifest", "n_cases", "weights", "weights_iteration") if k in meta}
+    render_page(out, title="Held-out test split", sections=sections, provenance=prov,
+                crumbs=[(test_dir.parent.name, None), ("Test split", None)])
     return out
 
 

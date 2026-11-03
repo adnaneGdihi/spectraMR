@@ -155,6 +155,7 @@ class UniversalMRIDataset(torch.utils.data.Dataset):
         log_scaling: bool = False,
         contrast_map: dict[str, int] | None = None,
         target_field_strength: float | None = None,
+        record_field_strength: bool = False,
         image_domain_crop_or_pad: tuple[int, int] | None = None,
     ):
         """
@@ -178,6 +179,10 @@ class UniversalMRIDataset(torch.utils.data.Dataset):
                 (the per-arm ``data.multi_contrast.contrast_map``), each sample is
                 stamped with a ``contrast_idx`` long tensor so FiLM / contrast
                 guidance fires; an unmapped contrast raises (pitfall #9).
+            record_field_strength: Stamp each sample's own ``field_strength`` (Tesla) from
+                its manifest record when the record carries one
+                (``data.expose.field_strength``), so a multi-field cohort conditions on the
+                field of each sample.
             target_field_strength: Optional target field (Tesla) for the paired
                 ULF→HF translation. When set (threaded from
                 ``data.mrixfields_target_field`` gated on
@@ -200,6 +205,7 @@ class UniversalMRIDataset(torch.utils.data.Dataset):
         # Validated once at construction (raises on a non-physical value) so the
         # per-sample stamp is a cheap constant lookup.
         self.target_field_strength = resolve_field_strength(target_field_strength)
+        self.record_field_strength = bool(record_field_strength)
         self.normalize_kspace = normalize_kspace
         self.kspace_percentile = kspace_percentile
         self.log_scaling = log_scaling
@@ -285,6 +291,13 @@ class UniversalMRIDataset(torch.utils.data.Dataset):
         # tensor per sample (the stored value is validated but immutable).
         if self.target_field_strength is not None:
             subject["field_strength_target"] = self.target_field_strength.clone()
+        # Per-record B0 for a multi-field cohort (data.expose.field_strength). A record
+        # without one is left to attach_field_strength's documented physics default.
+        if self.record_field_strength and record.get("field_strength") is not None:
+            b0 = float(record["field_strength"])
+            if b0 <= 0.0:  # validated here, so the per-step prior need not read it back
+                raise ValueError(f"{record['primary_path']}: field_strength {b0} T is not > 0")
+            subject["field_strength"] = torch.tensor(b0)
 
         # Apply user transforms
         if self.transform:

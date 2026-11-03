@@ -294,7 +294,6 @@ def _bare_fm(recorder: dict) -> FlowMatchingStrategy:
     s = object.__new__(FlowMatchingStrategy)
     s.device = torch.device("cpu")
     s._resolve_legacy_batch = lambda input_batch, kwargs: input_batch  # type: ignore[method-assign]
-    s._declared_model_input = None
 
     def _gen(x: torch.Tensor) -> torch.Tensor:  # no time arg -> gen(x_t) branch
         recorder["model_saw"] = x
@@ -305,7 +304,7 @@ def _bare_fm(recorder: dict) -> FlowMatchingStrategy:
     return s
 
 
-def test_flow_matching_declares_the_interpolant_it_feeds() -> None:
+def test_flow_matching_declares_the_interpolant_it_feeds(declared) -> None:
     recorder: dict = {}
     s = _bare_fm(recorder)
     x1 = torch.randn(2, 1, 8, 8)
@@ -313,10 +312,10 @@ def test_flow_matching_declares_the_interpolant_it_feeds() -> None:
 
     s._compute_losses_impl(input_batch={"target": x1, "source": x0}, epoch=0)
 
-    assert s._declared_model_input is not None, (
-        "flow matching inherits the carve-out, so it owes the wrapper a declaration"
+    assert declared() is not None, (
+        "flow matching builds its model input inside the step and names it"
     )
-    tensors, extra, in_kspace_keys = s._declared_model_input
+    tensors, extra, in_kspace_keys = declared()
 
     # The contract: what was declared IS what the network received.
     assert torch.equal(tensors["model_input"], recorder["model_saw"])
@@ -363,13 +362,12 @@ def _cond_fm(recorder: dict) -> FlowMatchingStrategy:
     s = object.__new__(FlowMatchingStrategy)
     s.device = torch.device("cpu")
     s._resolve_legacy_batch = lambda input_batch, kwargs: input_batch  # type: ignore[method-assign]
-    s._declared_model_input = None
     s.env = MagicMock()
     s.env.generator = _CondGen(recorder)
     return s
 
 
-def test_a_conditional_velocity_is_trained_on_the_input() -> None:
+def test_a_conditional_velocity_is_trained_on_the_input(declared) -> None:
     """The ULF input reaches the velocity as its condition and moves the CFM loss."""
     rec: dict = {}
     s = _cond_fm(rec)
@@ -384,7 +382,7 @@ def test_a_conditional_velocity_is_trained_on_the_input() -> None:
     torch.manual_seed(0)
     b = s._compute_losses_impl(input_batch={"target": x1, "input": 5 * y}, epoch=0)["loss_total"]
     assert not torch.allclose(a, b)
-    tensors, _, _ = s._declared_model_input
+    tensors, _, _ = declared()
     assert torch.equal(tensors["condition"], rec["condition"])
 
 

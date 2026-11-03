@@ -22,6 +22,8 @@ Reference:
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import torch
 from torch import Tensor, nn
 
@@ -55,6 +57,9 @@ class ProximalDCStep(nn.Module):
         x_pred = model(x_t, t)
         x_dc   = dc(x_pred, measured_kspace, mask)
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self, mode: str = "hard", soft_lambda: float = 1.0) -> None:
         """Initialise the DC projection.

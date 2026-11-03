@@ -1723,3 +1723,49 @@ def test_two_cpu_single_rank_still_keeps_one_train_worker(
     # count from collapsing to a serial loader.
     train_loader, _ = _build_default_loaders(tmp_path, monkeypatch, cpus=2.0)
     assert train_loader.num_workers == 1 and train_loader.persistent_workers is True
+
+
+class TestPerSiteValidationLoader:
+    """Balancing 'federated_blocks' scores each site on its own validation manifest."""
+
+    @staticmethod
+    def _config(**val_paths):
+        from spectramr.config.schemas.data import (
+            DataConfigSchema,
+            DomainConfigSchema,
+            MultiDomainConfigSchema,
+        )
+
+        md = MultiDomainConfigSchema(
+            enabled=True,
+            balancing="federated_blocks",
+            domains=[
+                DomainConfigSchema(name=n, index_path=f"/idx/{n}.json", validation_index_path=v)
+                for n, v in val_paths.items()
+            ],
+        )
+        return DataConfigSchema(multi_domain=md)
+
+    def test_each_site_reads_its_own_validation_manifest(self, monkeypatch) -> None:
+        from spectramr.infrastructure.builders.directors import data_pipeline_director as dpd
+
+        seen = []
+
+        def _fake(self, **kwargs):
+            seen.append(self._config.source.validation_index_path)
+            return object(), [self._config.source.validation_index_path]
+
+        monkeypatch.setattr(dpd.DataPipelineDirector, "build_dataloaders", _fake)
+        cfg = self._config(a="/val/a.json", b="/val/b.json")
+        chain = dpd.DataPipelineDirector(cfg).build_multi_domain_val_loader()
+        assert seen == ["/val/a.json", "/val/b.json"]
+        assert list(chain.loaders) == ["a", "b"]
+
+    def test_a_site_without_its_own_manifest_raises(self) -> None:
+        import pytest
+
+        from spectramr.infrastructure.builders.directors import data_pipeline_director as dpd
+
+        cfg = self._config(a="/val/a.json", b=None)
+        with pytest.raises(ValueError, match=r"\['b'\]"):
+            dpd.DataPipelineDirector(cfg).build_multi_domain_val_loader()

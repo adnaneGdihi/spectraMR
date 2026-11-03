@@ -1341,9 +1341,6 @@ def campaign_evaluate(args: argparse.Namespace) -> int:
     from spectramr.infrastructure.orchestration.campaign_evaluator import (
         CampaignEvaluator,
     )
-    from spectramr.infrastructure.orchestration.campaign_report_generator import (
-        CampaignReportGenerator,
-    )
     from spectramr.infrastructure.orchestration.campaign_state import CampaignState
 
     try:
@@ -1362,9 +1359,9 @@ def campaign_evaluate(args: argparse.Namespace) -> int:
 
         # Generate plots if configured
         if eval_config.generate_plots:
-            gen = CampaignReportGenerator(output_dir=args.campaign_dir)
-            dashboard = gen.generate(report)
-            print(f"\nDashboard: {dashboard}")
+            from spectramr.infrastructure.reporting.dashboard.campaign import build_campaign_report
+
+            print(f"\nDashboard: {build_campaign_report(args.campaign_dir)['index']}")
 
         # Export LaTeX if configured or --latex flag
         if args.latex or eval_config.export_latex:
@@ -1418,9 +1415,6 @@ def campaign_watch(args: argparse.Namespace) -> int:
     from spectramr.infrastructure.orchestration.campaign_orchestrator import (
         CampaignOrchestrator,
     )
-    from spectramr.infrastructure.orchestration.campaign_report_generator import (
-        CampaignReportGenerator,
-    )
 
     base_dir = str(args.base_dir) if args.base_dir else "."
     poll_interval = args.poll_interval
@@ -1461,9 +1455,11 @@ def campaign_watch(args: argparse.Namespace) -> int:
                 print(report.summary)
 
                 if eval_config.generate_plots:
-                    gen = CampaignReportGenerator(output_dir=args.campaign_dir)
-                    dashboard = gen.generate(report)
-                    print(f"\nDashboard: {dashboard}")
+                    from spectramr.infrastructure.reporting.dashboard.campaign import (
+                        build_campaign_report,
+                    )
+
+                    print(f"\nDashboard: {build_campaign_report(args.campaign_dir)['index']}")
 
                 if eval_config.export_latex and report.leaderboard is not None:
                     latex = CampaignEvaluator.leaderboard_to_latex(report.leaderboard)
@@ -1626,10 +1622,53 @@ def _metric_flags(args: argparse.Namespace) -> dict:
     return out
 
 
+# Flags each cross-run mode never reads; passing one is an error, not a no-op (pitfall 15).
+_SWITCHES = frozenset({"recursive", "compare", "catalog"})
+_UNREAD_UNDER_COMPARE = (
+    "task", "method", "seed", "dataset_version", "cohort_json", "interactive", "qc", "recursive",
+)
+_UNREAD_UNDER_CONTRASTS = (
+    *_UNREAD_UNDER_COMPARE, "figures", "config", "arms", "labels", "out_subdir",
+)
+_UNREAD_UNDER_DASHBOARD = (
+    *_UNREAD_UNDER_CONTRASTS, "compare", "catalog", "baseline", "metrics", "phases", "only",
+    "contrasts", "contrast_pairs", "out_root", "results_root", "style", "html",
+)
+
+
+def _report_dashboard(args: argparse.Namespace) -> int:
+    """``report --dashboard``: re-render the campaign site from outputs already on disk."""
+    from spectramr.infrastructure.reporting.dashboard import build_site
+
+    if (rc := _unread_flags(args, _UNREAD_UNDER_DASHBOARD, "--dashboard")) is not None:
+        return rc
+    if args.exp_dir is None or not args.exp_dir.is_dir():
+        print(f"error: --dashboard needs an existing --exp-dir, got {args.exp_dir}")
+        return 2
+    pages = build_site(args.exp_dir)
+    print(f"Dashboard: {pages['index']} ({len(pages)} page(s))")
+    return 0
+
+
+def _unread_flags(args: argparse.Namespace, names: tuple[str, ...], mode: str) -> int | None:
+    # None is "not given" for every flag except the store_true switches, whose default is False.
+    given = [
+        f"--{n.replace('_', '-')}"
+        for n in names
+        if getattr(args, n, None) is not None and not (n in _SWITCHES and not getattr(args, n))
+    ]
+    if not given:
+        return None
+    print(f"error: {mode} does not read {', '.join(given)}; drop them or report each run on its own")
+    return 2
+
+
 def _report_compare(args: argparse.Namespace, kwargs: dict) -> int:
     """``report --compare``: the cross-run report over the arms under --exp-dir."""
     from spectramr.infrastructure.reporting.comparison import generate_comparison
 
+    if (rc := _unread_flags(args, _UNREAD_UNDER_COMPARE, "--compare")) is not None:
+        return rc
     runs = list(args.arms) if args.arms else [args.exp_dir]
     labels = [s.strip() for s in args.labels.split(",")] if args.labels else None
     out_dir = args.exp_dir / (args.out_subdir or "comparison")
@@ -1643,6 +1682,7 @@ def _report_compare(args: argparse.Namespace, kwargs: dict) -> int:
         formats=tuple(kwargs.get("formats", ("pdf", "png"))),
         dpi=kwargs.get("dpi", 600),
         html_report=kwargs.get("html_report", True),
+        figures=kwargs.get("figures"),
         **_metric_flags(args),
     )
     n_fig = sum(1 for v in result["figures"].values() if v is not None)
@@ -1659,6 +1699,8 @@ def _report_contrasts(args: argparse.Namespace) -> int:
     from spectramr.infrastructure.reporting.comparison.contrast_folder import write_contrasts
     from spectramr.infrastructure.reporting.comparison.contrasts import load_contrast_set
 
+    if (rc := _unread_flags(args, _UNREAD_UNDER_CONTRASTS, "--contrasts")) is not None:
+        return rc
     only = [s.strip() for s in args.only.split(",") if s.strip()] if args.only else None
     if args.contrasts is not None and args.contrast_pairs is not None:
         print("error: give --contrasts (a file) or --contrast-pairs (a cohort), not both")
@@ -1713,6 +1755,8 @@ def report(args: argparse.Namespace) -> int:
     """
     from spectramr.infrastructure.reporting import generate_report
 
+    if getattr(args, "dashboard", False):
+        return _report_dashboard(args)
     if getattr(args, "contrasts", None) is not None or getattr(args, "contrast_pairs", None):
         return _report_contrasts(args)
     if args.exp_dir is None:
@@ -1724,7 +1768,7 @@ def report(args: argparse.Namespace) -> int:
 
         res = render_catalog(exp_dir, style=args.style or "nature")
         n_ok = sum(1 for v in res["figures"].values() if v is not None)
-        print(f"Catalog: {n_ok}/{len(res['figures'])} figures from built-in examples -> {exp_dir}")
+        print(f"Catalog: {n_ok}/{len(res['figures'])} figures from built-in examples -> {res['html']}")
         for fid, why in sorted(res["reasons"].items()):
             print(f"  {fid}: {why}")
         return 0 if n_ok == len(res["figures"]) else 1
@@ -1814,7 +1858,7 @@ def report(args: argparse.Namespace) -> int:
         return _report_compare(args, kwargs)
 
     # Batch mode: --exp-dir is a cohort root; report every run under it and
-    # write a linking report_index.html. Per-run failures don't abort the batch.
+    # write a linking index.html dashboard. Per-run failures don't abort the batch.
     if getattr(args, "recursive", False):
         from spectramr.infrastructure.reporting import generate_reports
 
@@ -3347,7 +3391,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="recursive",
         action="store_true",
         help="Treat --exp-dir as a cohort root: discover every run beneath it, "
-        "report each, and write a linking report_index.html.",
+        "report each, and write a linking index.html dashboard.",
     )
     report_parser.add_argument(
         "--config",
@@ -3387,9 +3431,10 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument(
         "--figures",
         default=None,
-        help="Comma-separated figure ids to render. Default: the --task preset "
-        "plus the QC figures; data-less figures are skipped with a recorded "
-        "reason. e.g. --figures fig_1_2_learning_curves,qc_group_strip",
+        help="Comma-separated figure ids to render, or 'all' for every registered "
+        "figure. Default: the --task preset plus the QC figures (with --compare, the "
+        "comparison set); data-less figures are skipped with a recorded reason. "
+        "e.g. --figures fig_1_2_learning_curves,qc_group_strip",
     )
     report_parser.add_argument(
         "--out-subdir",
@@ -3453,6 +3498,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cross-run report: compare every run under --exp-dir (or the --arms list) "
         "and write mosaics, per-case error bars, curves and a results table to "
         "<exp-dir>/comparison/.",
+    )
+    report_parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="Rebuild the campaign dashboard (<exp-dir>/index.html, plus every comparison and "
+        "contrast page under it) from the reports already written; draws no new figures.",
     )
     report_parser.add_argument(
         "--arms",

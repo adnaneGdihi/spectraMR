@@ -28,7 +28,7 @@ Author: Physics-AI MRI Framework
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import ClassVar, Literal
 
 import torch
 import torch.nn as nn
@@ -443,6 +443,9 @@ class NullSpaceProjection(nn.Module):
     Used in PA-PCFM to ensure network only generates null-space content.
     """
 
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
+
     def __init__(self, forward_operator: MultiCoilForwardOperator) -> None:
         """__init__.
 
@@ -503,6 +506,9 @@ class MultiCoilDataConsistency(nn.Module):
         mode: 'soft' for gradient step, 'hard' for k-space replacement
         lambda_dc: Weight for soft data consistency (default 1.0)
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(
         self,

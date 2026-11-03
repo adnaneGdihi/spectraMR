@@ -410,7 +410,7 @@ data:
   multi_domain:
     enabled: false
     domains: []
-    balancing: 'round_robin'       # options: 'round_robin', 'stratified', 'concat'
+    balancing: 'round_robin'       # options: 'round_robin', 'stratified', 'concat', 'domain_labelled', 'federated_blocks'
     target_supervised: false
 
   # Latent diffusion (Stage-1 autoencoder reuse).
@@ -508,6 +508,8 @@ data:
 #   multi_contrast:
 #     acquisition_params:
 #       - contrast_type: 'spin_echo'             # options: 'spin_echo', 'inversion_recovery', 'gradient_echo', 'diffusion_weighted', 'ssfp', 'mprage'
+#     positive_sampling: 'co_registered_subject' # options: 'co_registered_subject', 'same_volume_slice'
+#     negative_sampling: 'cross_subject'         # options: 'cross_subject', 'cross_volume'
 #   perfusion:
 #     aif_source: 'population'                   # options: 'population', 'measured'
 #     kinetic_model: 'extended_tofts'            # options: 'extended_tofts'
@@ -644,7 +646,7 @@ training:
 #     equivariance_target: 'transformed'         # options: 'transformed', 'band_limited'
 #     measurement_target: 'measured'             # options: 'measured', 'alternate_repetition'
 #   federated_config:
-#     aggregation_strategy: 'fed_avg'             # options: 'fed_avg', 'fed_prox', 'fed_opt', 'fed_adam', 'scaffold', 'fed_nova'
+#     aggregation_strategy: 'fed_avg'             # options: 'fed_avg', 'fed_bn'
 #   flow:
 #     sampling_method: 'euler'                    # options: 'euler', 'midpoint', 'rk45', 'heun'
 #   motion:
@@ -1684,19 +1686,6 @@ parallel:
 #   post_model: []
 #   pre_loss_target: []
 #   pre_metric: []
-#
-# backend_acceleration:          # SPECTRA / WCSR co-simulation backend
-#   backend: 'spectra'
-#   cosim_bridge_addr: null
-#   enable_nmae: true
-#   gridding_kernel_width: 4
-#   lanes: 4
-#   mesh_cols: 4
-#   mesh_rows: 4
-#   oversampling: 2.0
-#   pe_mode_policy: null                       # options: 'mixed', 'fp32', 'bf16', 'fp8'
-#   per_channel_scaling: true
-#   runtime: null                              # options: 'cosim', 'rocc'
 #
 # diffusion: {}                # free-form dict[str, Any]; distinct from the `training.diffusion` block
 #

@@ -1,15 +1,7 @@
-"""The content half of the model-input snapshot contract (#1298).
+"""Width check of the model input the snapshot hooks record (#1298).
 
-The presence half lives in
-``strategies/test_base_model_input_contract_2026_08.py``: it proves a snapshot
-arrived under the declared tag. These cases cover the part that was missing --
-whether what arrived describes the tensor the model was actually fed.
-
-The split between raising and warning is the subject of several cases below and
-is not stylistic. Naming failures are static: a class that never says which of
-its tensors is the model input, or names one it does not emit, is wrong before a
-batch is loaded. Width failures rest on a heuristic read of the backbone, so a
-false positive there would abort a real run over a diagnostic.
+Width failures rest on a heuristic read of the backbone, so they warn and stamp;
+a false positive must not abort a real run over a diagnostic.
 """
 
 from __future__ import annotations
@@ -22,65 +14,10 @@ from spectramr.infrastructure.training.model_input_contract import (
     STATUS_MATCH,
     STATUS_MISMATCH,
     STATUS_UNRESOLVED,
-    require_model_input_key,
     resolve_model_in_channels,
     verify_model_input,
 )
 
-# ── Naming: raises ─────────────────────────────────────────────────────────
-
-
-def test_an_unnamed_model_input_raises() -> None:
-    with pytest.raises(ValueError, match="without naming which of its tensors"):
-        require_model_input_key(
-            strategy_name="S", tag="t", tensors={"a": None, "b": None}, model_input_key=None
-        )
-
-
-def test_the_message_lists_the_keys_the_reader_would_have_to_guess_between() -> None:
-    """The point of the raise is to be actionable at the emitter, not generic."""
-    with pytest.raises(ValueError) as exc:
-        require_model_input_key(
-            strategy_name="VirtualFiducialStrategy",
-            tag="vf_twin",
-            tensors={"twin_corrupted_input": None, "twin_target_clean": None},
-            model_input_key=None,
-        )
-    assert "VirtualFiducialStrategy" in str(exc.value)
-    assert "vf_twin" in str(exc.value)
-    assert "twin_corrupted_input" in str(exc.value)
-
-
-def test_naming_an_absent_key_raises() -> None:
-    """#1298: the label pointed at a tensor the snapshot did not contain."""
-    with pytest.raises(ValueError, match="but that snapshot holds"):
-        require_model_input_key(
-            strategy_name="DiffusionTrainingStrategy",
-            tag="diffusion_step",
-            tensors={"noisy_kspace": None},
-            model_input_key="model_input",
-        )
-
-
-def test_an_empty_string_is_not_a_name() -> None:
-    """`extra.get(...)` on a dict that never set the key yields None; a caller
-    passing "" is the same defect and must not slip through a truthiness gap."""
-    with pytest.raises(ValueError, match="without naming"):
-        require_model_input_key(
-            strategy_name="S", tag="t", tensors={"a": None}, model_input_key=""
-        )
-
-
-def test_a_correct_name_is_returned_unchanged() -> None:
-    assert (
-        require_model_input_key(
-            strategy_name="S", tag="t", tensors={"a": None}, model_input_key="a"
-        )
-        == "a"
-    )
-
-
-# ── Resolving the backbone's declared width ────────────────────────────────
 
 
 def test_a_declared_in_channels_attribute_wins() -> None:

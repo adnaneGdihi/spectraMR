@@ -163,13 +163,8 @@ def test_empty_seam_raises(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
-def test_applied_lddmm_constants_reach_the_snapshot_provenance(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        ReconstructionTrainingStrategy, "_first_steps_extra", lambda self, epoch, batch=None: {}
-    )
-    lddmm = _bare_strategy()._first_steps_extra(0)["lddmm"]
+def test_applied_lddmm_constants_reach_the_snapshot_provenance() -> None:
+    lddmm = _bare_strategy()._snapshot_context()["lddmm"]
     assert lddmm["n_squarings"] == DiffeomorphicReconStrategy.n_squarings
     assert lddmm["lambda_warp"] == DiffeomorphicReconStrategy.lambda_warp
     assert lddmm["velocity_source"].startswith("velocity_field_head")

@@ -307,16 +307,22 @@ class MultiContrastConfigSchema(BaseModel):
     )
 
     # === v6.1 — multi-contrast SSL extensions (Item 1 of multi-contrast remaining) ===
-    positive_sampling: str = Field(
+    positive_sampling: Literal["co_registered_subject", "same_volume_slice"] = Field(
         default="co_registered_subject",
         description=(
-            "InfoNCE positive-pair strategy for multi-contrast SSL. "
-            "Options: ``co_registered_subject`` | ``same_volume_slice``."
+            "InfoNCE positive pair for multi-contrast SSL. ``co_registered_subject``: two "
+            "different co-registered contrasts of the same slice (``m4raw_triplet`` with "
+            "``contrastive_views``). ``same_volume_slice`` needs an augmentation pair that no "
+            "producer emits yet, so it raises at dataset build."
         ),
     )
-    negative_sampling: str = Field(
+    negative_sampling: Literal["cross_subject", "cross_volume"] = Field(
         default="cross_subject",
-        description="InfoNCE negative-pair strategy: ``cross_subject`` | ``cross_volume``.",
+        description=(
+            "InfoNCE negatives. ``cross_subject``: in-batch samples of other subjects (the "
+            "producer emits ``subject_index`` so same-subject pairs can be masked); "
+            "``cross_volume``: every other in-batch sample."
+        ),
     )
 
     # === v6.1 — vendor / protocol soft-prompt extensions (Item 4) ===
@@ -1452,6 +1458,7 @@ DomainBalancingStrategy = Literal[
     "stratified",  # Each batch contains samples from both domains
     "concat",  # No balancing — just zip the loaders
     "domain_labelled",  # One flat batch from both domains + per-sample domain_label
+    "federated_blocks",  # One contiguous block per client per round; per-site validation
 ]
 
 
@@ -1477,6 +1484,14 @@ class DomainConfigSchema(BaseModel):
     index_path: str | None = Field(
         default=None,
         description="Override manifest index path for this domain. None inherits.",
+    )
+    validation_index_path: str | None = Field(
+        default=None,
+        description=(
+            "Override the validation manifest for this domain. A per-site validation "
+            "(balancing 'federated_blocks') needs one per site, or every site is scored "
+            "on the parent's pooled split."
+        ),
     )
     dataset_type: str | None = Field(
         default=None,

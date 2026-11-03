@@ -75,10 +75,46 @@ def _nex_mode(path: Path) -> str | None:
     return None if m is None else (m.decode() if isinstance(m, bytes) else str(m))
 
 
-class M4RawTripletDataset(Dataset):
-    """One item per valid slice of each registered subject: ``input``/``target`` (3, H, W, 1)."""
+class ContrastiveViews:
+    """Which two co-registered contrasts of a slice form the positive pair, and their ids."""
 
-    def __init__(self, t2_root: Path, flair_root: Path, split: str) -> None:
+    def __init__(self, contrast_map: dict[str, int], *, positive: str, deterministic: bool) -> None:
+        if positive != "co_registered_subject":
+            raise ValueError(
+                f"positive_sampling {positive!r} needs an augmentation pair the triplet does "
+                "not produce; m4raw_triplet supports 'co_registered_subject' only"
+            )
+        by_name = {k.upper(): v for k, v in contrast_map.items()}
+        missing = [c for c in CONTRASTS if c not in by_name]
+        if missing:
+            raise ValueError(
+                f"data.multi_contrast.contrast_map has no id for {missing}; "
+                f"the triplet's contrasts are {list(CONTRASTS)}"
+            )
+        self.ids = torch.tensor([by_name[c] for c in CONTRASTS])
+        self.deterministic = deterministic
+
+    def pair(self, i: int) -> tuple[int, int]:
+        """Two distinct series indices: random per item in training, a fixed rotation in validation."""
+        n = len(CONTRASTS)
+        if self.deterministic:
+            a = i % n
+            return a, (a + 1) % n
+        a = int(torch.randint(n, ()).item())
+        return a, (a + 1 + int(torch.randint(n - 1, ()).item())) % n
+
+
+class M4RawTripletDataset(Dataset):
+    """One item per valid slice of each registered subject: ``input``/``target`` (3, H, W, 1).
+
+    With ``views``, each item also carries ``view_a``/``view_b`` (1, H, W), their
+    ``contrast_idx_a``/``contrast_idx_b`` and the ``subject_index``.
+    """
+
+    def __init__(
+        self, t2_root: Path, flair_root: Path, split: str, views: ContrastiveViews | None = None
+    ) -> None:
+        self.views = views
         a, b = Path(t2_root) / split, Path(flair_root) / split
         self.records: list[tuple[str, int]] = []
         self.excluded: dict[str, str] = {}
@@ -117,6 +153,7 @@ class M4RawTripletDataset(Dataset):
             self.records += [(subject, int(s)) for s in np.intersect1d(v2, vf)]
         if not self.records:
             raise FileNotFoundError(f"no registered triplet under {a} and {b}")
+        self._subject_index = {subject: k for k, subject in enumerate(self._files)}
         self._refuse_mixed_protocols()
 
     def _refuse_mixed_protocols(self) -> None:
@@ -149,4 +186,17 @@ class M4RawTripletDataset(Dataset):
             subject_id=subject,
             slice_index=s,
             **self._protocol[subject],
+            **self._views(x, i, subject),
         )
+
+    def _views(self, x: torch.Tensor, i: int, subject: str) -> dict[str, torch.Tensor]:
+        if self.views is None:
+            return {}
+        a, b = self.views.pair(i)
+        return {
+            "view_a": x[a, ..., 0].unsqueeze(0).clone(),
+            "view_b": x[b, ..., 0].unsqueeze(0).clone(),
+            "contrast_idx_a": self.views.ids[a],
+            "contrast_idx_b": self.views.ids[b],
+            "subject_index": torch.tensor(self._subject_index[subject]),
+        }

@@ -518,35 +518,6 @@ class OnFailureKind(str, Enum):
     CONTINUE = "continue"  # keep the changed weight and take no action
 
 
-class PrecisionPolicy(str, Enum):
-    """Valid per-layer arithmetic precision policies for the SPECTRA backend.
-
-    Maps to the morphable-PE precision modes (SPECTRA Workstream A7). ``MIXED``
-    lets the compiler choose FP32/BF16/FP8 per layer against a fidelity floor;
-    the others pin a single output precision. ``FP8`` alone is an
-    inner-loop/preconditioner precision, never a diagnostic output precision —
-    the ``check_spectra_precision_envelope`` Tier-1 guard enforces this.
-    """
-
-    MIXED = "mixed"
-    FP32 = "fp32"
-    BF16 = "bf16"
-    FP8 = "fp8"
-
-
-class SpectraRuntime(str, Enum):
-    """Valid SPECTRA execution runtimes (Workstream B4).
-
-    ``COSIM`` drives the real RTL through the Verilator co-simulation TCP bridge
-    (sandbox-portable, correctness vehicle — not a performance path). ``ROCC``
-    issues the RoCC instruction stream directly on silicon after Chipyard
-    elaboration.
-    """
-
-    COSIM = "cosim"
-    ROCC = "rocc"
-
-
 # =============================================================================
 # Legacy Enums (Consolidated from domain/entities/enums/)
 # These maintain backward compatibility with existing code
@@ -815,8 +786,6 @@ __all__ = [
     "ActivationFunction",
     "NormalizationType",
     "MetricMode",
-    "PrecisionPolicy",
-    "SpectraRuntime",
     "ReportTask",
     "ReportStyle",
     "SignalDomain",

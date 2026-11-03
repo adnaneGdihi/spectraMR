@@ -22,6 +22,7 @@ __all__ = [
     "ACQUISITION_PARAM_KEYS",
     "AcquisitionLookup",
     "align_contrast_rows",
+    "aux_map_loss_context",
     "bloch_loss_context",
     "build_acquisition_lookup",
     "contrast_inputs",
@@ -90,6 +91,19 @@ def bloch_loss_context(generator: Any) -> dict[str, Any]:
     if tissue is None or acquisition is None:
         return {}
     return {"context": {"tissue_params": tissue, "acquisition_params": acquisition}}
+
+
+def aux_map_loss_context(generator: Any, batch_context: dict[str, Any]) -> dict[str, Any]:
+    """The auxiliary maps a generator wrote on its last forward, with the batch's B0.
+
+    ``cross_field_fm`` with ``tissue_heads`` exposes ``last_aux_maps`` (``t1_ms``,
+    ``tissue_probabilities``); ``contrast_consistency`` reads them with the per-sample
+    ``field_strength``. Empty for any generator that writes no auxiliary maps.
+    """
+    aux = getattr(generator, "last_aux_maps", None)
+    if aux is None:
+        return {}
+    return {"aux_maps": aux, "field_strength": batch_context.get("field_strength")}
 
 
 def align_contrast_rows(contrast: torch.Tensor, rows: int) -> torch.Tensor:

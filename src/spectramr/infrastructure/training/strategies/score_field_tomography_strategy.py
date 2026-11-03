@@ -55,10 +55,6 @@ def _as_interleaved(x: torch.Tensor) -> torch.Tensor:
 class ScoreFieldTomographyStrategy(BaseTrainingStrategy):
     """Joint (x, c) denoising score matching with k-space Hermitian noise."""
 
-    # Debug-snapshot contract (non-negotiable 14): the model is fed a noised
-    # tensor, not the prepared input; declared here and emitted under the tag.
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
     # Validation undersamples the target with the arm's ``undersampling:`` block
     # (``_validation_mask``); training is unconditional DSM on the target.
     applies_undersampling = True
@@ -238,9 +234,9 @@ class ScoreFieldTomographyStrategy(BaseTrainingStrategy):
             self._val_sampler = sampler
         return sampler
 
-    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
+    def _snapshot_context(self) -> dict[str, Any]:
         """Stamp the resolved score-field and validation-sampler knobs (pitfall 15)."""
-        extra = super()._first_steps_extra(epoch, batch=batch)
+        extra = super()._snapshot_context()
         try:
             undersampling: dict[str, Any] | str = self._undersampling_record()
         except ValueError as exc:  # validation raises on it; the stamp records why

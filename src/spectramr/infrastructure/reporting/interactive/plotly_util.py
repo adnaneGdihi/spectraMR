@@ -2,9 +2,9 @@ r"""Shared helpers for the interactive (plotly) reporting layer.
 
 Single source of truth for: probing whether plotly is installed, inlining the
 plotly.js library **once** per report (so the HTML is self-contained and works
-offline — unlike the old ``include_plotlyjs="cdn"`` path), the dark theme that
-matches the QC report CSS, the image colour scales, and the "how to read this"
-caption block that makes every interactive panel explainable.
+offline — unlike the old ``include_plotlyjs="cdn"`` path), the report theme
+(colours from :mod:`spectramr.core.design_tokens`), the image colour scales, and the
+"how to read this" caption block that makes every interactive panel explainable.
 
 All plotly imports are guarded and happen inside functions, so importing this
 module never fails when plotly is absent — the builders simply return ``None``
@@ -15,15 +15,17 @@ from __future__ import annotations
 
 import html
 
-# Report panel background (matches ``_CSS`` --panel in html_report.py).
-_PANEL_BG = "#1c2029"
-_FG = "#e6e9ef"
-_FLAG = "#D55E00"
+from spectramr.core.design_tokens import FONT_SANS, colours
 
 # Greyscale for magnitude images (black background -> white signal, the MRI
 # display convention); Magma for error maps (dark = low error).
 GRAY_SCALE = [[0.0, "#000000"], [1.0, "#ffffff"]]
 ERROR_SCALE = "Magma"
+
+
+def role(name: str, mode: str = "light") -> str:
+    """A design-token colour by role (``ink``, ``series``, ``accent``, ``baseline`` ...)."""
+    return colours(mode)[name]  # type: ignore[arg-type]
 
 
 def has_plotly() -> bool:
@@ -49,22 +51,50 @@ def plotlyjs_script() -> str | None:
     return f"<script type='text/javascript'>{get_plotlyjs()}</script>"
 
 
+# No toolbar: drag-to-zoom, double-click reset and hover all work without it, and its
+# floating icons sat over titles and button rows.
+_CONFIG = {"displayModeBar": False, "responsive": True}
+
+
 def to_div(fig, *, div_id: str | None = None) -> str:
     """Serialise a plotly figure to an inline ``<div>`` (no embedded plotly.js)."""
-    return fig.to_html(include_plotlyjs=False, full_html=False, div_id=div_id)
+    return fig.to_html(include_plotlyjs=False, full_html=False, div_id=div_id, config=_CONFIG)
 
 
-def apply_dark(fig, *, title: str | None = None, height: int | None = None) -> None:
-    """Apply the report's dark theme to a plotly figure in place."""
+def seat_menus(fig) -> None:
+    """Seat a figure's button/dropdown menus between its title and the plot.
+
+    Call after the menus are set. A menu placed in paper coordinates above ``y=1``
+    shares the title's strip of top margin and overlaps it; this grows the margin by
+    one row and anchors each menu's bottom edge on the plot's top edge instead.
+    """
+    if not fig.layout.updatemenus:
+        return
+    fig.update_layout(margin={"t": (fig.layout.margin.t or 20) + 40})
+    for menu in fig.layout.updatemenus:
+        menu.update(y=1.0, yanchor="bottom", pad={"b": 8})
+
+
+def apply_theme(fig, *, title: str | None = None, height: int | None = None) -> None:
+    """Apply the report theme to a plotly figure in place.
+
+    Backgrounds stay transparent so the figure sits on the page surface in either
+    mode; the page's theme toggle re-inks text and gridlines via ``Plotly.relayout``.
+    """
+    tok = colours("light")
+    axis = {"gridcolor": tok["rule"], "linecolor": tok["rule_strong"], "zerolinecolor": tok["rule_strong"]}
     fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor=_PANEL_BG,
-        plot_bgcolor=_PANEL_BG,
-        font={"color": _FG, "size": 12},
+        template="plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": tok["ink_2"], "size": 12, "family": FONT_SANS},
+        hoverlabel={"font": {"family": FONT_SANS}},
         margin={"l": 70, "r": 20, "t": 44 if title else 20, "b": 40},
     )
+    fig.update_xaxes(**axis)
+    fig.update_yaxes(**axis)
     if title is not None:
-        fig.update_layout(title={"text": title, "font": {"size": 14}})
+        fig.update_layout(title={"text": title, "font": {"size": 14, "color": tok["ink"]}})
     if height is not None:
         fig.update_layout(height=height)
 
@@ -92,5 +122,5 @@ def caption(text: str) -> str:
 
 
 def flag_colour() -> str:
-    """Okabe-Ito vermillion used to flag outliers / departures (report SSOT)."""
-    return _FLAG
+    """Colour that flags outliers / departures (the ``bad`` status token)."""
+    return role("bad")

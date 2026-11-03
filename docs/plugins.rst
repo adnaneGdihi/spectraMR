@@ -108,6 +108,21 @@ Then either set ``SPECTRAMR_PLUGINS=my_pkg.models.my_unet``, add it to
 ``plugins.paths``, or declare the entry-point — and use ``model_type: my_unet``
 in any config, or build it directly via :doc:`scripting_api`.
 
+Ranking a plugin metric with Sim2Rank
+-------------------------------------
+
+A metric registered with a ``direction`` can be ranked by Sim2Rank. Name it
+alongside a reference pool, since the consensus rank is relative to the other
+metrics swept:
+
+.. code-block:: bash
+
+   export SPECTRAMR_PLUGINS=my_pkg.my_metric
+   spectramr meta-evaluate --metrics my_metric psnr ssim rmse mae --tables --figures
+
+A name the registry does not know raises, and a plugin metric is reported under
+the ``external`` category.
+
 In-repo example: the prior-method baselines
 -------------------------------------------
 

@@ -31,3 +31,13 @@ def test_extended_plots_annotate_the_best_ranked_metrics() -> None:
 
     metrics = ["mae", "ssim", "psnr", "hfen"]
     assert top_by_composite_rank(metrics, _DATA, 2) == [(1, 1.5), (3, 2.0)]
+
+
+def test_extended_plots_axis_lines_use_eight_hues_then_dash_them() -> None:
+    from scripts.sim2rank_extended_plots import axis_style
+    from spectramr.core.design_tokens import CATEGORICAL_DARK
+
+    styles = [axis_style(i) for i in range(13)]
+    assert [s["color"] for s in styles[:8]] == list(CATEGORICAL_DARK)
+    assert styles[8] == {"color": CATEGORICAL_DARK[0], "linestyle": "--"}
+    assert len({(s["color"], s["linestyle"]) for s in styles}) == 13

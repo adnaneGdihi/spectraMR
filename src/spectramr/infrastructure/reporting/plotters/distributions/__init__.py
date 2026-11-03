@@ -12,12 +12,11 @@ from . import (
     paired_scatter,
     rank_heatmap,
     subject_bars,
-    violin,
 )
 
 #: figures fed the per-slice frame / the image cases by the pipeline and the comparison
 SLICE_FIGURES = (
-    "fig_3_1_metric_violin",
+    "metric_distribution",
     "fig_3_2_subject_bars",
     "fig_3_3_metric_scatter",
     "cmp_paired_slice_scatter",
@@ -28,7 +27,6 @@ SLICE_FIGURES = (
 CASE_FIGURES = ("fig_3_8_intensity_joint", "fig_3_9_background_zoom")
 
 FIGURES = {
-    "fig_3_1_metric_violin": violin.make,
     "fig_3_2_subject_bars": subject_bars.make,
     "fig_3_3_metric_scatter": metric_scatter.make,
     "cmp_paired_slice_scatter": paired_scatter.make,

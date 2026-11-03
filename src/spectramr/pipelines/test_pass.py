@@ -101,9 +101,11 @@ def run_test_pass(
         raise ValueError(
             "data.source.test_index_path is declared but the environment holds no test loader."
         )
-    # The report's case sinks are fed by the validation loop; this pass must not add to them.
+    # The report's case sinks and the snapshot session are fed by the validation loop; this
+    # pass must not add to them (a test batch would be written as a ``val`` snapshot).
     sinks = {
-        k: getattr(strategy, k, None) for k in ("_per_case_metric_sink", "_report_case_recorder")
+        k: getattr(strategy, k, None)
+        for k in ("_per_case_metric_sink", "_report_case_recorder", "snapshot_session")
     }
     for key in sinks:
         if sinks[key] is not None:

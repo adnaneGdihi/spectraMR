@@ -149,6 +149,10 @@ def register_aliases() -> None:
 
     # --- Non-generator modules that need IGenerator wrappers -----------
 
+    # uncertainty_wrapper, pin_nerf, monai_swin_unetr, qmri_network, dvs, diffusion_recon,
+    # implicit_representation and latent_diffusion_hierarchical are NOT aliased here: each
+    # has its own @register_model class, so a setdefault would never bind.
+
     # `rl_scanner` is the YAML alias for `rl_mri` (ActiveScanner) — same
     # active-acquisition family.
     #
@@ -163,47 +167,15 @@ def register_aliases() -> None:
     if "rl_mri" in MODEL_REGISTRY:
         MODEL_REGISTRY.setdefault("rl_scanner", MODEL_REGISTRY["rl_mri"])
 
-    # uncertainty_wrappers.py → "mc_dropout", "deep_ensemble"
-    if "mc_dropout" in MODEL_REGISTRY:
-        MODEL_REGISTRY.setdefault("uncertainty_wrapper", MODEL_REGISTRY["mc_dropout"])
-
-    # pinn_nerf → pin_nerf
-    if "pinn_nerf" in MODEL_REGISTRY:
-        MODEL_REGISTRY.setdefault("pin_nerf", MODEL_REGISTRY["pinn_nerf"])
-
-    # physics_driven → pinn
+    # physics_driven → pinn. UnrolledPhysicsNetwork is an unrolled network, not a PINN; the
+    # name is kept because VALID_MODEL_TYPES and a campaign arm still use it.
     if "physics_driven" in MODEL_REGISTRY:
         MODEL_REGISTRY.setdefault("pinn", MODEL_REGISTRY["physics_driven"])
 
-    # neural_cache → neural_ca (name collision with cellular automata, but same file)
+    # neural_cache → neural_ca. A neural cache, not a neural cellular automaton; kept because
+    # experiment_88_neural_ca and VALID_MODEL_TYPES name it.
     if "neural_cache" in MODEL_REGISTRY:
         MODEL_REGISTRY.setdefault("neural_ca", MODEL_REGISTRY["neural_cache"])
-
-    # unetr_generator → monai_swin_unetr
-    if "unetr_generator" in MODEL_REGISTRY:
-        MODEL_REGISTRY.setdefault("monai_swin_unetr", MODEL_REGISTRY["unetr_generator"])
-
-    # qmap_generator → qmri_network
-    if "qmap_generator" in MODEL_REGISTRY:
-        MODEL_REGISTRY.setdefault("qmri_network", MODEL_REGISTRY["qmap_generator"])
-
-    # differentiable_slicer → dvs
-    if "differentiable_slicer" in MODEL_REGISTRY:
-        MODEL_REGISTRY.setdefault("dvs", MODEL_REGISTRY["differentiable_slicer"])
-
-    # diffusion_reconstruction → diffusion_recon
-    if "diffusion_reconstruction" in MODEL_REGISTRY:
-        MODEL_REGISTRY.setdefault("diffusion_recon", MODEL_REGISTRY["diffusion_reconstruction"])
-
-    # implicit_mri_field → implicit_representation
-    if "implicit_mri_field" in MODEL_REGISTRY:
-        MODEL_REGISTRY.setdefault("implicit_representation", MODEL_REGISTRY["implicit_mri_field"])
-
-    # latent_gaussian_diffusion → latent_diffusion_hierarchical
-    if "latent_gaussian_diffusion" in MODEL_REGISTRY:
-        MODEL_REGISTRY.setdefault(
-            "latent_diffusion_hierarchical", MODEL_REGISTRY["latent_gaussian_diffusion"]
-        )
 
     # configurable_unet → standard_unet, enhanced_deep_unet  (2026-05-04 cleanup)
     # Previously these were two empty ``class X(UNet): pass`` subclasses with

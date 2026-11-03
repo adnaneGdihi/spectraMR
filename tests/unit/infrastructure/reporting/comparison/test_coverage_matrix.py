@@ -50,3 +50,14 @@ def test_the_figure_is_written_and_a_wide_matrix_continues(tmp_path):
 def test_nothing_to_draw_gives_none(tmp_path):
     assert make(pd.DataFrame(), tmp_path / "c.png", phase_df=None, arms=ARMS) is None
     assert make(pd.DataFrame(), tmp_path / "c.png", phase_df=make_phase_table(), arms=[]) is None
+
+
+def test_long_metric_names_fit_without_a_tight_layout_warning(recwarn):
+    import pandas as pd
+
+    from spectramr.infrastructure.reporting.comparison import coverage_matrix as cm
+
+    names = [f"band_input_cross_power_{b}_{i}" for i in range(12) for b in ("low", "mid", "high")]
+    rows = [{"arm": a, "phase": "val", "metric": m, "mean": 1.0} for a in ("a", "b") for m in names]
+    cm._draw(names, pd.DataFrame(rows), [], ["a", "b"], ("val",))
+    assert not [w for w in recwarn if "tight_layout" in str(w.message).lower()]

@@ -205,6 +205,7 @@ class ConcretePMAVarNetStrategy(BaseTrainingStrategy):
                 input_batch=input_batch,
                 target_batch=target_batch,
                 step=batch_idx,
+                batch=val_batch,
             ),
         ):
             out = self._compute_losses_impl(input_batch, target_batch, epoch=0)

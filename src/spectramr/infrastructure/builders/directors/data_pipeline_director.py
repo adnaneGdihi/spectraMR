@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from torch.utils.data import DataLoader
 
@@ -321,6 +321,7 @@ def apply_coil_processing(
 _DOMAIN_OVERRIDE_DESTINATIONS: dict[str, tuple[str, ...]] = {
     "data_root": ("source", "root"),
     "index_path": ("source", "index_path"),
+    "validation_index_path": ("source", "validation_index_path"),
     "dataset_type": ("dataset_type",),
 }
 
@@ -905,8 +906,45 @@ class DataPipelineDirector:
             per_domain_loaders[domain.name] = train_loader
             weights[domain.name] = domain.weight
 
+        training = getattr(config, "training", None)
+        federated = getattr(training, "federated_config", None) if training is not None else None
         return build_balancer(
             loaders=per_domain_loaders,
             strategy=md.balancing,
             weights=weights,
+            local_epochs=federated.local_epochs if federated is not None else None,
         )
+
+    def build_multi_domain_val_loader(
+        self,
+        num_workers: int = 0,
+        pin_memory: bool = True,
+        val_batch_size: int | None = None,
+    ) -> Any:
+        """Each domain's validation loader in turn, every batch tagged with its domain.
+
+        For a balancer whose validation is per-site (``per_domain_validation``): each
+        domain's overrides build its own val split, so a site is scored on its own data.
+        """
+        from spectramr.data.builders.federated_balancer import ChainedDomainLoader
+
+        config = self._config
+        data_config = config.data if hasattr(config, "data") else config
+        md = data_config.multi_domain
+        missing = [d.name for d in md.domains if d.validation_index_path is None]
+        if missing:
+            raise ValueError(
+                f"per-site validation needs multi_domain.domains[].validation_index_path; "
+                f"{missing} would be scored on the pooled split"
+            )
+        loaders: dict[str, DataLoader] = {}
+        for domain in md.domains:
+            sub_director = DataPipelineDirector(_apply_domain_overrides(config, domain))
+            _train, val_loader = sub_director.build_dataloaders(
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                val_shuffle=False,
+                val_batch_size=val_batch_size,
+            )
+            loaders[domain.name] = val_loader
+        return ChainedDomainLoader(loaders)

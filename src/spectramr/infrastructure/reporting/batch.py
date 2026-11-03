@@ -5,12 +5,11 @@ A "cohort" here is any directory tree of run outputs (e.g. the whole
 walks the tree, treating a directory as a *run* as soon as it carries a run
 marker (``logs/training_metrics.csv`` / ``final_metrics.json`` / ...), and stops
 descending into it. ``generate_reports`` then produces one report per run and a
-top-level ``report_index.html`` linking them all.
+top-level dashboard ``index.html`` linking them all.
 """
 
 from __future__ import annotations
 
-import html
 import logging
 from pathlib import Path
 from typing import Any
@@ -37,6 +36,7 @@ _SKIP_DIRS = {
     "checkpoints",
     "logs",
     "debug_snapshots",
+    "snapshots",
     "report_cases",
     "__pycache__",
     "figures",
@@ -84,51 +84,13 @@ def discover_run_dirs(root: str | Path) -> list[Path]:
     return sorted(found)
 
 
-def _index_html(root: Path, rows: list[dict]) -> str:
-    items = []
-    for r in rows:
-        run: Path = r["run"]
-        rel = run.relative_to(root) if run != root else Path(run.name)
-        if r["ok"]:
-            html_path = r.get("html")
-            link = (
-                f"<a href='{html.escape(str(Path(html_path).relative_to(root)))}'>open report</a>"
-                if html_path
-                else "<span class='muted'>no HTML</span>"
-            )
-            status = f"<span class='ok'>{r['n_fig']} fig · {r['n_tab']} tab</span> &nbsp; {link}"
-        else:
-            status = f"<span class='fail'>failed: {html.escape(str(r.get('error', '')))}</span>"
-        items.append(f"<tr><td>{html.escape(str(rel))}</td><td>{status}</td></tr>")
-    n_ok = sum(1 for r in rows if r["ok"])
-    css = (
-        "body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;"
-        "background:#12151c;color:#e6e9ef;margin:0;padding:24px}"
-        "h1{font-size:20px}table{border-collapse:collapse;width:100%;font-size:13px}"
-        "td,th{border:1px solid #2a2f3a;padding:6px 10px;text-align:left}"
-        "th{background:#232834}.ok{color:#8fd18f}.fail{color:#D55E00}"
-        ".muted{color:#8a93a6}a{color:#56B4E9}"
-    )
-    return (
-        f"<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'>"
-        f"<title>Report index — {html.escape(root.name)}</title>"
-        f"<style>{css}</style></head><body>"
-        f"<h1>Report index — {html.escape(str(root))}</h1>"
-        f"<p class='muted'>{n_ok}/{len(rows)} runs reported.</p>"
-        f"<table><tr><th>Run</th><th>Report</th></tr>{''.join(items)}</table>"
-        f"</body></html>"
-    )
-
-
-def write_batch_index(
-    root: str | Path, rows: list[dict], filename: str = "report_index.html"
-) -> Path | None:
-    """Write a top-level HTML index linking every run's report. None if empty."""
-    root = Path(root)
+def write_batch_index(root: str | Path, rows: list[dict]) -> Path | None:
+    """Write the cohort dashboard (``<root>/index.html``) linking every run's report. None if empty."""
     if not rows:
         return None
-    out = root / filename
-    out.write_text(_index_html(root, rows), encoding="utf-8")
+    from .dashboard import build_site
+
+    out = build_site(root, batch_rows=rows)["index"]
     logger.info("batch report index: %s", out)
     return out
 

@@ -22,6 +22,7 @@ import torch
 
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.infrastructure.physics.fft_ops import sense_adjoint
+from spectramr.infrastructure.training.snapshot.session import loader_compressed
 from spectramr.infrastructure.physics.signal_models.flow_encoding import (
     encoding_directions,
     phase_difference,
@@ -190,10 +191,9 @@ class PhaseContrastReconStrategy(BaseTrainingStrategy):
                 "model_output": self._mid_frame(images),
                 "target": self._mid_frame(reference),
             },
-            step=step,
             tag="model_output",
             in_kspace_keys={"input_raw", "input_prepared"},
-            log_scaled_keys=set(),
+            log_scaled_keys=lambda: loader_compressed(batch, {"input_raw", "input_prepared"}),
             domain_exact=True,
         )
 

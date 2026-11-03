@@ -220,6 +220,14 @@ intersphinx_mapping = {
 # refs are a warning, not a failure, so a slow/offline host still builds.
 intersphinx_timeout = 15
 
+# PyTorch's pages no longer carry the intersphinx object ids and GitHub renders blob
+# headings client-side, so these anchors are absent from the served HTML; the page is
+# still checked.
+linkcheck_anchors_ignore_for_url = [
+    r"https://docs\.pytorch\.org/.*",
+    r"https://github\.com/[^/]+/[^/]+/blob/.*",
+]
+
 # Keep this list PRECISE. Every pattern here silently deletes a page from the
 # build, and Sphinx only *warns* when a `toctree` still links it — so an
 # over-broad glob produces a sidebar entry that resolves to nothing while the

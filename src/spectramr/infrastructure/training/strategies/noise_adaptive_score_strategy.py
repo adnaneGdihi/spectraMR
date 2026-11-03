@@ -48,8 +48,6 @@ class NoiseAdaptiveScoreStrategy(ReconstructionTrainingStrategy):
     #: Loss ownership: the DSM term is inline; declared image losses fold onto D(x_sigma; sigma, y).
     inline_losses: ClassVar[frozenset[str] | None] = frozenset()
     folds_image_losses: ClassVar[bool | None] = True
-    #: The network sees [c_in x_sigma, y], formed inside the step, not ``input_prepared``.
-    snapshot_prepared_is_model_input: bool = False
     #: The step scores D at a random sigma, so it reports no train_* metrics.
     reports_train_metrics: ClassVar[bool] = False
 

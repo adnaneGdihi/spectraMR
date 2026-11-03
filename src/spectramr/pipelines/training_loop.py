@@ -28,13 +28,14 @@ import math
 import os
 import time
 from collections.abc import Iterable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from itertools import cycle
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from spectramr.infrastructure.training.snapshot import SnapshotSession
 from spectramr.config.overrides import applied_override_paths
 from spectramr.config.schemas.validation import validation_declared_off
 from spectramr.config.training_budget import declares_no_training
@@ -1968,6 +1969,12 @@ def _execute_training_loop(
     nonfinite_monitor = NonFiniteMonitor(pipeline.device, distributed=process_group_spans_ranks())
     strategy.step_executor.nonfinite_monitor = nonfinite_monitor
 
+    # One snapshot session per run: it selects the steps, owns the model hooks and
+    # writes every stage recorded inside a selected step (loader to model output).
+    if getattr(strategy, "snapshot_session", None) is not None:
+        strategy.snapshot_session.close()
+    strategy.snapshot_session = SnapshotSession.build(strategy)
+
     # #1353: the strategy lifecycle contract (``on_epoch_start`` /
     # ``on_epoch_end`` / ``on_validation_start`` / ``on_validation_end``) was
     # declared on BaseTrainingStrategy and overridden by real strategies, but
@@ -2117,24 +2124,24 @@ def _execute_training_loop(
                     for k, v in batch.items()
                 }
 
-            # Strategy Step
-            # Strategy returns list of OptimizationStepConfigs
-            step_configs = strategy.train_step(
-                batch,
-                epoch,
-                iteration=iteration,
-                batch_data=batch,  # For legacy callbacks
-                scaler=scaler,
-            )
-
-            # Let the step executor orchestrate the standard PyTorch boilerplate
-            result = strategy.step_executor.execute_step(
-                step_configs,
-                epoch,
-                global_step=iteration,
-                model_type=model_type,
-                clip_and_log_fn=getattr(strategy, "_clip_and_log_gradients", None),
-            )
+            # The snapshot spans both calls: the forward runs inside the closures
+            # ``train_step`` returns, which ``execute_step`` invokes.
+            _snapshots = strategy.snapshot_session
+            with _snapshots.step("train", iteration, batch) if _snapshots else nullcontext():
+                step_configs = strategy.train_step(
+                    batch,
+                    epoch,
+                    iteration=iteration,
+                    batch_data=batch,  # For legacy callbacks
+                    scaler=scaler,
+                )
+                result = strategy.step_executor.execute_step(
+                    step_configs,
+                    epoch,
+                    global_step=iteration,
+                    model_type=model_type,
+                    clip_and_log_fn=getattr(strategy, "_clip_and_log_gradients", None),
+                )
 
             # [FIX] Step LR schedulers (created by OptimizationBuilder but previously never stepped)
             # This is the root cause of late-stage training oscillation: constant LR with no decay.

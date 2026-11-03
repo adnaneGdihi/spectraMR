@@ -493,6 +493,7 @@ class StarGANv2TrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
                 input_batch=x,
                 target_batch=real_trg,
                 step=iteration,
+                batch=resolved,
             ):
                 losses = self._compute_losses_impl(batch=resolved, epoch=epoch)
             g_total = losses["g_total_loss"]

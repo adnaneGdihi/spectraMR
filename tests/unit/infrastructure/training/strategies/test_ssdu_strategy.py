@@ -114,7 +114,6 @@ def test_it_declares_its_own_loss_ownership() -> None:
     assert SSDUReconstructionStrategy.__dict__["inline_losses"] == frozenset()
 
 
-
 def test_it_declares_the_ssdu_loss_columns_the_step_stamps() -> None:
     strategy = object.__new__(SSDUReconstructionStrategy)
     strategy._ssdu_weights_cache = {"ssdu_normalized": 1.0, "l1": 0.5}
@@ -416,8 +415,6 @@ def test_the_step_declares_the_adjoint_image_it_feeds_the_network() -> None:
     """#2508: ``input_prepared`` is the coil k-space; the network gets ``A^H y~``."""
     from spectramr.core.metrics.coil_manifold import as_interleaved
 
-    assert SSDUReconstructionStrategy.snapshot_prepared_is_model_input is False
-    assert SSDUReconstructionStrategy.snapshot_model_input_tag == "ssdu_model_input"
     h, w = 12, 20
     acquired = torch.zeros(1, 1, h, w)
     acquired[..., ::2] = 1.0
@@ -437,22 +434,6 @@ def test_the_step_declares_the_adjoint_image_it_feeds_the_network() -> None:
     assert len(declared) == 1
     tensors, kw = declared[0]
     assert tensors["model_input_image"] is fed and kw["in_kspace_keys"] == set()
-    # The wrapper's contract, not a stub: the declaration must name its model input.
-    from spectramr.infrastructure.training.model_input_contract import require_model_input_key
-
-    tag = SSDUReconstructionStrategy.snapshot_model_input_tag
-    key = require_model_input_key(
-        strategy_name="SSDUReconstructionStrategy",
-        tag=tag,
-        tensors=tensors,
-        model_input_key=kw["extra"]["model_input_key"],
-    )
-    assert key == "model_input_image"
-    with pytest.raises(ValueError, match="without naming"):  # the sabine crash, planted
-        require_model_input_key(
-            strategy_name="SSDUReconstructionStrategy", tag=tag, tensors=tensors, model_input_key=None
-        )
-
 
 
 def _weighted_step(weight: float) -> float:

@@ -42,9 +42,6 @@ class RiemannianBlochDiffusionStrategy(BaseTrainingStrategy):
     ``diffusion_step`` (cohort review 2026-09-02, T0.8).
     """
 
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
-
     #: Written by :meth:`validation_step`, which grades the held-out pass itself.
     capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
         emitted_metrics=frozenset({"val_geodesic_qmap_error", "val_geodesic_qmap_error_noised"})

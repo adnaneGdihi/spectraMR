@@ -179,6 +179,20 @@ class TestFastMRISubjectBuilder(TestCase):
         assert "target" in subject, "Should have target (defaults to kspace)"
         assert subject["kspace"].tensor.ndim == 4
 
+    def test_a_traced_build_records_the_load_and_coil_processing(self):
+        """On a snapshot step the loaded tensor and the coil-processed one are recorded."""
+        from spectramr.core import snapshot_trace as st
+
+        self.primary_io.load.return_value = {"data": torch.randn(4, 16, 16), "affine": np.eye(4)}
+        self.builder.build({"primary_path": "p.pt"})  # untraced: records nothing
+        trace = st.SnapshotTrace(phase="train", step=0, batched=False)
+        with st.active(trace):
+            self.builder.build({"primary_path": "p.pt"})
+        names = [stage.name for stage in trace.stages]
+        assert names == ["fastmri_loaded", "fastmri_coil_processing"]
+        assert trace.stages[0].params["path"] == "p.pt"
+        assert trace.stages[0].tensors["primary"].dim() == 3
+
     def test_build_records_the_source_path_for_sidecar_readers(self):
         """Every image here is built with ``tensor=``, so ``Image.path`` is None.
 

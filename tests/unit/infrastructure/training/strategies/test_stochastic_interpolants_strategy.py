@@ -133,7 +133,6 @@ class TestModelInputContract:
         s = object.__new__(StochasticInterpolantsStrategy)
         s.device = torch.device("cpu")
         s._resolve_legacy_batch = lambda input_batch, kwargs: input_batch  # type: ignore[method-assign]
-        s._declared_model_input = None
 
         def _gen(x: torch.Tensor) -> torch.Tensor:  # 1-arg -> gen(I_t) branch
             recorder["model_saw"] = x
@@ -142,7 +141,7 @@ class TestModelInputContract:
         s.env = SimpleNamespace(generator=_gen)
         return s
 
-    def test_declares_the_interpolant_it_feeds(self) -> None:
+    def test_declares_the_interpolant_it_feeds(self, declared) -> None:
         recorder: dict = {}
         s = self._bare(recorder)
         x1 = torch.randn(2, 1, 8, 8)
@@ -150,15 +149,15 @@ class TestModelInputContract:
 
         s._compute_losses_impl(input_batch={"target": x1, "source": x0}, epoch=0)
 
-        assert s._declared_model_input is not None, (
-            "SI inherits the carve-out, so it owes the wrapper a declaration"
+        assert declared() is not None, (
+            "SI builds its model input inside the step and names it"
         )
-        tensors, extra, in_kspace_keys = s._declared_model_input
+        tensors, extra, in_kspace_keys = declared()
         assert torch.equal(tensors["model_input"], recorder["model_saw"])
         assert extra["model_input_key"] == "model_input"
         assert in_kspace_keys == set(), "must be explicit, not None"
 
-    def test_declared_input_carries_the_stochastic_term(self) -> None:
+    def test_declared_input_carries_the_stochastic_term(self, declared) -> None:
         """What separates SI from flow matching is `sigma(t) * z`.
 
         Declaring the *deterministic* interpolant would be a plausible-looking
@@ -172,7 +171,7 @@ class TestModelInputContract:
         x0 = torch.randn(2, 1, 8, 8)
 
         s._compute_losses_impl(input_batch={"target": x1, "source": x0}, epoch=0)
-        tensors, _extra, _keys = s._declared_model_input
+        tensors, _extra, _keys = declared()
         i_t = tensors["model_input"]
 
         # Recover t from the deterministic part is impossible without z, so
@@ -251,25 +250,24 @@ class TestMeasurementConditionedSource:
         strat = cls.__new__(cls)
         strat.env = SimpleNamespace(generator=gen)
         strat.device = torch.device("cpu")
-        strat._declared_model_input = None
         return strat
 
-    def test_input_becomes_source_on_the_production_calling_convention(self):
+    def test_input_becomes_source_on_the_production_calling_convention(self, declared):
         from spectramr.data.batch_types import TrainingBatch
 
         strat = self._factory_strategy(_NoTimeGen())
         x_in, x1 = torch.randn(2, 1, 8, 8), torch.randn(2, 1, 8, 8)
         batch = TrainingBatch(input=x_in, target=x1)
         strat._compute_losses_impl(input_batch=x_in, target_batch=x1, epoch=0, batch=batch)
-        tensors, _extra, _keys = strat._declared_model_input
+        tensors, _extra, _keys = declared()
         assert torch.equal(tensors["source_x0"], x_in)
 
-    def test_published_source_wins_over_input(self):
+    def test_published_source_wins_over_input(self, declared):
         strat = self._factory_strategy(_NoTimeGen())
         b = _batch()
         b["input"] = torch.randn(2, 1, 8, 8)
         strat._compute_losses_impl(input_batch=b)
-        tensors, _extra, _keys = strat._declared_model_input
+        tensors, _extra, _keys = declared()
         assert torch.equal(tensors["source_x0"], b["source"])
 
     def test_missing_measurement_raises(self):

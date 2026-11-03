@@ -418,3 +418,15 @@ def test_the_strategy_declares_that_it_owns_its_objective() -> None:
 def test_the_gauge_prior_is_refused_in_calibrated_mode() -> None:
     with pytest.raises(ValueError, match="projected"):
         _strategy(gains=_GAINS, gain_ratio_prior=_PRIOR)
+
+
+def test_the_multi_param_mapping_model_is_fitted_through_the_render() -> None:
+    """multi_param_mapping (trunk + MultiParameterHead) trains under this strategy's loss."""
+    from spectramr.models.generators.multi_param_mapping import MultiParamMapping
+
+    s, batch = _strategy("projected", model=MultiParamMapping(base_channels=4, depth=2)), _batch()
+    out = s._compute_losses_impl(batch["input"], batch["target"], epoch=0, batch=batch)
+    out["g_total_loss"].backward()
+    head = s.env.generator.head.t1_head.weight
+    assert torch.isfinite(out["g_total_loss"]) and head.grad is not None
+    assert head.grad.abs().sum() > 0

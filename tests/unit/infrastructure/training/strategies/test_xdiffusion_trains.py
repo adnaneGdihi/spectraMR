@@ -130,11 +130,7 @@ class TestModelInputContract:
     two different contrasts (facade, pitfall #16).
     """
 
-    def test_declares_the_carve_out_rather_than_claiming_prepared(self):
-        assert XDiffusionTrainingStrategy.snapshot_prepared_is_model_input is False
-        assert XDiffusionTrainingStrategy.snapshot_model_input_tag == "xdiffusion_step"
-
-    def test_declares_the_noised_target_the_unet_actually_receives(self):
+    def test_declares_the_noised_target_the_unet_actually_receives(self, declared):
         gen = _TimestepGenerator(channels=2)
         s = _make_strategy(gen)
 
@@ -142,8 +138,8 @@ class TestModelInputContract:
         y = torch.randn(2, 2, 8, 8)  # target contrast
         s._compute_losses_impl(input_batch=x, target_batch=y, epoch=1)
 
-        assert s._declared_model_input is not None
-        tensors, extra, in_kspace_keys = s._declared_model_input
+        assert declared() is not None
+        tensors, extra, in_kspace_keys = declared()
 
         # The declared input is the noised TARGET, not the source modality --
         # which is exactly what the inherited `True` got wrong.
@@ -154,7 +150,7 @@ class TestModelInputContract:
         assert extra["model_input_key"] == "model_input"
         assert in_kspace_keys == set(), "must be explicit, not None"
 
-    def test_declared_input_is_the_tensor_the_generator_saw(self):
+    def test_declared_input_is_the_tensor_the_generator_saw(self, declared):
         """Pin the declaration to the forward call, not merely to `x_t`.
 
         The generator is invoked several lines below the declaration, through a
@@ -180,5 +176,5 @@ class TestModelInputContract:
             epoch=0,
         )
 
-        tensors, _extra, _keys = s._declared_model_input
+        tensors, _extra, _keys = declared()
         assert torch.equal(tensors["model_input"], seen["x"])

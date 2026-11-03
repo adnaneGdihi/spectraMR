@@ -295,6 +295,7 @@ class DomainAdaptationTrainingStrategy(BaseTrainingStrategy):
                 input_batch=input_batch,
                 target_batch=target_batch,
                 step=iteration,
+                batch=batch,
             ):
                 losses = self._compute_losses_impl(input_batch, target_batch, epoch, **kwargs)
             total_loss = losses["g_total_loss"]

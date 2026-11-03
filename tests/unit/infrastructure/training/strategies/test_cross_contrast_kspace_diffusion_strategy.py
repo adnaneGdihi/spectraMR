@@ -281,7 +281,7 @@ class TestModelInputContract:
     endpoints is the artifact that shows the bridge actually fired.
     """
 
-    def test_declares_the_bridge_interpolant_the_generator_saw(self):
+    def test_declares_the_bridge_interpolant_the_generator_saw(self, declared):
         gen = _identity_gen()
         s = _make_strategy(gen)
         k_src = torch.randn(2, 1, 8, 8)
@@ -293,8 +293,8 @@ class TestModelInputContract:
             epoch=0,
         )
 
-        assert s._declared_model_input is not None
-        tensors, extra, _in_kspace_keys = s._declared_model_input
+        assert declared() is not None
+        tensors, extra, _in_kspace_keys = declared()
 
         # The generator's first positional arg is k_t; the declaration must be
         # that exact tensor, not either endpoint.
@@ -306,7 +306,7 @@ class TestModelInputContract:
         assert torch.equal(tensors["kspace_target"], k_dst)
         assert extra["model_input_key"] == "kspace_interpolant"
 
-    def test_all_three_tensors_are_named_as_kspace(self):
+    def test_all_three_tensors_are_named_as_kspace(self, declared):
         """Named explicitly rather than left to the config union.
 
         ``save_debug_snapshot`` falls back to a ``"kspace"`` substring match over
@@ -326,14 +326,14 @@ class TestModelInputContract:
             epoch=0,
         )
 
-        _tensors, _extra, in_kspace_keys = s._declared_model_input
+        _tensors, _extra, in_kspace_keys = declared()
         assert in_kspace_keys == {
             "kspace_interpolant",
             "kspace_source",
             "kspace_target",
         }
 
-    def test_nothing_is_declared_when_the_guard_fires(self):
+    def test_nothing_is_declared_when_the_guard_fires(self, declared):
         """A raise must not leave a stale declaration behind.
 
         The declaration happens after the paired-k-space guard, so a batch that
@@ -341,7 +341,6 @@ class TestModelInputContract:
         no model input, because no forward pass happened.
         """
         s = _make_strategy(_identity_gen())
-        s._declared_model_input = None
 
         with pytest.raises(ValueError, match="kspace_source"):
             s._compute_losses_impl(
@@ -350,7 +349,7 @@ class TestModelInputContract:
                 epoch=0,
             )
 
-        assert s._declared_model_input is None
+        assert declared() is None
 
 
 def _paired_batch(**extra) -> dict:
@@ -525,12 +524,12 @@ def test_image_domain_bridges_rss_magnitudes_and_folds_l1_unbridged() -> None:
     assert "loss_l1" in out and torch.isfinite(out["loss_total"])
 
 
-def test_image_domain_source_is_the_loader_combined_image() -> None:
+def test_image_domain_source_is_the_loader_combined_image(declared) -> None:
     """The source endpoint is the loader's RSS image, declared as image-domain (NN14)."""
     batch = _image_batch()
     s = _image_strategy(_identity_gen())
     s._compute_losses_impl(input_batch=batch)
-    tensors, extra, in_kspace = s._declared_model_input
+    tensors, extra, in_kspace = declared()
     assert torch.equal(tensors["image_source"], batch["kspace_source"][..., 0])
     assert not in_kspace
     assert extra["model_input_key"] == "image_interpolant"

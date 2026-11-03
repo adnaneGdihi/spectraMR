@@ -177,6 +177,12 @@ _RECORDS = [
         live="training.output_dir",
     ),
     RemovalRecord(
+        "backend_acceleration",
+        "2026-11-02",
+        "The SPECTRA RISC-V chip backend it configured had no caller under "
+        "train/infer/predict and was removed with it.",
+    ),
+    RemovalRecord(
         "early_stopping.check_interval",
         "2026-10-09",
         "Only `EarlyStoppingService.should_check` used it, and nothing called "

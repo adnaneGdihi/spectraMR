@@ -52,9 +52,16 @@ COHORT = (
     / "attention_shootout"
 )
 CONTROL = "experiment_11_attention_none"
-#: Arms whose micro-batch is lifted for memory (job 8818221 OOM at batch 4). The samples and
-#: effective-batch tests still bind them, so they train the same 420000 samples in 105000 steps.
-MEMORY_FALLBACK = frozenset({"experiment_11_attention_kan_dual_domain_sparse"})
+#: Arms whose micro-batch is lifted for memory (OOM at batch 4: job 8818221, and the two
+#: loss-v2 KAN arms). The samples and effective-batch tests still bind them, so they train the
+#: same 420000 samples in 105000 steps.
+MEMORY_FALLBACK = frozenset(
+    {
+        "experiment_11_attention_kan_dual_domain",
+        "experiment_11_attention_kan_dual_domain_smap",
+        "experiment_11_attention_kan_dual_domain_sparse",
+    }
+)
 
 
 def _arms() -> dict[str, TrainingSettings]:

@@ -23,7 +23,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from spectramr.infrastructure.reporting.style import save_plot
+from spectramr.infrastructure.reporting.style import save_plot, use_default_style
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ def make_beltrami_field(
     if mu.ndim != 2:
         logger.warning("fig_c1: expected 2-D mu, got shape %s", mu.shape)
         return None
+    use_default_style()
     fig, (ax_mag, ax_phase) = plt.subplots(1, 2, figsize=(8.0, 3.5))
     im0 = ax_mag.imshow(np.abs(mu), cmap="viridis", vmin=0.0)
     ax_mag.set_title("|μ| (Beltrami magnitude)")
@@ -95,6 +96,7 @@ def make_spd_geodesic_trajectory(
     else:
         logger.info("fig_c2: no data — skipping.")
         return None
+    use_default_style()
     fig, ax = plt.subplots(figsize=(5.0, 3.2))
     ax.plot(steps, d, linewidth=1.6)
     ax.set_xlabel("Training step")
@@ -128,6 +130,7 @@ def make_teichmuller_schedule(
     r = np.asarray(r).clip(0.0, 0.999)
     t = np.linspace(0.0, 1.0, len(r))
     log_k = np.log((1.0 + r) / np.clip(1.0 - r, 1e-6, None))
+    use_default_style()
     fig, (ax_r, ax_k) = plt.subplots(1, 2, figsize=(7.5, 3.2))
     ax_r.plot(t, r, linewidth=1.6)
     ax_r.set_xlabel("t")
@@ -174,6 +177,7 @@ def make_fingerprint_embedding(
     x = np.asarray(embedding) - np.asarray(embedding).mean(axis=0, keepdims=True)
     u, s, vt = np.linalg.svd(x, full_matrices=False)
     proj = u[:, :2] * s[:2]
+    use_default_style()
     fig, ax = plt.subplots(figsize=(5.0, 4.0))
     if labels is not None:
         sc = ax.scatter(

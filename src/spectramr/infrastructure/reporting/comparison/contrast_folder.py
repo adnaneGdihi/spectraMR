@@ -182,7 +182,7 @@ def write_contrasts(
             style=style,
             formats=formats,
             dpi=dpi,
-            html_report=html_report,
+            html_report=False,  # rendered below, once contrast.json and paired_stats.csv exist
         )
         used = write_data(
             folder,
@@ -193,6 +193,13 @@ def write_contrasts(
             (contrast_set, phases, train_window),
         )
         _write_contrast_json(folder, contrast, contrast_set, arms, report["figures"], used)
+        if html_report:
+            from ..dashboard import comparison_page, write_plotly_asset
+
+            try:
+                comparison_page(folder, plotly_js=write_plotly_asset(out_root / "_assets"))
+            except Exception as exc:  # the folder's data is the deliverable; the page is a view of it
+                logger.warning("contrast page for %s failed: %s", folder, exc)
         results.append(
             ContrastResult(
                 contrast.name,

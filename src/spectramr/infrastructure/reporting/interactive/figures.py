@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .plotly_util import apply_dark, caption, flag_colour, has_plotly, to_div
+from ..legend import arm_palette
+from .plotly_util import apply_theme, caption, flag_colour, has_plotly, role, seat_menus, to_div
 
 _NON_METRIC = {
     "case_id",
@@ -32,21 +33,12 @@ _NON_METRIC = {
     "value",
     "epoch",
     "iteration",
+    "batch_index",
 }
 
-_OKABE_ITO = [
-    "#0072B2",
-    "#E69F00",
-    "#009E73",
-    "#CC79A7",
-    "#56B4E9",
-    "#D55E00",
-    "#F0E442",
-    "#000000",
-]
-
-_PANEL_LINE = "#12151c"
-_MUTED_LINE = "#8a93a6"
+# Arms keep the colour the static figures give them (one owner: legend.arm_palette).
+_SURFACE_LINE = role("surface")
+_MUTED_LINE = role("muted")
 
 
 def _directions() -> dict[str, bool]:
@@ -114,6 +106,31 @@ def _collect_series(per_call_df, predictions_df) -> dict[str, pd.DataFrame]:
     return {}
 
 
+# Above this many cases per metric the page would carry every row as JSON (13.5k cases x
+# 36 metrics was 17 MB per chart), so dots are a seeded sample that keeps every outlier.
+MAX_POINTS = 400
+
+
+def _box_stats(values: pd.Series) -> dict[str, float]:
+    """Exact Tukey box statistics over every case (whiskers at the last point within 1.5 IQR)."""
+    v = values.to_numpy(dtype=float)
+    q1, med, q3 = (float(x) for x in pd.Series(v).quantile([0.25, 0.5, 0.75]))
+    lo_f, hi_f = q1 - 1.5 * (q3 - q1), q3 + 1.5 * (q3 - q1)
+    inside = v[(v >= lo_f) & (v <= hi_f)]
+    return {"q1": q1, "median": med, "q3": q3, "mean": float(v.mean()),
+            "lowerfence": float(inside.min()), "upperfence": float(inside.max())}
+
+
+def _thin(frame: pd.DataFrame, cap: int = MAX_POINTS) -> pd.DataFrame:
+    """Every outlier beyond 1.5 IQR plus a seeded sample of at most ``cap`` other cases."""
+    if len(frame) <= cap:
+        return frame
+    st = _box_stats(frame["value"])
+    out = (frame["value"] < st["lowerfence"]) | (frame["value"] > st["upperfence"])
+    rest = frame[~out].sample(n=min(cap, int((~out).sum())), random_state=0)
+    return pd.concat([frame[out], rest]).sort_index()
+
+
 def group_iqm_div(per_call_df=None, predictions_df=None) -> str | None:
     """Horizontal box+strip of every metric at once — the group IQM overview."""
     if not has_plotly():
@@ -122,41 +139,53 @@ def group_iqm_div(per_call_df=None, predictions_df=None) -> str | None:
     if not series:
         return None
     import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
     directions = _directions()
     metrics = sorted(series)
-    fig = go.Figure()
-    for m in metrics:
+    # One row and one x-axis per metric: PSNR (~20 dB) and MSE (~1e-3) on a shared axis
+    # left every small-valued metric as a smear at zero.
+    fig = make_subplots(rows=len(metrics), cols=1, vertical_spacing=min(0.04, 0.6 / len(metrics)))
+    thinned = False
+    for row, m in enumerate(metrics, start=1):
         frame = series[m]
+        name = _arrow(m, directions)
+        st = _box_stats(frame["value"])
         fig.add_trace(
             go.Box(
-                x=frame["value"],
-                name=_arrow(m, directions),
-                orientation="h",
-                boxpoints="all",
-                jitter=0.5,
-                pointpos=0,
-                boxmean=True,
-                marker={
-                    "size": 4,
-                    "color": "#56B4E9",
-                    "line": {"color": _PANEL_LINE, "width": 0.4},
-                },
-                line={"width": 1},
-                fillcolor="rgba(86,180,233,0.12)",
-                text=frame["label"],
-                hovertemplate="%{text}: %{x:.4g}<extra>" + m + "</extra>",
-            )
+                y=[name], orientation="h", **{k: [v] for k, v in st.items()},
+                boxpoints=False, line={"width": 1.2, "color": role("series")},
+                fillcolor="rgba(31,95,153,0.10)", hoverinfo="skip",
+            ),
+            row=row, col=1,
         )
-    apply_dark(fig, title="Group IQM distribution", height=80 * len(metrics) + 130)
-    fig.update_layout(showlegend=False)
+        pts = _thin(frame)
+        thinned |= len(pts) < len(frame)
+        # Dots ride an invisible box on the same row, so plotly jitters them for us.
+        fig.add_trace(
+            go.Box(
+                x=pts["value"], y=[name] * len(pts), orientation="h", boxpoints="all",
+                jitter=0.5, pointpos=0, line={"width": 0, "color": "rgba(0,0,0,0)"},
+                fillcolor="rgba(0,0,0,0)", whiskerwidth=0,
+                marker={"size": 4, "color": role("series"), "line": {"color": _SURFACE_LINE, "width": 0.4}},
+                text=pts["label"], hovertemplate="%{text}: %{x:.4g}<extra>" + m + "</extra>",
+            ),
+            row=row, col=1,
+        )
+    apply_theme(fig, title="Group IQM distribution", height=72 * len(metrics) + 110)
+    fig.update_layout(showlegend=False, boxmode="overlay")
+    fig.update_xaxes(nticks=5, tickfont={"size": 10})
+    fig.update_yaxes(automargin=True, showgrid=False)
+    seat_menus(fig)
     body = to_div(fig, div_id="iqm-group")
     return body + caption(
-        "One row per metric across every recorded case. The box spans the "
+        "One row per metric across every recorded case, each on its own scale. The box spans the "
         "inter-quartile range, the dashed mean marker is the group average, and "
         "each dot is one case (hover for its id). Points beyond the whiskers are "
         "1.5x-IQR outliers — the cases worth inspecting in the mosaic below. "
         "Arrows show whether higher or lower is better."
+        + (f" Boxes use every case; dots show every outlier and a random {MAX_POINTS} of the rest."
+           if thinned else "")
     )
 
 
@@ -183,7 +212,7 @@ def learning_curve_div(df) -> str | None:
     # Default to a populated loss panel (never the hardcoded "loss" when it is absent).
     default = next((m for m in ("loss", "g_total_loss") if m in metrics), metrics[0])
     methods = sorted(curve[method_col].astype(str).unique()) if method_col in curve else ["model"]
-    colour = {mth: _OKABE_ITO[i % len(_OKABE_ITO)] for i, mth in enumerate(methods)}
+    colour = arm_palette(methods)
 
     fig = go.Figure()
     trace_metric: list[str] = []
@@ -227,7 +256,7 @@ def learning_curve_div(df) -> str | None:
                 "args": [{"visible": vis}, {"yaxis.title.text": metric}],
             }
         )
-    apply_dark(fig, title="Training dynamics", height=460)
+    apply_theme(fig, title="Training dynamics", height=460)
     fig.update_layout(
         xaxis_title="step",
         yaxis_title=default,
@@ -239,8 +268,6 @@ def learning_curve_div(df) -> str | None:
                 "showactive": True,
                 "x": 0.0,
                 "xanchor": "left",
-                "y": 1.16,
-                "yanchor": "top",
             },
             {
                 "type": "buttons",
@@ -248,8 +275,6 @@ def learning_curve_div(df) -> str | None:
                 "showactive": False,
                 "x": 1.0,
                 "xanchor": "right",
-                "y": 1.16,
-                "yanchor": "top",
                 "buttons": [
                     {"label": "linear-y", "method": "relayout", "args": [{"yaxis.type": "linear"}]},
                     {"label": "log-y", "method": "relayout", "args": [{"yaxis.type": "log"}]},
@@ -257,6 +282,7 @@ def learning_curve_div(df) -> str | None:
             },
         ],
     )
+    seat_menus(fig)
     body = to_div(fig, div_id="learning-curves")
     return body + caption(
         "Each line is a metric vs training step; solid = train, dotted = "
@@ -294,16 +320,20 @@ def metric_distribution_div(per_call_df=None, predictions_df=None) -> str | None
     if not metrics:
         return None
     methods = sorted(by_method)
-    colour = {mth: _OKABE_ITO[i % len(_OKABE_ITO)] for i, mth in enumerate(methods)}
+    colour = arm_palette(methods)
     default = "psnr" if "psnr" in metrics else metrics[0]
 
     fig = go.Figure()
+    thinned = False
     trace_metric: list[str] = []
     for metric in metrics:
         for mth in methods:
             frame = by_method[mth].get(metric)
             if frame is None or frame.empty:
                 continue
+            full_n = len(frame)
+            frame = _thin(frame)
+            thinned |= len(frame) < full_n
             fig.add_trace(
                 go.Violin(
                     y=frame["value"],
@@ -336,7 +366,7 @@ def metric_distribution_div(per_call_df=None, predictions_df=None) -> str | None
         }
         for metric in metrics
     ]
-    apply_dark(fig, title="Per-case metric distribution", height=440)
+    apply_theme(fig, title="Per-case metric distribution", height=440)
     fig.update_layout(
         yaxis_title=default,
         violinmode="group",
@@ -348,11 +378,10 @@ def metric_distribution_div(per_call_df=None, predictions_df=None) -> str | None
                 "showactive": True,
                 "x": 0.0,
                 "xanchor": "left",
-                "y": 1.16,
-                "yanchor": "top",
             }
         ],
     )
+    seat_menus(fig)
     body = to_div(fig, div_id="metric-dist")
     return body + caption(
         "The distribution of a single metric across cases: the violin is the "
@@ -360,6 +389,8 @@ def metric_distribution_div(per_call_df=None, predictions_df=None) -> str | None
         "its id). When several methods are present they sit side by side so you "
         "can compare spread, not just the mean. Choose the metric from the "
         "dropdown."
+        + (f" With many cases the shape is drawn from every outlier and a random {MAX_POINTS} "
+           "of the rest." if thinned else "")
     )
 
 
@@ -399,7 +430,7 @@ def comparison_div(predictions_df=None) -> str | None:
                 y=diff,
                 mode="markers",
                 name=metric,
-                marker={"size": 7, "color": "#56B4E9"},
+                marker={"size": 8, "color": role("series")},
                 text=[str(i) for i in pair.index],
                 visible=vis,
                 hovertemplate="%{text}<br>mean %{x:.4g}, diff %{y:.4g}<extra></extra>",
@@ -434,7 +465,7 @@ def comparison_div(predictions_df=None) -> str | None:
         }
         for metric in sorted(set(trace_metric))
     ]
-    apply_dark(fig, title=f"Bland-Altman: {m_a} vs {m_b}", height=440)
+    apply_theme(fig, title=f"Bland-Altman: {m_a} vs {m_b}", height=440)
     fig.update_layout(
         xaxis_title="mean of the two methods",
         yaxis_title=f"{m_a} - {m_b}",
@@ -445,15 +476,14 @@ def comparison_div(predictions_df=None) -> str | None:
                 "showactive": True,
                 "x": 0.0,
                 "xanchor": "left",
-                "y": 1.16,
-                "yanchor": "top",
             }
         ],
     )
+    seat_menus(fig)
     body = to_div(fig, div_id="bland-altman")
     return body + caption(
         f"Agreement between {m_a} and {m_b} per subject: x is their average, y "
-        "their difference. The vermillion line is the mean bias and the dashed "
+        "their difference. The red line is the mean bias and the dashed "
         "lines the +/-1.96 SD limits of agreement; points outside them are the "
         "subjects where the two methods disagree most. Pick the metric from the "
         "dropdown."

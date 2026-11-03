@@ -13,23 +13,14 @@ from matplotlib.legend import Legend
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
 
-from .style import METHOD_COLOURS, OKABE_ITO, colour_for
+from .style import colour_for
 
 MAX_LEGEND_ENTRIES = 12
 LEGEND_COLUMNS = 6
 
-# beyond the eight Okabe-Ito hues: distinct, colour-blind-tolerant extras so 12 arms never share one
-_EXTRA_HUES = ("#7F7F7F", "#8C564B", "#17BECF", "#7B3294", "#A6761D")
-
-
 def arm_palette(arms: Sequence[str]) -> dict[str, str]:
     """Colour per arm, stable across figures (registered methods keep their own colour)."""
-    pool = [c for c in OKABE_ITO if c.lower() != "#000000"] + list(_EXTRA_HUES)
-    out: dict[str, str] = {}
-    for i, arm in enumerate(arms):
-        registered = str(arm).lower() in METHOD_COLOURS
-        out[str(arm)] = colour_for(str(arm), i) if registered else pool[i % len(pool)]
-    return out
+    return {str(arm): colour_for(str(arm), i) for i, arm in enumerate(arms)}
 
 
 def collect_handles(axes: Iterable) -> tuple[list, list[str]]:

@@ -304,15 +304,31 @@ _BALANCERS: dict[str, Callable[[dict[str, DataLoader], dict[str, float] | None],
 }
 
 
+def _federated_blocks(loaders, weights, local_epochs):
+    from spectramr.data.builders.federated_balancer import federated_blocks
+
+    return federated_blocks(loaders, weights, local_epochs)
+
+
+#: Balancers with a round structure: the only ones that read ``local_epochs``.
+_ROUND_BALANCERS = {"federated_blocks": _federated_blocks}
+
+
 def build_balancer(
     loaders: dict[str, DataLoader],
     strategy: str = "round_robin",
     weights: dict[str, float] | None = None,
+    local_epochs: int | None = None,
 ) -> Balancer:
     """Dispatch on strategy string to the right balancer class."""
+    if strategy in _ROUND_BALANCERS:
+        return _ROUND_BALANCERS[strategy](loaders, weights, local_epochs)
+    if local_epochs is not None:
+        raise ValueError(f"local_epochs={local_epochs}: only 'federated_blocks' reads it")
     factory = _BALANCERS.get(strategy)
     if factory is None:
         raise ValueError(
-            f"Unknown balancing strategy: {strategy}. Must be one of: {', '.join(_BALANCERS)}."
+            f"Unknown balancing strategy: {strategy}. Must be one of: "
+            f"{', '.join([*_BALANCERS, *_ROUND_BALANCERS])}."
         )
     return factory(loaders, weights)

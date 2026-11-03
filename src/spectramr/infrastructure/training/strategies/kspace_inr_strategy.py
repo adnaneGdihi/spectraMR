@@ -47,7 +47,6 @@ class KSpaceINRStrategy(ReconstructionTrainingStrategy):
     validation_reads_context_measurement = True
     #: The network is handed coordinates, never the prepared input image; the audit's
     #: coil-channel alignment reads this.
-    snapshot_prepared_is_model_input: bool = False
     model_input_is_coordinates: ClassVar[bool] = True
     # parallel_compat: the fit evaluates the bare generator through functional_call, outside
     # any wrapper's forward, so DDP never all-reduces and a sharded backend reads shards.

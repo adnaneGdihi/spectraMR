@@ -25,6 +25,8 @@ import math
 from pathlib import Path
 from typing import Any
 
+from spectramr.core.design_tokens import colours
+
 # Probed without importing: pyplot costs ~0.5 s and is needed only to draw.
 MATPLOTLIB_AVAILABLE = importlib.util.find_spec("matplotlib") is not None
 
@@ -54,16 +56,13 @@ def _require_matplotlib() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Palette — editorial, matches scripts/sim2rank/style.py by value so the
-# two reporting surfaces look identical without a forbidden import.
-# ---------------------------------------------------------------------------
-
-ACCENT = "#D97A3A"  # top-k emphasis (editorial orange)
-BAR = "#3B6E8F"  # default / bottom-k bars (editorial blue)
-DIM_GREY = "#C0C4C9"  # de-emphasised bulk
-DEFENSIBLE_GREEN = "#2C7A3D"  # passes the defensibility rule
-FAIL_RED = "#A93030"  # fails the defensibility rule
+# Palette: the shared design tokens, the same roles sim2rank's editorial profile uses.
+_TOKENS = colours("light")
+ACCENT = _TOKENS["accent"]  # top-k emphasis
+BAR = _TOKENS["series"]  # default / bottom-k bars
+DIM_GREY = _TOKENS["rule_strong"]  # de-emphasised bulk
+DEFENSIBLE_GREEN = _TOKENS["good"]  # passes the defensibility rule
+FAIL_RED = _TOKENS["bad"]  # fails the defensibility rule
 
 DIVERGING_CMAP = "RdBu_r"  # correlation / signed heatmaps
 SEQUENTIAL_CMAP = "viridis"  # magnitude heatmaps
@@ -152,7 +151,7 @@ def top_bottom_indices(values: list[float], k: int = 3) -> tuple[list[int], list
 
 
 def annotate_top_bottom(
-    ax,
+    ax: Any,
     values: list[float],
     *,
     k: int = 3,
@@ -225,7 +224,7 @@ def barh_figsize(
 # ---------------------------------------------------------------------------
 
 
-def figure(*, figsize: tuple[float, float] = (7.0, 4.5), polar: bool = False):
+def figure(*, figsize: tuple[float, float] = (7.0, 4.5), polar: bool = False) -> tuple[Any, Any]:
     """Create a constrained-layout figure + axis.
 
     Constrained layout handles colorbars / suptitles / external legends
@@ -237,13 +236,13 @@ def figure(*, figsize: tuple[float, float] = (7.0, 4.5), polar: bool = False):
     return fig, ax
 
 
-def figure_grid(rows: int, cols: int, *, figsize: tuple[float, float]):
+def figure_grid(rows: int, cols: int, *, figsize: tuple[float, float]) -> tuple[Any, Any]:
     """Constrained-layout subplot grid (always 2-D ``axes``)."""
     fig, axes = pyplot().subplots(rows, cols, figsize=figsize, layout="constrained", squeeze=False)
     return fig, axes
 
 
-def save_figure(fig, path, *, dpi: int = DEFAULT_DPI) -> Path:
+def save_figure(fig: Any, path: str | Path, *, dpi: int = DEFAULT_DPI) -> Path:
     """The single ``savefig`` site. Returns the written path."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

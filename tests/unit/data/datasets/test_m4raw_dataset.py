@@ -2746,3 +2746,33 @@ def test_header_acquisition_vector_reaches_the_collated_batch(tmp_path, single_c
     # Each row is its own file's protocol: TR 500 on T1, 5500 on T2.
     expected_tr = [500.0 if "_T1" in s["source_path"] else 5500.0 for s in subjects]
     assert phi[:, 1].tolist() == expected_tr
+
+
+def test_a_traced_getitem_records_the_dataset_stages_before_the_transforms(tmp_path) -> None:
+    """On a snapshot step the loaded repetitions and the built input/target are recorded."""
+    from spectramr.core import snapshot_trace as st
+
+    shape = (1, 2, 16, 16)
+    files = []
+    for i in range(1, 3):
+        path = tmp_path / f"2022_T1{i:02d}.h5"
+        with h5py.File(str(path), "w") as f:
+            f.create_dataset("kspace", data=np.full(shape, i, dtype=np.complex64))
+        files.append(path)
+    ds = M4RawRepetitionDataset(
+        h5_files=files,
+        single_contrast=True,
+        coil_processing_mode="none",
+        use_repetitions=True,
+        target_mode="complex_mean",
+    )
+    ds[0]  # untraced: records nothing and raises nothing
+    trace = st.SnapshotTrace(phase="train", step=0, batched=False)
+    with st.active(trace):
+        ds[0]
+    stages = {s.name: s for s in trace.stages}
+    reps = stages["m4raw_repetitions"]
+    assert {"rep0", "rep1"} <= set(reps.tensors) and reps.params["input_repetition"] == 0
+    built = stages["m4raw_input_and_target"]
+    assert set(built.tensors) == {"input", "target"}
+    assert built.params["target_mode"] == "complex_mean"

@@ -13,7 +13,7 @@ Observed on ``ei_unet_m4raw_r4`` and ``ei_control_mc_only_m4raw_r4`` (cluster ru
 2026-09-20, ``45e4af988ba6``): four ``🧲 Strategy DC: Enabled in config but NOT found
 in generator model`` warnings, ``input_raw == input_prepared`` at ``min=-35.25
 max=42.94`` (k-space dynamic range) in every ``first_steps`` snapshot, and a
-``mri_a7_kspace_recon`` "proposed" panel that is the DC spike — the white blob at the
+``mri_recon_panel`` "prediction" panel that is the DC spike — the white blob at the
 centre of an otherwise black frame.
 
 Each test below plants one shape the rule has to cover (non-negotiable 15): the
@@ -29,6 +29,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from spectramr.config.schemas.data import MultiContrastConfigSchema
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.infrastructure.training.strategies.reconstruction import (
     ReconstructionTrainingStrategy,
@@ -67,6 +68,8 @@ def _strategy(model_type: str, *, dataset_type: str = "kspace") -> Reconstructio
             multislice_enabled=False,
             processing=SimpleNamespace(enable_kspace_normalization=True),
             coils=SimpleNamespace(processing_mode="none"),
+            # the schema default (off): the contrast-forwarding seam reads it on every step
+            multi_contrast=MultiContrastConfigSchema(),
         ),
     )
     s.env = SimpleNamespace(generator=_Plain(), config=s.config)

@@ -63,6 +63,11 @@ _INCOHERENT_NEX_TARGET_MODE = "complex_mean"
 #: is not one: its builder hard-wires the registered trees' averaging.
 _NEX_TARGET_MODE_ROUTES = frozenset({"m4raw"})
 
+#: Routes whose builder fixes the target, and the ``target_mode`` the schema requires
+#: them to declare (``DataConfigSchema._triplet_route_serves_phase_aligned_mean``).
+#: Declaring that value states the route's fact; it is not an unread knob.
+_PINNED_TARGET_MODE = {"m4raw_triplet": "phase_aligned_mean"}
+
 #: The config paths that decide WHERE one arm's artifacts land. Every one is
 #: read on a production path -- ``bootstrap.py`` resolves the log sink and the
 #: metrics directory, and ``training.output_dir`` is read at hundreds of sites --
@@ -2415,7 +2420,11 @@ class ConfigHealthChecker:
                 self._resolve_strategy_class(config), "reads_model_kwargs", None
             )
             severity = "info" if strategy_reads is None else "error"
-            strategy_reads = strategy_reads or frozenset()
+            from spectramr.infrastructure.training.builders.model_builder import (
+                BUILDER_READ_MODEL_KWARGS,
+            )
+
+            strategy_reads = (strategy_reads or frozenset()) | BUILDER_READ_MODEL_KWARGS
             for key in kwargs:
                 if key in schema or key in sig_params or key in strategy_reads:
                     continue
@@ -4843,6 +4852,20 @@ class ConfigHealthChecker:
             )
 
         model = getattr(config, "model", None)
+        # The model's prompt table must be as wide as the data's vendor ids.
+        model_nv = ((getattr(model, "model_kwargs", None) or {}) if model else {}).get("n_vendors")
+        if model_nv is not None and int(model_nv) != len(vendor_map or {}):
+            return HealthCheckResult(
+                passed=False,
+                check_name="vendor_model_support",
+                message=(
+                    f"model.model_kwargs.n_vendors={model_nv} but data.multi_contrast.vendor_map "
+                    f"names {len(vendor_map or {})} vendors; the prompt table and the ids disagree."
+                ),
+                severity="error",
+                category="schema",
+                yaml_keys=["model.model_kwargs.n_vendors", "data.multi_contrast.vendor_map"],
+            )
         model_type = getattr(model, "model_type", None) if model is not None else None
         if not model_type:
             return HealthCheckResult(
@@ -7045,6 +7068,7 @@ class ConfigHealthChecker:
             data is not None
             and "target_mode" in data.model_fields_set
             and dataset_type not in _NEX_TARGET_MODE_ROUTES
+            and _PINNED_TARGET_MODE.get(dataset_type) != data.target_mode
         ):
             # The complementary leg (#1870): only the NEX routes read target_mode.
             return HealthCheckResult(
@@ -12730,210 +12754,6 @@ class ConfigHealthChecker:
             severity="info",
         )
 
-    # ------------------------------------------------------------------
-    # SPECTRA hardware backend checks (implementation plan Workstream C, C4)
-    #
-    # All three no-op (passed=True, severity="info") when no SPECTRA backend
-    # block is configured, so non-SPECTRA configs are entirely unaffected.
-    # ------------------------------------------------------------------
-
-    def check_spectra_backend_schema(self, config: Any) -> HealthCheckResult:
-        """Guard: a SPECTRA backend must be declared via the typed schema block.
-
-        Fires (error) when something selects the spectra backend but the
-        ``backend_acceleration`` block is absent, or when the block is present
-        but its ``backend`` is not ``"spectra"`` — the "selected without schema"
-        invariant. This is the config-time equivalent of the Tier-0
-        ``extra="forbid"`` guard for the *value* (Tier-0 already rejects unknown
-        keys; this rejects a mis-selected/missing backend).
-        """
-        block = getattr(config, "backend_acceleration", None)
-
-        # Detect a stray backend selection elsewhere (e.g. acceleration.backend
-        # == "spectra" pointed at the wrong block) without the typed schema.
-        accel = getattr(config, "undersampling", None)
-        stray = getattr(accel, "backend", None) if accel is not None else None
-        if block is None:
-            if stray == "spectra":
-                return HealthCheckResult(
-                    passed=False,
-                    check_name="spectra_backend_schema",
-                    message=(
-                        "The SPECTRA backend is selected (acceleration.backend="
-                        "'spectra') but the typed 'backend_acceleration' block is "
-                        "missing."
-                    ),
-                    severity="error",
-                    category="backend_acceleration",
-                    yaml_keys=["acceleration.backend", "backend_acceleration"],
-                    fix_hint=(
-                        "Add a 'backend_acceleration:' block with backend: spectra "
-                        "(see spectramr.config.schemas.spectra)."
-                    ),
-                )
-            return HealthCheckResult(
-                passed=True,
-                check_name="spectra_backend_schema",
-                message="No SPECTRA backend configured (not applicable).",
-                severity="info",
-                category="backend_acceleration",
-            )
-
-        backend = getattr(block, "backend", None)
-        if backend != "spectra":
-            return HealthCheckResult(
-                passed=False,
-                check_name="spectra_backend_schema",
-                message=(
-                    f"backend_acceleration.backend={backend!r} is not 'spectra'; "
-                    "this block only configures the SPECTRA backend."
-                ),
-                severity="error",
-                category="backend_acceleration",
-                yaml_keys=["backend_acceleration.backend"],
-                fix_hint="Set backend_acceleration.backend: spectra.",
-            )
-
-        return HealthCheckResult(
-            passed=True,
-            check_name="spectra_backend_schema",
-            message="SPECTRA backend schema present and well-formed.",
-            severity="info",
-            category="backend_acceleration",
-        )
-
-    def check_spectra_precision_envelope(self, config: Any) -> HealthCheckResult:
-        """Guard: reject FP8 *output* precision for a diagnostic recon task.
-
-        Encodes the A7 numerics discipline (implementation plan Workstream C):
-        FP8-E4M3 alone falls below the diagnostic PSNR/SSIM envelope, so it is an
-        inner-loop precision, never an output precision. When the SPECTRA backend
-        is configured with ``pe_mode_policy == fp8`` for a reconstruction-class
-        task, this is an error.
-        """
-        block = getattr(config, "backend_acceleration", None)
-        if block is None:
-            return HealthCheckResult(
-                passed=True,
-                check_name="spectra_precision_envelope",
-                message="No SPECTRA backend configured (not applicable).",
-                severity="info",
-                category="backend_acceleration",
-            )
-
-        policy = getattr(block, "pe_mode_policy", None)
-        policy_val = getattr(policy, "value", policy)  # Enum or raw str
-
-        # Diagnostic reconstruction-class tasks: reading the training mode and
-        # the model type (either signal is sufficient).
-        training = getattr(config, "training", None)
-        mode = getattr(training, "training_mode", None) if training is not None else None
-        mode_val = getattr(mode, "value", mode)
-        model = getattr(config, "model", None)
-        model_type = getattr(model, "model_type", None) if model is not None else None
-        is_diagnostic_recon = str(mode_val).lower() == "reconstruction" or str(
-            model_type
-        ).lower() in {
-            "modl",
-            "deep_cascade",
-            "reconstruction",
-            "varnet",
-            "unrolled_reconstruction",
-        }
-
-        if policy_val == "fp8" and is_diagnostic_recon:
-            return HealthCheckResult(
-                passed=False,
-                check_name="spectra_precision_envelope",
-                message=(
-                    "pe_mode_policy=fp8 is below the diagnostic-fidelity envelope "
-                    f"for a reconstruction task (model={model_type!r}). FP8 is an "
-                    "inner-loop precision, not an output precision."
-                ),
-                severity="error",
-                category="backend_acceleration",
-                yaml_keys=["backend_acceleration.pe_mode_policy", "model.model_type"],
-                fix_hint=(
-                    "Raise the output-precision floor to BF16 or FP32 "
-                    "(pe_mode_policy: bf16 | fp32 | mixed)."
-                ),
-            )
-
-        return HealthCheckResult(
-            passed=True,
-            check_name="spectra_precision_envelope",
-            message=f"SPECTRA precision policy '{policy_val}' meets the fidelity envelope.",
-            severity="info",
-            category="backend_acceleration",
-        )
-
-    def check_spectra_gridding_sized(self, config: Any) -> HealthCheckResult:
-        """Guard: the NUFFT gridding kernel must fit the accumulator depth.
-
-        From the A4 sizing model: each non-uniform sample scatters into a
-        ``J**spatial_dims`` neighbourhood, so the engine must coalesce at least
-        that many in-flight grid addresses. ``J**D`` must not exceed the
-        synthesized accumulator depth bound. Spatial dimensionality is taken
-        from ``data.sampling.patch_size`` length (default 2-D).
-        """
-        block = getattr(config, "backend_acceleration", None)
-        if block is None:
-            return HealthCheckResult(
-                passed=True,
-                check_name="spectra_gridding_sized",
-                message="No SPECTRA backend configured (not applicable).",
-                severity="info",
-                category="backend_acceleration",
-            )
-
-        kernel_width = getattr(block, "gridding_kernel_width", None)
-        if kernel_width is None:
-            kernel_width = 4  # schema default
-
-        data = getattr(config, "data", None)
-        patch_size = data.sampling.patch_size if data is not None else None
-        spatial_dims = len(patch_size) if isinstance(patch_size, (list, tuple)) else 2
-        spatial_dims = max(2, spatial_dims)
-
-        # Synthesized accumulator-depth bound (A4): the gridding engine provides
-        # banked accumulators sized to a fixed J^2_max footprint. The published
-        # first-cut engine targets J up to 6 in 2-D (J^2 = 36), so the bound is
-        # 6**spatial_dims — generous in 2-D, tight in 3-D.
-        accumulator_depth_bound = 6**spatial_dims
-        required_depth = kernel_width**spatial_dims
-
-        if required_depth > accumulator_depth_bound:
-            return HealthCheckResult(
-                passed=False,
-                check_name="spectra_gridding_sized",
-                message=(
-                    f"gridding_kernel_width={kernel_width} over {spatial_dims}-D "
-                    f"requires {required_depth} banked accumulators, exceeding the "
-                    f"synthesized bound of {accumulator_depth_bound}."
-                ),
-                severity="error",
-                category="backend_acceleration",
-                yaml_keys=[
-                    "backend_acceleration.gridding_kernel_width",
-                    "data.sampling.patch_size",
-                ],
-                fix_hint=(
-                    "Reduce gridding_kernel_width (J) so J**spatial_dims <= "
-                    f"{accumulator_depth_bound}, or lower the spatial dimensionality."
-                ),
-            )
-
-        return HealthCheckResult(
-            passed=True,
-            check_name="spectra_gridding_sized",
-            message=(
-                f"SPECTRA gridding sized OK: J**{spatial_dims}={required_depth} "
-                f"<= {accumulator_depth_bound}."
-            ),
-            severity="info",
-            category="backend_acceleration",
-        )
-
     def check_tta_adapter_only(self, config: Any) -> HealthCheckResult:
         """Guard: a SPECTRA-TTA config must run the spectra_tta strategy with a
         frozen backbone.
@@ -14947,11 +14767,6 @@ class ConfigHealthChecker:
         report.results.append(self.check_latent_decode_resolution(config))
         report.results.append(self.check_multi_contrast_model_support(config))
         report.results.append(self.check_vendor_model_support(config))
-        # SPECTRA hardware-backend Tier-1 guards (implementation plan
-        # Workstream C, C4). All no-op when backend_acceleration is absent.
-        report.results.append(self.check_spectra_backend_schema(config))
-        report.results.append(self.check_spectra_precision_envelope(config))
-        report.results.append(self.check_spectra_gridding_sized(config))
         report.results.append(self.check_tta_adapter_only(config))
         report.results.append(self.check_metric_names_are_registered(config))
         report.results.append(self.check_transform_names_are_registered(config))

@@ -8,6 +8,7 @@ This module provides physics-based components for MRI reconstruction including:
 """
 
 import logging
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -45,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 class OperatorProjectionDataConsistency(nn.Module):
     """Data consistency layer for reconstruction networks."""
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self, operator: IForwardOperator, lambda_dc: float = 1.0):
         """__init__.

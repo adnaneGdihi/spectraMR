@@ -219,9 +219,9 @@ class DiffeomorphicReconStrategy(ReconstructionTrainingStrategy):
             base["loss"] = base["g_total_loss"]
         return base
 
-    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
+    def _snapshot_context(self) -> dict[str, Any]:
         """Stamp the applied LDDMM constants into the snapshot provenance."""
-        extra = super()._first_steps_extra(epoch, batch=batch)
+        extra = super()._snapshot_context()
         extra["lddmm"] = {
             "n_squarings": self.n_squarings,
             "lambda_smooth": self.lambda_smooth,

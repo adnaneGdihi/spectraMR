@@ -2489,8 +2489,8 @@ class TestM4RawNexTargetModeDeclared:
         assert result.severity == "warning"
         assert "never reads it" in result.message
 
-    def test_target_mode_on_the_triplet_route_is_flagged(self):
-        """_create_m4raw_triplet never reads data.target_mode, so declaring it is inert."""
+    @staticmethod
+    def _triplet(target_mode: str):
         from types import SimpleNamespace
 
         from spectramr.config.schemas.data import DataConfigSchema
@@ -2498,9 +2498,20 @@ class TestM4RawNexTargetModeDeclared:
         data = DataConfigSchema.model_construct(
             _fields_set={"dataset_type", "target_mode"},
             dataset_type="m4raw_triplet",
-            target_mode="phase_aligned_mean",
+            target_mode=target_mode,
         )
-        result = self._check(SimpleNamespace(data=data))
+        return SimpleNamespace(data=data)
+
+    def test_the_triplet_routes_pinned_target_mode_is_not_flagged(self):
+        """The schema requires phase_aligned_mean on m4raw_triplet (its builder serves the
+        registered NEX averages), so declaring it states the route's fact. Flagging it
+        made every triplet arm fail the audit: deleting the key fails the schema."""
+        result = self._check(self._triplet("phase_aligned_mean"))
+        assert result.passed is True
+
+    def test_another_target_mode_on_the_triplet_route_is_flagged(self):
+        """Planted: a value the triplet builder never serves is still an inert declaration."""
+        result = self._check(self._triplet("rep_pair"))
         assert result.passed is False
         assert result.severity == "warning"
         assert "never reads it" in result.message
@@ -4801,3 +4812,49 @@ def test_data_efficiency_real_only_cell_passes_without_synthetic_manifest() -> N
         SimpleNamespace(training=training)
     )
     assert result.passed, result.message
+
+
+class TestVendorPromptWidthMatchesTheMap:
+    """model_kwargs.n_vendors sizes the prompt table; it must equal the vendor ids the data emits."""
+
+    @staticmethod
+    def _cfg(model_nv):
+        from types import SimpleNamespace
+
+        mc = SimpleNamespace(vendor_map={"siemens": 0, "ge": 1}, n_vendors=2)
+        model = SimpleNamespace(
+            model_type="vendor_aware_translation", model_kwargs={"n_vendors": model_nv}
+        )
+        return SimpleNamespace(data=SimpleNamespace(multi_contrast=mc), model=model)
+
+    def test_a_narrower_prompt_table_is_refused(self):
+        result = ConfigHealthChecker().check_vendor_model_support(self._cfg(1))
+        assert result.passed is False
+        assert "model.model_kwargs.n_vendors=1" in result.message
+
+    def test_a_matching_table_passes(self):
+        result = ConfigHealthChecker().check_vendor_model_support(self._cfg(2))
+        assert result.passed is True, result.message
+
+
+class TestBuilderReadModelKwargsAreConsumed:
+    """Keys ModelBuilder reads itself (backbone_checkpoint, vae_checkpoint_path) are not facades."""
+
+    class _Stage2:
+        def __init__(self, base_channels: int = 4) -> None:
+            pass
+
+    def _check(self, monkeypatch, model_kwargs: dict) -> list:
+        from spectramr.models import registry as registry_mod
+
+        monkeypatch.setattr(registry_mod, "get_model_class", lambda name: self._Stage2)
+        cfg = SimpleNamespace(model=SimpleNamespace(model_type="stage2", model_kwargs=model_kwargs))
+        return [r for r in ConfigHealthChecker().check_advertised_options(cfg) if not r.passed]
+
+    def test_a_builder_read_key_is_not_flagged(self, monkeypatch) -> None:
+        assert self._check(monkeypatch, {"backbone_checkpoint": "/x.safetensors"}) == []
+
+    def test_any_other_unread_key_still_is(self, monkeypatch) -> None:
+        """Planted: an unread knob beside it is still reported."""
+        failed = self._check(monkeypatch, {"backbone_checkpoint": "/x", "head_width": 3})
+        assert [r.yaml_keys for r in failed] == [["model.model_kwargs.head_width"]]

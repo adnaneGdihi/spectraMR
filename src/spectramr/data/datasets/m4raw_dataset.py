@@ -67,6 +67,8 @@ import torch
 import torchio as tio
 from torch.utils.data import Dataset
 
+from spectramr.core import snapshot_trace
+from spectramr.data.transforms.traced_compose import plane
 from spectramr.data.datasets.h5_handle_cache import open_h5
 from spectramr.data.datasets.m4raw_coil_map_recipe import DEFAULT_RECIPE
 from spectramr.data.datasets.m4raw_identity import (
@@ -2008,6 +2010,22 @@ class M4RawRepetitionDataset(Dataset):
                 else (None, None)
             )
 
+            if snapshot_trace.is_active():
+                snapshot_trace.record(
+                    "loader",
+                    "m4raw_repetitions",
+                    {
+                        **{f"rep{j}": plane(r) for j, r in enumerate(kspace_reps)},
+                        "coil_maps": None if maps is None else plane(maps),
+                    },
+                    params={
+                        "files": [str(rep_paths[i]) for i in loaded],
+                        "slice_index": slice_index,
+                        "input_repetition": k,
+                        "coil_maps_source": maps_source,
+                    },
+                )
+
             # Input = one repetition (noisy), Target = averaged reps (high-SNR)
             input_kspace = kspace_reps[k].clone()
             # The repetition as acquired, kept when the split below replaces the
@@ -2038,6 +2056,21 @@ class M4RawRepetitionDataset(Dataset):
                     None
                     if self.n2n_pairing is not None
                     else self._nex_target(kspace_reps, context, input_index=k, shifts=shifts)
+                )
+
+            if snapshot_trace.is_active():
+                snapshot_trace.record(
+                    "loader",
+                    "m4raw_input_and_target",
+                    {
+                        "input": plane(input_kspace),
+                        "target": None if target_kspace is None else plane(target_kspace),
+                        "measured_kspace": None if measured_kspace is None else plane(measured_kspace),
+                    },
+                    params={
+                        "target_mode": self.target_mode,
+                        "registered": shifts is not None,
+                    },
                 )
 
             # Slot 0 is the served input; the rest are the split's target half or
@@ -2079,6 +2112,17 @@ class M4RawRepetitionDataset(Dataset):
                     alt_kspace = _rss_combine(alt_kspace)
                 if measured_kspace is not None:
                     measured_kspace = _rss_combine(measured_kspace)
+
+            if snapshot_trace.is_active() and self.coil_processing_mode == "rss":
+                snapshot_trace.record(
+                    "loader",
+                    "m4raw_coil_processing",
+                    {
+                        "input": plane(input_kspace),
+                        "target": None if target_kspace is None else plane(target_kspace),
+                    },
+                    params={"coil_processing_mode": self.coil_processing_mode},
+                )
 
             # NOTE: k-space normalization is NOT applied here. The dataset
             # matches and serves; morphing belongs to the transform layer

@@ -62,10 +62,6 @@ class BlochManifoldDPSStrategy(BaseTrainingStrategy, KspaceMixin):
     # parallel_compat: Runs the score network only through its wrapped forward and builds no parameters.
     parallel_compat = frozenset({"replicated"})
 
-    # Debug-snapshot contract (non-negotiable 14): the model is fed q_sample(x0),
-    # not the prepared input; declared here and emitted under the tag.
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
     r"""DDPM training + Bloch-manifold-constrained DPS sampling.
 
     Training is standard ε-prediction; only the sampling/validation path

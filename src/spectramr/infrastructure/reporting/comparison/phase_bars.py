@@ -16,7 +16,7 @@ import pandas as pd
 from matplotlib.patches import Patch
 
 from ..metadata import RunMetadata
-from ._bars import HATCH, arm_colours, decorate, draw_bar, grouped_positions, wrap_label
+from ._bars import GAP, HATCH, arm_colours, decorate, draw_bar, grouped_positions, wrap_label
 from ._grid import MAX_PANELS, new_grid, write_chunks
 from .metric_bars import _label
 
@@ -31,7 +31,10 @@ def _tick(one, phase):
 
 def _draw(chunk, table, arms):
     colours = arm_colours(arms)
-    fig, axes = new_grid(len(chunk))
+    n_phases = len(set(table["phase"]) & {"train", "val", "test"})
+    fig, axes = new_grid(
+        len(chunk), slots=max(1, n_phases) * (len(arms) + GAP), label_chars=max(map(len, arms))
+    )
     for ax, metric in zip(axes, chunk, strict=True):
         one = table[table["metric"] == metric]
         phases = [p for p in ("train", "val", "test") if p in set(one["phase"])]

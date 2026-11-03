@@ -247,7 +247,7 @@ reporting:
   - fig_1_5_predicted_vs_true
   - fig_1_11_stratified_performance
   - fig_1_12_failure_gallery
-  - mri_a7_kspace_recon
+  - mri_recon_panel
   - mri_a11_cohort_table
   tables:
   - tab_2_1_main_results

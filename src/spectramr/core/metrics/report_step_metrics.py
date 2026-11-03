@@ -219,7 +219,7 @@ class RadialKSpaceError(BaseMetric):
     r"""Mean ``|F·x̂ - F·x|`` binned by radial k-space frequency.
 
     Returns a scalar — the mean over the radial bins. Lower is better.
-    Use the plotter ``mri_a7_kspace_recon`` for the per-radius curve.
+    Use the plotter ``mri_recon_panel`` (its radial k-error column) for the per-radius curve.
     """
 
     def compute_metric(self, preds: Image, target: Image, **_: Any) -> Tensor:

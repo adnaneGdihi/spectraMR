@@ -48,5 +48,29 @@ def test_to_div_has_no_external_plotly_fetch():
     assert "cdn.plot.ly/plotly" not in div
 
 
-def test_flag_colour_is_okabe_ito_vermillion():
-    assert pu.flag_colour() == "#D55E00"
+def test_flag_colour_is_the_bad_status_token():
+    from spectramr.core.design_tokens import colours
+
+    assert pu.flag_colour() == colours("light")["bad"]
+
+
+def test_to_div_hides_the_toolbar():
+    if not _HAS_PLOTLY:
+        return
+    import plotly.graph_objects as go
+
+    assert '"displayModeBar": false' in pu.to_div(go.Figure(go.Scatter(x=[0], y=[0])))
+
+
+def test_seat_menus_moves_menus_off_the_title_strip():
+    if not _HAS_PLOTLY:
+        return
+    import plotly.graph_objects as go
+
+    fig = go.Figure(go.Scatter(x=[0], y=[0]))
+    pu.apply_theme(fig, title="t")
+    fig.update_layout(updatemenus=[{"type": "buttons", "y": 1.12, "yanchor": "top", "buttons": []}])
+    pu.seat_menus(fig)
+    menu = fig.layout.updatemenus[0]
+    assert (menu.y, menu.yanchor) == (1.0, "bottom")
+    assert fig.layout.margin.t == 84

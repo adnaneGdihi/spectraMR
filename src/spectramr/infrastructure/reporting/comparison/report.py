@@ -17,33 +17,18 @@ from spectramr.core.run_artifacts import read_parity
 
 from ..aggregator import eval_source
 from ..metadata import detect_metadata, run_provenance
+from ..plotters.differences import IDENTITY_FIGURES
 from ..plotters.distributions import SLICE_FIGURES
 from ..run_status import status_notes
-from ..style import set_panel_labels, use_default_style
+from ..style import select_style, set_panel_labels
 from .all_metric_figures import cohort_figures, curve_names, more_curves, sweeps, table_metrics
 from .arms import load_arms, resolve_runs
+from .figure_set import comparison_figure_ids
 from .metric_selection import PHASES, check_phases, discover_metrics, select_metrics, union
 from .phase_tables import latex_table, phase_table, wide
 
 logger = logging.getLogger(__name__)
 
-#: Figure ids rendered by a comparison, in report order.
-COMPARISON_FIGURES: tuple[str, ...] = (
-    "cmp_metric_bars",
-    "fig_1_2_learning_curves",
-    "acceleration_sweep",
-    "cmp_mosaic",
-    "fig_3_1_metric_violin",
-    "fig_3_2_subject_bars",
-    "fig_3_3_metric_scatter",
-    "cmp_paired_slice_scatter",
-    "cmp_rank_heatmap",
-    "fig_3_6_error_decomposition",
-    "fig_3_7_metric_embedding",
-    "fig_4_1_weight_trajectory",
-    "fig_4_2_layer_drift",
-    "fig_4_4_image_embedding",
-)
 COMPARISON_TABLES: tuple[str, ...] = ("tab_2_1_main_results",)
 
 
@@ -128,6 +113,7 @@ def generate_comparison(
     phases: tuple[str, ...] = PHASES,
     max_panels: int = 12,
     train_window: int = 50,
+    figures: str | list[str] | None = None,
     stats: Any = None,
     ladder: Any = None,
     groups: dict[str, str] | None = None,
@@ -136,6 +122,9 @@ def generate_comparison(
 
     ``baseline`` names the arm the others are tested against (a label after
     shortening). Returns ``{"figures", "tables", "out_dir", "summary", "html"}``.
+
+    ``figures`` is ``None`` for the default comparison set, ``"all"`` for every
+    registered figure (each soft-skips without its data), or a list of ids.
 
     ``metrics`` is ``None`` for the headline panels, ``"all"`` for every metric any
     phase logged, or a list of base names. ``phases`` limits which of ``val`` /
@@ -152,11 +141,12 @@ def generate_comparison(
     if baseline is not None and baseline not in arms.labels:
         raise ValueError(f"baseline {baseline!r} is not an arm; arms are {arms.labels}")
     out_dir = Path(out_dir)
+    fig_ids = comparison_figure_ids(figures)  # before ``figures`` is reused for the outputs below
     fig_dir, tab_dir = out_dir / "figures", out_dir / "tables"
     phases = check_phases(phases)
     found = discover_metrics(arms, phases)
     chosen = select_metrics(metrics, found)
-    use_default_style(style)
+    select_style(style)
     set_panel_labels(panel_labels)
     datasets = {run_provenance(d)["dataset_version"] for d in arms.run_dirs.values()}
     metadata = detect_metadata(dataset_version="; ".join(sorted(d for d in datasets if d)) or None)
@@ -169,7 +159,7 @@ def generate_comparison(
             "expected_methods": arms.labels,
         },
     }
-    for fid in SLICE_FIGURES:
+    for fid in (*SLICE_FIGURES, *IDENTITY_FIGURES):
         per_fig.setdefault(fid, {})["slice_df"] = arms.per_case
     for fid in ("fig_4_1_weight_trajectory", "fig_4_2_layer_drift"):
         per_fig.setdefault(fid, {})["weight_runs"] = arms.run_dirs
@@ -181,7 +171,7 @@ def generate_comparison(
         per_fig["fig_1_2_learning_curves"] = {"metrics": curves[:max_panels]}
     figures: dict[str, Path | None] = {}
     reasons: dict[str, str] = {}
-    for fid in COMPARISON_FIGURES:
+    for fid in fig_ids:
         out = plotters.dispatch_detailed(
             arms.df, [fid], fig_dir, formats=formats, dpi=dpi, **common, **per_fig.get(fid, {})
         )[fid]
@@ -276,18 +266,13 @@ def generate_comparison(
     html = None
     if html_report:
         try:
-            from ..html_report import build_html_report
+            from ..dashboard import comparison_page, write_plotly_asset
 
-            html = build_html_report(
+            html = comparison_page(
                 out_dir,
-                figures=figures,
-                tables=tables_out,
-                metadata=metadata,
-                aggregated_df=arms.df,
-                interactive=False,
-                method="comparison",
-                task=f"{len(arms.labels)} arms, {view} view",
-                filename="comparison.html",
+                baseline=baseline,
+                title=f"Comparison: {len(arms.labels)} arms, {view} view",
+                plotly_js=write_plotly_asset(out_dir / "_assets"),
             )
         except Exception as exc:  # the figures are the deliverable; HTML is a view of them
             logger.warning("comparison html failed: %s", exc)

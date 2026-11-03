@@ -21,7 +21,7 @@ from spectramr.core.metrics.reciprocal import is_reciprocal
 
 from ..metadata import RunMetadata
 from ..style import pretty_label
-from ._bars import arm_colours, decorate, draw_bar, grouped_positions, wrap_label
+from ._bars import GAP, arm_colours, decorate, draw_bar, grouped_positions, wrap_label
 from ._grid import new_grid, write_chunks
 
 #: Metrics per figure (the x groups); more continue in numbered files.
@@ -61,7 +61,8 @@ def improvement_rows(paired_df: pd.DataFrame, paired: dict) -> tuple[pd.DataFram
 
 def _draw(chunk, rows, variants, omitted, phases):
     colours = arm_colours(variants)
-    fig, axes = new_grid(len(phases), row_height=0.3, columns=1)
+    longest = max((len(m) for m in chunk), default=0)
+    fig, axes = new_grid(len(phases), columns=1, slots=len(chunk) * (len(variants) + GAP), label_chars=longest)
     for ax, phase in zip(axes, phases, strict=True):
         one = rows[rows["phase"] == phase]
         shown = [m for m in chunk if m in set(one["metric"])]  # no empty slot for a metric
@@ -120,10 +121,12 @@ def make(
     variants = [a for a in arms if a != baseline and a in set(rows["variant"])]
     phases = [p for p in ("val", "test") if p in set(rows["phase"])]
     metrics = list(dict.fromkeys(rows["metric"]))
+    # A row holds metrics x arms bars; keep it near 60 so each bar keeps its width.
+    per_figure = max(1, min(max_metrics, 60 // max(1, len(variants) + 1)))
     return write_chunks(
         out_path,
         metrics,
-        max_metrics,
+        per_figure,
         lambda chunk: _draw(chunk, rows, variants, omitted, phases),
         formats=formats,
         dpi=dpi,

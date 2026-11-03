@@ -199,7 +199,6 @@ src/spectramr/infrastructure/training/builders/data_builder.py  # 463 loc
 src/spectramr/infrastructure/training/builders/loss_builder.py  # 828 loc
 src/spectramr/infrastructure/training/builders/model_builder.py  # 654 loc
 src/spectramr/infrastructure/training/builders/optimization_builder.py  # 530 loc
-src/spectramr/infrastructure/training/debug_snapshot.py  # 717 loc
 src/spectramr/infrastructure/training/gradient_stability.py  # 643 loc
 src/spectramr/infrastructure/training/loss_schedule_controller.py  # 688 loc
 src/spectramr/infrastructure/training/middleware/__init__.py  # 380 loc

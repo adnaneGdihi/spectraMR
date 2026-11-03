@@ -123,24 +123,6 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
     #: read by ``validation_step`` (``ood_acceleration_readout``).
     reads_ood_acceleration_range = True
 
-    #: The DigitalTwinSimulator corrupts the input INSIDE the step, so
-    #: ``first_steps/input_prepared`` -- captured before the forward pass --
-    #: equals ``input_raw``/``target`` and the markers are invisible in it. The
-    #: model is fed ``corrupted_norm``; see ``_compute_losses_impl``.
-    #:
-    #: The code has said so in a comment since the twin snapshot was added
-    #: ("the base first_steps auto-snapshot captures the PRE-twin input"), but
-    #: the flag stayed at its ``True`` default -- so every VF artifact stamped
-    #: ``prepared_equals_model_input: True`` and asserted the opposite of the
-    #: comment. A caveat in the source mitigates for whoever edits the file; the
-    #: field is what the reader of the artifact actually consumes (pitfall #16).
-    snapshot_prepared_is_model_input: bool = False
-
-    #: ``_snapshot_twin_outputs`` already writes this tag, and
-    #: ``save_debug_snapshot`` marks the model-input requirement met on the way
-    #: through -- so naming it here wires the existing emission to the contract
-    #: rather than adding a second copy of the same tensors.
-    snapshot_model_input_tag: str | None = "vf_twin"
 
     def __init__(
         self,
@@ -645,19 +627,8 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
                     "twin_marker_residual": marker_residual,
                     "twin_marker_prior": marker_prior_norm,
                 },
-                step=step,
                 tag="vf_twin",
                 extra=_twin_extra,
-                # ``vf_twin`` IS this strategy's ``snapshot_model_input_tag``,
-                # so the snapshot must say which of its four tensors the model
-                # receives; the other three are the clean twin and the marker
-                # halves shown for contrast. It has always been
-                # ``corrupted_norm`` (class docstring, line ~74) -- naming it
-                # here is what makes that checkable instead of documented.
-                # A parameter and not part of ``_twin_extra`` because that dict
-                # is deferred: resolving it to read one key would force the very
-                # ``.item()`` sync the deferral exists to postpone.
-                model_input_key="twin_corrupted_input",
             )
         except Exception as exc:  # diagnostics must never break training
             logger.debug("[VirtualFiducialStrategy] twin snapshot skipped: %s", exc)
@@ -866,6 +837,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
         b0_map: torch.Tensor | None = None,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Compute image-quality validation metrics for the VF reconstruction.
@@ -920,6 +892,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
                     input_batch=target,
                     target_batch=target,
                     step=batch_idx,
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(

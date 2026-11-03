@@ -38,6 +38,7 @@ from .loss_folding import (
 from .mixins.contrast_forwarding import (
     AcquisitionLookup,
     align_contrast_rows,
+    aux_map_loss_context,
     bloch_loss_context,
     contrast_inputs,
     declared_acquisition_lookup,
@@ -324,6 +325,7 @@ class ReconstructionStepMixin:
         if nig_params is not None:
             loss_context["nig_params"] = nig_params
         loss_context.update(bloch_loss_context(unwrap_model(self.env.generator)))
+        loss_context.update(aux_map_loss_context(unwrap_model(self.env.generator), batch_context))
 
         loss_output = self.loss_computer.compute(
             pred=eval_fakes,

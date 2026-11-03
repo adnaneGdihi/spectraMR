@@ -311,7 +311,7 @@ Where this run's log actually went
 ==================================
 
 A run can write ``provenance.json``, ``resolved_config.json``, a TensorBoard
-event file, its ``debug_snapshots/`` and every validation PNG — and not one log
+event file, its ``snapshots/`` and every validation PNG — and not one log
 line — and until the path is recorded, no artifact can say why.
 
 Two mechanisms put a log somewhere other than beside the run:

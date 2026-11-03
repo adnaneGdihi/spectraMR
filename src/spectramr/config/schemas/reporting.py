@@ -14,6 +14,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .enums import ReportStyle, ReportTask
 from .renames import reject_renamed_keys
 
+#: Figure ids merged into another figure: old id -> the figure that now draws it. A config or
+#: CLI naming an old id raises with the replacement instead of silently losing the figure.
+RETIRED_FIGURE_IDS: dict[str, str] = {
+    "mri_a7_kspace_recon": "mri_recon_panel",
+    "fig_3_1_metric_violin": "metric_distribution",
+}
+
 
 class ReportingSettings(BaseModel):
     """Per-experiment reporting hook configuration.
@@ -43,7 +50,9 @@ class ReportingSettings(BaseModel):
     # was written on 2026-08-05 and had never once reached a user. Every other
     # block owning a `raise` record mounts this; `reporting` was the one that
     # did not.
-    _reject_renamed = model_validator(mode="before")(classmethod(reject_renamed_keys("reporting")))
+    _reject_renamed = model_validator(mode="before")(
+        classmethod(reject_renamed_keys("reporting"))  # type: ignore[arg-type]
+    )
 
     enabled: bool = Field(
         default=False,
@@ -158,6 +167,15 @@ class ReportingSettings(BaseModel):
         ),
     )
 
+    @field_validator("figures")
+    @classmethod
+    def _reject_retired_figures(cls, v: list[str] | None) -> list[str] | None:
+        retired = {f: RETIRED_FIGURE_IDS[f] for f in v or [] if f in RETIRED_FIGURE_IDS}
+        if retired:
+            moves = ", ".join(f"{old} -> {new}" for old, new in retired.items())
+            raise ValueError(f"reporting.figures names retired figure id(s): {moves}; use the replacement")
+        return v
+
     @field_validator("formats")
     @classmethod
     def _validate_formats(cls, v: list[str]) -> list[str]:
@@ -171,7 +189,7 @@ class ReportingSettings(BaseModel):
 
     figures: list[str] | None = Field(
         default=None,
-        description="Override the task preset's figure list. None = preset default.",
+        description="Override the task preset's figure list. None = preset default; [all] = every registered figure.",
     )
     tables: list[str] | None = Field(
         default=None,

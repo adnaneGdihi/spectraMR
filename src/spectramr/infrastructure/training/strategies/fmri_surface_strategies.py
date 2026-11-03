@@ -124,11 +124,6 @@ class RiemannianDFCDiffusionStrategy(BaseTrainingStrategy):
     inline_losses: ClassVar[frozenset[str] | None] = frozenset()
     folds_image_losses: ClassVar[bool | None] = False
 
-    # Debug-snapshot contract (non-negotiable 14): the model is fed a noised
-    # tensor, not the prepared input; declared here and emitted under the tag.
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
-
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         cfg = getattr(self.config.training, "riemannian_dfc_diffusion", None)
@@ -186,11 +181,6 @@ class HRFManifoldDiffusionStrategy(BaseTrainingStrategy):
     # is the design (LossBuilder.validate) and any declared image loss is a decoy.
     inline_losses: ClassVar[frozenset[str] | None] = frozenset()
     folds_image_losses: ClassVar[bool | None] = False
-
-    # Debug-snapshot contract (non-negotiable 14): the model is fed a noised
-    # tensor, not the prepared input; declared here and emitted under the tag.
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
 
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)

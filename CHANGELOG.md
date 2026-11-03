@@ -109,12 +109,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phasor loss (`losses.physics.lambda_phase_contrast_image_nmse` / `lambda_phase_contrast_phasor`).
   Validation assembles each subject's volume and reports vessel-ROI velocity RMSE, normalised
   divergence and mass conservation; it refuses a validation cap and multi-process backends. First
-  arm: `experiments/inprogress/phase_contrast/pc4d_synth_supervised_r6.yaml`.
+  arm: `pc4d_synth_supervised_r6` in the `phase_contrast` cohort.
 - `flow_kt_unrolled`: an unrolled k-t reconstruction of velocity-encoded multicoil k-space
   (per-encoding SENSE gradient steps plus a shared (2+1)D regulariser over all encodings),
   returning per-encoding complex images from which velocity is decoded by the physics.
 - A k-t variable-density sampler (`kt_vd_gaussian`) with an exact per-frame budget and a
   different pattern per velocity encoding and cardiac frame, and a strict `flow` collate.
+- **Debug snapshots trace the whole data path.** Each snapshot step is written as
+  `snapshots/<run_id>/<train|val>/step_N/` with a `manifest.json` listing every stage in order:
+  one dataset sample re-fetched through each loader stage (including the FastMRI/universal
+  builder's load, crop and coil steps), the prepared batch, the exact model input and output,
+  and data-consistency and projection modules as `post` stages. A strategy whose snapshot step
+  records no model call fails the coverage test.
+- One reporting dashboard module for runs and campaigns. A campaign report draws every
+  registered figure for each finished run and for the comparison, and records why a figure was
+  skipped in `report_manifest.json`. Demo dashboard render scripts.
+- Placeholder models made real: `contrast_agnostic_encoder` with a contrastive strategy that
+  consumes co-registered views (`data.m4raw_triplet.contrastive_views`), `frozen_backbone_with_head`
+  loading the stage-1 encoder, field-FiLM `cross_field_fm`, `multi_param_mapping` fitted through
+  the TSE render, and vendor-conditioned translation with vendor ids from the manifest.
+- Federated training: FedAvg/FedBN rounds with per-site DP and per-site validation, read from
+  `training.federated_config`.
+- Sim2Rank `--metrics` (`SIM2RANK_METRICS`) resolves metric names against the live registry,
+  plugin metrics included; an unregistered name raises.
 
 ### Fixed
 - Four-point velocity decoding re-wraps the encoded phase difference, so phases near ±π no
@@ -137,6 +154,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-Cartesian `q_sample` on real input, and the V100 OOM arms.
 - About 120 in-progress cohort fixes (waves W0–W1, 3a and 3b-A) that wire declared knobs,
   add matched controls and repair stale baselines across the experiment corpus.
+- The v6.1 wrapper models build the backbone their arm declares. They previously ignored the
+  flattened `model_kwargs` and built a default backbone. Eight stub aliases that never bound
+  are deleted.
+- BALD acquisition scores real MC-dropout disagreement over k-space lines and applies it to the
+  input; the eight passes were previously identical.
+- Sim2Rank per-axis Spearman correlations mid-rank ties (`rankdata(method="average")`), which
+  lowers previously inflated correlations on tied inputs.
+- Report comparisons pair arms by subject and slice instead of by batch position. A campaign
+  report covers the runs on disk rather than a stale campaign state.
+- Report and Sim2Rank figure styling is scoped to each figure; arm, Sim2Rank category and
+  corruption-axis palettes are colour-blind safe. Duplicate figure pairs are merged and the
+  YAMLs naming them migrated.
+- Debug-snapshot inputs are log-decompressed per batch from the loader's evidence.
+
+### Removed
+- The SPECTRA RISC-V chip backend and its `cosim` arms. It had no production
+  caller, and its executor raised unless a test injected the runtime.
+
+### Security
+- Vulnerable locked dependencies bumped.
 
 ## [1.3.3] - 2026-10-28
 

@@ -298,3 +298,13 @@ class TestPerCaseMetricsWasRenamed:
         assert "CALL" in desc
         assert "BATCH-AGGREGATE" in desc
         assert "per_case_metrics" in desc, "say what it was renamed from"
+
+
+def test_a_retired_figure_id_raises_at_load_with_its_replacement():
+    import pytest
+
+    from spectramr.config.schemas.reporting import ReportingSettings
+
+    with pytest.raises(ValueError, match="mri_a7_kspace_recon -> mri_recon_panel"):
+        ReportingSettings(figures=["mri_a7_kspace_recon"])
+    assert ReportingSettings(figures=["mri_recon_panel"]).figures == ["mri_recon_panel"]

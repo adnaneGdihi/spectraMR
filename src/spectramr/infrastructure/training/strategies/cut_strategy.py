@@ -460,6 +460,7 @@ class CUTTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
                 input_batch=real_a,
                 target_batch=real_b,
                 step=iteration,
+                batch=batch,
             ):
                 losses = self._compute_losses_impl(
                     input_batch=real_a, target_batch=real_b, epoch=epoch

@@ -140,7 +140,7 @@ def test_unsupported_undersampling_raises() -> None:
 
 def test_first_steps_snapshot_stamps_the_sampler_knobs_and_mask() -> None:
     strat = _strategy(_OracleScoreField(torch.zeros(1, 2, 8, 8), 5))
-    stamp = strat._first_steps_extra(0)["score_field_tomography"]
+    stamp = strat._snapshot_context()["score_field_tomography"]
     assert stamp["validation_sampler"] == "annealed_langevin_dc"
     assert (stamp["val_num_levels"], stamp["val_steps_per_level"], stamp["val_step_size"]) == (
         5,

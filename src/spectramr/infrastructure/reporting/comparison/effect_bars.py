@@ -18,7 +18,7 @@ from matplotlib.patches import Patch
 from matplotlib.ticker import MaxNLocator
 
 from ..metadata import RunMetadata
-from ._bars import HATCH, arm_colours, arm_groups, decorate, draw_bar, grouped_positions, wrap_label
+from ._bars import GAP, HATCH, arm_colours, arm_groups, decorate, draw_bar, grouped_positions, wrap_label
 from ._grid import MAX_PANELS, new_grid, write_chunks
 from .effect_forest import adjusted_p
 from .metric_bars import _label
@@ -32,7 +32,10 @@ def _draw(chunk, paired_df, paired, arms, groups, baseline):
     positions, spans = grouped_positions(layout)
     group_of = {arm: g for g, members in layout.items() for arm in members}
     colours = arm_colours(arms)
-    fig, axes = new_grid(len(chunk))
+    fig, axes = new_grid(
+        len(chunk), slots=len(variants) + GAP * (len(layout) - 1),
+        label_chars=max(map(len, variants), default=0),
+    )
     rng = np.random.default_rng(0)
     for ax, metric in zip(axes, chunk, strict=True):
         one = paired_df[paired_df["metric"] == metric]

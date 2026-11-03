@@ -28,6 +28,11 @@ from spectramr.infrastructure.optimization.ema import ModelEma  # [FIX] Added fo
 
 from .base import Builder
 
+#: model_kwargs keys this builder reads itself (warm-start), not the model's constructor.
+BUILDER_READ_MODEL_KWARGS: frozenset[str] = frozenset(
+    {"vae_checkpoint_path", "freeze_vae", "backbone_checkpoint"}
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -160,6 +165,16 @@ class ModelBuilder(Builder):
                     "scripts/migrations/convert_checkpoints_v1.py."
                 ) from exc
             loader(state, freeze=freeze, source=str(vae))
+        backbone = (getattr(model_cfg, "model_kwargs", None) or {}).get("backbone_checkpoint")
+        if backbone:
+            # A stage-2 model built on a pretrained stage-1 network (frozen_backbone_with_head).
+            loader = getattr(generator, "load_backbone_state", None)
+            if loader is None:
+                raise ValueError(
+                    f"model_kwargs.backbone_checkpoint is set but {type(generator).__name__} "
+                    "has no load_backbone_state; nothing would load it"
+                )
+            loader(read_part(backbone, "generator"), source=str(backbone))
         ckpt_path = getattr(model_cfg, "checkpoint_path", None)
         if ckpt_path:
             weights(ckpt_path, "generator", generator, policy="overlap")

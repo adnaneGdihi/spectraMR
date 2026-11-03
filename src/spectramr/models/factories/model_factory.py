@@ -681,6 +681,12 @@ class ModelCreator:
                         f"for {generator_class.__name__} (constructor expects list/sequence)"
                     )
 
+        # A wrapper that forwards to an inner backbone names `_declared_keys` to receive the
+        # arm's pre-sweep set; a swept top-level field must not read as an unread knob there.
+        from spectramr.core.component_signature import signature_contract
+
+        if "_declared_keys" in signature_contract(generator_class).accepted:
+            mapped_params["_declared_keys"] = _declared_keys
         generator = generator_class(**mapped_params)
         generator = self._activation_manager.apply_activation(generator, model_type)
         self._logger.debug(f"ModelCreator created {model_type}: {type(generator)}")

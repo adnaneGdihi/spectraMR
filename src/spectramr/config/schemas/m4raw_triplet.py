@@ -20,6 +20,15 @@ class M4RawTripletConfigSchema(BaseModel):
     )
     train_split: str = Field(..., description="Split directory under each root, for training.")
     val_split: str = Field(..., description="Split directory under each root, for validation.")
+    contrastive_views: bool = Field(
+        default=False,
+        description=(
+            "Also emit two co-registered contrasts of each slice as ``view_a``/``view_b`` "
+            "(1, H, W), their ``contrast_idx_a``/``contrast_idx_b`` from "
+            "``data.multi_contrast.contrast_map`` and the ``subject_index``, for contrastive "
+            "pretraining. The pair is random in training and fixed in validation."
+        ),
+    )
     raw_repetition_root: str | None = Field(
         default=None,
         description=(

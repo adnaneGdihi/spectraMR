@@ -200,6 +200,10 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     "guarded_ring_fidelity_mean": False,
     "guarded_ring_fidelity_mean_partial": False,
     "selection_guard_tripped": False,
+    # multi_contrast_contrastive validation: InfoNCE on the val pairs, and the share of
+    # views whose nearest neighbour is their own co-registered partner.
+    "infonce": False,
+    "view_retrieval_top1": True,
     "val_t1_mape": False,  # mean absolute percentage error
     # conformal coverage / certificates — higher is better (coverage → 1 - alpha)
     "coverage_at_alpha": True,
@@ -214,8 +218,6 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     #     KspaceConsistencyTTALoss data-consistency term, i.e. a loss.
     #   entropy — exp_tta_sotadit.yaml declares `mode: min` alongside it
     #     (test-time entropy MINIMIZATION).
-    #   no_crash_lowering — a cosim wiring smoke: 1 = the GEMM lowered onto the
-    #     SPECTRA array without crashing. Higher is better.
     "val_kspace_consistency_tta": False,
     "kspace_consistency_tta": False,
     # Disentanglement readings of DisentangledTrainingStrategy.finalize_validation
@@ -249,7 +251,6 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     "per_pair_consistency_residual": False,
     "nll": False,
     "certified_recall_lower_bound": True,
-    "no_crash_lowering": True,
     # ---------------------------------------------------------------
     # Names carried over from the legacy ``types.DEFAULT_METRIC_DIRECTIONS``
     # table. None of these is a registered metric (no @register_metric class),

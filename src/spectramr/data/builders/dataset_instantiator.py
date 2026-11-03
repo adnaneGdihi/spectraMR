@@ -489,6 +489,18 @@ class DatasetInstantiator:
             noise_covariance_missing=noise_covariance_missing,
             input_repetition="first",
         )
+        mc = config.multi_contrast
+        if mc.vendor_map:
+            from spectramr.data.datasets.vendor_tagging import (
+                VendorTaggedDataset,
+                vendor_ids_by_path,
+            )
+
+            vmap, nv = mc.vendor_map, mc.n_vendors
+            train_ds = VendorTaggedDataset(
+                train_ds, vendor_ids_by_path(train_index, train_h5, vmap, nv)
+            )
+            val_ds = VendorTaggedDataset(val_ds, vendor_ids_by_path(val_index, val_h5, vmap, nv))
         unit = "slice records" if slice_level_records else "groups"
         logger.info(
             f"[DATASET] M4RawRepetitionDataset with {len(train_ds)} train {unit}, "
@@ -1067,6 +1079,7 @@ class DatasetInstantiator:
             log_scaling=config.processing.enable_log_scaling,
             image_domain_crop_or_pad=config.processing.image_domain_crop_or_pad,
             contrast_map=contrast_map,
+            record_field_strength=config.expose.field_strength,
         )
         val_ds = UniversalMRIDataset(
             index=val_idx,
@@ -1082,6 +1095,7 @@ class DatasetInstantiator:
             log_scaling=config.processing.enable_log_scaling,
             image_domain_crop_or_pad=config.processing.image_domain_crop_or_pad,
             contrast_map=contrast_map,
+            record_field_strength=config.expose.field_strength,
         )
         logger.info("[DATASET] FastMRI UniversalMRIDataset")
         return train_ds, val_ds
@@ -1269,6 +1283,11 @@ class DatasetInstantiator:
             raise ValueError("dataset_type 'm4raw_triplet' requires a data.m4raw_triplet block")
         roots = (block.t2_registered_root, block.flair_registered_root)
         if block.raw_repetition_root is not None:
+            if block.contrastive_views:
+                raise ValueError(
+                    "data.m4raw_triplet.contrastive_views is served from the NEX averages; "
+                    "unset raw_repetition_root"
+                )
             from spectramr.data.datasets import m4raw_repetition_triplet
 
             rep = m4raw_repetition_triplet.M4RawRepetitionTripletDataset
@@ -1278,7 +1297,19 @@ class DatasetInstantiator:
                 rep(*roots, raw, block.val_split, deterministic=True),
             )
         build = m4raw_triplet_dataset.M4RawTripletDataset
-        return build(*roots, block.train_split), build(*roots, block.val_split)
+        if not block.contrastive_views:
+            return build(*roots, block.train_split), build(*roots, block.val_split)
+        mc = config.multi_contrast
+
+        def views(deterministic: bool):
+            return m4raw_triplet_dataset.ContrastiveViews(
+                mc.contrast_map, positive=mc.positive_sampling, deterministic=deterministic
+            )
+
+        return (
+            build(*roots, block.train_split, views=views(False)),
+            build(*roots, block.val_split, views=views(True)),
+        )
 
     @staticmethod
     def _create_quantitative_dataset(config, train_tfm, val_tfm):

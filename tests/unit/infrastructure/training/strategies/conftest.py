@@ -77,3 +77,32 @@ def no_gpu_sync():
 @pytest.fixture
 def empty_metrics_is_safe():
     return assert_empty_is_safe
+
+
+@pytest.fixture
+def declared(monkeypatch):
+    """Trace the whole test; ``declared()`` returns the last ``_declare_model_input`` call.
+
+    Returns ``(tensors, extra, in_kspace_keys)`` -- whole tensors, the declared extra,
+    and the k-space keys exactly as the strategy passed them -- or ``None``.
+    """
+    from spectramr.core import snapshot_trace as st
+    from spectramr.infrastructure.training.snapshot.policy import ViewPolicy
+    from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+
+    monkeypatch.setattr(BaseTrainingStrategy, "_snapshot_view_policy", ViewPolicy())
+    trace = st.SnapshotTrace(phase="train", step=0, batched=False, max_repeats=1000)
+    token = st._ACTIVE.set(trace)
+
+    def _last():
+        stages = [s for s in trace.stages if s.group == "strategy" and s.name.startswith("model_input")]
+        if not stages:
+            return None
+        stage = stages[-1]
+        prefix = f"strategy/{stage.name}."
+        extra = {k[len(prefix) :]: v for k, v in trace.extra.items() if k.startswith(prefix)}
+        keys = stage.params.get("in_kspace_keys")
+        return stage.tensors, extra, None if keys is None else set(keys)
+
+    yield _last
+    st._ACTIVE.reset(token)

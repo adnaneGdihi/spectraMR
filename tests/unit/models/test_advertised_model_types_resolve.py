@@ -105,15 +105,10 @@ def test_ldm_latent_discriminator_resolves(populated_registry: dict) -> None:
 _V6_1_NAMES_AFTER_COLLISION = (
     "latent_diffusion_multi_axis_cfg",
     "vendor_aware_translation",
-    "filterdiff_baseline",
-    "amk_cdiffnet_baseline",
     "multi_param_mapping",
-    "mrf_dictionary_matching",
-    "cross_field_hypernet",
     "cross_field_fm",
     "scas",
-    "scout_conditioned_sampler_hypernet",
-    "federated_dp_recon",
+    "diffusion",
 )
 
 
@@ -169,4 +164,4 @@ def test_create_latent_discriminator_rejects_unknown_type() -> None:
     )
 
     with pytest.raises(ValueError, match="Unknown discriminator_type"):
-        create_latent_discriminator(discriminator_type="pacth")
+        create_latent_discriminator(discriminator_type="pacth")  # codespell:ignore

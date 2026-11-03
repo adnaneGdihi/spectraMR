@@ -219,3 +219,17 @@ def test_compute_losses_hands_the_loss_computer_the_bloch_context() -> None:
         s._compute_losses_impl(x, x, epoch=0)
     assert seen["context"]["tissue_params"] is model.last_tissue_params
     assert seen["context"]["acquisition_params"] is model.last_acquisition_params
+
+
+def test_aux_map_loss_context_hands_the_maps_and_the_batch_field() -> None:
+    from types import SimpleNamespace
+
+    from spectramr.infrastructure.training.strategies.mixins.contrast_forwarding import (
+        aux_map_loss_context,
+    )
+
+    maps = {"t1_ms": torch.ones(1, 1, 2, 2)}
+    field = torch.tensor([0.3])
+    ctx = aux_map_loss_context(SimpleNamespace(last_aux_maps=maps), {"field_strength": field})
+    assert ctx["aux_maps"] is maps and ctx["field_strength"] is field
+    assert aux_map_loss_context(SimpleNamespace(), {"field_strength": field}) == {}

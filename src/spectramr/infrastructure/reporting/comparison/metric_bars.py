@@ -31,6 +31,7 @@ from ..plotters._stats import bootstrap_ci, holm_bonferroni, paired_bootstrap_pv
 from ..style import (
     column_width,
     panel_label,
+    panel_letter,
     pretty_label,
     save_figure,
     use_default_style,
@@ -204,7 +205,7 @@ def make(
     if by_case and baseline is not None and baseline not in covered:
         notes.append(f"no tests: baseline {baseline} has no per-case rows")
     if by_case:
-        notes.append(f"n = {arms.call_unit}")
+        notes.append(f"n = {arms.case_unit}")
     lacking = [m for m in wanted if m not in set(source["base_metric"])]
     if lacking or not by_case:
         notes.append("one value per arm where there are no per-case rows")
@@ -277,7 +278,7 @@ def _figure(
         sparse_ticks(ax)
         ax.set_ylabel(_label(metric))
         if len(chunk) > 1:
-            panel_label(ax, chr(ord("a") + i))
+            panel_label(ax, panel_letter(i))
     for j in range(len(chunk), rows_n * cols):
         axes[j // cols][j % cols].set_visible(False)
     if by_case:

@@ -6,6 +6,7 @@ for solving inverse problems in MRI reconstruction.
 """
 
 from collections.abc import Callable
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -111,6 +112,9 @@ class DiffusionPrior(nn.Module):
 
 class DataConsistency(nn.Module):
     """Data consistency module for reconstruction."""
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self, forward_operator: Callable, lambda_dc: float = 1.0):
         """__init__.

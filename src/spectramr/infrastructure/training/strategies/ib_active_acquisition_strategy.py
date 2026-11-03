@@ -150,8 +150,8 @@ class IBActiveAcquisitionStrategy(BaseTrainingStrategy):
             "validation_rollouts": ["random", *POLICY_ROLLOUTS],
         }
 
-    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
-        extra = super()._first_steps_extra(epoch, batch=batch)
+    def _snapshot_context(self) -> dict[str, Any]:
+        extra = super()._snapshot_context()
         extra["ib_acquisition"] = self.ib_provenance()
         return extra
 

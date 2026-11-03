@@ -36,6 +36,7 @@ from spectramr.core.metrics.ring_power import RING_METRICS
 from spectramr.core.metrics.scalar_transfer import fuse_to_host
 from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import align_scale_to_batch, read_batch_field
+from spectramr.data.transforms.normalization import LoaderNormalization, loader_normalization
 from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.checkpointing.restore import ZeroOverlapError, weights
 from spectramr.infrastructure.physics.coil_sensitivity import (
@@ -45,7 +46,8 @@ from spectramr.infrastructure.physics.coil_sensitivity import (
     resolve_estimation_settings,
 )
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
-from spectramr.infrastructure.training.debug_snapshot import ChannelSegment
+from spectramr.core import snapshot_trace
+from spectramr.core.snapshot_trace import ChannelSegment
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.measured_map_scoring import (
     MeasuredMapStash,
@@ -156,6 +158,29 @@ _SAMPLER_STEP_PARAM_NAMES: tuple[str, ...] = (
     "n_steps",
     "steps",
 )
+
+# What each non-APPLIED verdict observed on the batch, and why it implicates the
+# transform; the three point at different wiring faults, so they stay distinct.
+_UNNORMALIZED_EVIDENCE: dict[LoaderNormalization, tuple[str, str]] = {
+    LoaderNormalization.MARKED_RAW: (
+        "published kspace_normalized=False",
+        "the dataset's own marker says the tensors left it raw, and "
+        "KSpaceNormalizationTransform overwrites that marker with "
+        "True whenever it runs — so it did not run on the tensor "
+        "that reached train_step",
+    ),
+    LoaderNormalization.NO_EVIDENCE: (
+        "published NEITHER a kspace_scale NOR a 'kspace_normalized' marker",
+        "the transform publishes both, so a batch carrying neither "
+        "was not produced by a chain containing it",
+    ),
+    LoaderNormalization.IDENTITY_SCALE: (
+        "published an IDENTITY kspace_scale (1.0) and no 'kspace_normalized' marker",
+        "an identity scale is the placeholder a dataset publishes to say "
+        "it served raw k-space; KSpaceNormalizationTransform overwrites "
+        "it with the scale it divided by, so it did not run",
+    ),
+}
 
 
 def describe_nonfinite_prediction(hr_fakes: torch.Tensor) -> str | None:
@@ -390,16 +415,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         | declared_measured_keys(_MEASUREMENT_AWARE_METRIC_NAMES)
     )
 
-    #: Diffusion degrades the prepared input INSIDE the step -- ``q_sample``
-    #: adds noise, or (cold) zero-fills with ``x_0 * mask``. The base class
-    #: captures ``first_steps/input_prepared`` before the forward pass, so for
-    #: this family it is the CLEAN tensor, not the one the model receives. The
-    #: real model input is emitted separately under ``diffusion_step`` (key
-    #: ``noisy_kspace``, #1177). Declaring False here is what stops a reader
-    #: concluding a cold-diffusion arm was fed fully-sampled data --
-    #: ``docs/debug_snapshot_contract.rst``.
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
     #: Cold / Gaussian schedules build their own masks (``generate_batch_masks``).
     applies_undersampling = True
     #: The cold branch grades the zero-filled baseline from the MASKED measurement
@@ -608,8 +623,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
 
         # OPTIMIZATION (Phase 3C): Cache frequently-accessed config values
         self._cached_log_interval = self.config.logging.intervals.log
-        _val = self.config.validation
-        self._cached_val_interval = int(_val.schedule.interval_steps) if _val.enabled else 0
         self._cached_normalize_kspace = self.config.data.processing.enable_kspace_normalization
         # One warning per run, not one per step: 30,000 copies would bury it.
         # Guards all three "the batch arrived unnormalized" states, not just the
@@ -1037,14 +1050,11 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         ``~44`` through this module's ``sqrt(R^2 + I^2)``), so that batch was
         provably never compressed.
 
-        Positive evidence, in order of authority:
-
-        1. ``kspace_normalized`` — set True by the transform, False by a dataset
-           that serves raw. An explicit answer; believe it.
-        2. Otherwise a *non-identity* ``kspace_scale``. Something divided by it,
-           so the tensors are not raw. An identity scale means nothing was
-           divided, and re-running the divide is a no-op rather than a
-           double-application, so falling through is safe.
+        The evidence is read by
+        :func:`~spectramr.data.transforms.normalization.loader_normalization`,
+        which the base strategy's snapshot emitters share. An identity scale
+        means nothing was divided, and re-running the divide is a no-op rather
+        than a double-application, so falling through is safe.
 
         **Every** route to ``False`` announces itself, because each one means the
         declared transform's output is not reaching ``train_step`` and the
@@ -1062,63 +1072,12 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         reached 30,000 iterations with a mosaic of DC blobs and nothing in the
         log (CLAUDE.md #3, #4; issues #1211, #1213).
         """
-        # Read through the mapping protocol, NOT isinstance-dict + hasattr. A
-        # TrainingBatch fails both of those legs -- it is not a mapping, and its
-        # metadata is invisible to attribute lookup -- so the pair read a
-        # published marker as absent and fell through to the "cannot say" branch
-        # below. See ``read_batch_field`` for the measured access table.
-        marker = read_batch_field(batch_data, "kspace_normalized")
-        if marker is not None:
-            # Collated per-subject markers arrive as a tensor/list of one value
-            # per sample; reducing with ``all`` keeps a partially-normalized
-            # batch (a pipeline bug of its own) out of the fast path, and avoids
-            # ``bool(tensor([False, False]))`` raising.
-            if torch.is_tensor(marker):
-                normalized = bool(marker.all())
-            elif isinstance(marker, (list, tuple)):
-                normalized = all(bool(m) for m in marker)
-            else:
-                normalized = bool(marker)
-            if normalized:
-                return True
-            self._warn_batch_reached_step_unnormalized(
-                current_step,
-                observed="published kspace_normalized=False",
-                diagnosis=(
-                    "the dataset's own marker says the tensors left it raw, and "
-                    "KSpaceNormalizationTransform overwrites that marker with "
-                    "True whenever it runs — so it did not run on the tensor "
-                    "that reached train_step"
-                ),
-            )
-            return False
-
-        if kspace_scale is None:
-            self._warn_batch_reached_step_unnormalized(
-                current_step,
-                observed="published NEITHER a kspace_scale NOR a 'kspace_normalized' marker",
-                diagnosis=(
-                    "the transform publishes both, so a batch carrying neither "
-                    "was not produced by a chain containing it"
-                ),
-            )
-            return False
-
-        scale_tensor = (
-            kspace_scale if torch.is_tensor(kspace_scale) else torch.as_tensor(kspace_scale)
-        )
-        scale_float = scale_tensor.float()
-        if not torch.allclose(scale_float, torch.ones_like(scale_float)):
+        verdict = loader_normalization(batch_data, kspace_scale)
+        if verdict is LoaderNormalization.APPLIED:
             return True
-
+        observed, diagnosis = _UNNORMALIZED_EVIDENCE[verdict]
         self._warn_batch_reached_step_unnormalized(
-            current_step,
-            observed="published an IDENTITY kspace_scale (1.0) and no 'kspace_normalized' marker",
-            diagnosis=(
-                "an identity scale is the placeholder a dataset publishes to say "
-                "it served raw k-space; KSpaceNormalizationTransform overwrites "
-                "it with the scale it divided by, so it did not run"
-            ),
+            current_step, observed=observed, diagnosis=diagnosis
         )
         return False
 
@@ -1435,72 +1394,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             return result
 
         return super().q_sample(x_start, t, noise)
-
-    def _save_debug_snapshots(
-        self,
-        tensors: dict[str, torch.Tensor],
-        step: int,
-        extra: dict[str, Any] | None = None,
-    ) -> None:
-        """Save visual snapshots of tensors for debugging.
-
-        Delegates to the paradigm-agnostic
-        :meth:`BaseTrainingStrategy.save_debug_snapshot` so the same
-        textual / JSON / image-preview format is used across all
-        strategies. Tagged ``diffusion_step`` to distinguish from the
-        base class's ``first_steps`` auto-snapshot.
-
-        **Not the primary path any more.** ``_prepare_diffusion_inputs`` now
-        DECLARES its model input (``_declare_model_input``) and the wrapper
-        emits it, so a subclass overriding ``_compute_losses_impl`` cannot drop
-        the ``diffusion_step`` snapshot its ``first_steps`` artifact promises.
-        This method remains a valid way to satisfy that contract directly:
-        its tag equals ``snapshot_model_input_tag``, so
-        :meth:`BaseTrainingStrategy.save_debug_snapshot` marks the step's
-        model-input requirement met on the way through. Prefer declaring —
-        one emitter, and the wrapper owns the "did anything arrive" check.
-
-        Args:
-            tensors: Key -> tensor to capture.
-            step: Current training step.
-            extra: JSON-serialisable provenance recorded alongside the tensors
-                -- for the cold path, which tensor the forward process degraded.
-                The tag's snapshot is the only artifact showing the *degraded*
-                model input, so what it was derived from belongs in it.
-        """
-        try:
-            # Mark only the keys that genuinely contain k-space data. ``smaps``
-            # is image-domain even though its channels are real-stacked
-            # complex — see findings booklet 2026-05-05 VIS-1.
-            #
-            # That exclusion is necessary but not sufficient: ``model_input`` is
-            # ``cat([noisy_images, smaps])``, so keeping the standalone ``smaps``
-            # key out of the k-space set still leaves the SAME maps inside
-            # ``model_input`` being IFFT'd as if they were a spectrum.
-            # ``channel_segments`` splits that tensor back into its two domains
-            # for rendering; it returns ``{}`` when no maps were concatenated,
-            # so arms without smaps conditioning render exactly as before.
-            self.save_debug_snapshot(
-                tensors,
-                step=step,
-                tag="diffusion_step",
-                in_kspace_keys={
-                    "input",
-                    "target",
-                    "noisy_images",
-                    "noisy_kspace",
-                    "model_input",
-                },
-                channel_segments=self._model_input_channel_segments(tensors),
-                extra=extra,
-                # This tag equals ``snapshot_model_input_tag``, so this method
-                # satisfies the model-input contract on the way through and owes
-                # it the same naming the declaring path gives -- through the
-                # same rule, not a second copy of it (#697).
-                model_input_key=cold_model_input_key(tensors),
-            )
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Failed to save debug snapshot: {e}")
 
     def _adversarial_loss_computer(self):
         """The GAN loss computer used for the DISCRIMINATOR step only.
@@ -2131,41 +2024,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             acquired=acquired_plane,
         )
 
-        # The class declares ``snapshot_prepared_is_model_input = False`` and
-        # ``snapshot_model_input_tag = "diffusion_step"``, which obliges EVERY
-        # path through here to declare the tensor the network is actually fed
-        # (non-negotiable 14). Only one path did: the declaration in
-        # ``_prepare_diffusion_inputs`` sits inside
-        # ``if takes_coil_maps(self.config.model.model_type)``,
-        # so the promise was kept for one model family and broken for every
-        # other diffusion arm -- which then died on the contract check with
-        # "its _compute_losses_impl neither called _declare_model_input() nor
-        # emitted a snapshot tagged 'diffusion_step'".
-        #
-        # ``model_input`` is that tensor on the general path, and this is the
-        # last point before it reaches the network. Guarded on "nothing declared
-        # yet" rather than called unconditionally: the k-space branch has
-        # already declared a RICHER record (channel_segments for the
-        # [noisy_kspace || smaps] concat), and ``_declare_model_input`` is a
-        # plain overwrite, so an unconditional call here would silently discard
-        # it. The stash is reset per step by ``_compute_losses``, so this reads
-        # None on entry for every arm that did not take that branch.
-        if getattr(self, "_declared_model_input", None) is None:
-            # ``model_input_key`` is required, not decorative: the tag promises a
-            # reader "the real model input is in here", and the contract refuses to
-            # let them guess which tensor -- a guess is what let #1298's mislabel
-            # stand.
-            declared = {"model_input": model_input}
-            # The source contrast is concatenated inside the generator, so the
-            # snapshot names it beside the input it joins (non-negotiable 14).
-            if gen_kwargs.get("reference") is not None:
-                declared["kspace_source"] = gen_kwargs["reference"]
-            self._declare_model_input(
-                declared,
-                extra={"model_input_key": "model_input"},
-                in_kspace_keys={"kspace_source"} & declared.keys(),
-            )
-
         # STEP 3: Forward pass through generator
         predicted_output = self._forward_through_model(
             model_input=model_input,
@@ -2459,7 +2317,7 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             # Cadence check is INSIDE the guard: this snapshot is purely
             # diagnostic and must never perturb loss computation, even if
             # ``_cached_log_interval`` or the tensors are unexpected (tests/mocks).
-            _due_tags = self._output_snapshot_tags_due(current_step)
+            _due_tags = ("model_output_dc",) if snapshot_trace.is_active() else ()
             if _due_tags:
                 _dc_snap = self._build_output_snapshot(
                     hr_fakes_for_loss,
@@ -2472,7 +2330,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                 for _tag in _due_tags:
                     self.save_debug_snapshot(
                         _dc_snap,
-                        step=current_step,
                         # Its OWN tag, not "model_output" (#706, one level down).
                         # The budget is per-(run_dir, tag), and the base class's
                         # generic `model_output` emitter fires on EVERY early step
@@ -2514,13 +2371,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                             "timesteps": lambda: timesteps.detach().flatten().tolist(),
                             "realised_acceleration": lambda: self._snapshot_realised_acceleration(
                                 mask, acquired_plane
-                            ),
-                            # Only the validation-cadence tag is captured at a
-                            # validation step; the early tag is log-cadence.
-                            "snapshot_kind": (
-                                "train_step_at_val_cadence"
-                                if _tag == "model_output_dc_validation"
-                                else "train_step_at_log_cadence"
                             ),
                         },
                     )
@@ -3356,22 +3206,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
 
         return total_loss
 
-    def _output_snapshot_tags_due(self, step: int) -> tuple[str, ...]:
-        """Snapshot tags due at ``step``: the early cadence, then once per validation.
-
-        ``model_output_dc`` fires every ``log_interval // 10`` steps and spends its
-        8-call budget by step 4000 on the cohort, mid-curriculum, before the top
-        rungs train. ``model_output_dc_validation`` has its own budget and fires on
-        the validation steps, so the trained model's output is captured too.
-        """
-        tags: list[str] = []
-        if step % max(1, int(self._cached_log_interval) // 10) == 0:
-            tags.append("model_output_dc")
-        val_interval = int(getattr(self, "_cached_val_interval", 0) or 0)
-        if val_interval > 0 and step > 0 and step % val_interval == 0:
-            tags.append("model_output_dc_validation")
-        return tuple(tags)
-
     def _build_output_snapshot(
         self,
         hr_fakes_for_loss: torch.Tensor,
@@ -3477,7 +3311,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         multistep = bool(validation_cfg.sampling.enable_multistep_cold) if validation_cfg else False
         self.save_debug_snapshot(
             tensors,
-            step=resolve_loop_iteration(self),
             tag="cascade_val_8x",
             extra={
                 "acceleration": accel,
@@ -4458,35 +4291,10 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                     except Exception as e:
                         logger.warning(f"Failed to compute model_input stats: {e}")
 
-            # Declare the degraded tensor as THE model input. The wrapper
-            # (``BaseTrainingStrategy._compute_losses``) emits it under
-            # ``snapshot_model_input_tag`` -- the tag ``first_steps`` already
-            # points readers to. Declaring rather than emitting here is what
-            # closes the dangling pointer: this method is reachable only through
-            # ``_compute_losses_impl``, the hook seven subclasses override, so
-            # every one of them inherited the ``diffusion_step`` promise and
-            # emitted nothing at its target.
-            #
-            # When ``model_input`` is the concat ``[noisy_kspace || smaps]``,
-            # rendering it as a single k-space tensor produces a
-            # superposition of brain (iFFT of k-space half) + bright DC
-            # spike (iFFT of image-domain smaps half). Pass the parts as
-            # separate keys so the visualizer can apply the right
-            # transform to each. See findings booklet 2026-05-05 VIS-1.
-            #
-            # UNCONDITIONAL, and that is load-bearing. Two owners have gated this
-            # on a cadence: first ``self._cached_log_interval * 5`` -- i.e.
-            # ``logging.intervals.log``, a *logging* knob arms routinely set to
-            # 5000, which put this snapshot at step 25 000 and made it
-            # unreachable in every shorter run (#706's shape); then
-            # ``snapshot_step_is_due``, the RIGHT cadence but still a second
-            # gate. The wrapper's contract check is deliberately not
-            # step-dependent, so any cadence here makes the two disagree: under
-            # ``snapshots.interval_steps: 100`` this would declare on step 0 and
-            # the wrapper would raise on step 1 -- a violation manufactured by
-            # the gate. Cadence belongs to ``save_debug_snapshot`` alone, and a
-            # declaration is a dict of references plus a tensor view, so there is
-            # no per-step cost to avoid (non-negotiable 9).
+            # Name the degraded tensor and its parts for the snapshot; the
+            # ``[noisy_kspace || smaps]`` concat is split so each half renders in
+            # its own domain (findings booklet 2026-05-05 VIS-1). A no-op unless
+            # the snapshot schedule selected this step.
             snap: dict[str, torch.Tensor] = {
                 "noisy_kspace": noisy_images,
                 "target": target_batch,
@@ -8617,23 +8425,6 @@ class XDiffusionTrainingStrategy(BaseTrainingStrategy):
     # wrapped forward.
     parallel_compat = frozenset({"replicated"})
 
-    #: X-Diffusion noises the clean target inside the step
-    #: (``x_t = sqrt(a_bar) * x_0 + sqrt(1 - a_bar) * eps``), so
-    #: ``first_steps/input_prepared`` -- captured before the forward pass -- is
-    #: the source modality, not what the UNet receives.
-    #:
-    #: Stated explicitly because this class extends ``BaseTrainingStrategy``
-    #: rather than ``DiffusionTrainingStrategy``, so it inherited the ``True``
-    #: default despite running a textbook forward diffusion. Its own docstrings
-    #: describe the noising; the machine-readable flag contradicted them, which
-    #: is the half a reader of the artifact sees (non-negotiable 14).
-    snapshot_prepared_is_model_input: bool = False
-
-    #: Its own tag, not the parent's ``diffusion_step``: this class does not
-    #: share ``DiffusionTrainingStrategy``'s emission path, and the per-tag call
-    #: budget in ``save_debug_snapshot`` is keyed on ``(run_dir, tag)`` -- so a
-    #: borrowed name would also mean a borrowed allowance.
-    snapshot_model_input_tag: str | None = "xdiffusion_step"
 
     #: Loss ownership (issue #1918). Unlike its sibling this class does not use a
     #: loss computer: ``_compute_losses_impl`` iterates ``self.env.losses`` directly

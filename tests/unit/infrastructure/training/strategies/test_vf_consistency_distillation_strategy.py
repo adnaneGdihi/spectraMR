@@ -189,7 +189,7 @@ class _RecordingStudent(nn.Module):
         return self.conv(x)
 
 
-def test_declares_the_student_input_not_the_clean_target():
+def test_declares_the_student_input_not_the_clean_target(declared):
     strat, _ = _make_strategy(beta0=0.0)
     student = _RecordingStudent()
     strat.env = SimpleNamespace(generator=student)
@@ -197,8 +197,8 @@ def test_declares_the_student_input_not_the_clean_target():
 
     strat._compute_losses_impl(input_batch=batch)
 
-    assert strat._declared_model_input is not None
-    tensors, extra, in_kspace_keys = strat._declared_model_input
+    assert declared() is not None
+    tensors, extra, in_kspace_keys = declared()
 
     # The student is called first; that call is the one the contract binds to.
     assert torch.equal(tensors["model_input"], student.seen[0])
@@ -209,7 +209,7 @@ def test_declares_the_student_input_not_the_clean_target():
     assert in_kspace_keys == set(), "must be explicit, not None"
 
 
-def test_teacher_input_rides_alongside_and_differs_from_the_student_input():
+def test_teacher_input_rides_alongside_and_differs_from_the_student_input(declared):
     """A one-tensor snapshot cannot show the mechanism.
 
     Student and teacher get the SAME noise draw at two adjacent knots
@@ -225,7 +225,7 @@ def test_teacher_input_rides_alongside_and_differs_from_the_student_input():
     strat.env = SimpleNamespace(generator=student)
 
     strat._compute_losses_impl(input_batch=_batch())
-    tensors, _extra, _keys = strat._declared_model_input
+    tensors, _extra, _keys = declared()
 
     assert "teacher_input" in tensors
     assert not torch.equal(tensors["model_input"], tensors["teacher_input"]), (

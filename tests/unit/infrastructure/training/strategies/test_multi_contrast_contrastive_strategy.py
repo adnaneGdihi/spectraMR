@@ -60,7 +60,8 @@ class _ProjEncoder(nn.Module):
 def _config_with_block(mc_block: Any | None) -> SimpleNamespace:
     """A config exposing the nested SSOT ``training.ssl.multi_contrast_contrastive``."""
     ssl = SimpleNamespace(multi_contrast_contrastive=mc_block)
-    return SimpleNamespace(training=SimpleNamespace(ssl=ssl))
+    data = SimpleNamespace(multi_contrast=SimpleNamespace(negative_sampling="cross_volume"))
+    return SimpleNamespace(training=SimpleNamespace(ssl=ssl), data=data)
 
 
 def _block(
@@ -131,21 +132,19 @@ def test_symmetrize_without_momentum_actually_changes_loss() -> None:
     gen = _ProjEncoder()
 
     sym = _make_strategy(block=_block(symmetrize=True, use_momentum=False), generator=gen)
-    one = _make_strategy(
-        block=_block(symmetrize=False, use_momentum=False), generator=gen
-    )
+    one = _make_strategy(block=_block(symmetrize=False, use_momentum=False), generator=gen)
 
     torch.manual_seed(7)
     view_a = torch.randn(3, 4)
     view_b = torch.randn(3, 4)
     batch = {"view_a": view_a, "view_b": view_b}
 
-    loss_sym = sym._compute_losses_impl(
-        input_batch=None, target_batch=None, epoch=0, batch=batch
-    )["loss_total"]
-    loss_one = one._compute_losses_impl(
-        input_batch=None, target_batch=None, epoch=0, batch=batch
-    )["loss_total"]
+    loss_sym = sym._compute_losses_impl(input_batch=None, target_batch=None, epoch=0, batch=batch)[
+        "loss_total"
+    ]
+    loss_one = one._compute_losses_impl(input_batch=None, target_batch=None, epoch=0, batch=batch)[
+        "loss_total"
+    ]
 
     assert not torch.allclose(loss_sym, loss_one), (
         "symmetrize=True produced the same loss as the one-sided value — the "
@@ -164,9 +163,7 @@ def test_missing_view_a_raises_descriptive_error() -> None:
     batch = {"view_b": torch.randn(2, 4)}  # view_a missing
 
     with pytest.raises(RuntimeError, match=r"view_a"):
-        strat._compute_losses_impl(
-            input_batch=None, target_batch=None, epoch=0, batch=batch
-        )
+        strat._compute_losses_impl(input_batch=None, target_batch=None, epoch=0, batch=batch)
 
 
 def test_present_dict_missing_view_b_raises_naming_contract() -> None:
@@ -181,9 +178,7 @@ def test_present_dict_missing_view_b_raises_naming_contract() -> None:
     batch = {"view_a": torch.randn(2, 4)}  # view_b missing
 
     with pytest.raises(RuntimeError, match=r"co-registered contrast"):
-        strat._compute_losses_impl(
-            input_batch=None, target_batch=None, epoch=0, batch=batch
-        )
+        strat._compute_losses_impl(input_batch=None, target_batch=None, epoch=0, batch=batch)
 
 
 def test_empty_batch_raises_no_gen_none() -> None:
@@ -196,9 +191,7 @@ def test_empty_batch_raises_no_gen_none() -> None:
     strat = _make_strategy(generator=_ProjEncoder())
 
     with pytest.raises(RuntimeError, match=r"multi_contrast_contrastive"):
-        strat._compute_losses_impl(
-            input_batch=None, target_batch=None, epoch=0, batch={}
-        )
+        strat._compute_losses_impl(input_batch=None, target_batch=None, epoch=0, batch={})
 
 
 # ---------------------------------------------------------------------------
@@ -293,3 +286,81 @@ def test_a_saved_momentum_encoder_is_refused_when_momentum_is_off() -> None:
     resumed = _make_strategy(block=_block(use_momentum=False), generator=_ProjEncoder(seed=0))
     with pytest.raises(RuntimeError, match="_target_encoder"):
         resumed.load_strategy_state_dict(saved.strategy_state_dict())
+
+
+# ---------------------------------------------------------------------------
+# Negatives, real batches and validation (contrast_agnostic_encoder unit).
+# ---------------------------------------------------------------------------
+
+
+def _views_batch(b: int = 4, subjects=(0, 0, 1, 1)):
+    torch.manual_seed(3)
+    return {
+        "view_a": torch.randn(b, 4),
+        "view_b": torch.randn(b, 4),
+        "subject_index": torch.tensor(subjects),
+    }
+
+
+def test_cross_subject_masks_same_subject_negatives() -> None:
+    gen = _ProjEncoder()
+    cross_vol = _make_strategy(block=_block(use_momentum=False), generator=gen)
+    cross_subj = _make_strategy(block=_block(use_momentum=False), generator=gen)
+    cross_subj._negative_sampling = "cross_subject"
+    batch = _views_batch()
+    l_vol = cross_vol._compute_losses_impl(
+        input_batch=None, target_batch=None, epoch=0, batch=batch
+    )
+    l_subj = cross_subj._compute_losses_impl(
+        input_batch=None, target_batch=None, epoch=0, batch=batch
+    )
+    assert l_subj["loss_total"] < l_vol["loss_total"]  # fewer negatives, lower loss
+    same = cross_subj._same_subject(batch["subject_index"], 0)
+    assert same.tolist() == [
+        [False, True, False, False],
+        [True, False, False, False],
+        [False, False, False, True],
+        [False, False, True, False],
+    ]
+
+
+def test_cross_subject_without_subject_index_raises() -> None:
+    s = _make_strategy(block=_block(use_momentum=False), generator=_ProjEncoder())
+    s._negative_sampling = "cross_subject"
+    batch = {"view_a": torch.randn(2, 4), "view_b": torch.randn(2, 4)}
+    with pytest.raises(RuntimeError, match="subject_index"):
+        s._compute_losses_impl(input_batch=None, target_batch=None, epoch=0, batch=batch)
+
+
+def test_views_are_read_from_a_training_batch() -> None:
+    from spectramr.data.batch_types import BatchAdapter
+
+    s = _make_strategy(block=_block(use_momentum=False), generator=_ProjEncoder())
+    batch = BatchAdapter.from_dict(
+        {"input": torch.zeros(2, 4), "target": torch.zeros(2, 4), **_views_batch(2, (0, 1))}
+    )
+    out = s._compute_losses_impl(input_batch=None, target_batch=None, epoch=0, batch=batch)
+    assert torch.isfinite(out["loss_total"])
+
+
+def test_validation_reports_infonce_and_retrieval() -> None:
+    s = _make_strategy(block=_block(use_momentum=False), generator=_ProjEncoder())
+    batch = _views_batch(4, (0, 1, 2, 3))
+    batch["view_b"] = batch["view_a"].clone()  # identical views retrieve themselves
+    out = s.validation_step(None, None, batch_data=batch)
+    assert float(out["view_retrieval_top1"]) == 1.0
+    assert set(out) == set(MultiContrastContrastiveStrategy.capabilities.emitted_metrics)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync-debug mode needs a GPU")
+def test_the_masked_loss_does_not_sync_the_gpu() -> None:
+    s = _make_strategy(block=_block(use_momentum=False), generator=_ProjEncoder())
+    subj = torch.tensor([0, 0, 1, 1], device="cuda")
+    za, zb = torch.randn(4, 3, device="cuda"), torch.randn(4, 3, device="cuda")
+    s._info_nce(za, zb, 0.07, 0, s._same_subject(subj, 0))  # warm-up
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        s._info_nce(za, zb, 0.07, 0, s._same_subject(subj, 0))
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

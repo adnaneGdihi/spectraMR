@@ -126,9 +126,9 @@ class ConcreteDistillationStrategy(BaseTrainingStrategy):
             )
         return value
 
-    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
+    def _snapshot_context(self) -> dict[str, Any]:
         """Stamp what validation feeds the student into the snapshot provenance."""
-        extra = super()._first_steps_extra(epoch, batch=batch)
+        extra = super()._snapshot_context()
         extra["distillation"] = {"validation_input": self._validation_input}
         return extra
 

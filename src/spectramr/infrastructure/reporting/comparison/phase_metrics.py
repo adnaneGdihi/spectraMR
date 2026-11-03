@@ -20,6 +20,7 @@ from ..style import (
     colour_for,
     column_width,
     panel_label,
+    panel_letter,
     pretty_label,
     save_figure,
     use_default_style,
@@ -69,7 +70,7 @@ def _figure(chunk: list[str], table: pd.DataFrame, arms: list[str], colours: dic
         ax.set_ylabel(direction_label(metric))
         ax.set_title(pretty_label(metric), fontsize="x-small", loc="left")
         if len(chunk) > 1:
-            panel_label(ax, chr(ord("a") + i))
+            panel_label(ax, panel_letter(i))
     for j in range(len(chunk), rows_n * cols):
         axes[j // cols][j % cols].set_visible(False)
     handles = next((h for h in (a.get_legend_handles_labels() for a in axes.ravel()) if h[0]), None)

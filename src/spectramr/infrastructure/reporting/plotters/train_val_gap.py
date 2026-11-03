@@ -20,6 +20,7 @@ from spectramr.infrastructure.reporting.metadata import RunMetadata, stamp_figur
 from spectramr.infrastructure.reporting.style import (
     colour_for,
     panel_label,
+    panel_letter,
     pretty_label,
     save_figure,
     use_default_style,
@@ -102,7 +103,7 @@ def make(
         ax.set_title(pretty_label(base))
         ax.set_xlabel(pretty_label("step"))
         if n > 1:
-            panel_label(ax, chr(ord("a") + i))
+            panel_label(ax, panel_letter(i))
         sparse_ticks(ax)
     # colour names the metric; line style names the split
     shared_legend(

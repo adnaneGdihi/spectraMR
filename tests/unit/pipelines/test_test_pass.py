@@ -74,6 +74,7 @@ class _Strategy:
     def __init__(self):
         self._per_case_metric_sink = object()
         self._report_case_recorder = object()
+        self.snapshot_session = object()
         self.sinks_during = {}
 
 
@@ -90,9 +91,11 @@ def test_a_test_pass_writes_final_eval_and_leaves_the_report_sinks_as_it_found_t
 
     strategy, seen = _Strategy(), {}
     sink, recorder = strategy._per_case_metric_sink, strategy._report_case_recorder
+    session = strategy.snapshot_session
 
     class Loop(_Loop):
         def evaluate(self, **kw):
+            assert strategy.snapshot_session is None, "a test batch must not become a val snapshot"
             strategy.sinks_during = {
                 "sink": strategy._per_case_metric_sink,
                 "recorder": strategy._report_case_recorder,
@@ -118,6 +121,7 @@ def test_a_test_pass_writes_final_eval_and_leaves_the_report_sinks_as_it_found_t
     assert seen["split"] == "test"
     assert seen["sinks"] == {"sink": None, "recorder": None}
     assert (strategy._per_case_metric_sink, strategy._report_case_recorder) == (sink, recorder)
+    assert strategy.snapshot_session is session
     assert json.loads((tmp_path / "final_eval.json").read_text()) == {
         "psnr": {"s1/T1/f/0": 21.0, "s1/T1/f/1": 23.0}
     }

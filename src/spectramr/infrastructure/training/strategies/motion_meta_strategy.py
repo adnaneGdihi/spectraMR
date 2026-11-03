@@ -316,12 +316,15 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Run validation with fixed motion for reproducibility.
 
         Args:
             val_batch: Validation batch.
+            batch_data: The loader's batch, forwarded so the snapshot can read
+                its normalization markers.
             batch_idx: Batch index.
 
         Returns:
@@ -358,6 +361,7 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
                     input_batch=target,
                     target_batch=target,
                     step=batch_idx,
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(

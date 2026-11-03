@@ -188,3 +188,28 @@ def test_validation_scores_the_critic_in_the_domain_it_was_trained_on():
     out = s.validation_step(x, x.clone())
     assert seen == ["converted", "converted"]
     assert {"real_score", "fake_score"} <= out.keys()
+
+
+# --- vendor_aware_translation: the batch's ids reach the generator ------------
+
+
+def test_train_step_hands_a_conditioned_generator_the_batchs_ids(monkeypatch) -> None:
+    monkeypatch.setattr(gan_mod, "_resolve_disc_updates", lambda cfg, *, iteration: 1)
+
+    class _Gen(torch.nn.Module):
+        def forward(self, x, *, contrast_idx=None, vendor_id=None):
+            return x
+
+    strategy = object.__new__(GANTrainingStrategy)
+    strategy._step_counter = 0
+    strategy.config = MagicMock()
+    strategy.loop_state = LoopState(iteration=0)
+    strategy.env = MagicMock(generator=_Gen(), losses={})
+    strategy._to_device = lambda x: x
+    strategy._train_discriminator_step = lambda *a: (lambda: {})
+    strategy._train_generator_step = lambda *a: (lambda: {})
+    batch = {"vendor_id": torch.tensor([1, 0]), "contrast_idx": torch.tensor([0, 1])}
+    x = torch.zeros(2, 1, 8, 8)
+    strategy.train_step(batch, 0, input_batch=x, target_batch=x)
+    assert strategy._gen_conditioning["vendor_id"].tolist() == [1, 0]
+    assert strategy._gen_conditioning["contrast_idx"].tolist() == [0, 1]

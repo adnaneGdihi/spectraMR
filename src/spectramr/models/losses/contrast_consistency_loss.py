@@ -38,7 +38,7 @@ import torch.nn as nn
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.infrastructure.physics.relaxation_priors import (
     TissueClass,
-    bottomley_t1,
+    bottomley_t1_tensor,
 )
 from spectramr.models.losses.registry import register_loss
 
@@ -108,66 +108,52 @@ class ContrastConsistencyLoss(nn.Module):
 
     def forward(
         self,
-        predicted_t1_ms: torch.Tensor,
-        tissue_probabilities: torch.Tensor,
-        field_strength_T: float | torch.Tensor,  # noqa: N803 — unit suffix Tesla
+        pred: torch.Tensor,
+        target: torch.Tensor | None = None,
+        *,
+        aux_maps: dict[str, torch.Tensor] | None = None,
+        field_strength: torch.Tensor | None = None,
         **_: object,
     ) -> torch.Tensor:
-        r"""Compute the contrast-consistency loss.
+        r"""Compute the contrast-consistency loss from the model's auxiliary maps.
 
         Args:
-            predicted_t1_ms: ``[B, 1, H, W]`` predicted T1 in ms.
-            tissue_probabilities: ``[B, K, H, W]`` tissue probabilities.
-                ``K`` must equal ``len(self.tissue_order)``.
-            field_strength_T: scalar B0 in Tesla.
-
-        Returns:
-            Scalar loss tensor.
+            pred, target: the image pair every image loss receives; unused here.
+            aux_maps: the generator's ``t1_ms`` ``[B, 1, H, W]`` and
+                ``tissue_probabilities`` ``[B, K, H, W]`` from its last forward.
+            field_strength: ``[B]`` per-sample B0 in Tesla.
 
         Raises:
-            ValueError: shape / channel-count mismatches.
+            ValueError: a missing input or a shape / channel-count mismatch.
         """
+        del pred, target
+        if not aux_maps or "t1_ms" not in aux_maps or "tissue_probabilities" not in aux_maps:
+            raise ValueError(
+                "contrast_consistency needs the generator's aux_maps (t1_ms, "
+                "tissue_probabilities); the model must build its tissue heads"
+            )
+        if field_strength is None:
+            raise ValueError("contrast_consistency needs the batch's per-sample field_strength")
+        predicted_t1_ms, tissue_probabilities = aux_maps["t1_ms"], aux_maps["tissue_probabilities"]
         if predicted_t1_ms.dim() != 4 or predicted_t1_ms.shape[1] != 1:
+            raise ValueError(f"t1_ms must be [B, 1, H, W]; got {tuple(predicted_t1_ms.shape)}")
+        k = tissue_probabilities.shape[1]
+        if tissue_probabilities.dim() != 4 or len(self.tissue_order) != k:
             raise ValueError(
-                f"predicted_t1_ms must be [B, 1, H, W]; got {tuple(predicted_t1_ms.shape)}"
+                f"tissue_probabilities {tuple(tissue_probabilities.shape)} must be [B, "
+                f"{len(self.tissue_order)}, H, W] (one channel per tissue_order entry)"
             )
-        if tissue_probabilities.dim() != 4:
+        b0 = field_strength.reshape(-1).to(predicted_t1_ms)
+        if b0.shape[0] != predicted_t1_ms.shape[0]:
             raise ValueError(
-                f"tissue_probabilities must be 4-D; got {tuple(tissue_probabilities.shape)}"
+                f"{b0.shape[0]} field strengths for {predicted_t1_ms.shape[0]} samples"
             )
-        K = tissue_probabilities.shape[1]
-        if len(self.tissue_order) != K:
-            raise ValueError(
-                f"tissue_probabilities has {K} channels but tissue_order has "
-                f"{len(self.tissue_order)} entries — must match."
-            )
-
-        b0_value = (
-            float(field_strength_T.item())
-            if isinstance(field_strength_T, torch.Tensor)
-            else float(field_strength_T)
-        )
-        if b0_value <= 0:
-            raise ValueError(f"field_strength_T must be > 0; got {b0_value}")
-
-        # Build the per-class target T1 in ms.  Stored as a
-        # buffer-equivalent tensor on the same device / dtype.
-        targets = torch.tensor(
-            [bottomley_t1(b0_value, t) for t in self.tissue_order],
-            dtype=predicted_t1_ms.dtype,
-            device=predicted_t1_ms.device,
-        )  # [K]
-
-        # Squared error between prediction and each tissue's target,
-        # broadcast across spatial dims.
-        # predicted_t1_ms: [B, 1, H, W] → [B, K, H, W]
-        sq_err = (predicted_t1_ms - targets.view(1, K, 1, 1)) ** 2  # [B, K, H, W]
-
-        # Weight by tissue probability and aggregate.
+        # Per-sample, per-class Bottomley target [B, K]; no host read of B0.
+        targets = torch.stack([bottomley_t1_tensor(b0, t) for t in self.tissue_order], dim=1)
+        sq_err = (predicted_t1_ms - targets[:, :, None, None]) ** 2  # [B, K, H, W]
         weighted = sq_err * tissue_probabilities
         if self.reduction == "mean":
-            denom = tissue_probabilities.sum().clamp_min(1e-12)
-            penalty = weighted.sum() / denom
+            penalty = weighted.sum() / tissue_probabilities.sum().clamp_min(1e-12)
         else:
             penalty = weighted.sum()
         return self.weight * penalty

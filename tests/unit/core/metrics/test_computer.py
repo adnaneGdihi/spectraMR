@@ -625,3 +625,27 @@ def test_a_subset_call_narrows_last_not_applicable() -> None:
         "a subset call left the previous call's N/A record in place; if it is "
         "cleared (as here) it must run FIRST, not after the full compute"
     )
+
+
+def test_factory_reads_scoring_compute_from_a_training_config() -> None:
+    """A training config's ``.metrics`` schema block must not shadow ``validation.scoring``."""
+    from types import SimpleNamespace
+
+    from spectramr.core.metrics.computer import create_validation_metrics_computer
+
+    cfg = SimpleNamespace(
+        metrics=SimpleNamespace(compute=["mse"]),
+        validation=SimpleNamespace(scoring=SimpleNamespace(compute=["psnr", "ssim"], primary="ssim")),
+    )
+    comp = create_validation_metrics_computer(cfg)
+    assert comp.get_metric_names() == ["psnr", "ssim"]
+    assert comp.config.primary_metric == "ssim"
+
+
+def test_factory_refuses_a_metrics_attribute_that_names_nothing() -> None:
+    from types import SimpleNamespace
+
+    from spectramr.core.metrics.computer import create_validation_metrics_computer
+
+    with pytest.raises(TypeError, match="not a list or dict"):
+        create_validation_metrics_computer(SimpleNamespace(metrics=SimpleNamespace(compute=[])))

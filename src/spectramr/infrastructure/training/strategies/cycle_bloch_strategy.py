@@ -249,9 +249,9 @@ class CycleBlochStrategy(BaseTrainingStrategy):
         """_setup_strategy_specific_components."""
         pass
 
-    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
+    def _snapshot_context(self) -> dict[str, Any]:
         """Stamp the resolved backward operator and its sequence into the snapshot."""
-        extra = super()._first_steps_extra(epoch, batch=batch)
+        extra = super()._snapshot_context()
         extra["cycle_bloch"] = dict(self.cycle_bloch_provenance)
         generator = self.env.generator
         if isinstance(getattr(generator, "module", None), nn.Module):  # DDP-wrapped

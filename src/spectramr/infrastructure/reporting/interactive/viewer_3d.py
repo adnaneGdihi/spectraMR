@@ -18,10 +18,11 @@ import numpy as np
 from .plotly_util import (
     ERROR_SCALE,
     GRAY_SCALE,
-    apply_dark,
+    apply_theme,
     caption,
     has_plotly,
     image_axes,
+    seat_menus,
     to_div,
 )
 
@@ -135,7 +136,7 @@ def volume_viewer_3d_div(cases) -> str | None:
         for z in range(z_n)
     ]
 
-    apply_dark(fig, title=f"{title}  ·  slice {mid}", height=560)
+    apply_theme(fig, title=f"{title}  ·  slice {mid}", height=560)
     image_axes(fig, n_cols=1)
     fig.update_layout(
         sliders=[
@@ -155,8 +156,6 @@ def volume_viewer_3d_div(cases) -> str | None:
                 "showactive": True,
                 "x": 0.0,
                 "xanchor": "left",
-                "y": 1.12,
-                "yanchor": "top",
                 "buttons": [
                     {
                         "label": "Prediction",
@@ -177,6 +176,7 @@ def volume_viewer_3d_div(cases) -> str | None:
             }
         ],
     )
+    seat_menus(fig)
     body = to_div(fig, div_id="volume-3d")
     return body + caption(
         "Drag the slider to move through the volume's slices (the mosaic "

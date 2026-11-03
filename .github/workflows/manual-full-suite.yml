@@ -70,6 +70,8 @@ jobs:
     if: github.event_name == 'schedule' || inputs.only == 'all' || inputs.only == 'full-suite'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-env
         with:
           extras: dev
@@ -92,6 +94,8 @@ jobs:
     if: github.event_name == 'schedule' || inputs.only == 'all' || inputs.only == 'docs-strict'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-env
         with:
           extras: dev
@@ -114,6 +118,8 @@ jobs:
     if: github.event_name == 'schedule' || inputs.only == 'all' || inputs.only == 'supply-chain'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-env
         with:
           extras: dev
@@ -129,15 +135,16 @@ jobs:
       # at .github/actions/setup-env/action.yml is referenced by nine jobs
       # across both lanes and sits outside the narrower root, so the one tool
       # that would flag its unpinned `actions/setup-python@v5` has never seen
-      # it. --persona=pedantic because a finding here costs attention, not a
-      # blocked merge.
+      # it. The pedantic pass is printed for attention; only medium and above fail
+      # the job, since zizmor exits non-zero on any finding, informational ones too.
       #
       # osv-scanner and OpenSSF Scorecard were planned for this job and are
       # deferred to Phase 2: both add third-party actions immediately before the
       # pass that SHA-pins and audits every `uses:` ref, and Scorecard needs
       # `id-token: write` plus `security-events: write` -- two elevated
       # permissions and an outward-facing publish, which is a separate decision.
-      - run: uvx zizmor --persona=pedantic --format=plain .github/
+      - run: uvx zizmor --persona=pedantic --format=plain .github/ || true
+      - run: uvx zizmor --persona=pedantic --format=plain --min-severity=medium .github/
 
   link-check:
     name: docs links + paths
@@ -146,6 +153,8 @@ jobs:
     if: github.event_name == 'schedule' || inputs.only == 'all' || inputs.only == 'link-check'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup-env
         with:
           extras: dev

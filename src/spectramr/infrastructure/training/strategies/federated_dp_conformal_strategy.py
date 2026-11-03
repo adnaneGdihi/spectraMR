@@ -18,7 +18,8 @@ returns a surrogate loss whose gradient is the mean clipped gradient. The
 ``N(0, (noise_multiplier * max_grad_norm / batch_size)^2)`` noise and advances
 the accountant. The hook raises if the step did not go through the per-sample
 path, so the reported ``(epsilon, delta)`` always matches the applied mechanism.
-Site partitioning and federated aggregation are not part of this strategy.
+With ``training.federated_config`` it runs FedAvg / FedBN rounds with per-site DP
+(:mod:`.mixins.federated_rounds_mixin`).
 """
 
 from __future__ import annotations
@@ -38,12 +39,15 @@ from spectramr.infrastructure.services.privacy.per_sample_clipping import (
 )
 
 from .mixins.dp_mixin import DPMixin
+from .mixins.federated_rounds_mixin import FederatedRoundsMixin
 from .reconstruction import ReconstructionTrainingStrategy
 
 logger = logging.getLogger(__name__)
 
 
-class FederatedDPConformalULFStrategy(DPMixin, ReconstructionTrainingStrategy):
+class FederatedDPConformalULFStrategy(
+    FederatedRoundsMixin, DPMixin, ReconstructionTrainingStrategy
+):
     """Federated reconstruction with DP-SGD + post-hoc conformal."""
 
     # Resolved in _configure_from_settings; plain attrs since a strategy is not an nn.Module.

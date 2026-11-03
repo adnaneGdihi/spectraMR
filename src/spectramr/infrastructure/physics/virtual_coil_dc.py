@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import torch
 import torch.nn as nn
 
@@ -15,6 +17,9 @@ class VirtualCoilDataConsistency(nn.Module):
     x_DC^{(k)} = x^{(k-1)} - \alpha \\hat{S}_{\theta}^* \\odot \\mathcal{F}^H \\mathcal{P}^T
                  \\left( \\mathcal{P} \\mathcal{F} ( \\hat{S}_{\theta} \\odot x^{(k-1)} ) - y \right)
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self, init_alpha: float = 0.5):
         """__init__.

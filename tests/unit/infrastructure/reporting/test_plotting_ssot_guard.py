@@ -30,8 +30,6 @@ _ALLOWED_DIRS = (
 # Frozen baseline: pre-existing emitters left out of scope by the report-only
 # consolidation. New violations must NOT be added; these are migration candidates.
 _BASELINE: dict[str, str] = {
-    "infrastructure/orchestration/campaign_report_generator.py":
-        "campaign dashboards (fold-in candidate)",
     "models/analysis/operator_id_report.py":
         "operator-id figures in models/ (fold-in candidate)",
     "models/diffusion/noise_schedules.py":

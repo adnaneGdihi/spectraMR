@@ -186,3 +186,18 @@ class TestUnregisteredMethodsAreNotAllBlack:
         from spectramr.infrastructure.reporting.style import colour_for
 
         assert colour_for("cyclegan") == colour_for("cycle_gan")
+
+
+def test_panel_letters_continue_past_z_instead_of_into_punctuation():
+    from spectramr.infrastructure.reporting.style import panel_letter
+
+    assert [panel_letter(i) for i in (0, 25, 26, 27, 52, 701, 702)] == ["a", "z", "aa", "ab", "ba", "zz", "aaa"]
+
+
+def test_select_style_records_the_choice_without_touching_rcparams(monkeypatch):
+    monkeypatch.setattr(style_mod, "_ACTIVE_STYLE", "nature")
+    before = dict(mpl.rcParams)
+    style_mod.select_style("ieee")
+    assert dict(mpl.rcParams) == before and style_mod._ACTIVE_STYLE == "ieee"
+    with pytest.raises(ValueError, match="unknown report style"):
+        style_mod.select_style("sepia")

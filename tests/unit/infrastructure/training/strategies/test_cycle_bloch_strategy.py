@@ -257,7 +257,7 @@ def test_unknown_backward_model_raises(mock_env):
 
 def test_first_steps_snapshot_stamps_the_backward_model(mock_env):
     strat = _build(mock_env, _ulf_forward_cfg(), 0.064)
-    assert strat._first_steps_extra(0)["cycle_bloch"]["backward_model"] == "ulf_forward"
+    assert strat._snapshot_context()["cycle_bloch"]["backward_model"] == "ulf_forward"
 
 
 # ── losses.gan.gan_loss_type: the cycle_bloch critic ──────────────────────────
@@ -541,5 +541,5 @@ def test_the_pre_loss_target_chain_bridges_only_the_measured_input(strategy):
 
 def test_first_steps_snapshot_stamps_the_generator_sequence(strategy, mock_env):
     mock_env.generator.sequence_provenance = {"tr_ms": 2000.0, "te_ms": 100.0}
-    extra = strategy._first_steps_extra(0)["cycle_bloch"]
+    extra = strategy._snapshot_context()["cycle_bloch"]
     assert extra["generator_sequence"] == {"tr_ms": 2000.0, "te_ms": 100.0}

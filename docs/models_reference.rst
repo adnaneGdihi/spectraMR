@@ -1122,18 +1122,6 @@ Data Layer: Image Volume Utilities
 These helpers centralise the logic shared across TRELLIS dataset variants.
 
 
-Infrastructure: Reporting Tables
-==================================
-
-CertificateTable (``infrastructure.reporting.tables.certificate_table``)
-------------------------------------------------------------------------
-
-Builds a per-certificate summary table from a ``ValidationBadge`` JSON
-payload (``upstream_certificates`` key).  ``render_markdown`` and
-``render_latex`` produce ``.md`` / ``.tex`` side-by-side outputs.
-``write_certificate_table(badge_payload, out_dir)`` writes both files.
-
-
 Diffusion-Transformer Backbones (k-space adapted)
 =================================================
 

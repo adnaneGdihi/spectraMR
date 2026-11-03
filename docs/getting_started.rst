@@ -471,8 +471,8 @@ The run finishes with a summary line, and everything it produced lands under
 ``resolved_config.json``   the fully resolved configuration, as run
 ``provenance.json``        run id, seed, device, config hash, git state
 ``final_metrics.json``     the metric values the run ended on
-``debug_snapshots/``       input, prepared input and target for the first
-                           steps, so you can see what the model was fed
+``snapshots/``             every stage of the first steps, loader to model
+                           output, so you can see what the model was fed
 ``analysis/``              gradient logs
 ``report/``                written by ``spectramr report`` (below)
 =========================  ==================================================

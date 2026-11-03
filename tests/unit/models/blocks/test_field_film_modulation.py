@@ -34,10 +34,17 @@ def test_zero_num_channels_rejected() -> None:
         FieldFiLMBlock(num_channels=0, sequence_dim=4)
 
 
-def test_zero_sequence_dim_rejected() -> None:
-    """``sequence_dim < 1`` raises."""
+def test_negative_sequence_dim_rejected() -> None:
+    """``sequence_dim < 0`` raises."""
     with pytest.raises(ValueError, match="sequence_dim"):
-        FieldFiLMBlock(num_channels=4, sequence_dim=0)
+        FieldFiLMBlock(num_channels=4, sequence_dim=-1)
+
+
+def test_field_only_conditioning_takes_an_empty_sequence_vector() -> None:
+    """``sequence_dim=0``: B0 alone conditions; the caller passes ``[B, 0]``."""
+    block = FieldFiLMBlock(num_channels=4, sequence_dim=0)
+    gamma, beta = block(torch.tensor([0.064, 3.0]), torch.zeros(2, 0))
+    assert gamma.shape == beta.shape == (2, 4)
 
 
 # ---------------------------------------------------------------------------

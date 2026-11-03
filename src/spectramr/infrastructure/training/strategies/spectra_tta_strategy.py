@@ -15,10 +15,7 @@ cannot hold. Freezing the backbone collapses the gradient and moment terms from
 fits the inference datapath. The ``tta_adapter_only`` Tier-1 check enforces this
 at config time; this strategy enforces it at runtime via ``requires_grad``.
 
-This is a host/co-sim prototype of the paradigm (plan §D recommends prototyping
-TTA on host first, hardening to silicon only after the inference path is
-measured and stable). It composes with the SPECTRA inference backend
-(``backend_acceleration``) but does not require it to run.
+This is a host prototype of the paradigm.
 """
 
 from __future__ import annotations

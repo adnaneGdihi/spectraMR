@@ -20,9 +20,10 @@ from torch.cuda import OutOfMemoryError as CudaOutOfMemoryError
 # Type checking imports (avoid circular dependencies)
 if TYPE_CHECKING:
     from spectramr.domain.interfaces.service_interfaces import ILoggingService
-    from spectramr.infrastructure.training.debug_snapshot import ChannelSegment
+    from spectramr.core.snapshot_trace import ChannelSegment
 
 
+from spectramr.core import snapshot_trace
 from spectramr.infrastructure.builders.leaf.adapter_builders import apply_pre_model
 
 # Phase 2: Use frozen TrainingEnvironment from builders (SSOT)
@@ -211,33 +212,6 @@ class TrainingStepStrategy(ABC, MetricsMixin, BatchPreparationMixin, ValidationM
 # Mixins
 
 logger = logging.getLogger(__name__)
-
-
-def _first_tensor(output: Any) -> torch.Tensor | None:
-    """Extract the primary tensor from a model output and detach it.
-
-    Generators return a bare tensor, a tuple ``(recon, aux...)``, or a dict
-    (e.g. ``{"reconstruction": ...}`` from the disentangled / multi-head
-    models). The model-output debug snapshot only needs the principal
-    reconstruction, detached so it never pins the autograd graph across steps.
-    Returns ``None`` when no tensor is present (the caller then skips).
-    """
-    if isinstance(output, torch.Tensor):
-        return output.detach()
-    if isinstance(output, (tuple, list)):
-        for o in output:
-            if isinstance(o, torch.Tensor):
-                return o.detach()
-        return None
-    if isinstance(output, dict):
-        for key in ("reconstruction", "output", "prediction"):
-            v = output.get(key)
-            if isinstance(v, torch.Tensor):
-                return v.detach()
-        for v in output.values():
-            if isinstance(v, torch.Tensor):
-                return v.detach()
-    return None
 
 
 class BaseTrainingStrategy(
@@ -473,54 +447,6 @@ class BaseTrainingStrategy(
         self._owned_modules: dict[str, nn.Module] = {}
         self._owned_wrappers: dict[str, nn.Module] = {}
 
-        # Model-output debug-snapshot capture (parity with the pre-forward
-        # ``first_steps`` auto-snapshot). A lazily-registered forward hook on
-        # the generator stashes its latest output so ``_compute_losses`` can
-        # auto-emit a ``model_output`` snapshot for EVERY paradigm — closing
-        # the 2026-06-21 forensics "model output missing" gap for the field /
-        # VF / recon / GAN / VAE arms that previously emitted inputs only.
-        self._last_generator_output: torch.Tensor | None = None
-        self._capture_gen_output: bool = False
-        # Keyed by ``id(module)`` -> ``(module, handle)``, NOT a single handle:
-        # a strategy may own a generator that is not ``env.generator`` (cut /
-        # cyclegan / stargan_v2 all build their own when the env-built primary
-        # is an incompatible type), and one global handle meant whichever
-        # module armed first won forever. The module is stored beside its
-        # handle so the ``id()`` key cannot be recycled by a later allocation
-        # at the same address.
-        self._gen_output_hook_handles: dict[int, tuple[Any, Any]] = {}
-        self._model_output_snapshot_done: bool = False
-
-        # Model-INPUT declaration for strategies that degrade the prepared input
-        # further inside the step (``snapshot_prepared_is_model_input = False``).
-        # The wrapper cannot capture this itself: the tensor the model receives
-        # is built by each ``_compute_losses_impl`` and never leaves it -- flow
-        # matching's interpolant, EDM's preconditioned ``c_in * noised`` and
-        # ambient's corruption are different tensors from different math. So the
-        # impl hands it over and the wrapper emits it. See
-        # ``_snapshot_declared_model_input`` for the enforcement.
-        self._declared_model_input: (
-            tuple[dict[str, Any], dict[str, Any] | None, set[str] | None] | None
-        ) = None
-        # Channel-domain decomposition for the declared tensors, kept beside the
-        # triple above rather than inside it (sibling strategies' tests unpack
-        # that triple positionally).
-        self._declared_channel_segments: Mapping[str, Sequence[ChannelSegment]] | None = None
-        # Which of the declared tensors are ACTUALLY ``log1p``-compressed. Same
-        # sidecar treatment, same reason. ``None`` keeps the historical
-        # "every declared-k-space tensor is decompressed" default.
-        self._declared_log_scaled_keys: set[str] | None = None
-        self._declared_domain_exact: bool = False
-        self._model_input_snapshot_done: bool = False
-        # Backbone input width, resolved lazily and cached. The resolution walks
-        # ``modules()``, and the wrapper that needs it runs on EVERY step (the
-        # write gates live downstream, in the writer), so re-walking would put
-        # an O(len(modules)) loop in the training step for a diagnostic --
-        # non-negotiable 9. ``None`` here means "not looked up yet"; a genuine
-        # "could not be read" caches as ``(None, "unresolved")``, so a backbone
-        # whose width is unreadable is walked once, not once per step.
-        self._model_input_width: tuple[int | None, str] | None = None
-        self._model_input_contract_warned: bool = False
 
         # Initialize logging service (DI or from kwargs)
         if "logging_service" in kwargs:
@@ -870,288 +796,53 @@ class BaseTrainingStrategy(
         # to fabricate phase, so the tensor passes through unchanged.
         return target
 
+    #: The live snapshot session, set by the training loop; ``None`` when snapshots are off.
+    snapshot_session: Any = None
+    _snapshot_view_policy: Any = None
+
+    def _snapshot_views(self, names: Any, **kwargs: Any) -> dict[str, Any]:
+        """Rendering views for ``names`` under this run's domain facts (see ``ViewPolicy``)."""
+        if self._snapshot_view_policy is None:
+            from spectramr.infrastructure.training.snapshot.policy import ViewPolicy
+
+            self._snapshot_view_policy = ViewPolicy.from_config(self.config)
+        return self._snapshot_view_policy.views(names, **kwargs)
+
     @final
     def save_debug_snapshot(
         self,
         tensors: dict[str, Any],
         *,
-        step: int,
         tag: str = "train_step",
         extra: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
         in_kspace_keys: set[str] | None = None,
-        log_scaled_keys: set[str] | None = None,
+        log_scaled_keys: set[str] | Callable[[], set[str]] | None = None,
         channel_segments: Mapping[str, Sequence[ChannelSegment]] | None = None,
-        model_input_key: str | None = None,
         domain_exact: bool = False,
     ) -> None:
-        """Paradigm-agnostic per-step debug snapshot.
+        """Record named intermediates as one ``strategy/<tag>`` stage of the active snapshot.
 
-        Any strategy can call this from its ``_compute_losses_impl`` to
-        write a comprehensive textual + JSON + image-preview snapshot to
-        ``<run_dir>/debug_snapshots/`` for the first few training steps.
-        Gated on ``config.logging.snapshots.enabled`` (default True) and
-        capped by ``config.logging.snapshots.max_calls`` (default 8, per
-        ``(run_dir, tag)``) so disk usage stays bounded across paradigms.
-
-        See :mod:`spectramr.infrastructure.training.debug_snapshot` for the
-        full contract and rendering rules. The base class also auto-
-        calls this once at the first training step of every experiment
-        — strategies only need to call it explicitly to capture
-        paradigm-specific intermediate tensors.
-
-        ``extra`` may be a zero-arg callable (or a dict of them) when building
-        the values costs a device->host sync; it is then resolved only if a
-        write actually happens. See
-        :func:`~spectramr.infrastructure.training.debug_snapshot._resolve_deferred_extra`.
-
-        ``log_scaled_keys`` names the tensors that are actually ``log1p``-
-        compressed, for arms that set ``data.processing.enable_log_scaling``.
-        Pass it whenever a snapshot mixes domains — the two emitters in this
-        class both capture ``target``/``input`` as they entered ``train_step``,
-        i.e. BEFORE :meth:`apply_kspace_normalization` compresses them, so the
-        arm-level flag alone would have them decompressed with ``expm1`` and
-        rendered as a ringing phase-only artifact (#682's blind spot). Omitting
-        it keeps the historical all-keys behaviour, which is right for the
-        strategy-side emitters that capture only post-normalization tensors.
-
-        ``model_input_key`` names which of ``tensors`` the model is ACTUALLY fed.
-        Required when ``tag`` is this strategy's ``snapshot_model_input_tag``,
-        ignored on every other snapshot. A real parameter rather than one more
-        ``extra`` convention because ``extra`` may be a deferred callable:
-        reading a key out of it here would force the device sync the deferral
-        exists to avoid, so a contract built on ``extra`` could not be checked
-        on the self-emitting route -- which is precisely the route that produced
-        #1298. The five ``_declare_model_input`` sites keep writing it into their
-        (plain-dict) ``extra``; ``_snapshot_declared_model_input`` lifts it out
-        and forwards it here.
+        A no-op on every step the snapshot schedule did not select; the session owns
+        the step, and the forward hooks record the model input.
         """
-        try:
-            from spectramr.infrastructure.training.debug_snapshot import (
-                save_debug_snapshot,
-            )
-            from spectramr.infrastructure.training.utils.kspace_view import (
-                log_scaling_enabled,
-            )
-        except Exception as exc:
-            logger.debug("Debug snapshot helper unavailable: %s", exc)
+        if not snapshot_trace.is_active():
             return
-
-        # Resolve run dir (mirrors diffusion._save_debug_snapshots logic)
-        run_dir = (
-            getattr(self.env, "run_output_dir", None)
-            or getattr(self.config.training, "output_dir", None)
-            or "experiments/outputs"
+        if callable(log_scaled_keys):
+            log_scaled_keys = log_scaled_keys()
+        views = self._snapshot_views(
+            tensors,
+            in_kspace_keys=in_kspace_keys,
+            log_scaled_keys=log_scaled_keys,
+            segments=channel_segments,
+            domain_exact=domain_exact,
         )
-        logging_cfg = getattr(self.config, "logging", None)
-
-        # Mark which tensors carry k-space so the previewer IFFTs them for a
-        # human-readable image: when the config says the dataloader yields
-        # k-space, the canonical key names are UNIONed into the caller's set.
-        # ``model_output`` follows the model's declared output domain instead of
-        # the loader's, because an image-emitting network on a k-space loader
-        # (EI ``standard_unet``, SSDU ``unrolled_reconstruction``) otherwise has
-        # its image IFFT'd into a centred crosshair.
-        try:
-            from spectramr.infrastructure.training.utils.domain_inference import (
-                needs_ifft_for_visualization,
-            )
-
-            preds_are_kspace, targets_are_kspace = needs_ifft_for_visualization(self.config)
-        except Exception as exc:
-            logger.debug("first_steps in_kspace inference skipped: %s", exc)
-            preds_are_kspace = targets_are_kspace = False
-        # Keys whose k-space domain the config SSOT declares. The previewer IFFTs
-        # these unconditionally, bypassing a spectrum veto that false-negates on
-        # normalized multicoil M4Raw k-space, so nothing whose domain depends on
-        # the branch belongs here (``noisy_images`` can hold a diffusion latent).
-        authoritative_kspace_keys: set[str] = set()
-        # ``domain_exact`` makes the caller's ``in_kspace_keys`` the whole answer. The
-        # canonical union below assumes ``model_input`` lives in the target's domain,
-        # which an image network fed ``A^H y`` contradicts.
-        if targets_are_kspace and not domain_exact:
-            _canonical = {
-                "input",
-                "input_raw",
-                "input_prepared",
-                "target",
-                # Cold diffusion's ``cat([x_t, smaps])``; the emitter declares
-                # ``channel_segments`` so the image-domain maps are not IFFT'd.
-                "model_input",
-                "noisy_kspace",
-                "model_output_backbone",
-                "model_output_backbone_projected",
-                "model_output_pre_dc",
-                "model_output_post_dc",
-            }
-            if preds_are_kspace:
-                _canonical.add("model_output")
-            authoritative_kspace_keys = _canonical & set(tensors.keys())
-            if in_kspace_keys is None:
-                in_kspace_keys = set(tensors.keys())
-            else:
-                in_kspace_keys = set(in_kspace_keys) | authoritative_kspace_keys
-            if not preds_are_kspace:
-                # A declared image output is not left to the veto either: an
-                # untrained network's output has no DC peak and reads as k-space.
-                in_kspace_keys.discard("model_output")
-
-        # A strategy that emits its OWN model-output snapshot (diffusion's
-        # richer pre/post-DC capture, tagged ``model_output_dc``) marks the step
-        # done so the base wrapper's generic emission in
-        # ``_snapshot_model_output`` skips the duplicate. Prefix-matched rather
-        # than compared to one literal: the richer captures carry their own tag
-        # so they get their own per-tag call budget, and an exact match would
-        # have stopped suppressing the duplicate the moment they did.
-        if tag.startswith("model_output"):
-            self._model_output_snapshot_done = True
-
-        # Same idiom for the model-INPUT contract: a strategy that already emits
-        # its own snapshot under the tag it declares (VF's ``vf_twin``) satisfies
-        # ``_snapshot_declared_model_input`` here rather than declaring a second
-        # copy of the same tensors.
-        #
-        # Set on ATTEMPT, before the writer's gates -- exactly like the flag
-        # above. Setting it on a successful WRITE would make the per-(run_dir,
-        # tag) budget produce a false violation: once ``max_calls`` is spent the
-        # writer stops writing, the flag would stop being set, and the wrapper
-        # would raise at step ``max_calls + 1`` of a run that is behaving
-        # correctly. Invisible to a one-step unit test, fatal to a real run.
-        declared_tag = self.snapshot_model_input_tag
-        model_input_contract: dict[str, Any] | None = None
-        if declared_tag and tag == declared_tag:
-            self._model_input_snapshot_done = True
-            # Both routes into the model-input snapshot pass through here -- the
-            # declared one (``_snapshot_declared_model_input`` calls this
-            # method) and the self-emitting one that only sets the flag above.
-            # The self-emitting route is the one that mislabelled #1298, so a
-            # check placed on the declared branch alone would have missed it.
-            model_input_contract = self._verify_model_input_snapshot(
-                tensors=tensors, tag=tag, model_input_key=model_input_key
-            )
-
-        try:
-            save_debug_snapshot(
-                run_dir=run_dir,
-                step=step,
-                tag=tag,
-                tensors=tensors,
-                paradigm=type(self).__name__,
-                config_section=logging_cfg,
-                in_kspace_keys=in_kspace_keys,
-                authoritative_kspace_keys=authoritative_kspace_keys,
-                # The one place that can supply this: `debug_snapshot` receives
-                # `config.logging` and cannot reach `config.data`, so it had no
-                # way to know the k-space it was handed was log1p-compressed and
-                # IFFT'd it as-is (#682).
-                log_scaled=log_scaling_enabled(self.config),
-                log_scaled_keys=log_scaled_keys,
-                channel_segments=channel_segments,
-                extra=extra,
-                provenance=self._snapshot_provenance(self._snapshot_phase),
-                model_input_contract=model_input_contract,
-            )
-        except Exception as exc:
-            logger.debug("save_debug_snapshot raised: %s", exc)
-
-    def _verify_model_input_snapshot(
-        self, *, tensors: dict[str, Any], tag: str, model_input_key: str | None
-    ) -> dict[str, Any] | None:
-        """Check that the model-input snapshot describes the tensor the model got.
-
-        Two tiers, matching the static / artifact split
-        :meth:`_snapshot_declared_model_input` already draws:
-
-        * the NAMING half raises. A snapshot that does not say which of its
-          tensors is the model input, or that names one it does not carry, is
-          wrong before any batch is loaded, and it is the failure that let
-          #1298's mislabel read as a passing contract.
-        * the WIDTH half warns and stamps. Resolving a backbone's input width is
-          a heuristic (see
-          :func:`~spectramr.infrastructure.training.model_input_contract.resolve_model_in_channels`),
-          and a false positive here would abort a real run over a diagnostic.
-
-        The verdict goes into the artifact either way -- including
-        ``unresolved``. Non-negotiable 14 makes the declared-vs-applied
-        divergence *itself* the finding, and a check whose negative result is
-        only a log line is one clamped log level away from invisible (the
-        attention_shootout arms run at ``level: warning``).
-
-        Returns ``None`` only when the whole verification could not run, so the
-        writer omits the key rather than stamping a hollow one.
-        """
-        from spectramr.infrastructure.training.model_input_contract import (
-            STATUS_MISMATCH,
-            require_model_input_key,
-            resolve_model_in_channels,
-            verify_model_input,
+        snapshot_trace.record(
+            "strategy", tag, tensors, views=views, extra={"extra": extra} if callable(extra) else extra
         )
 
-        key = require_model_input_key(
-            strategy_name=type(self).__name__,
-            tag=tag,
-            tensors=tensors,
-            model_input_key=model_input_key,
-        )
-
-        if self._model_input_width is None:
-            try:
-                module = self.generator_model
-            except Exception as exc:  # a strategy whose env has no generator yet
-                logger.debug("model-input contract: generator unavailable: %s", exc)
-                module = None
-            self._model_input_width = resolve_model_in_channels(module)
-        in_channels, in_channels_source = self._model_input_width
-
-        try:
-            verdict = verify_model_input(
-                tensors=tensors,
-                model_input_key=key,
-                in_channels=in_channels,
-                in_channels_source=in_channels_source,
-            )
-        except Exception as exc:  # a diagnostic must never break a training step
-            logger.debug("model-input contract: verification skipped: %s", exc)
-            return None
-
-        if verdict.status == STATUS_MISMATCH and not self._model_input_contract_warned:
-            # Latched: this wrapper runs every step (the write budget lives
-            # downstream), so an unlatched warning would emit once per iteration
-            # for the whole run.
-            self._model_input_contract_warned = True
-            logger.warning(
-                "[model-input contract] %s snapshot %r: %s",
-                type(self).__name__,
-                tag,
-                verdict.detail,
-            )
-        return verdict.as_record()
-
-    #: Does ``first_steps/input_prepared`` hold the tensor the model is fed?
-    #: True for every strategy whose preparation finishes before the forward
-    #: pass. A strategy that transforms the prepared input FURTHER inside the
-    #: step (cold diffusion degrades it there) overrides this to False and
-    #: emits its own snapshot of the real model input -- see
-    #: ``docs/debug_snapshot_contract.rst``. A class attribute, not a config
-    #: knob: it states what the code does, so it is not the user's to set.
-    snapshot_prepared_is_model_input: bool = True
-
-    #: Where the real model input lives when the flag above is False. The
-    #: contract is only useful if the artifact says where to look instead;
-    #: "this is not the model input" alone sends the reader back to the code.
-    snapshot_model_input_tag: str | None = None
-
-    #: Channel-domain decomposition declared alongside the model input, for a
-    #: tensor whose channel axis superposes domains (cold diffusion's
-    #: ``model_input`` is ``cat([x_t, smaps], dim=1)``). A CLASS-level default so
-    #: it exists even on an instance whose ``__init__`` was bypassed -- the
-    #: emitter reads it unconditionally, and the strategy tests build doubles
-    #: that never run ``__init__``. Defaulting it here rather than reaching for a
-    #: ``getattr(..., None)`` at the read site keeps "absent" from becoming a
-    #: silent synonym for "declared nothing" in production code.
-    _declared_channel_segments: Mapping[str, Sequence[ChannelSegment]] | None = None
-    #: Companion to the above, defaulted here for the same reason.
-    _declared_log_scaled_keys: set[str] | None = None
-    _declared_domain_exact: bool = False
+    def _snapshot_context(self) -> dict[str, Any]:
+        """Strategy knobs stamped into every snapshot manifest; subclasses extend it."""
+        return {}
 
     def _snapshot_mask_pattern(self) -> str | None:
         """The pattern this strategy passes on each mask call, for the provenance.
@@ -1160,34 +851,6 @@ class BaseTrainingStrategy(
         strategy that names the pattern per call overrides this.
         """
         return None
-
-    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
-        """Context stamped on the ``first_steps`` snapshot.
-
-        States the canonical-key contract in the artifact itself:
-        ``input_prepared`` is captured BEFORE the forward pass, so for a
-        strategy that degrades further inside the step it is not the tensor the
-        model receives. Saying so — and naming where the real one is — is what
-        stops a reader concluding the arm was fed fully-sampled data (the
-        experiment_11 report that produced this contract).
-        """
-        prepared_is_input = bool(self.snapshot_prepared_is_model_input)
-        extra: dict[str, Any] = {
-            "epoch": int(epoch),
-            "prepared_equals_model_input": prepared_is_input,
-        }
-        if not prepared_is_input:
-            tag = self.snapshot_model_input_tag or "see strategy docs"
-            extra["model_input_snapshot_tag"] = tag
-        if batch is not None:
-            from spectramr.infrastructure.training.snapshot_provenance import (
-                realised_acceleration,
-            )
-
-            # Deferred: the writer resolves it only past its budget gate, so the
-            # host read never runs on a step that writes nothing (#2382).
-            extra["realised_acceleration"] = lambda: realised_acceleration(batch)
-        return extra
 
     def _snapshot_provenance(self, source: str = "train") -> dict[str, Any] | None:
         """Build the data-provenance record once PER SOURCE and reuse it.
@@ -1259,124 +922,17 @@ class BaseTrainingStrategy(
         finally:
             self._snapshot_phase = previous
 
-    def _ensure_generator_output_capture(self, module: Any = None) -> None:
-        """Register a forward hook on the generator that stashes its latest
-        output, enabling the paradigm-agnostic ``model_output`` snapshot in
-        :meth:`_compute_losses` and :meth:`_capture_model_output`.
-
-        The hook captures the REAL model output regardless of how each strategy
-        invokes the generator (``gen(x)`` for recon, ``gen(x, field_strength=…)``
-        for the field family, the digital-twin-stacked input for VF, …), so no
-        per-strategy wiring is needed. It only stashes while
-        ``self._capture_gen_output`` is set (the training forward inside
-        ``_compute_losses``), so validation / witness forwards are ignored.
-
-        Args:
-            module: The module whose forward to hook. ``None`` means the env's
-                primary ``env.generator``. A strategy that owns a generator
-                DIFFERENT from the env's must pass its own -- ``cut``
-                (``cut_strategy.py:117``), ``cyclegan``
-                (``cyclegan_strategy.py:158``) and ``stargan_v2``
-                (``stargan_v2_strategy.py:150``) each build their own whenever
-                the env-built primary is an incompatible type, and hooking
-                ``env.generator`` for those installs the hook on a module the
-                strategy never forwards: a snapshot that is wired and can still
-                never fire (pitfall #16).
-
-        Registration is guarded PER MODULE. The previous single
-        ``_gen_output_hook_handle`` meant whichever module armed first won
-        forever, so the explicit ``module`` above would have been silently
-        ignored for any strategy whose base ``__init__`` path armed the env
-        generator first.
-
-        No raise when there is nothing to hook: silence is this method's
-        pre-existing contract (a mock-fed strategy has no hookable module), and
-        every wired call site passes a concrete one.
-        """
-        handles = getattr(self, "_gen_output_hook_handles", None)
-        if handles is None:
-            handles = {}
-            self._gen_output_hook_handles = handles
-        gen = module if module is not None else getattr(self.env, "generator", None)
-        if gen is None or not hasattr(gen, "register_forward_hook"):
-            return
-        if id(gen) in handles:
-            return
-
-        def _hook(_module: Any, _inputs: Any, output: Any) -> None:
-            if getattr(self, "_capture_gen_output", False):
-                self._last_generator_output = _first_tensor(output)
-
-        try:
-            handles[id(gen)] = (gen, gen.register_forward_hook(_hook))
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("generator-output hook registration skipped: %s", exc)
-
     @contextmanager
-    def _capture_model_output(
-        self,
-        *,
-        module: Any,
-        input_batch: Any,
-        target_batch: Any,
-        step: int = 0,
-    ) -> Iterator[None]:
-        """Arm the ``model_output`` capture around a forward, and emit on exit.
+    def _capture_model_output(self, *, module: Any = None, **_unused: Any) -> Iterator[None]:
+        """Hook a strategy-owned ``module`` the environment does not hold.
 
-        :meth:`_compute_losses` is the wrapper that normally does this, but 13
-        call sites invoke ``_compute_losses_impl`` DIRECTLY -- a custom
-        ``train_step`` that needs the losses inside an optimizer closure, or a
-        ``validation_step`` reusing the training loss. Those bypass the wrapper
-        and so never reached :meth:`_snapshot_model_output` at all (#1190).
-        This is the wrapper's snapshot half, extracted so both paths reach it
-        through ONE mechanism instead of two divergent copies (non-negotiable 6).
-
-        Deliberately NOT included here, because the bypass sites already have
-        both and duplicating them would change behaviour:
-
-        * **AMP.** ``StepExecutor.execute_step`` enters
-          ``amp_helper.get_autocast_context()`` around every closure it runs
-          (``step_executor.py``), so a train-path bypass is already inside
-          autocast.
-        * **Total-loss key normalization.** Every bypass site reads
-          ``losses["g_total_loss"]`` itself.
-
-        Args:
-            module: The module that produces the model output. REQUIRED and
-                explicit -- pass ``None`` only to mean "the env's primary
-                generator". See :meth:`_ensure_generator_output_capture` for why
-                defaulting would make this a no-op for exactly the strategies
-                that own their generator.
-            input_batch: Batch as it entered the step, for the snapshot's
-                ``input`` row.
-            target_batch: Ground truth, for the snapshot's ``target`` row.
-            step: Training iteration the snapshot is stamped with.
-
-        Arm TIGHTLY around the forward that produces the model output. The
-        adversarial strategies also run the GENERATOR inside their discriminator
-        closure to make fakes (``cut_strategy.py``, ``cyclegan_strategy.py``,
-        ``stargan_v2_strategy.py`` -- all under ``torch.no_grad()``); a flag left
-        armed across the whole step would let that no-grad pass overwrite the
-        stash, and the snapshot would show D's fake rather than G's output.
-
-        :meth:`_ensure_input_contract_guard` is deliberately NOT called here even
-        though :meth:`_compute_losses` installs it alongside this capture. That
-        guard is the TRAINING dimension contract and can raise under
-        ``SPECTRAMR_DIMENSION_CONTRACT=enforce``; installing it from here would
-        extend it to the seven validation paths, which is a runtime behaviour
-        change well outside a snapshot-coverage fix. It stays in the wrapper.
+        The session hooks every ``env.models`` entry; cut, cyclegan and stargan_v2
+        build their own generator when the env-built one is the wrong type, and
+        register it here so its calls are recorded too.
         """
-        self._ensure_generator_output_capture(module=module)
-        self._model_output_snapshot_done = False
-        self._capture_gen_output = True
-        try:
-            yield
-        finally:
-            self._capture_gen_output = False
-        # After the try/finally, NOT inside it: an exception escaping the body
-        # must propagate without emitting a snapshot of a forward that never
-        # completed. Same ordering as :meth:`_compute_losses`.
-        self._snapshot_model_output(input_batch=input_batch, target_batch=target_batch, step=step)
+        if module is not None and self.snapshot_session is not None:
+            self.snapshot_session.hooks.attach(type(module).__name__, module)
+        yield
 
     def _ensure_input_contract_guard(self) -> None:
         """Install a forward PRE-hook enforcing the model's declared dimension
@@ -1446,238 +1002,33 @@ class BaseTrainingStrategy(
         log_scaled_keys: set[str] | None = None,
         domain_exact: bool = False,
     ) -> None:
-        """Hand the wrapper the tensor the model is ACTUALLY fed.
+        """Record the strategy's own names for the input it built, with how they render.
 
-        For a strategy that sets ``snapshot_prepared_is_model_input = False``,
-        the ``first_steps`` snapshot's ``input_prepared`` is captured before the
-        forward pass and so is *not* the model input. This declares the real
-        one; :meth:`_snapshot_declared_model_input` emits it under
-        ``snapshot_model_input_tag`` -- the tag ``first_steps`` already points
-        readers to.
-
-        Call it from ``_compute_losses_impl`` at the point the model input
-        exists, UNCONDITIONALLY. There is deliberately no cadence check here:
-        the stash is a dict-of-references assignment (non-negotiable 9 -- no
-        copy, no device sync), and ``save_debug_snapshot`` is the single
-        authority on enabled/interval/budget. A second gate at the call site is
-        precisely how #706 and the ``intervals.log * 5`` mis-gating happened.
-
-        Args:
-            tensors: Key -> tensor. Name each key for what the tensor IS: the
-                names drive the previewer's domain inference and are what a
-                reader concludes from the rendered PNG.
-            extra: JSON-serialisable provenance stamped into the snapshot.
-            channel_segments: For a key whose channel axis superposes domains,
-                its ``[(label, width, is_kspace[, log_compressed]), ...]``
-                decomposition. See
-                :func:`~spectramr.infrastructure.training.debug_snapshot.save_debug_snapshot`.
-            in_kspace_keys: Which keys hold k-space, so the previewer IFFTs
-                them. Pass it EXPLICITLY -- ``None`` falls back to a ``"kspace"``
-                substring match over key names, which mis-renders an
-                image-domain tensor that borrowed a k-space name (findings
-                booklet 2026-05-05 VIS-1). An empty set is a valid, explicit
-                "none of these are k-space".
-            log_scaled_keys: Which keys are ACTUALLY ``log1p``-compressed, for
-                the arms where the compression is on. ``None`` keeps the
-                historical "every declared-k-space key is decompressed", which
-                is right only when every tensor in ``tensors`` was captured
-                post-normalization. Pass it explicitly as soon as one is not --
-                a key that is k-space but uncompressed (cold diffusion's
-                ``fft2c``'d S-maps) gets ``expm1`` applied to a spectrum that
-                never saw ``log1p``, which flattens every bin above
-                ``DECOMPRESS_MAGNITUDE_CEILING`` onto one value.
-            domain_exact: Treat ``in_kspace_keys`` as complete, skipping the
-                canonical-key union. Set it when ``model_input`` is declared
-                image-domain on a k-space loader (an image network fed ``A^H y``);
-                the union would otherwise IFFT it into a single central pixel.
+        The forward hooks already record what the model received. This adds the
+        strategy's view of it -- for a channel-superposed ``model_input`` (cold
+        diffusion's ``cat([x_t, smaps_k])``) the split that renders each half in its
+        own domain -- and hands that view to the hooks for the same tensor.
         """
-        self._declared_model_input = (tensors, extra, in_kspace_keys)
-        self._declared_domain_exact = domain_exact
-        # Deliberately NOT a fourth tuple slot: several strategies' tests
-        # unpack this triple positionally, so widening it breaks modules
-        # whose own paired test never runs here. Set and cleared in lockstep
-        # with the triple below.
-        self._declared_channel_segments = channel_segments
-        self._declared_log_scaled_keys = log_scaled_keys
-
-    def _snapshot_declared_model_input(self, *, step: int) -> None:
-        """Emit the declared model input, or RAISE when the declaration is absent.
-
-        This is what makes non-negotiable 14's carve-out structural instead of a
-        convention. ``snapshot_prepared_is_model_input = False`` is a *pointer*:
-        it tells whoever reads a ``first_steps`` artifact "the real model input
-        is under <tag>". Nothing used to check that the target existed -- and it
-        did not. ``DiffusionTrainingStrategy`` declares ``diffusion_step``, but
-        the sole emitter sat in ``_prepare_diffusion_inputs``, reachable only
-        through ``diffusion._compute_losses_impl`` -- the hook seven subclasses
-        override. Each inherited the pointer and emitted nothing at its target,
-        so the artifact named a tag that was never written.
-
-        Lives in the WRAPPER rather than the overridable hook for exactly that
-        reason: a subclass cannot silently drop what it does not implement.
-
-        Two checks with deliberately different scopes:
-
-        * ``tag`` unset while the carve-out is declared is a STATIC defect in
-          the class -- wrong before any run starts -- so it raises regardless of
-          config.
-        * A missing declaration is an ARTIFACT defect, so it is enforced on the
-          runs that write artifacts. With snapshots disabled no ``first_steps``
-          record makes the claim, so there is nothing to contradict. That gate
-          reads ``enabled`` ONLY, never a step-dependent predicate -- see
-          :func:`~spectramr.infrastructure.training.debug_snapshot.snapshots_are_enabled`.
-
-        Raises rather than skipping quietly per non-negotiable 3: a silent skip
-        is the exact failure mode this method exists to close.
-        """
-        if self.snapshot_prepared_is_model_input:
-            return  # No carve-out -- ``first_steps/input_prepared`` IS the input.
-
-        declared = self._declared_model_input
-        # Read the sidecar BEFORE clearing it -- it is consumed further down.
-        declared_segments = self._declared_channel_segments
-        declared_log_keys = self._declared_log_scaled_keys
-        declared_domain_exact = getattr(self, "_declared_domain_exact", False)
-        self._declared_model_input = None  # Never pin one step's tensors.
-        self._declared_channel_segments = None
-        self._declared_log_scaled_keys = None
-        self._declared_domain_exact = False
-
-        tag = self.snapshot_model_input_tag
-        if not tag:
-            raise ValueError(
-                f"{type(self).__name__} sets snapshot_prepared_is_model_input="
-                "False but leaves snapshot_model_input_tag unset. The flag tells"
-                " a reader that 'input_prepared' is not the model input; without"
-                " a tag it does not say where the real one is, which sends them"
-                " back to the code (non-negotiable 14). Set both, or neither."
-            )
-
-        from spectramr.infrastructure.training.debug_snapshot import (
-            snapshots_are_enabled,
+        trace = snapshot_trace.current()
+        if trace is None:
+            return
+        views = self._snapshot_views(
+            tensors,
+            in_kspace_keys=in_kspace_keys,
+            log_scaled_keys=log_scaled_keys,
+            segments=channel_segments,
+            domain_exact=domain_exact,
         )
-
-        if not snapshots_are_enabled(getattr(self.config, "logging", None)):
-            return
-
-        if declared is not None:
-            tensors, extra, in_kspace_keys = declared
-            channel_segments = declared_segments
-            log_scaled_keys = declared_log_keys
-            # ``extra`` is a plain dict on this route by construction (the five
-            # declare sites pass dict literals), so the key can be lifted out of
-            # it here and handed to the wrapper as a real parameter. That keeps
-            # the declaration where its five callers already write it while
-            # giving the wrapper something it can also demand of the deferred,
-            # self-emitting route.
-            self.save_debug_snapshot(
-                tensors,
-                step=step,
-                tag=tag,
-                extra=extra,
-                in_kspace_keys=in_kspace_keys,
-                channel_segments=channel_segments,
-                log_scaled_keys=log_scaled_keys,
-                model_input_key=(
-                    extra.get("model_input_key") if isinstance(extra, Mapping) else None
-                ),
-                domain_exact=declared_domain_exact,
-            )
-            return
-
-        if self._model_input_snapshot_done:
-            return  # The strategy emitted under ``tag`` itself.
-
-        raise RuntimeError(
-            f"{type(self).__name__} declares snapshot_prepared_is_model_input="
-            f"False and snapshot_model_input_tag={tag!r}, but its "
-            "_compute_losses_impl neither called _declare_model_input() nor "
-            f"emitted a snapshot tagged {tag!r}. The 'first_steps' artifact "
-            f"therefore points at a {tag!r} snapshot that does not exist. "
-            "Declare the tensor the model is fed at the point it is built:\n"
-            "    self._declare_model_input({'<name>': <tensor>}, "
-            "in_kspace_keys=set())\n"
-            "If this strategy does NOT degrade its input inside the step, drop "
-            "the two class attributes instead and let the base contract stand."
+        if "model_input" in views:
+            trace.model_views["input"] = views["model_input"]
+        snapshot_trace.record(
+            "strategy",
+            "model_input",
+            tensors,
+            views=views,
+            params={"in_kspace_keys": None if in_kspace_keys is None else sorted(in_kspace_keys)},
+            extra=extra,
         )
-
-    def _snapshot_model_output(self, *, input_batch: Any, target_batch: Any, step: int) -> None:
-        """Emit a ``model_output`` snapshot from the hooked generator output.
-
-        Skipped when the strategy already emitted its own ``model_output``
-        snapshot this step (``_model_output_snapshot_done``) or when no output
-        was captured. Always clears the stash so a forward's output is never
-        pinned across training steps.
-        """
-        out = getattr(self, "_last_generator_output", None)
-        self._last_generator_output = None
-        if out is None or getattr(self, "_model_output_snapshot_done", False):
-            return
-        try:
-            self.save_debug_snapshot(
-                {"model_output": out, "target": target_batch, "input": input_batch},
-                step=step,
-                tag="model_output",
-                # Only the generator's output is in network units (compressed
-                # when the arm log-scales). ``target``/``input`` are the batch as
-                # it entered ``train_step`` -- pre-normalization, so physical.
-                # The same split the scale-context note below describes.
-                log_scaled_keys={"model_output"},
-                # DEFERRED, not called here: `_model_output_scale_context` does
-                # two `float(tensor)` device->host syncs, and this method runs
-                # once per training step for every strategy routed through
-                # `_compute_losses`. Building it eagerly paid both syncs on
-                # every step while the budget only suppressed the WRITE -- the
-                # same shape as #1188's `vf_twin` defect, in the base emitter.
-                extra=lambda: self._model_output_scale_context(out, target_batch),
-            )
-        except Exception as exc:  # pragma: no cover - never break training
-            logger.debug("model_output auto-snapshot skipped: %s", exc)
-
-    @staticmethod
-    def _model_output_scale_context(model_output: Any, target_batch: Any) -> dict[str, Any]:
-        """Describe the SCALE each row of the model_output snapshot lives on.
-
-        This fallback snapshot pairs the generator's raw output — network units,
-        i.e. whatever space the model was handed — with ``target``/``input`` as
-        they entered ``train_step``, BEFORE any normalization the strategy
-        applies internally (``_prepare_diffusion_inputs`` normalizes when the
-        batch carries no ``kspace_scale``). The two can therefore sit on
-        different scales in adjacent rows of the same stats table.
-
-        Read at face value that manufactures an alarming mismatch. On exp_11
-        attention_none it showed ``model_output`` at abs_max 3.8 against a
-        ``target`` at 2401 — a 630x gap that reads as a broken model, when in
-        fact ``expm1(4.707) * 22.207 = 2435``: the target was simply displayed
-        in physical units while the output stayed log-compressed. The loss
-        itself compares like with like. Issue #587.
-
-        Emitting the ratio makes the table state this rather than imply the
-        reader will notice.
-        """
-        context: dict[str, Any] = {
-            "model_output_scale": "generator output (network units)",
-            "target_input_scale": "batch as received by train_step (pre-strategy-normalization)",
-        }
-        try:
-            out_max = float(model_output.detach().abs().max())
-            tgt_max = float(target_batch.detach().abs().max())
-        except Exception:  # pragma: no cover - defensive, never break training
-            return context
-        context["abs_max_model_output"] = out_max
-        context["abs_max_target"] = tgt_max
-        if out_max > 0.0 and tgt_max > 0.0:
-            ratio = max(out_max, tgt_max) / min(out_max, tgt_max)
-            context["abs_max_ratio"] = round(ratio, 2)
-            if ratio > 10.0:
-                context["scale_warning"] = (
-                    f"model_output and target differ by {ratio:.0f}x in peak magnitude. "
-                    "These rows are NOT on a common scale — compare them only after "
-                    "putting both in the same space. This is expected when the "
-                    "strategy normalizes internally (#587), and is NOT by itself "
-                    "evidence of a model or loss defect."
-                )
-        return context
 
     def train_step(
         self,
@@ -1693,13 +1044,8 @@ class BaseTrainingStrategy(
         Subclasses should typically override `_compute_losses_impl`.
 
         Note:
-            For every paradigm, the base class writes a per-experiment
-            debug snapshot at the first few training steps via
-            :meth:`save_debug_snapshot`. This generalises the
-            diffusion-only ``_save_debug_snapshots`` mechanism so the
-            same diagnostics (shape/dtype/range/NaN-count + IFFT-aware
-            image previews) are produced for GAN / VAE / recon / SSL /
-            cycle-Bloch / disentangled / etc. experiments.
+            On a snapshot step it records ``prepare/input_prepared``; the session
+            records the batch and the forward hooks the model input and output.
         """
         # Unpack batch if lr/hr not provided
         if input_batch is None or target_batch is None:
@@ -1823,37 +1169,19 @@ class BaseTrainingStrategy(
                         "Cannot reconcile shape for loss computation."
                     )
 
-        # ── Auto debug-snapshot at the first few training steps ──────
-        # Captures (input, prepared_input, target) for every paradigm so
-        # the same diagnostics (shape/dtype/range/NaN/IFFT-preview) are
-        # produced for GAN / VAE / recon / SSL / cycle-Bloch / etc.
-        # Strategies may also call self.save_debug_snapshot directly to
-        # capture paradigm-specific intermediates (e.g. noisy_images
-        # for diffusion).
-        try:
-            current_step = int(kwargs.get("iteration", 0) or 0)
-            self.save_debug_snapshot(
-                {
-                    "input_raw": input_batch,
-                    "input_prepared": input_batch_prepared,
-                    "target": target_batch,
-                },
-                step=current_step,
-                tag="first_steps",
-                # Every tensor here is the batch as the dataloader delivered it,
-                # captured before any strategy-side normalization -- so none of
-                # them is log-compressed, whatever the arm declares.
-                log_scaled_keys=set(),
-                # The canonical-key contract, stated in the artifact itself.
-                # ``input_prepared`` is captured BEFORE the forward pass, so for
-                # a strategy that degrades further inside the step it is NOT the
-                # tensor the model receives; saying so here is what stops a
-                # reader concluding the arm was fed fully-sampled data (the
-                # experiment_11 report that produced this contract).
-                extra=self._first_steps_extra(epoch, batch=batch),
+        if snapshot_trace.is_active():
+            from spectramr.infrastructure.training.snapshot.session import loader_compressed
+
+            prepared = {"input_prepared": input_batch_prepared, "target": target_batch}
+            snapshot_trace.record(
+                "prepare",
+                "input_prepared",
+                prepared,
+                views=self._snapshot_views(
+                    prepared, log_scaled_keys=loader_compressed(batch, set(prepared))
+                ),
+                params={"epoch": int(epoch)},
             )
-        except Exception as _exc:
-            logger.debug("Auto debug-snapshot skipped: %s", _exc)
 
         # Build closure that performs the forward pass and loss computation
         def g_closure() -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -2323,78 +1651,38 @@ class BaseTrainingStrategy(
         for _dup in ("input_batch", "target_batch", "epoch"):
             kwargs.pop(_dup, None)
 
-        # Capture the generator output for the paradigm-agnostic ``model_output``
-        # snapshot (parity with the pre-forward ``first_steps`` auto-snapshot),
-        # and auto-emit it on exit -- budget-capped by
-        # ``logging.snapshots.max_calls``, and suppressed when the strategy
-        # already emitted its own richer ``model_output`` snapshot during the
-        # forward. ``module=None`` keeps this path on ``env.generator``, which is
-        # what it has always hooked; the 13 sites that bypass this wrapper enter
-        # the SAME context manager with their own module (#1190).
-        #
-        # The total-loss normalization below sits INSIDE the block so a missing
-        # key still raises before any snapshot is written -- the emit is placed
-        # after the manager's try/finally, so an exception escaping here skips it.
-        #
-        # The dimension-contract guard stays HERE rather than inside the context
-        # manager: it is the training contract, and it can raise under
-        # ``enforce``. Installing it from the shared manager would silently apply
-        # it to the seven validation paths that manager also serves.
+        # The training dimension contract; it can raise under ``enforce``, so it is
+        # installed here and not on the validation paths.
         self._ensure_input_contract_guard()
-        # The model-INPUT contract's per-step resets. `_capture_model_output`
-        # below owns the model-OUTPUT half (`_model_output_snapshot_done`,
-        # `_capture_gen_output`) since #1190, so only the input flags are set
-        # here. Both the declaration and the "the strategy emitted it itself"
-        # flag are per-step: a stale value from the previous step must never
-        # satisfy this step's check.
-        self._model_input_snapshot_done = False
-        self._declared_model_input = None
-        self._declared_channel_segments = None
-        self._declared_log_scaled_keys = None
-        self._declared_domain_exact = False
-        with self._capture_model_output(
-            module=None,
-            input_batch=input_batch,
-            target_batch=target_batch,
-            step=int(kwargs.get("iteration", 0) or 0),
-        ):
-            with self.amp_helper.get_autocast_context():
-                losses = self._compute_losses_impl(
-                    input_batch=input_batch,
-                    target_batch=target_batch,
-                    epoch=epoch,
-                    **kwargs,
+        with self.amp_helper.get_autocast_context():
+            losses = self._compute_losses_impl(
+                input_batch=input_batch,
+                target_batch=target_batch,
+                epoch=epoch,
+                **kwargs,
+            )
+
+        # Normalize the total-loss key. Strategies historically used a
+        # mix of "g_total_loss" / "g_loss_total" / "loss_total" / "total"
+        # (per TODO/audit/07_strategies_v6_2_v6_3_exotic.md F2 + F18).
+        # The pre-fix behaviour silently substituted ``torch.tensor(0.0)``
+        # when the canonical key was missing, producing a zero gradient
+        # that looks like training is happening — exactly the
+        # CLAUDE.md #9 silent fallback class. Now we accept any of the
+        # synonyms but raise if NONE are present.
+        if "g_total_loss" not in losses:
+            for synonym in ("g_loss_total", "loss_total", "total"):
+                aliased = losses.get(synonym)
+                if aliased is not None:
+                    losses["g_total_loss"] = aliased
+                    break
+            else:
+                raise ValueError(
+                    f"_compute_losses_impl returned no recognized total-loss key. "
+                    f"Expected one of {{'g_total_loss', 'g_loss_total', "
+                    f"'loss_total', 'total'}}; got {sorted(losses.keys())}. "
+                    "Strategies must include a scalar total loss for backprop."
                 )
-
-            # Normalize the total-loss key. Strategies historically used a
-            # mix of "g_total_loss" / "g_loss_total" / "loss_total" / "total"
-            # (per TODO/audit/07_strategies_v6_2_v6_3_exotic.md F2 + F18).
-            # The pre-fix behaviour silently substituted ``torch.tensor(0.0)``
-            # when the canonical key was missing, producing a zero gradient
-            # that looks like training is happening — exactly the
-            # CLAUDE.md #9 silent fallback class. Now we accept any of the
-            # synonyms but raise if NONE are present.
-            if "g_total_loss" not in losses:
-                for synonym in ("g_loss_total", "loss_total", "total"):
-                    aliased = losses.get(synonym)
-                    if aliased is not None:
-                        losses["g_total_loss"] = aliased
-                        break
-                else:
-                    raise ValueError(
-                        f"_compute_losses_impl returned no recognized total-loss key. "
-                        f"Expected one of {{'g_total_loss', 'g_loss_total', "
-                        f"'loss_total', 'total'}}; got {sorted(losses.keys())}. "
-                        "Strategies must include a scalar total loss for backprop."
-                    )
-
-        # Emit the model INPUT for strategies that build it inside the step, and
-        # raise if one declares the carve-out without handing anything over.
-        # Placed in the wrapper so an overriding ``_compute_losses_impl`` cannot
-        # drop it -- that override is what let the diffusion pointer dangle.
-        self._snapshot_declared_model_input(
-            step=int(kwargs.get("iteration", 0) or 0),
-        )
 
         return losses, metrics_tensor
 
