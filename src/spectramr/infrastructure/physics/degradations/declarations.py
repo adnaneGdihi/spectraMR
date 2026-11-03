@@ -13,6 +13,7 @@ __all__ = [
     "MAGNITUDE",
     "PHASE",
     "PHASE_ONLY",
+    "PHYSICAL_OVERRIDE_KWARGS",
     "is_known_collinear",
 ]
 
@@ -179,3 +180,18 @@ DECLARED_THETA_ZERO_PEDESTAL: Mapping[str, float] = {
 #: a suite must give its phantom. The calibrated dielectric standing wave varies on the RF
 #: wavelength (332 mm at 3 T), so on a few-cm unit-voxel phantom it vanishes, as it physically does.
 DECLARED_PHYSICAL_FOV_MM: Mapping[str, float] = {"dielectric_b1": 192.0}
+
+
+#: Axes whose kernel takes the theta-scaled value itself as a kwarg, replacing ``theta * literal``:
+#: name -> those kwargs. A caller-supplied physical value would bypass the declared severity axis,
+#: so the sweep and training paths reject them and the profile path checks them for conflicts.
+PHYSICAL_OVERRIDE_KWARGS: Mapping[str, frozenset[str]] = {
+    "gradient_nonlinearity": frozenset({"severity"}),
+    "rigid_motion": frozenset({"max_translation", "max_rotation"}),
+    "b0": frozenset({"strength"}),
+    "b0_geometric_distortion": frozenset({"b0_strength"}),
+    "chemical_shift": frozenset({"shift_pixels"}),
+    "gibbs": frozenset({"truncation_fraction"}),
+    "spike": frozenset({"probability"}),
+    "eddy": frozenset({"strength"}),
+}

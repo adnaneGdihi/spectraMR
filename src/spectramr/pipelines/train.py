@@ -20,6 +20,7 @@ import time
 import traceback
 import weakref
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -141,6 +142,9 @@ from spectramr.domain.interfaces.service_interfaces import (
     IMetricsService,
 )
 from spectramr.infrastructure.checkpointing.layout import CheckpointLayout  # noqa: E402
+from spectramr.infrastructure.checkpointing.legacy_layout import (  # noqa: E402
+    checkpoint_layout_kwargs,
+)
 from spectramr.infrastructure.checkpointing.payload import CONVERTER  # noqa: E402
 from spectramr.infrastructure.checkpointing.select import pre_v1_names, select  # noqa: E402
 from spectramr.infrastructure.distributed.distributed_training import RankUtility
@@ -333,9 +337,10 @@ _VALIDATION_FORWARD_FIELDS: tuple[str, ...] = (
     "field_strength_t",
     "field_strength_source_t",
     "contrast_id",
-    # B-1.1 multi-source consensus: the travelling-volunteer tuple, so validation can
-    # render the variance-reduced consensus mean over all source fields.
+    # B-1.1 multi-source consensus: the travelling-volunteer tuple and each source's field,
+    # so validation can render the variance-reduced consensus mean over all source fields.
     "sources",
+    "source_field_strengths",
 )
 
 
@@ -386,7 +391,10 @@ _VISUAL_CONTEXT_FIELDS: tuple[str, ...] = (
     "field_strength_t",
     "field_strength_source_t",
     "contrast_id",
+    "contrast_idx",  # the M4Raw spelling; a contrast-conditioned forward raises without it
     "sources",
+    "source_field_strengths",
+    "acquisition_metadata",  # the acquisition prompt of universal_reconstruction
 )
 
 
@@ -459,10 +467,43 @@ def _discover_resume_checkpoint(run_dir: str | Path, logging_service: Any) -> st
     return str(latest)
 
 
+def _resume_checkpoint_layout(
+    resume_path: str | None, run_dir: str | Path, logging_service: Any
+) -> dict[str, bool]:
+    """Generator kwargs that rebuild the module layout of the checkpoint a resume loads.
+
+    Read before the build: ZeRO restores optimizer state by flat position, so the model
+    must already have the checkpoint's parameters when the optimizer is made. Step 9
+    resolves the same checkpoint and owns every refusal, so an unreadable one yields
+    ``{}`` here and raises there.
+    """
+    if not resume_path:
+        return {}
+    mode = str(resume_path).strip()
+    try:
+        path = (
+            _discover_resume_checkpoint(run_dir, logging_service)
+            if mode in _RESUME_DISCOVERY_MODES
+            else mode
+        )
+        if path is None or not Path(path).is_file():
+            return {}
+        layout = checkpoint_layout_kwargs(path)
+    except Exception:  # step 9 re-resolves and raises with the run's failure record
+        logger.debug("checkpoint layout probe failed for %s", resume_path, exc_info=True)
+        return {}
+    if layout:
+        logging_service.log_warning(
+            f"[Resume] {path} was written with an older module layout; rebuilding it "
+            f"({', '.join(sorted(layout))}) so the optimizer state resumes exactly."
+        )
+    return layout
+
+
 def _stamp_resume_record(run_dir: Path, record: dict[str, Any], logger_: Any = None) -> None:
     """Record what the resume actually did, beside ``provenance.json``.
 
-    Appends rather than overwrites: a 120 h wall-clock chain produces one entry
+    Appends rather than overwrites: a 96 h wall-clock chain produces one entry
     per link, and the sequence of ``start_iteration`` values is what shows the
     chain advanced instead of restarting. Fail-open — a stamp must never take
     down a run that is otherwise ready to train.
@@ -707,6 +748,10 @@ def run_training_pipeline(
     experiment_status = _refuse_unlaunchable_status(config, allow_status)
     if experiment_status is not None:
         logger.info("[Pipeline] metadata.status=%s", experiment_status)
+    _refuse_compression_with_ema(config)
+    # An evaluation-only arm declares the CLI flag in its YAML; either source turns it on.
+    validate_only_declared = bool(config.training.validate_only)
+    validate_only = bool(validate_only) or validate_only_declared
 
     # 0. Global Seeding
     # ONE seed. `training.seed` used to win over the root `seed:`, so 96 arms
@@ -825,6 +870,10 @@ def run_training_pipeline(
         )
     except Exception:  # pragma: no cover - provenance never blocks training
         logger.debug("run provenance capture failed", exc_info=True)
+    provenance["validate_only"] = {
+        "applied": validate_only,
+        "declared": "training.validate_only" if validate_only_declared else None,
+    }
 
     # Publish that identity so every debug snapshot this process writes carries
     # it (#1299). The record is HANDED OVER rather than rebuilt downstream: a
@@ -919,6 +968,7 @@ def run_training_pipeline(
     # - Immutable component management
     # - Direct TrainingEnvironment usage (no adapter wrappers)
     # =====================================================================
+    checkpoint_layout: dict[str, bool] = {}
     try:
         if env is not None:
             # Scripting / in-process path: reuse a pre-built TrainingEnvironment
@@ -926,9 +976,13 @@ def run_training_pipeline(
             # loop below. (Container + services were already built above.)
             pipeline = env
         else:
+            checkpoint_layout = _resume_checkpoint_layout(
+                resume_path, resolve_run_dir(config, is_sanity_check), logging_service
+            )
             director = TrainingEnvironmentDirector(config)
             pipeline = director.build_environment(
-                with_test_loader=validate_only or config.data.source.test_pass == "train_end"
+                with_test_loader=validate_only or config.data.source.test_pass == "train_end",
+                checkpoint_layout=checkpoint_layout,
             )
 
         generator = pipeline.models.get("generator")
@@ -1022,6 +1076,9 @@ def run_training_pipeline(
                     noise = forward_noise_scope(generator)
                     if noise is not None:
                         provenance["forward_noise"] = noise
+                    mechanism = getattr(unwrap_model(generator), "provenance_record", None)
+                    if callable(mechanism):
+                        provenance["model_mechanism"] = mechanism()
                 loaders = getattr(pipeline, "data_loaders", {}) or {}
                 # ``is not None``, not truthiness: a DataLoader defines
                 # ``__len__``, so an EMPTY loader is falsy and used to be
@@ -1378,6 +1435,7 @@ def run_training_pipeline(
                     "declared": _resume_mode,
                     "resolved_checkpoint": _resume_path,
                     "outcome": "restored",
+                    "checkpoint_layout": checkpoint_layout,
                     "start_iteration": start_iteration,
                     "epoch": resumed.epoch,
                     "checkpoint_reason": resumed.reason,
@@ -1484,6 +1542,9 @@ def run_training_pipeline(
             _run_held_out_test_pass(
                 loop, pipeline, strategy, config, paths, result, is_sanity_check=is_sanity_check
             )
+        _maybe_run_compression_export(
+            loop, pipeline, config, paths, result, is_sanity_check=is_sanity_check
+        )
         if tb_writer:
             _write_hparams(tb_writer, config)
             tb_writer.close()
@@ -1883,6 +1944,7 @@ def _emit_run_summary(
             "loader_wait": (result.get("loader_wait") if isinstance(result, dict) else None),
             # --- metrics ----------------------------------------------------
             "best_metrics": (result.get("best_metrics") if isinstance(result, dict) else None),
+            "compression": (result.get("compression") if isinstance(result, dict) else None),
             # False when restore_best_weights was asked for and the restore failed:
             # the final checkpoint then holds the last weights, not the best.
             "best_weights_restored": (
@@ -2117,8 +2179,19 @@ def _maybe_run_calibration(strategy, pipeline, output_paths, logging_service) ->
             "calibration hook: no validation loader; a certify-only calibration "
             "arm cannot produce its certificate without a calibration cohort."
         )
+    kwargs = {}
+    # A held-out exchangeability test scores the test split separately from the calibration one.
+    if getattr(strategy, "calibration_needs_test_loader", False) is True:
+        test_loader = (getattr(pipeline, "data_loaders", None) or {}).get("test")
+        if test_loader is None:
+            raise RuntimeError(
+                "calibration hook: the strategy declares a held-out exchangeability test "
+                "but the environment holds no test loader (declare data.source.test_index_path "
+                "with test_pass: train_end)."
+            )
+        kwargs["test_dataloader"] = test_loader
     try:
-        reports = run_calibration(val_loader)
+        reports = run_calibration(val_loader, **kwargs)
     except Exception as exc:
         raise RuntimeError(
             "calibration hook: run_calibration failed — the certificate is this "
@@ -2242,6 +2315,12 @@ def _run_held_out_test_pass(
         or not declares_test_set(config)
     ):
         return
+    if getattr(strategy, "calibration_needs_test_loader", False) is True:
+        logger.info(
+            "[TestPass] the held-out split is scored by the strategy's calibration certificate "
+            "(_maybe_run_calibration), not by a metric test pass."
+        )
+        return
     if config.data.source.test_pass == "infer" and not result.get("validate_only"):
         logger.info(
             "[TestPass] data.source.test_pass=infer: the held-out test set is scored only by "
@@ -2273,6 +2352,58 @@ def _run_held_out_test_pass(
     )
     if summary is not None:
         result["test_metrics"] = summary["metrics"]
+
+
+def _refuse_compression_with_ema(config: Any) -> None:
+    """Refuse at launch, not after training: validation grades the EMA shadow, never the
+    compressed generator weights."""
+    cfg = getattr(config, "compression", None)
+    ema = getattr(config, "ema", None)
+    if cfg is not None and cfg.enabled and ema is not None and ema.enabled:
+        raise ValueError(
+            "compression.enabled with ema.enabled is not supported: validation grades the EMA "
+            "shadow, so the compressed generator weights would never be scored."
+        )
+
+
+def _maybe_run_compression_export(
+    loop: Any, pipeline: Any, config: Any, paths: Any, result: Any, *, is_sanity_check: bool
+) -> None:
+    """Run the declared ``compression:`` export on the final weights and stamp its summary.
+
+    Every rank re-scores (validation reduces across ranks); only the main rank writes. EMA is
+    refused because the validation pass would swap the uncompressed EMA weights back in.
+    """
+    cfg = getattr(config, "compression", None)
+    if (
+        cfg is None
+        or not cfg.enabled
+        or is_sanity_check
+        or not isinstance(result, dict)
+        or result.get("wall_clock_yield")
+        or result.get("success") is False
+    ):
+        return
+    if getattr(pipeline, "ema", None) is not None:
+        raise ValueError(
+            "compression export with EMA enabled is not supported: validation grades the EMA "
+            "shadow, so the compressed generator weights would never be scored."
+        )
+    from spectramr.infrastructure.inference.compression_export import (
+        ModelCompressionExportService,
+    )
+
+    service = ModelCompressionExportService(cfg, seed=int(config.run.seed))
+    write = RankUtility.is_main_rank()
+    report = service.run(
+        pipeline.generator,
+        lambda: loop.evaluate(iteration=0, epoch=0, csv_file=None, split="val", record=False),
+        Path(paths["run_output_dir"]) if write else None,
+    )
+    result["compression"] = {
+        k: report[k]
+        for k in ("model_size_mb", "model_size_mb_fp32", "compression_ratio", "weight_sparsity")
+    } | {"val_metrics_delta": report["val_metrics_delta"]}
 
 
 def _validate_only_result(
@@ -2991,54 +3122,62 @@ def _run_validation(
 
                 _sink = getattr(strategy, "_per_case_metric_sink", None)
                 _sink_mark = getattr(_sink, "n_observed", 0)
-                # Dispatch based on strategy's validation_step signature
-                # (_vs_params resolved once before the loop — PIPE-3).
-                # Pattern A: (input_batch, target_batch, **kwargs) — 13 strategies
-                # Pattern B: (batch, **kwargs) or (val_batch, batch_idx) — 5 strategies
-                # Pattern C: (batch, input_batch=None, target_batch=None) — 3 strategies
-                if (
-                    _val_input is not None
-                    and _val_target is not None
-                    and len(_vs_params) >= 3  # self + 2 positional
-                    and "target_batch" in _vs_params
-                    and "batch" not in _vs_params[:2]  # exclude Pattern C
-                ):
-                    # Pattern A: two-tensor signature. Gated extra: pass a real
-                    # reference field (e.g. b0_map) ONLY to strategies that
-                    # declare it (the VF real-reference seam) — no effect on the
-                    # other Pattern-A strategies.
-                    _vs_extra: dict[str, Any] = {"batch_idx": i}
-                    # Gated per-sample field seam (b0_map/b1_map/trajectory_*,
-                    # field_strength[_target], contrast_id): forward each field ONLY
-                    # to a strategy whose validation_step declares it AND when the
-                    # batch carries it. Extracted to select_validation_extra_fields
-                    # (testable; single source of truth). Previously this was inline
-                    # and gated on isinstance(val_batch, dict) — ALWAYS False after
-                    # the TrainingBatch conversion above, so the seam was DEAD; the
-                    # VF real-reference + MRIxFields cross-field arms self-graded on
-                    # the wrong field. The double gate also prevents the
-                    # batch_context/kwargs collision in the field-conditioned arms.
-                    _vs_extra.update(select_validation_extra_fields(val_batch, _vs_params))
-                    metrics = strategy.validation_step(_val_input, _val_target, **_vs_extra)
-                elif "batch" in _vs_params or "val_batch" in _vs_params:
-                    # Pattern B/C: whole-batch signature
-                    if "input_batch" in _vs_params:
-                        # Pattern C: batch + optional keyword tensors
-                        metrics = strategy.validation_step(
-                            val_batch,
-                            input_batch=_val_input,
-                            target_batch=_val_target,
-                        )
-                    elif "batch_idx" in _vs_params:
-                        metrics = strategy.validation_step(val_batch, batch_idx=i)
+                # The first batch of each validation pass is a ``val`` snapshot step.
+                _snapshots = getattr(strategy, "snapshot_session", None)
+                _val_snap = (
+                    _snapshots.step("val", iteration, val_batch)
+                    if _snapshots is not None and i == 0
+                    else nullcontext()
+                )
+                with _val_snap:
+                    # Dispatch based on strategy's validation_step signature
+                    # (_vs_params resolved once before the loop — PIPE-3).
+                    # Pattern A: (input_batch, target_batch, **kwargs) — 13 strategies
+                    # Pattern B: (batch, **kwargs) or (val_batch, batch_idx) — 5 strategies
+                    # Pattern C: (batch, input_batch=None, target_batch=None) — 3 strategies
+                    if (
+                        _val_input is not None
+                        and _val_target is not None
+                        and len(_vs_params) >= 3  # self + 2 positional
+                        and "target_batch" in _vs_params
+                        and "batch" not in _vs_params[:2]  # exclude Pattern C
+                    ):
+                        # Pattern A: two-tensor signature. Gated extra: pass a real
+                        # reference field (e.g. b0_map) ONLY to strategies that
+                        # declare it (the VF real-reference seam) — no effect on the
+                        # other Pattern-A strategies.
+                        _vs_extra: dict[str, Any] = {"batch_idx": i}
+                        # Gated per-sample field seam (b0_map/b1_map/trajectory_*,
+                        # field_strength[_target], contrast_id): forward each field ONLY
+                        # to a strategy whose validation_step declares it AND when the
+                        # batch carries it. Extracted to select_validation_extra_fields
+                        # (testable; single source of truth). Previously this was inline
+                        # and gated on isinstance(val_batch, dict) — ALWAYS False after
+                        # the TrainingBatch conversion above, so the seam was DEAD; the
+                        # VF real-reference + MRIxFields cross-field arms self-graded on
+                        # the wrong field. The double gate also prevents the
+                        # batch_context/kwargs collision in the field-conditioned arms.
+                        _vs_extra.update(select_validation_extra_fields(val_batch, _vs_params))
+                        metrics = strategy.validation_step(_val_input, _val_target, **_vs_extra)
+                    elif "batch" in _vs_params or "val_batch" in _vs_params:
+                        # Pattern B/C: whole-batch signature
+                        if "input_batch" in _vs_params:
+                            # Pattern C: batch + optional keyword tensors
+                            metrics = strategy.validation_step(
+                                val_batch,
+                                input_batch=_val_input,
+                                target_batch=_val_target,
+                            )
+                        elif "batch_idx" in _vs_params:
+                            metrics = strategy.validation_step(val_batch, batch_idx=i)
+                        else:
+                            metrics = strategy.validation_step(val_batch)
                     else:
-                        metrics = strategy.validation_step(val_batch)
-                else:
-                    # Fallback: try two-tensor if we have both
-                    if _val_input is not None and _val_target is not None:
-                        metrics = strategy.validation_step(_val_input, _val_target)
-                    else:
-                        metrics = strategy.validation_step(val_batch, batch_idx=i)
+                        # Fallback: try two-tensor if we have both
+                        if _val_input is not None and _val_target is not None:
+                            metrics = strategy.validation_step(_val_input, _val_target)
+                        else:
+                            metrics = strategy.validation_step(val_batch, batch_idx=i)
 
                 # A strategy that could not produce a prediction returns the sentinel instead of
                 # raising; it is a failed batch, not a scored one (#2750 counts every failure).

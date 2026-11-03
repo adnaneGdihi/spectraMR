@@ -408,33 +408,30 @@ class MaskGenerator:
         acceleration_factor: float,
         kappa: float = 2.0,
         n_steps: int | None = None,
+        n_points: int | None = None,
+        allowed: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """Schramm–Loewner Evolution trajectory sampling.
+        """Schramm-Loewner Evolution multi-shot sampling at the declared acceleration.
 
-        Dispatches to :func:`spectramr.data.transforms.sle_trajectory.build_sle_kspace_mask`.
-        ``acceleration_factor`` controls the number of trace points
-        (``n_steps``) when not explicitly provided: a higher acceleration
-        means fewer points and hence a sparser mask.
+        Dispatches to :func:`spectramr.data.transforms.sle_trajectory.build_sle_budget_mask`,
+        which unions independent SLE shots until exactly ``n_points`` bins are
+        acquired (default ``round(H * W / acceleration_factor)``). A single trace
+        covers far fewer bins than any practical budget, so one shot cannot honour R.
         """
-        from spectramr.data.transforms.sle_trajectory import build_sle_kspace_mask
+        from spectramr.data.transforms.sle_trajectory import build_sle_budget_mask
 
         if len(shape) == 3:
             h, w = shape[1], shape[2]
         else:
             h, w = shape[0], shape[1]
-        if n_steps is None:
-            # Target |M| ≈ (H * W) / acceleration_factor lattice points.
-            target = max(2, int(h * w / max(1.0, acceleration_factor)))
-            n_steps = min(target, h * w)
+        if n_points is None:
+            n_points = max(1, round(h * w / max(1.0, acceleration_factor)))
         gen = None
         if self.seed is not None:
             gen = torch.Generator().manual_seed(int(self.seed))
-        mask_2d = build_sle_kspace_mask(
-            kappa=kappa,
-            shape=(h, w),
-            n_steps=n_steps,
-            generator=gen,
+        mask_2d, _ = build_sle_budget_mask(
+            kappa, (h, w), n_points, allowed=allowed, n_steps=n_steps, generator=gen
         )
         if len(shape) == 3:
             return mask_2d.unsqueeze(0).expand(shape[0], -1, -1).contiguous()

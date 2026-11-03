@@ -74,6 +74,7 @@ class _Strategy:
     def __init__(self):
         self._per_case_metric_sink = object()
         self._report_case_recorder = object()
+        self.snapshot_session = object()
         self.sinks_during = {}
 
 
@@ -90,9 +91,11 @@ def test_a_test_pass_writes_final_eval_and_leaves_the_report_sinks_as_it_found_t
 
     strategy, seen = _Strategy(), {}
     sink, recorder = strategy._per_case_metric_sink, strategy._report_case_recorder
+    session = strategy.snapshot_session
 
     class Loop(_Loop):
         def evaluate(self, **kw):
+            assert strategy.snapshot_session is None, "a test batch must not become a val snapshot"
             strategy.sinks_during = {
                 "sink": strategy._per_case_metric_sink,
                 "recorder": strategy._report_case_recorder,
@@ -118,6 +121,7 @@ def test_a_test_pass_writes_final_eval_and_leaves_the_report_sinks_as_it_found_t
     assert seen["split"] == "test"
     assert seen["sinks"] == {"sink": None, "recorder": None}
     assert (strategy._per_case_metric_sink, strategy._report_case_recorder) == (sink, recorder)
+    assert strategy.snapshot_session is session
     assert json.loads((tmp_path / "final_eval.json").read_text()) == {
         "psnr": {"s1/T1/f/0": 21.0, "s1/T1/f/1": 23.0}
     }
@@ -152,7 +156,7 @@ def test_an_arm_without_a_test_set_is_not_scored(tmp_path):
     assert not (tmp_path / "final_eval.json").exists()
 
 
-def _hook(monkeypatch, result, *, sanity=False, declared=True, trigger="train_end"):
+def _hook(monkeypatch, result, *, sanity=False, declared=True, trigger="train_end", strategy=None):
     from spectramr.pipelines import test_pass, train
 
     calls = []
@@ -169,7 +173,7 @@ def _hook(monkeypatch, result, *, sanity=False, declared=True, trigger="train_en
         )
     )
     train._run_held_out_test_pass(
-        None, None, None, cfg, {"run_output_dir": "/tmp/x"}, result, is_sanity_check=sanity
+        None, None, strategy, cfg, {"run_output_dir": "/tmp/x"}, result, is_sanity_check=sanity
     )
     return calls
 
@@ -177,6 +181,13 @@ def _hook(monkeypatch, result, *, sanity=False, declared=True, trigger="train_en
 def test_test_pass_infer_skips_the_end_of_training_pass(monkeypatch):
     result = {"success": True, "best_weights_restored": True, "iterations_completed": 9}
     assert _hook(monkeypatch, result, trigger="infer") == []
+
+
+def test_a_calibration_certificate_owns_its_held_out_split(monkeypatch):
+    """A strategy whose certificate scores the test split gets no metric test pass on it."""
+    result = {"success": True, "best_weights_restored": True, "iterations_completed": 9}
+    owner = SimpleNamespace(calibration_needs_test_loader=True)
+    assert _hook(monkeypatch, result, strategy=owner) == []
 
 
 def test_test_pass_infer_is_scored_by_a_validate_only_run(monkeypatch):

@@ -219,7 +219,7 @@ def test_walk_dedupes_aliased_dotted_paths(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_operator_registered_resolves_real_keys() -> None:
     assert operator_registered("fft2d")
-    assert operator_registered("phase_contrast")
+    assert operator_registered("multi_coil_fft")
 
 
 def test_operator_registered_is_false_for_none_and_unknown() -> None:

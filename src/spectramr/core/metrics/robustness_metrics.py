@@ -55,6 +55,7 @@ from typing import Any
 
 import torch
 
+from spectramr.core.metrics.context import MetricContext, resolve_context
 from spectramr.core.metrics.registry import register_metric
 
 
@@ -100,14 +101,16 @@ def _pgd_linf_attack(
     # point of a symmetric reconstruction loss (e.g. a quadratic minimized
     # at delta=0 has zero gradient there), which would trap vanilla PGD.
     delta = torch.empty_like(x0).uniform_(-epsilon, epsilon)
-    for _ in range(steps):
-        delta = delta.clone().requires_grad_(True)
-        out = model(x0 + delta)
-        loss = torch.mean((out - target.detach().to(torch.float32)) ** 2)
-        (grad,) = torch.autograd.grad(loss, delta)
-        with torch.no_grad():
-            delta = delta + step_size * grad.sign()
-            delta = torch.clamp(delta, min=-epsilon, max=epsilon)
+    # Validation runs under no_grad; the ascent needs a graph through the model.
+    with torch.enable_grad():
+        for _ in range(steps):
+            delta = delta.clone().requires_grad_(True)
+            out = model(x0 + delta)
+            loss = torch.mean((out - target.detach().to(torch.float32)) ** 2)
+            (grad,) = torch.autograd.grad(loss, delta)
+            with torch.no_grad():
+                delta = delta + step_size * grad.sign()
+                delta = torch.clamp(delta, min=-epsilon, max=epsilon)
     with torch.no_grad():
         return model(x0 + delta)
 
@@ -162,6 +165,75 @@ class AdversarialPSNRDropMetric:
         )
         adv_psnr = _psnr(adv, target)
         return float(clean_psnr - adv_psnr)
+
+
+@register_metric(
+    "certified_radius",
+    aliases=["smoothing_certified_radius"],
+    requires_reference=False,
+    needs=("reconstructor",),
+    direction="higher",
+)
+class CertifiedRadiusMetric:
+    """Randomized-smoothing radius lower bound (Cohen et al., ICML 2019), higher is better.
+
+    The smoothed predictor's soft vote is the mean output response over
+    ``n_samples`` Gaussian draws ``x + sigma * n``; the radius is
+    ``sigma * Phi^{-1}(p)`` with ``p = sigmoid(vote)``. Needs the reconstructor
+    (``context.reconstructor``) and the tensor it consumes (``model_input``), and
+    raises without them: a radius of an input we do not have cannot be reported.
+
+    Args:
+        sigma: Smoothing noise standard deviation.
+        n_samples: Monte-Carlo draws per input.
+    """
+
+    def __init__(self, sigma: float = 0.25, n_samples: int = 32) -> None:
+        if sigma <= 0.0 or n_samples < 1:
+            raise ValueError(
+                f"certified_radius needs sigma > 0 and n_samples >= 1; got {sigma}, {n_samples}"
+            )
+        self.sigma = float(sigma)
+        self.n_samples = int(n_samples)
+
+    @property
+    def name(self) -> str:
+        return "certified_radius"
+
+    @property
+    def higher_is_better(self) -> bool:
+        return True
+
+    def per_sample(
+        self, predict: Callable[[torch.Tensor], torch.Tensor], x: torch.Tensor
+    ) -> torch.Tensor:
+        """The radius for each row of ``x``, shape ``[B]``."""
+        with torch.no_grad():
+            votes = torch.zeros(x.shape[0], device=x.device)
+            for _ in range(self.n_samples):
+                noisy = x + self.sigma * torch.randn_like(x)
+                votes = votes + predict(noisy).flatten(1).mean(dim=1)
+            p = (votes / self.n_samples).sigmoid().clamp(1e-3, 1 - 1e-3)
+            return self.sigma * math.sqrt(2.0) * torch.erfinv(2 * p - 1)
+
+    def __call__(
+        self,
+        prediction: torch.Tensor | None = None,
+        target: torch.Tensor | None = None,
+        *,
+        context: MetricContext | None = None,
+        **kwargs: Any,
+    ) -> float:
+        del prediction, target
+        recon = resolve_context(context, kwargs).reconstructor
+        model_input = kwargs.get("model_input")
+        if recon is None or not isinstance(model_input, torch.Tensor):
+            raise ValueError(
+                "certified_radius needs context.reconstructor and model_input=; the "
+                "validation metrics computer supplies neither, so the strategy that "
+                "owns the forward must call it (AdversarialRobustnessStrategy does)."
+            )
+        return float(self.per_sample(recon, model_input).mean().item())
 
 
 @register_metric("ood_acceleration_shift", aliases=["ood_psnr_shift", "acceleration_ood_shift"])
@@ -286,7 +358,6 @@ class InputDependenceSpreadMetric:
         """Higher spread -> output depends on the measurement (good)."""
         return True
 
-    @torch.no_grad()
     def __call__(
         self,
         prediction: torch.Tensor | None = None,
@@ -310,13 +381,14 @@ class InputDependenceSpreadMetric:
         if preds is not None and len(preds) >= 2:
             # Per-pixel std across the cascade axis, then mean magnitude,
             # normalised by the mean |prediction| -> relative structural spread.
-            stack = torch.stack(
-                [(p.abs() if torch.is_complex(p) else p).float() for p in preds],
-                dim=0,
-            )
-            per_pixel_std = stack.std(dim=0)
-            denom = stack.abs().mean() + self.eps
-            return float((per_pixel_std.mean() / denom).item())
+            with torch.no_grad():
+                stack = torch.stack(
+                    [(p.abs() if torch.is_complex(p) else p).float() for p in preds],
+                    dim=0,
+                )
+                per_pixel_std = stack.std(dim=0)
+                denom = stack.abs().mean() + self.eps
+                return float((per_pixel_std.mean() / denom).item())
 
         means = kwargs.get("cascade_pred_means")
         if means is not None and len(means) >= 2:
@@ -333,6 +405,7 @@ class InputDependenceSpreadMetric:
 
 __all__ = [
     "AdversarialPSNRDropMetric",
+    "CertifiedRadiusMetric",
     "InputDependenceSpreadMetric",
     "OODAccelerationShiftMetric",
     "_psnr",

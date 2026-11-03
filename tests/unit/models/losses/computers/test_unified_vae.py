@@ -20,7 +20,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from spectramr.config.schemas.loss import LossConfigSchema, ReconstructionLossesConfig
+from spectramr.config.schemas.loss import (
+    LossComponentConfig,
+    LossConfigSchema,
+    ReconstructionLossesConfig,
+)
 from spectramr.models.losses.computers.unified_vae import (
     UnifiedVAELossComputer,
     UnifiedVQVAELossComputer,
@@ -39,7 +43,7 @@ def _config(**recon_kwargs) -> SimpleNamespace:
     return SimpleNamespace(
         losses=LossConfigSchema(
             output_domain="image",
-            reconstruction=ReconstructionLossesConfig(**recon_kwargs),
+            reconstruction=ReconstructionLossesConfig(lambda_l2=1.0, **recon_kwargs),
         )
     )
 
@@ -119,7 +123,7 @@ class TestKLAnnealNamingSchism:
         config = SimpleNamespace(
             losses=LossConfigSchema(
                 output_domain="image",
-                reconstruction=ReconstructionLossesConfig(),
+                reconstruction=ReconstructionLossesConfig(lambda_l2=1.0),
             ),
             training=training,
         )
@@ -233,3 +237,114 @@ class TestKLAnnealNamingSchism:
         # Midpoint proves the ramp advances rather than sitting at either bound.
         mid = comp._get_loss_weight("kl", iteration=2_500)
         assert 1e-6 < mid < 1e-4
+
+
+def test_vae_reconstruction_is_the_declared_mse_not_an_l1() -> None:
+    """The declared reconstruction term is the one trained, at its declared weight (#2280)."""
+    import torch
+    from torch import nn
+
+    from spectramr.config.schemas.loss import LossComponentConfig, LossConfigSchema
+    from spectramr.models.losses.computers.unified_vae import UnifiedVAELossComputer
+    from spectramr.models.losses.weights import build_loss_weight_table
+
+    cfg = LossConfigSchema(
+        output_domain="image",
+        image_losses=[LossComponentConfig(name="mse", weight=2.0)],
+    )
+    comp = UnifiedVAELossComputer(config=SimpleNamespace(losses=cfg))
+    comp.reconstruction_name, comp.reconstruction_loss_fn = "l2", nn.MSELoss()
+    comp._loss_weight_table = build_loss_weight_table(cfg)
+    out = comp.compute(torch.zeros(2, 4), torch.ones(2, 4))
+    assert out.components["reconstruction"].item() == pytest.approx(1.0)
+    assert out.total.item() == pytest.approx(2.0)
+
+
+def test_vae_refuses_a_declared_reconstruction_weight_with_no_declared_loss() -> None:
+    from types import SimpleNamespace
+
+    from spectramr.config.schemas.loss import LossConfigSchema, ReconstructionLossesConfig
+    from spectramr.domain.exceptions import ConfigurationError
+    from spectramr.models.losses.computers.unified_vae import (
+        _refuse_undeclared_reconstruction,
+    )
+
+    cfg = LossConfigSchema(
+        reconstruction=ReconstructionLossesConfig(lambda_reconstruction=1.0)
+    )
+    with pytest.raises(ConfigurationError, match="no reconstruction loss is declared"):
+        _refuse_undeclared_reconstruction(SimpleNamespace(losses=cfg))
+
+
+def test_vq_loss_is_included_at_its_declared_weight() -> None:
+    import torch
+
+    from spectramr.config.schemas.loss import LatentLossesConfig, LossConfigSchema
+    from spectramr.models.losses.computers.unified_vae import UnifiedVQVAELossComputer
+    from spectramr.models.losses.weights import build_loss_weight_table
+
+    cfg = LossConfigSchema(
+        output_domain="image",
+        latent=LatentLossesConfig(lambda_vq=0.5),
+        image_losses=[LossComponentConfig(name="mse", weight=1.0)],
+    )
+    comp = UnifiedVQVAELossComputer(config=SimpleNamespace(losses=cfg))
+    comp._loss_weight_table = build_loss_weight_table(cfg)
+    out = comp.compute(torch.zeros(2, 4), torch.zeros(2, 4), vq_loss=torch.tensor(2.0))
+    assert "vq_loss" in out.components
+    assert out.total.item() == pytest.approx(1.0)
+
+
+def _arm(rel: str):
+    from pathlib import Path
+
+    from spectramr.config.settings import TrainingSettings
+
+    root = Path(__file__).resolve().parents[5]
+    return TrainingSettings.from_yaml(str(root / "experiments/inprogress" / rel))
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "ldm_two_stage_ulf_to_hf/stage1_vae_hf.yaml",
+        "ldm_two_stage_ulf_to_hf/stage1_sparse_vae_slab.yaml",
+        "ldm_two_stage_ulf_to_hf/stage1_slat_slab_to_volume.yaml",
+    ],
+)
+def test_stage1_vae_arm_reconstructs_with_its_declared_l1(rel: str) -> None:
+    comp = UnifiedVAELossComputer(config=_arm(rel), device=torch.device("cpu"))
+    assert comp.reconstruction_name == "l1"
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "vae_latent/vqvae2_brain.yaml",
+        "vae_latent/experiment_54_hierarchical_vq_vae.yaml",
+    ],
+)
+def test_declared_vq_term_fires_on_a_real_vq_arm(rel: str) -> None:
+    comp = UnifiedVQVAELossComputer(config=_arm(rel), device=torch.device("cpu"))
+    out = comp.compute(torch.zeros(2, 4), torch.zeros(2, 4), vq_loss=torch.tensor(2.0))
+    assert out.components["vq_loss"].item() == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize("cls", [UnifiedVAELossComputer, UnifiedVQVAELossComputer])
+def test_no_declared_reconstruction_raises(cls) -> None:
+    """Decision 16: a VAE/VQ-VAE arm with no reconstruction term is refused, not latent-only."""
+    from spectramr.domain.exceptions import ConfigurationError
+
+    with pytest.raises(ConfigurationError, match="no reconstruction loss is declared"):
+        cls(config=None, device=torch.device("cpu"))
+    bare = SimpleNamespace(losses=LossConfigSchema(output_domain="image"))
+    with pytest.raises(ConfigurationError, match="no reconstruction loss is declared"):
+        cls(config=bare, device=torch.device("cpu"))
+    off = SimpleNamespace(
+        losses=LossConfigSchema(
+            output_domain="image",
+            image_losses=[LossComponentConfig(name="mse", weight=0.0)],
+        )
+    )
+    with pytest.raises(ConfigurationError, match="no reconstruction loss is declared"):
+        cls(config=off, device=torch.device("cpu"))

@@ -50,6 +50,8 @@ class Arms:
     cases: dict[str, list[dict]] = field(default_factory=dict)
     view: str = "selected"
     call_unit: str = "validation calls (batch means)"
+    #: what one unaccelerated ``per_case`` row is: "slices" when every arm has slice rows
+    case_unit: str = "slices"
     #: completion state of every tabulated arm (``ok`` or ``unknown``)
     status: dict[str, RunStatus] = field(default_factory=dict)
     #: crashed arms left out of every table and figure, with their run dirs
@@ -145,12 +147,29 @@ def align_cases(cases: dict[str, list[dict]], max_rows: int) -> list[str]:
     return picked
 
 
-def _case_rows(run: Path, *, step: int | None, label: str) -> pd.DataFrame:
-    """Per-call rows when the run recorded them, else its per-slice rows (#2500)."""
+def _case_rows(run: Path, *, step: int | None, label: str) -> tuple[pd.DataFrame, bool]:
+    """Per-slice rows keyed by subject, contrast and slice; per-call rows only to fill gaps.
+
+    Returns ``(rows, keyed_by_slice)``. Per-call rows are batch means paired across arms by
+    position, which pairs different slices whenever batch sizes or loader order differ, so
+    they supply only what the slice rows lack: a run with no slice rows, or the
+    acceleration-qualified metrics (``psnr@R8``) cascading validation logs per call.
+    """
+    rows = slice_case_rows(run, step=step, run_id=label, method=label)
     per_call = read_per_call(run)
-    if per_call is not None:
-        return per_case_rows(per_call, step=step, run_id=label, method=label)
-    return slice_case_rows(run, step=step, run_id=label, method=label)
+    calls = (
+        per_case_rows(per_call, step=step, run_id=label, method=label)
+        if per_call is not None
+        else pd.DataFrame()
+    )
+    if rows.empty:
+        return calls, calls.empty
+    if calls.empty or "acceleration" not in calls:
+        return rows, True
+    have = set(zip(rows["base_metric"], rows["acceleration"].fillna(-1.0), strict=True))
+    extra = calls[calls["acceleration"].notna()]
+    extra = extra[[(m, a) not in have for m, a in zip(extra["base_metric"], extra["acceleration"], strict=True)]]
+    return (pd.concat([rows, extra], ignore_index=True) if not extra.empty else rows), True
 
 
 def load_arms(
@@ -196,12 +215,13 @@ def load_arms(
     steps = {
         lab: by_run[f"{lab}_run{i}"] for i, lab in enumerate(labels) if f"{lab}_run{i}" in by_run
     }
-    frames = [
+    loaded = [
         _case_rows(run, step=steps.get(lab), label=lab)
         for lab, run in zip(labels, run_dirs, strict=True)
     ]
-    frames = [f for f in frames if not f.empty]
+    frames = [f for f, _ in loaded if not f.empty]
     per_case = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    by_slice = all(keyed for f, keyed in loaded if not f.empty)
     arms = Arms(
         labels,
         dict(zip(labels, run_dirs, strict=True)),
@@ -210,6 +230,7 @@ def load_arms(
         per_case,
         view=view,
         call_unit=call_unit([validation_batch_size(r) for r in run_dirs]),
+        case_unit="slices" if by_slice else call_unit([validation_batch_size(r) for r in run_dirs]),
         status={lab: status[lab] for lab in labels},
         excluded=excluded,
         excluded_dirs=excluded_dirs,

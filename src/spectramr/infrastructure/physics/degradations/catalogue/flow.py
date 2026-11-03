@@ -59,6 +59,7 @@ def flow_ghosts(
     vessel_map: Tensor | None = None,
     tr_ms: float = 50.0,
     t_card_ms: float = 1000.0,
+    max_depth: float = FLOW_GHOST_MAX_DEPTH,
 ) -> Tensor:
     """Pulsatile-flow ghosts: vessel signal scaled by ``1 + a cos(2 pi t_n / T_card + phi0)`` per line.
 
@@ -81,7 +82,7 @@ def flow_ghosts(
     times = line_times(geometry, d, h, tr_s=tr_ms * 1e-3).double()
     cycles = ((times / (t_card_ms * 1e-3)) % 1.0).to(device=x5.device, dtype=x5.real.dtype)
     phi0 = u[:, -1].to(x5.real.dtype).view(b, 1, 1, 1, 1)
-    depth = float(theta) * FLOW_GHOST_MAX_DEPTH
+    depth = float(theta) * max_depth
     mod = depth * torch.cos(2.0 * math.pi * (cycles.view(1, 1, d, h, 1) + phi0))
     dims = K_DIMS[geometry.mode]
     ghosts = ifftnc(fftnc(vessel * x5, dims=dims) * mod, dims=dims)
@@ -133,6 +134,7 @@ def flow_voids(
     *,
     vessel_map: Tensor | None = None,
     te_ms: float = 20.0,
+    max_velocity_cm_s: float = FLOW_VOID_MAX_CM_S,
 ) -> Tensor:
     """Flow voids: vessel signal times :func:`washout_factor` at ``v = 50 theta`` cm/s.
 
@@ -148,7 +150,7 @@ def flow_voids(
     u = sample_draws(x5, seed)
     vessel = resolve_vessels(x5, vessel_map, u, "flow_voids", ndim_in=x.dim())
     f = washout_factor(
-        float(theta) * FLOW_VOID_MAX_CM_S, te_ms, _thickness_mm(geometry, x5.shape[-3])
+        float(theta) * max_velocity_cm_s, te_ms, _thickness_mm(geometry, x5.shape[-3])
     )
     return (x5 * (1.0 - vessel * (1.0 - f))).view_as(x)
 
@@ -190,6 +192,7 @@ def inflow_enhancement(
     tr_ms: float = 30.0,
     t1_ms: float = 1500.0,
     fa_deg: float = 30.0,
+    max_velocity_cm_s: float = INFLOW_MAX_CM_S,
 ) -> Tensor:
     """Inflow enhancement: vessel signal times :func:`inflow_gain` at ``v = 50 theta`` cm/s.
 
@@ -209,7 +212,7 @@ def inflow_enhancement(
     vessel = resolve_vessels(x5, vessel_map, u, "inflow_enhancement", ndim_in=x.dim())
     depth = (torch.arange(d, dtype=torch.float64) + 0.5) * voxel_mm_or_unit(geometry.voxel_mm)[0]
     gain = inflow_gain(
-        depth, float(theta) * INFLOW_MAX_CM_S, tr_ms=tr_ms, t1_ms=t1_ms, fa_deg=fa_deg
+        depth, float(theta) * max_velocity_cm_s, tr_ms=tr_ms, t1_ms=t1_ms, fa_deg=fa_deg
     )
     gain = gain.to(device=x5.device, dtype=x5.real.dtype).view(1, 1, d, 1, 1)
     return (x5 * (1.0 + vessel * (gain - 1.0))).view_as(x)

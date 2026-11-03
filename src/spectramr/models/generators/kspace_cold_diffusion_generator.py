@@ -89,7 +89,6 @@ from spectramr.models.blocks.kspace_geometry_encoding import (
     KSPACE_GEOMETRY_CHANNELS,
     as_interleaved_complex,
     kspace_geometry_channels,
-    measurement_support,
     resolve_geometry_planes,
 )
 from spectramr.models.blocks.null_space_attention import NullSpaceDualDomainAttention
@@ -244,6 +243,25 @@ _TRANSFORMER_KNOBS: dict[str, frozenset[str]] = {
 }
 _TRANSFORMER_ALIASES = {"u_vit": "uvit"}
 
+#: Keys ``resolve_generator_kwargs`` adds from outside ``model_kwargs``. The constructor
+#: checks the resolved kwargs, so these are never misspellings (``dc_weight`` is within
+#: the near-miss cutoff of hat's ``cab_weight``).
+_RESOLVER_SUPPLIED_KWARGS = frozenset(
+    {
+        "acceleration_config",
+        "dc_weight",
+        "device",
+        "eval_noise_level",
+        "kspace_log_scaled",
+        "noise_type",
+        "num_timesteps",
+        "phase_encode_axis",
+        "sampler",
+        "train_noise_level",
+        "use_dc",
+    }
+)
+
 
 def _transformer_knob_defects(backbone_type: str, kw: Mapping[str, Any]) -> list[str]:
     """Inert and misspelt knobs for dit/uvit/diffit/hat, which absorb unknown keys."""
@@ -263,6 +281,7 @@ def _transformer_knob_defects(backbone_type: str, kw: Mapping[str, Any]) -> list
         | others
         | set(inspect.signature(KSpaceColdDiffusionGenerator.__init__).parameters)
         | {"heads", "max_timesteps"}
+        | _RESOLVER_SUPPLIED_KWARGS
     )
     for key in sorted(k for k in kw if k not in known):
         near = difflib.get_close_matches(key, sorted(own | {"heads"}), n=1, cutoff=0.75)
@@ -276,6 +295,18 @@ def _accepts_timesteps(backbone: nn.Module) -> bool:
     return "timesteps" in inspect.signature(backbone.forward).parameters
 
 
+# ``use_complex_conv`` realisation (#1461, #1359). Readers honour the flag (swin_diff_rec
+# takes it as a parameter and has no real-valued path). ``unet`` honours it by building
+# ComplexUNet in the bridge (no force_pure_kspace) or PureKSpaceUNet (force_pure_kspace,
+# complex by construction). Complex-only backbones build complex blocks, and the rest
+# absorb ``**kwargs``, so a declaration there is inert and raises.
+_USE_COMPLEX_CONV_READERS = frozenset({"nafnet", "mamba_unet", "vision_mamba", "swin_diff_rec"})
+_INERT_CONV_REASON = {
+    "complex_unet": "it builds complex blocks unconditionally",
+    "swin_diff_rec_kan": "it builds complex blocks unconditionally",
+}
+
+
 def backbone_kwargs_defects(model_kwargs: Mapping[str, Any] | None) -> list[str]:
     """Every ``backbone_type`` x ``model_kwargs`` incompatibility in an arm, as messages.
 
@@ -284,6 +315,8 @@ def backbone_kwargs_defects(model_kwargs: Mapping[str, Any] | None) -> list[str]
     of them from the frozen config, without building the model. Before #2047 the
     rules lived only in the constructor, so ``audit --strict`` passed four arms that
     then died at generator construction. Absent keys take the constructor's defaults.
+    ``use_complex_conv`` is legal only on the backbones that read it; any other
+    declaration is inert and raises (#1461).
     """
     kw = dict(model_kwargs or {})
     backbone_type = str(kw.get("backbone_type", DEFAULT_BACKBONE_TYPE))
@@ -369,6 +402,34 @@ def backbone_kwargs_defects(model_kwargs: Mapping[str, Any] | None) -> list[str]
             "the wrong domain. Set model_kwargs.force_pure_kspace: false so "
             "FourierBridgeNetwork performs the entry ifft2c, or choose "
             "backbone_type: 'complex_unet', which is k-space-native."
+        )
+
+    declared_cc = kw.get("use_complex_conv")
+    if declared_cc is not None:
+        if backbone_type == "unet":
+            if force_pure_kspace and not bool(declared_cc):
+                defects.append(
+                    "use_complex_conv=False with force_pure_kspace on backbone_type='unet': "
+                    "PureKSpaceUNet is complex by construction and has no real-valued path. "
+                    "Drop the key or set true."
+                )
+        elif backbone_type == "swin_diff_rec" and not bool(declared_cc):
+            defects.append(
+                "use_complex_conv=False on backbone_type='swin_diff_rec': SwinDiffRec has no "
+                "real-valued block path and raises at build. Drop the key or set true."
+            )
+        elif backbone_type not in _USE_COMPLEX_CONV_READERS:
+            reason = _INERT_CONV_REASON.get(backbone_type, "it absorbs the flag and never reads it")
+            defects.append(
+                f"use_complex_conv={bool(declared_cc)} is inert on backbone_type={backbone_type!r}: "
+                f"{reason}. Drop the key (#1461)."
+            )
+
+    if "num_repetitions" in kw:
+        defects.append(
+            "num_repetitions builds ComplexRepetitionFusion, whose repetition-major "
+            "[B, Reps, Coils, Ky, Kx] gate no dataset satisfies (M4Raw stacks repetitions "
+            "last), so the fusion never runs. Remove the key until the layout is decided (#1463)."
         )
     return defects
 
@@ -1218,6 +1279,9 @@ class FourierBridgeNetwork(nn.Module):
         backbone_type: str = "unet",
         force_pure_kspace: bool = False,
         time_embedding_dim: int = 256,
+        output_channels: int | None = None,
+        input_channels: int | None = None,
+        legacy_rep_fusion: bool = False,
         **backbone_kwargs,
     ):
         """__init__.
@@ -1226,9 +1290,18 @@ class FourierBridgeNetwork(nn.Module):
             config (UNetConfig): Description.
             backbone_type (str): Description.
             force_pure_kspace (bool): Description.
+            output_channels (int | None): Declared output width. Set when the
+                generator lifted a real channel to a complex pair (#1359); the
+                output is cut back to it. ``None`` means ``config.out_channels``.
+            input_channels (int | None): Declared real input width, the width the
+                repetition fusion sees. ``None`` means ``config.in_channels``.
+            legacy_rep_fusion (bool): Build the pre-#3363 unused ``rep_fusion`` so a
+                checkpoint written with it resumes. Set by the resume path from the
+                checkpoint's keys (``checkpointing.legacy_layout``), never by an arm.
         """
         super().__init__()
         self.config = config
+        self.output_channels = output_channels or config.out_channels
         self.force_pure_kspace = force_pure_kspace
         self.backbone_type = backbone_type
         # Feature domain fed to the backbone: k-space when we skip the entry
@@ -1237,10 +1310,24 @@ class FourierBridgeNetwork(nn.Module):
         # knob of its own (no unread-knob surface, pitfall #15).
         self.feature_domain = "kspace" if force_pure_kspace else "image"
 
-        # Add RepetitionFusion for 5D data
+        # Repetition fusion exists only when the arm declares ``num_repetitions``
+        # (#1359). An unused module used to be built on every bridge, and the
+        # validation fallback in ``mixins/kspace.py`` fused through its untrained
+        # weights. Sized from the declaration, at the declared real width.
         from spectramr.models.blocks.pseudo_3d_kspace import RepetitionFusion
 
-        self.rep_fusion = RepetitionFusion(channels=config.in_channels, num_reps=18)
+        self.input_channels = input_channels or config.in_channels
+        declared_reps = backbone_kwargs.get("num_repetitions")
+        self.rep_fusion_declared = declared_reps is not None
+        if self.rep_fusion_declared:
+            self.rep_fusion = RepetitionFusion(channels=self.input_channels, num_reps=declared_reps)
+        elif legacy_rep_fusion:
+            # Same shape and registration slot as before #3363: ZeRO restores optimizer
+            # state by flat position, so the pre-#3363 parameter list must be rebuilt
+            # exactly. Never called (rep_fusion_declared is False).
+            self.rep_fusion = RepetitionFusion(channels=config.in_channels, num_reps=18)
+        else:
+            self.rep_fusion = None
 
         # Backbones that support time conditioning
         self.time_conditioned_backbones = {
@@ -1455,9 +1542,11 @@ class FourierBridgeNetwork(nn.Module):
                 window_size=base_clean_kwargs.pop("window_size", 8),
                 **base_clean_kwargs,
             )
-        elif backbone_type == "unet":
+        elif backbone_type == "unet" and not bool(backbone_kwargs.get("use_complex_conv")):
             self.backbone = UNet(config)
-        elif backbone_type == "complex_unet":
+        elif backbone_type in ("complex_unet", "unet"):
+            # ``unet`` with a declared complex conv (#1359) runs this same complex
+            # backbone, so the declaration is honoured instead of ignored.
             from spectramr.models.generators.complex_unet import ComplexUNet
 
             padding_mode = base_clean_kwargs.pop("padding_mode", None)
@@ -1466,6 +1555,9 @@ class FourierBridgeNetwork(nn.Module):
                     "circular"  # 🧲 PHYSICS FIX: Circular is required for k-space periodicity
                 )
             padding_mode = padding_mode or "circular"
+            # ``features`` is passed explicitly from ``config.features``; a leftover
+            # model_kwargs copy would collide with it in ComplexUNet's signature.
+            base_clean_kwargs.pop("features", None)
 
             # ComplexUNet expects slightly different args. feature_domain is
             # passed EXPLICITLY here (not via base_clean_kwargs) so it reaches
@@ -1533,6 +1625,43 @@ class FourierBridgeNetwork(nn.Module):
             )
         else:
             self.phase_safe_attention = None
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list,
+        unexpected_keys: list,
+        error_msgs: list,
+    ) -> None:
+        """Drop ``rep_fusion`` weights from checkpoints that built the unused module (#1359).
+
+        Checkpoints written before the module became conditional carry its keys. This
+        bridge no longer builds it for those arms, so the keys are dropped and each one
+        is logged by name rather than failing the strict load.
+        """
+        if self.rep_fusion is None:
+            stale = [k for k in state_dict if k.startswith(prefix + "rep_fusion.")]
+            for key in stale:
+                del state_dict[key]
+            if stale:
+                logger.warning(
+                    "[FourierBridgeNetwork] ignoring %d checkpoint key(s) for the unused "
+                    "rep_fusion module (this arm declares no num_repetitions): %s",
+                    len(stale),
+                    ", ".join(stale),
+                )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def set_grad_checkpointing(self, enable: bool = True) -> None:
         """Forward the request to the wrapped backbone.
@@ -1921,9 +2050,10 @@ class FourierBridgeNetwork(nn.Module):
             # The loss and validation pipelines handle channel mismatches via
             # truncation (see diffusion.py _extract_and_fix_output).
             # Zero-padding would inject zeros that corrupt ifft_magnitude output.
-            expected_out = self.config.out_channels
+            expected_out = self.output_channels
             if kspace_out.shape[1] > expected_out:
-                # Truncate excess channels (e.g. backbone returned more than expected)
+                # Truncate excess channels (e.g. backbone returned more than expected).
+                # A lifted single real channel keeps its real part here (#1359).
                 kspace_out = kspace_out[:, :expected_out]
 
         # ✅ Restore 5D shape if input was 5D
@@ -2304,7 +2434,7 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         time_embedding_type: str = "sinusoidal",
         training_mode: str | None = None,
         activation: str = "complex",
-        use_complex_conv: bool = True,
+        use_complex_conv: bool | None = None,
         acceleration_config: dict | None = None,
         kspace_log_scaled: bool | None = None,
         device: "torch.device | str | None" = None,
@@ -2328,7 +2458,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             time_embedding_type (str): Description.
             training_mode (str | None): Description.
             activation (str): Description.
-            use_complex_conv (bool): Description.
+            use_complex_conv (bool | None): None = not declared; a declared value is
+                forwarded to readers and checked against the backbone by
+                :func:`backbone_kwargs_defects` (#1461).
             acceleration_config (dict | None): Description.
             kspace_log_scaled: whether this arm's k-space is ``log1p``-compressed
                 (``data.processing.enable_log_scaling``). DECLARED here, not
@@ -2756,7 +2888,10 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # runs on the frozen config (#2047). It sits before EITHER backbone branch:
         # the ``force_pure_kspace and backbone_type == 'unet'`` branch below builds
         # PureKSpaceUNet directly and never constructs the bridge.
-        defects = backbone_kwargs_defects(kwargs)
+        legacy_rep_fusion = bool(kwargs.pop("legacy_rep_fusion", False))
+        defects = backbone_kwargs_defects(
+            kwargs if use_complex_conv is None else {**kwargs, "use_complex_conv": use_complex_conv}
+        )
         if defects:
             raise ValueError(defects[0])
 
@@ -2873,10 +3008,17 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             kwargs["kspace_geometry_gain_planes"] = self.kspace_geometry_channels
             geometry_width = 0
 
+        # #1359: one real channel is one complex coil with a zero imaginary part.
+        # The backbone is built at that complex width; the bridge zero-pads the
+        # input and truncates the output back to the declared ``out_channels``.
+        built_in_channels = (
+            backbone_in_channels + 1 if backbone_in_channels == 1 else backbone_in_channels
+        )
+        built_out_channels = out_channels + 1 if out_channels == 1 else out_channels
         unet_config = UNetConfig(
             # noisy + smaps when conditioning enabled, the source reference, geometry
-            in_channels=backbone_in_channels + self.reference_channels + geometry_width,
-            out_channels=out_channels,  # Output image channels
+            in_channels=built_in_channels + self.reference_channels + geometry_width,
+            out_channels=built_out_channels,  # Output image channels
             features=features,
             depth=num_layers,
             attention_type=attn_enum,
@@ -2932,15 +3074,23 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             # ``backbone_type='complex_unet'``. This can no longer fire on the
             # DEFAULT: an unspecified attention_type resolves to ``none`` for
             # this backbone above.
+            # A declared complex conv on ``unet`` builds ComplexUNet in the bridge (#1359),
+            # which takes the full block-attention vocabulary, so the real-UNet set applies
+            # only to the real bridge.
             _UNET_BLOCK_ATTENTION = {"none", "channel", "spatial"}
-            if backbone_type == "unet" and attention_type not in _UNET_BLOCK_ATTENTION:
+            if (
+                backbone_type == "unet"
+                and not use_complex_conv
+                and attention_type not in _UNET_BLOCK_ATTENTION
+            ):
                 raise ValueError(
                     "backbone_type='unet' (the reconstruction-UNet bridge) builds "
                     "ConfigurableResidualBlock, which implements only attention_type "
                     f"in {sorted(_UNET_BLOCK_ATTENTION)}; got {attention_type!r}. Use "
-                    "backbone_type: 'complex_unet' to keep self/dual_domain/kan/"
-                    "wavelet block-attention, or set model_kwargs.attention_type to a "
-                    "supported value ('none'/'channel'/'spatial')."
+                    "backbone_type: 'complex_unet' or use_complex_conv: true to keep "
+                    "self/dual_domain/kan/wavelet block-attention, or set "
+                    "model_kwargs.attention_type to a supported value "
+                    "('none'/'channel'/'spatial')."
                 )
             # Same facade, different backbones. The seamless set builds NO
             # attention: those modules contain zero references to
@@ -2974,6 +3124,10 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
                 force_pure_kspace=force_pure_kspace,
                 time_embedding_dim=time_embedding_dim,
                 attention_type=attention_type,  # ✅ Pass attention_type explicitly for Phase 5
+                output_channels=out_channels,
+                input_channels=in_channels,
+                legacy_rep_fusion=legacy_rep_fusion,
+                **({} if use_complex_conv is None else {"use_complex_conv": use_complex_conv}),
                 **kwargs,
             )
 
@@ -4288,10 +4442,8 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
         # 1. Run the Diffusion Loop (K-Space -> Refined K-Space)
         # We assume 'x' is the measurement (starting point for Cold Diff)
         measurement = kwargs.get("measurement", x)
+        # A missing mask is resolved (or refused) by sample(), from the arm's own cascade.
         mask = kwargs.get("mask")
-
-        if mask is None:
-            mask = measurement_support(measurement)
 
         # Run full sampling loop
         kspace_pred = self.sample(
@@ -4450,7 +4602,9 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
 
         Args:
             measurement: The input undersampled k-space (x_T)
-            mask: Optional measurement mask
+            mask: Measurement mask. Omitted, it is the forward process's cascade mask at
+                ``start_timestep``; a process without one, or a measurement carrying
+                data outside it, raises (#2555).
             device: Device to run on
             inference_timesteps: Number of inference steps (default: use training timesteps)
                 Set to smaller value (e.g. 50) for faster inference
@@ -4511,7 +4665,16 @@ class KSpaceColdDiffusionGenerator(nn.Module, IGenerator):
             from spectramr.models.diffusion.samplers import get_sampler
 
             if mask is None:
-                mask = measurement_support(measurement)
+                # Never guessed from the non-zeros: structurally zero lines would read as
+                # unsampled and a fully sampled input as all ones (#2555).
+                from spectramr.models.diffusion.cold_rung import process_rung_mask
+
+                mask = process_rung_mask(
+                    getattr(self, "kspace_process", None),
+                    measurement,
+                    start_timestep,
+                    _measured_lines,
+                )
 
             # Use configured steps or passed steps
             steps = self._sampling_steps if inference_timesteps is None else inference_timesteps
@@ -4839,8 +5002,9 @@ def create_complex_kspace_cold_diffusion_generator(
     The "Dual Generator" approach (independent real/imag networks) has been removed due to
     phase incoherence.
     """
-    # Force use_complex_conv=True for "complex" requests
-    kwargs["use_complex_conv"] = True
+    # Only readers take the flag; forcing it on any other backbone would raise (#1461).
+    if kwargs.get("backbone_type", DEFAULT_BACKBONE_TYPE) in _USE_COMPLEX_CONV_READERS:
+        kwargs["use_complex_conv"] = True
     kwargs["activation"] = "complex"
 
     # Map old 'out_channels' (usually 1 for dual) to strict 2 for unified

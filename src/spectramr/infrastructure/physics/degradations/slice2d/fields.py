@@ -12,6 +12,7 @@ from spectramr.infrastructure.physics.degradations._common import (
     _ensure_complex,
     _generator,
     _isolated_rng,
+    reject_override_with_endpoint,
 )
 from spectramr.infrastructure.physics.digital_twin_simulator import (
     DEFAULT_CHI_PPM,
@@ -181,19 +182,26 @@ def degrade_bias_field(
     return x * bias
 
 
-def _delegate_b0(x, theta, seed=0, **kw):
+def _delegate_b0(x, theta, seed=0, max_strength=1.0, **kw):
     x = _ensure_complex(x)
+    reject_override_with_endpoint(
+        "b0", "strength", kw.get("strength"), "max_strength", max_strength, 1.0
+    )
     with _isolated_rng(x.device, seed):
         torch.manual_seed(int(seed))
         if x.device.type == "cuda":
             torch.cuda.manual_seed(int(seed))
-        strength = float(kw.get("strength", float(theta)))
+        strength = float(kw.get("strength", float(theta) * float(max_strength)))
         out = ifft2c(simulate_b0_inhomogeneity(fft2c(x), x.shape[-2:], strength=strength))
     return out
 
 
-def _delegate_b0_geometric(x, theta, seed=0, **kw):
+def _delegate_b0_geometric(x, theta, seed=0, max_b0_strength=1.0, **kw):
     x = _ensure_complex(x)
+    reject_override_with_endpoint(
+        "b0_geometric_distortion", "b0_strength", kw.get("b0_strength"),
+        "max_b0_strength", max_b0_strength, 1.0,
+    )
     with _isolated_rng(x.device, seed):
         torch.manual_seed(int(seed))
         if x.device.type == "cuda":
@@ -202,7 +210,7 @@ def _delegate_b0_geometric(x, theta, seed=0, **kw):
         # (the displacement is proportional to dwell_time * Delta_B0).
         # Bumped 1e-5 -> 5e-5 so theta=1 produces a clearly visible
         # voxel shift at the FOV periphery (Halbach low-field regime).
-        b0_strength = float(kw.get("b0_strength", float(theta)))
+        b0_strength = float(kw.get("b0_strength", float(theta) * float(max_b0_strength)))
         dwell_time = float(kw.get("dwell_time", 5e-5))
         out = simulate_b0_geometric_distortion(
             x,
@@ -214,7 +222,7 @@ def _delegate_b0_geometric(x, theta, seed=0, **kw):
     return out
 
 
-def _delegate_chemical_shift(x, theta, seed=0, **kw):
+def _delegate_chemical_shift(x, theta, seed=0, max_shift_pixels=14.0, **kw):
     x = _ensure_complex(x)
     # Without a field and bandwidth the shift is a synthetic 0-14 px ramp. With both,
     # theta scales the physical fat shift at that B0 and bandwidth; forwarding them to
@@ -222,6 +230,15 @@ def _delegate_chemical_shift(x, theta, seed=0, **kw):
     has_b0, has_bw = "b0_T" in kw, "bw_per_pixel_hz" in kw
     if has_b0 != has_bw:
         raise ValueError("chemical_shift needs both b0_T and bw_per_pixel_hz, or neither.")
+    reject_override_with_endpoint(
+        "chemical_shift", "shift_pixels", kw.get("shift_pixels"),
+        "max_shift_pixels", max_shift_pixels, 14.0,
+    )
+    if has_b0 and max_shift_pixels != 14.0:
+        raise ValueError(
+            f"chemical_shift: max_shift_pixels={max_shift_pixels} is ignored when b0_T and "
+            "bw_per_pixel_hz set the physical shift; pass one"
+        )
     if "shift_pixels" in kw and has_b0:
         raise ValueError("chemical_shift takes shift_pixels or b0_T/bw_per_pixel_hz, not both.")
     if has_b0:
@@ -230,7 +247,7 @@ def _delegate_chemical_shift(x, theta, seed=0, **kw):
         )
         shift = float(theta) * physical
     else:
-        shift = float(kw.get("shift_pixels", float(theta) * 14.0))
+        shift = float(kw.get("shift_pixels", float(theta) * float(max_shift_pixels)))
     # Default fat_fraction lowered 0.35 -> 0.15: 35 % was non-physical for brain
     # (parenchyma is < 1 % fat) and produced a whole-image fat ghost at 35 %
     # intensity; 0.15 keeps the ghost visible while being a more plausible

@@ -749,6 +749,18 @@ def test_forward_psf_rejects_an_even_kernel_and_zero_regularisation() -> None:
 class TestDegradationSchedules:
     """physics.digital_twin severity ramp -- undersampling's schedule, on severity."""
 
+    def test_degradation_schedule_rejects_log(self):
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        with pytest.raises(ValidationError, match="log is applied to physical endpoints"):
+            DigitalTwinConfig(degradation_schedule="log")
+
+    def test_degradation_schedules_rejects_log(self):
+        from spectramr.config.schemas.physics import DigitalTwinConfig
+
+        with pytest.raises(ValidationError, match="log is applied to physical endpoints"):
+            DigitalTwinConfig(degradation_schedules={"noise": "log"})
+
     def test_defaults_reproduce_the_pre_existing_linear_remap(self):
         from spectramr.config.schemas.enums import AccelerationSchedule
         from spectramr.config.schemas.physics import DigitalTwinConfig

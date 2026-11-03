@@ -102,6 +102,7 @@ def b1_transmit_volume(
     tr_ms: float | None = None,
     t1_ms: Any = DEFAULT_T1_MS,
     kappa_map: Tensor | None = None,
+    kappa_peak: float = KAPPA_PEAK,
 ) -> Tensor:
     """``x`` times the signal ratio of the calibrated ``kappa_full = 1 + 0.4 s(r)``.
 
@@ -114,7 +115,7 @@ def b1_transmit_volume(
         return x
     if kappa_map is None:
         s = centre_bright_shape(x.shape[0], tuple(x.shape[-3:]), geometry.voxel_mm, seed, x.device)
-        kappa = calibrated_kappa(1.0 + KAPPA_PEAK * s, object_support(x), theta)
+        kappa = calibrated_kappa(1.0 + kappa_peak * s, object_support(x), theta)
     else:
         kappa = 1.0 + theta * (torch.as_tensor(kappa_map, device=x.device) - 1.0)
     return apply_transmit(x, kappa, **signal)
@@ -154,6 +155,7 @@ def dielectric_b1_volume(
     fa_deg: float | None = None,
     tr_ms: float | None = None,
     t1_ms: Any = DEFAULT_T1_MS,
+    standing_wave_amplitude: float = DIELECTRIC_AMPLITUDE,
 ) -> Tensor:
     """Calibrated standing-wave scale of ``1 + 0.5 cos(2 pi |r| / lambda)`` inside the support."""
     check_input(x, geometry, "dielectric_b1")
@@ -162,7 +164,12 @@ def dielectric_b1_volume(
     if theta <= 0.0:
         return x
     full = dielectric_kappa(
-        tuple(x.shape[-3:]), geometry.voxel_mm, b0_T=b0_T, eps_r=eps_r, device=x.device
+        tuple(x.shape[-3:]),
+        geometry.voxel_mm,
+        b0_T=b0_T,
+        eps_r=eps_r,
+        amplitude=standing_wave_amplitude,
+        device=x.device,
     )
     kappa = calibrated_kappa(full, object_support(x), theta)
     return apply_transmit(x, kappa, **signal)

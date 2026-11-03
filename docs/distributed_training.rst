@@ -67,19 +67,154 @@ draw the same data-stream seed. Validation metrics are summed over the data-para
 group only, so a sample is counted once. The run's provenance records the mesh shape
 and dimension names.
 
-**Tensor parallelism** (``mesh.tensor > 1``, with ``strategy: ddp``) splits every
+**Tensor parallelism** (``mesh.tensor > 1``, with ``strategy: ddp`` or ``fsdp``) splits every
 ``TokenAttention`` by heads and the MLPs of ``DiTBlock`` and ``UViTBlock`` by hidden
 units, Megatron-style: each rank keeps the q, k and v rows of its own heads and the
 matching input columns of ``proj``, and one all-reduce per block sums the partial
 outputs. This covers the DiT, UViT and HAT backbones; a model with
-nothing to split is refused, as is ``fsdp`` with a tensor mesh (that needs DTensor
-plans). Before training, each split block is checked against an unsplit copy (output,
+nothing to split is refused. Before training, each split block is checked against an unsplit copy (output,
 input gradient, and the weights after one SGD step), on every rank, with the weights
 required identical across the tensor group. Parameter names are unchanged and a
 checkpoint gathers to full shapes on save and slices on load, so it is interchangeable
 with an unsplit model's; saving is therefore entered by every rank. Tensor peers draw
 the same strategy random streams (timesteps, masks), keyed by data-parallel rank.
-Context, spatial and pipeline axes are not wired into training yet.
+
+Under ``fsdp`` the split comes first and ``fully_shard`` then shards over the
+data-parallel dims of the same mesh only (``dp_shard``, or ``dp_replicate x dp_shard``
+for hybrid, flattened with ``cp`` under tensor x context), so no shard or gradient
+reduction ever spans tensor peers; a shard mesh
+that does, or an FSDP unit inside a split block (shard the enclosing
+``DiTBlock``/``UViTBlock`` with ``auto_wrap_policy: transformer_block``), is refused.
+The checkpoint hooks gather over dp, then over tp, so the full state dict is the unsplit
+model's; optimizer state (Adam moments) is gathered and sliced with the same transforms,
+under ``ddp`` as well, so a resume restores every tensor rank's moments. The EMA shadow is split and sharded like the generator so its per-step
+blend stays local. The gradient-norm clip (``grad_norm.clip_grad_norm_global_``, under
+``ddp`` as well) sums the split parameters' squared norms over the tensor group and
+counts replicated ones once. The composition is verified in float32 and under mixed
+precision (see below), without CPU offload or compile; those two are refused.
+Provenance records it under ``tensor_parallel``.
+
+**Context parallelism** (``mesh.context > 1``, with ``strategy: ddp`` or ``fsdp``) splits
+the token sequence of a DiT or U-ViT trunk across the context peers. Every peer embeds
+and position-encodes the full field, takes its contiguous chunk of tokens before the
+first transformer block, and all-gathers the sequence after the last one, so the stem
+and head run unsplit (U-ViT's long skips stay chunk-local). Each ``TokenAttention`` keeps
+its queries local and all-gathers keys and values, whose gradient is reduce-scattered
+back to the owning peer; an explicit attention mask is sliced to the peer's query rows.
+This is all-gather attention rather than ring attention: V100 and P100 have no flash
+kernel, and torch's ring attention needs those SDPA backends and does not run on CPU.
+The token count (plus U-ViT's time token) must divide by ``context``, or the forward
+raises. Gradients are averaged over ``dp x cp`` (DDP's process group; FSDP shards over
+the flattened ``dp_shard x cp``, ``no_shard`` is refused), with the gather's backward
+scaled by ``context`` so that average is the unsplit gradient. Before training, two
+copies of the backbone with their zero-initialised gates randomised are compared, split
+against unsplit: every attention under a random mask (output rows, input gradient), and
+the whole backbone (output, and the cp-mean of the input and parameter gradients); any
+mismatch raises on every rank. Parameters are untouched, so checkpoints and optimizer
+state are the unsplit model's. The first forward checks that the context peers entered
+the trunk with identical inputs; peers draw the same timesteps and noise because they
+share the data-parallel seed, and on resume rank 0's peers replay its random stream.
+HAT (windowed attention), gradient checkpointing, ``torch.compile``, FSDP CPU
+offload, and a context axis combined with ``spatial`` or ``pipeline`` are
+refused. Each peer holds the full keys and values of every layer and computes a
+``(N / cp) x N`` score matrix. Provenance records it under ``context_parallel``.
+
+**Tensor x context** (``mesh: {tensor: T, context: C}``) composes the two on a DiT or
+U-ViT trunk: the head split and the sequence split are orthogonal. The tensor split is
+applied and gated first; the context split then adopts each tensor-parallel attention
+as ``TensorContextParallelAttention``, which keeps its own heads' q, k and v rows and its
+token chunk, all-gathers the keys and values of its own heads over the context group,
+and sums its partial output over the tensor group. The MLPs are per-token and keep
+their hidden split. The context gate compares the tensor-split backbone against the same
+backbone also split along the sequence, so the two gates together prove the composed
+model equal to the unsplit one. Parameters are replicated across ``dp x cp`` and split
+across ``tp``, so DDP averages and FSDP shards over the flattened ``dp x cp`` only, never
+over ``tp``; the gradient-norm clip sums the split parameters' squared norms over the
+tensor group alone, so context peers are not counted twice. Checkpoints and optimizer
+state are the unsplit model's, as under tensor parallelism alone, and the tensor and
+context peers of one replica share its random stream. Per layer and step the
+communication is the tensor all-reduce of the attention and MLP outputs plus the
+context all-gather (and its reduce-scatter in backward) of ``1 / tp`` of the heads'
+keys and values. Provenance records the composition as ``tensor_parallel.order:
+tp_then_cp_then_<strategy>`` and ``context_parallel.tensor_split_attention_layers``.
+It is verified on four CPU ranks (``tp = cp = 2``, ``ddp`` and ``fsdp`` ``full_shard``).
+
+Every other pair of model-parallel axes is refused by the schema, each with its reason:
+no registered model can use both. Tensor and context parallelism split the
+``TokenAttention`` of the 2-D token backbones (DiT, U-ViT; HAT for tensor only), while
+spatial parallelism depth-splits 3-D volumes and refuses ``LayerNorm``; no 3-D model
+carries ``TokenAttention`` (the 3-D MAE ViTs use their own attention, which no tensor or
+context plan covers). Pipeline parallelism splits the unrolled cascades with
+``pipeline_stages`` (``unrolled_reconstruction``, ``unrolled_list``, ``nc_pdnet``,
+``diff_varnet``), which are 2-D, with convolutional denoisers and no token trunk.
+
+Spatial (depth-split) parallelism
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``parallel.mesh.spatial: N`` splits each 3D volume along depth across ``N`` peers.
+The generator's convolutions, norms and upsamplers are converted to their
+depth-split forms, which exchange halos and reduce statistics over the ``sp``
+group; the converted model must then reproduce the unsplit model on a synthetic
+volume (``parallel.spatial_probe_shape``, else ``data.sampling.patch_size``) before
+training starts, or the run raises. Every peer gathers the split outputs, so the
+loss sees the full volume, and the gather's backward scales this peer's slab of
+the gradient by ``N``. Averaging the gradients over ``dp x sp`` then gives the
+unsplit gradient.
+
+Under ``ddp`` that average is DDP's all-reduce over the combined group. Under
+``fsdp`` the peers hold identical parameters, so FSDP2 shards every model over the
+flattened ``dp_shard x sp`` axis (``hybrid_shard``: replicate over
+``dp_replicate``, shard over ``dp_shard x sp``) and its reduce-scatter performs the
+same average. Gradient clipping reads the global norm over that mesh, and a
+gathered checkpoint carries the unsplit model's keys, so it loads into a plain
+model. ``fsdp.sharding_strategy: no_shard`` is refused with a spatial axis; use
+``ddp`` for a replicated run. Spatial parallelism is not combined with another
+model-parallel axis (no registered model has both, see above), ``sync_batch_norm`` or
+``torch.compile``.
+Validation runs on every peer, because each forward needs the whole group, and
+metrics are summed over the data-parallel group only. Provenance records the
+composition under ``parallel.spatial``.
+
+**Pipeline parallelism** (``mesh.pipeline > 1``, ``strategy: ddp`` or ``fsdp``) splits an
+unrolled cascade (``nc_pdnet``, ``unrolled_reconstruction``; any model with
+``pipeline_stages(n)``. ``diff_varnet`` has the hook, but trains inside the cold-diffusion
+generator, which does not) into contiguous, balanced stages, one per pipeline rank. The
+inter-stage payload is the running estimate plus the context every data-consistency step
+needs (measured k-space, mask, maps, an embedding), which stages pass on unchanged. Each
+step runs a GPipe fill-drain schedule over ``mesh.pipeline_microbatches`` microbatches: a
+stage posts each microbatch downstream as soon as its cascades finish, so stage k+1 works
+on microbatch i while stage k computes i+1. The last stage back-propagates the full-batch
+loss once, and upstream stages then back-propagate microbatch by microbatch as each
+gradient arrives. Headers and host-side entries travel over a gloo copy of the pipeline
+group, so reading them never waits on the device. The overlap is checked on CPU ranks; its
+speed-up on GPUs is not measured. A batch the count does not divide runs as
+``gcd(batch, m)`` equal microbatches, which changes the overlap but not the loss
+(computed on the full batch). A model with BatchNorm needs ``m = 1``. The last stage broadcasts its output, so every rank computes the same loss and
+validation metrics (reduced over data-parallel only) and global rank 0, the first stage,
+logs, snapshots and writes checkpoints as without a pipeline. The pipeline step policy
+owns the backward: it moves gradients stage to stage, averages them over replicas under
+``ddp`` (no DDP wrapper: its reducer cannot span several microbatch backwards) or lets
+FSDP2 reduce-scatter them under ``fsdp`` (the stage is sharded over its data-parallel
+group), and clips by the norm summed over every stage. Checkpoints gather the stages
+into the unsplit model's keys, so ``spectramr infer`` loads them single-process; resuming
+needs the same pipeline size. Only a strategy declaring ``"pipelined"`` in its own
+``parallel_compat`` may run it (``reconstruction`` does), in float32 or mixed precision,
+without EMA, compile, gradient accumulation, CPU offload, or another model-parallel
+axis (the cascades are 2-D and have no token trunk, see above). Every other combination
+raises at audit or build.
+
+**fp16 under model parallelism.** fp16 is the only half precision on V100 (P100 runs
+it without tensor cores; bf16 needs sm_80+), so tensor, context, spatial and pipeline
+runs accept it under ``ddp`` and ``fsdp`` (``MixedPrecisionPolicy(param_dtype=fp16,
+reduce_dtype=fp32)``, float32 master weights and checkpoints). Every model-parallel
+layout uses the sharded ``ComplexGradScaler``, whose non-finite flag is all-reduced over
+the whole world: model-parallel peers hold different gradients, so an overflow on any
+tensor, context, spatial or pipeline peer, or any replica, skips the step and halves the
+scale on every rank. Gradients are unscaled before the global-norm clip. Under a
+pipeline the last stage back-propagates the scaled loss and every stage unscales its own
+gradients. The depth-split norms take their statistics in float32 and return the slab's
+dtype. The equivalence gates (tensor, context, spatial) run in float32 on the unsharded
+model, before FSDP applies its precision. Complex-valued arms cannot use fp16 at all.
 
 Launching
 ---------
@@ -274,7 +409,8 @@ Gradient clipping under FSDP
 Under FSDP2 every sharded parameter, and so every gradient, is a DTensor, and
 ``torch.nn.utils.clip_grad_norm_`` over DTensor gradients all-reduces the squared
 norms before scaling: the plain utility is already the global clip, so FSDP needs no
-step policy of its own. The training loop clips through the strategy's
+step policy of its own. A tensor-parallel model adds a reduction over the tensor group
+(see *Tensor parallelism* above). The training loop clips through the strategy's
 ``_clip_and_log_gradients`` hook; ``_compute_gradient_norm`` returns the replicated
 norm as a plain tensor so callers never mix DTensor and Tensor arithmetic.
 

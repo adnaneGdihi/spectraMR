@@ -197,17 +197,11 @@ class ParameterMapper:
                 "acceleration_config",
                 "features",
                 "score_matching",
-                "sde_type",
-                "sigma_min",
-                "sigma_max",
             },
             "score_based_diffusion_generator": {
                 "acceleration_config",
                 "features",
                 "score_matching",
-                "sde_type",
-                "sigma_min",
-                "sigma_max",
             },
             "neural_ode": {
                 "acceleration_config",
@@ -687,6 +681,12 @@ class ModelCreator:
                         f"for {generator_class.__name__} (constructor expects list/sequence)"
                     )
 
+        # A wrapper that forwards to an inner backbone names `_declared_keys` to receive the
+        # arm's pre-sweep set; a swept top-level field must not read as an unread knob there.
+        from spectramr.core.component_signature import signature_contract
+
+        if "_declared_keys" in signature_contract(generator_class).accepted:
+            mapped_params["_declared_keys"] = _declared_keys
         generator = generator_class(**mapped_params)
         generator = self._activation_manager.apply_activation(generator, model_type)
         self._logger.debug(f"ModelCreator created {model_type}: {type(generator)}")
@@ -1741,7 +1741,10 @@ class ModelFactory:
             ("reflexion_reconstruction", "..generators", "ReflexionReconstruction"),
             ("continual_learning_unet", "..generators", "ContinualLearningUNet"),
             ("spiking_unet", "..generators", "SpikingUNet"),
-            ("symbolic_regression", "..generators", "SymbolicRegressionWrapper"),
+            # The name builds the symbolic head exp118 declares; the wrapper (a
+            # plain base generator plus offline residual analysis) keeps its own (#977).
+            ("symbolic_regression", "..generators", "SymbolicRegressionGenerator"),
+            ("symbolic_regression_wrapper", "..generators", "SymbolicRegressionWrapper"),
             (
                 "uncertainty_wrapper",
                 "spectramr.models.generators.uncertainty_wrappers",
@@ -1826,6 +1829,12 @@ class ModelFactory:
             )
         except ImportError as e:
             self._logger.debug(f"Skipping StableDiffusionAdapter: {e}")
+
+        from spectramr.models.generators.pretrained_sd_adapter import (
+            PretrainedSDAdapterGenerator,
+        )
+
+        self._registry.register_generator("pretrained_sd_adapter", PretrainedSDAdapterGenerator)
 
         try:
             from spectramr.models.generators.x_diffusion_generator import (

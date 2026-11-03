@@ -522,6 +522,27 @@ step).
      - The number of averaged repetitions whose noise energy equals the
        corrected error: how many excitations the network's output is worth.
        ``rep_bias_variance``.
+   * - ``band_corrected_mse_<K>``, ``band_bias_squared_<K>``
+     - lower = better
+     - ``reference_noise_corrected_mse`` and ``bias_squared`` restricted to the
+       radial k-space band :math:`K` (``low`` :math:`\rho<1/8`, ``mid`` to
+       :math:`3/8`, ``high`` beyond, :math:`\rho` normalised to Nyquist). The
+       reference noise is spread over the bands with its own null-space
+       spectrum, so the three bands sum to the totals. ``rep_spectral_bands``.
+   * - ``band_cross_power_<K>``, ``band_input_cross_power_<K>``
+     - higher = better
+     - :math:`\sum_{k\in K}\operatorname{Re}\langle\hat f,\hat t\rangle` of the
+       prediction (or of the k-space input) with the phase-aligned reference;
+       unbiased by the reference's noise without a noise model.
+       ``rep_spectral_bands``.
+   * - ``band_signal_deficit_<K>``
+     - lower = better
+     - The reference's noise-corrected power in :math:`K` minus the cross
+       power. The band transfer :math:`T_K=\text{cross}/(\text{cross}+
+       \text{deficit})` is :math:`g` for an output that scales the band by
+       :math:`g`; form it from column means over slices or subjects, never per
+       slice. On a fully sampled input, cross / input cross is the transfer
+       relative to the identity. ``rep_spectral_bands``.
    * - ``sense_psnr``, ``sense_ssim``
      - higher = better
      - ``psnr`` / ``ssim`` on the SENSE combination

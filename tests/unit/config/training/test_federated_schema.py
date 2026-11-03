@@ -15,17 +15,23 @@ class TestFederatedConfig:
 
     def test_custom_values(self):
         config = FederatedConfig(
-            num_clients=5,
-            local_epochs=2,
-            aggregation_strategy="fed_prox",
-            client_fraction=0.5,
-            num_rounds=20,
+            num_clients=5, local_epochs=2, aggregation_strategy="fed_bn", num_rounds=20
         )
         assert config.num_clients == 5
         assert config.local_epochs == 2
-        assert config.aggregation_strategy == "fed_prox"
-        assert config.client_fraction == 0.5
+        assert config.aggregation_strategy == "fed_bn"
         assert config.num_rounds == 20
+
+    def test_unimplemented_rules_and_subsampling_are_refused(self):
+        import pydantic
+        import pytest
+
+        with pytest.raises(pydantic.ValidationError):
+            FederatedConfig(aggregation_strategy="fed_prox")
+        with pytest.raises(pydantic.ValidationError, match="subsampling"):
+            FederatedConfig(client_fraction=0.5)
+        with pytest.raises(pydantic.ValidationError):
+            FederatedConfig(fed_prox_mu=0.01)
 
 
 class TestTrainingConfigFederated:

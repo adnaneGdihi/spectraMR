@@ -1,24 +1,14 @@
-"""Hermitian-equivariant spectral blocks (Idea 1 of audit_plan_novel).
+"""Hermitian-tied spectral blocks (Idea 1 of audit_plan_novel).
 
-A standard ``SpectralConv2d`` learns a full complex kernel
-``W ∈ C^{C_in × C_out × modes1 × modes2}`` in the Fourier domain. When
-the inputs are k-space tensors with the Hermitian-symmetry constraint
-``K(-k) = conj(K(k))``, the corresponding kernel is over-parameterised
-by a factor of two: it can be expressed by two *real* tensors
-``W_R, W_I`` of the half-spectrum shape with the parity constraints
-
-    W_R(-k, -k') =  W_R(k, k'),
-    W_I(-k, -k') = -W_I(k, k').
-
-This module enforces those parities at the parameter level by storing
-only the half-spectrum and assembling the symmetric kernel at forward
-time. The block then commutes with the FFT and preserves Hermitian
-symmetry: ``IFFT2 ∘ Block ∘ FFT2`` maps real images to real images
-without spurious imaginary components.
-
-The framework's existing ``frequency_domain_consistency`` loss becomes
-redundant under this backbone (the constraint is now an *architectural*
-invariant rather than a soft penalty).
+A standard ``SpectralConv2d`` learns an unconstrained complex kernel on the
+retained rfft modes. Here the negative-row modes are tied to the positive
+rows by the half-spectrum reflection ``W(-k1, k2) = conj W(k1, k2)``, with the
+``k1 = 0`` row real and the unpaired ``-modes1`` row zero. Combined with the
+Hermitian symmetry that ``irfft2`` imposes along the width axis, this makes
+the circular kernel even in width, so the layer commutes with a width flip
+(``x.flip(-1)``) at the parameter count of the untied kernel. It is not
+height-flip equivariant. The output is real for any kernel, since ``irfft2``
+of a half-spectrum multiplier is a real circular convolution.
 """
 
 from __future__ import annotations
@@ -28,15 +18,12 @@ import torch.nn as nn
 
 
 class HermitianSpectralConv2d(nn.Module):
-    """Spectral convolution with Hermitian-parity parameter sharing.
+    """Spectral convolution whose negative rows reflect the positive rows.
 
-    Stores two real parameter tensors of half-spectrum shape and
-    assembles the full complex kernel at forward time. Parameter count
-    is exactly ``2 * (C_in * C_out * modes1 * modes2)`` (two real values
-    per spectral location), the same as a baseline ``SpectralConv2d``
-    that stores a complex tensor — but because the kernel respects
-    Hermitian symmetry, the network preserves the symmetry of its
-    inputs.
+    Stores two real tensors for rows ``k1 = 0 .. modes1-1`` and assembles
+    rows ``-1 .. -(modes1-1)`` as their conjugates, which makes the layer
+    width-flip equivariant. Parameter count is ``2 * C_in * C_out * modes1 *
+    modes2``; the imaginary part of row 0 is stored but masked to zero.
 
     Args:
         in_channels: Number of input channels.
@@ -59,15 +46,16 @@ class HermitianSpectralConv2d(nn.Module):
         self.modes2 = modes2
 
         scale = (2.0 / (in_channels + out_channels)) ** 0.5
-        # Half-spectrum storage: real and imaginary parts of one quadrant.
-        # The other quadrant of the rfft output is assembled at forward time
-        # via the parity constraints.
         self.w_real = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
         self.w_imag = nn.Parameter(scale * torch.randn(in_channels, out_channels, modes1, modes2))
 
-    def _assemble_kernel(self) -> torch.Tensor:
-        """Assemble the Hermitian-symmetric complex kernel ``W ∈ C^{...}``."""
-        return torch.complex(self.w_real, self.w_imag)
+    def _assemble_kernel(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Kernels for rfft rows ``[:modes1]`` and ``[-modes1:]`` (frequencies ``-modes1..-1``)."""
+        imag = torch.cat([torch.zeros_like(self.w_imag[:, :, :1]), self.w_imag[:, :, 1:]], 2)
+        k_pos = torch.complex(self.w_real, imag)
+        # Slice row r holds frequency r - modes1: row 0 (-modes1) has no stored partner.
+        k_neg = torch.cat([torch.zeros_like(k_pos[:, :, :1]), k_pos[:, :, 1:].flip(-2).conj()], 2)
+        return k_pos, k_neg
 
     @staticmethod
     def _compl_mul2d(x_ft: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -81,9 +69,7 @@ class HermitianSpectralConv2d(nn.Module):
             x: Real input ``[B, C, H, W]``.
 
         Returns:
-            Real output ``[B, C_out, H, W]``. Hermitian symmetry of the
-            intermediate k-space tensor is enforced by the kernel's
-            parameter sharing; therefore the IFFT is purely real.
+            Real output ``[B, C_out, H, W]``.
         """
         b, _, h, w = x.shape
         x_ft = torch.fft.rfft2(x, norm="ortho")
@@ -92,29 +78,24 @@ class HermitianSpectralConv2d(nn.Module):
             self.out_channels,
             h,
             w // 2 + 1,
-            dtype=torch.cfloat,
+            dtype=torch.promote_types(x_ft.dtype, torch.cfloat),
             device=x.device,
         )
-        k = self._assemble_kernel()
-        # Apply to low-frequency corner: rows [0:modes1], cols [0:modes2].
+        k_pos, k_neg = self._assemble_kernel()
         out_ft[:, :, : self.modes1, : self.modes2] = self._compl_mul2d(
-            x_ft[:, :, : self.modes1, : self.modes2], k
+            x_ft[:, :, : self.modes1, : self.modes2], k_pos
         )
-        # The negative-frequency corner uses the parity-conjugated kernel.
-        # For rfft2 we only need rows [-modes1:] (negative-frequency band
-        # along axis -2); the conjugate symmetry is built in along axis -1.
         out_ft[:, :, -self.modes1 :, : self.modes2] = self._compl_mul2d(
-            x_ft[:, :, -self.modes1 :, : self.modes2], k.conj()
+            x_ft[:, :, -self.modes1 :, : self.modes2], k_neg
         )
         return torch.fft.irfft2(out_ft, s=(h, w), norm="ortho")
 
 
 class HermitianFNOBlock(nn.Module):
-    """FNO block with the Hermitian-equivariant spectral conv inside.
+    """FNO block with the Hermitian-tied spectral conv inside.
 
-    Composition: ``SpectralConv → 1×1 Conv (residual) → activation``.
-    The residual 1×1 conv is purely real, so the whole block preserves
-    Hermitian symmetry of any input that already satisfies it.
+    Composition: ``SpectralConv → 1x1 Conv (residual) → activation``. Every
+    part commutes with a width flip, so the block is width-flip equivariant.
     """
 
     def __init__(

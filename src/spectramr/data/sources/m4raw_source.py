@@ -13,7 +13,7 @@ cache exists) the tissue tiers -- never ``path:*`` or ``control:*``.
 The reference is the NEX pseudo-GT
 ----------------------------------
 Multi-repetition complex k-space averaging (Macovski 1996) gives the full sqrt(N)
-SNR boost, and :func:`~spectramr.infrastructure.physics.m4raw_pseudo_gt.synthesize_pseudo_gt`
+SNR boost, and :func:`~spectramr.data.datasets.pseudo_gt_reference.synthesize_pseudo_gt`
 is the SSOT for it. This source wraps it rather than re-deriving a reference --
 sim2rank grades every metric against this image, so a second, subtly different
 reference implementation would silently change what "correct" means.
@@ -26,15 +26,13 @@ from pathlib import Path
 
 import torch
 
+from spectramr.data.datasets.contrast_grid import contrast_label
 from spectramr.data.datasets.m4raw_repetition_groups import discover_repetition_groups
 from spectramr.data.regions.mask_cache import RegionMaskCache
 from spectramr.data.regions.region_registry import REGION_SPECS, RegionTier
 from spectramr.data.sources.sim2rank_source import Sim2RankSlice
 from spectramr.infrastructure.physics.fft_ops import fft2c
-from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
-    extract_contrast_label,
-    synthesize_pseudo_gt,
-)
+from spectramr.data.datasets.pseudo_gt_reference import synthesize_pseudo_gt
 
 __all__ = ["M4RawSource"]
 
@@ -95,7 +93,7 @@ class M4RawSource:
 
     @property
     def contrasts(self) -> Sequence[str]:
-        return tuple(sorted({extract_contrast_label(g[0]) for g in self._groups}))
+        return tuple(sorted({contrast_label(g[0]) for g in self._groups}))
 
     @staticmethod
     def _group_id(rep_paths: list[Path]) -> str:
@@ -106,6 +104,11 @@ class M4RawSource:
         runs would look like a different subject.
         """
         return rep_paths[0].name.split(".")[0][:-2]
+
+    @staticmethod
+    def _subject_id(group_id: str) -> str:
+        """``YYYYMMDDNN_<contrast>`` -> ``YYYYMMDDNN``: every contrast of a scan is one subject."""
+        return group_id.split("_")[0]
 
     def __len__(self) -> int:
         return len(self._groups) * self.slices_per_volume
@@ -141,7 +144,7 @@ class M4RawSource:
         for rep_paths in self._groups:
             paths = [Path(p) for p in rep_paths]
             group_id = self._group_id(paths)
-            contrast = extract_contrast_label(paths[0])
+            contrast = contrast_label(paths[0])
 
             for slice_index in self._slice_indices(self._volume_depth(paths[0])):
                 # synthesize_pseudo_gt returns (coil_images, smaps, x_gt_mag, p99).
@@ -171,6 +174,7 @@ class M4RawSource:
                     contrast=contrast,
                     file_id=group_id,
                     slice_index=slice_index,
+                    subject_id=self._subject_id(group_id),
                     kspace=kspace,
                     coil_maps=smaps,
                     region_masks=masks,

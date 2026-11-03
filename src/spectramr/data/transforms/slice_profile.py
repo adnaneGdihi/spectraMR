@@ -52,7 +52,11 @@ from spectramr.infrastructure.physics.degradations.blocks.slice_physics import (
     slice_profile_kernel,
 )
 
-__all__ = ["SliceProfileTransform"]
+__all__ = ["SLICE_PROFILE_RATIO_KEY", "SLICE_PROFILE_Z_AXIS_KEY", "SliceProfileTransform"]
+
+#: Subject keys stamped when ``decimate`` is on; read by SliceToVolumeStrategy.
+SLICE_PROFILE_RATIO_KEY = "slice_profile_ratio"
+SLICE_PROFILE_Z_AXIS_KEY = "slice_profile_z_axis"
 
 
 # Profile names this transform accepts -> slice_physics kernel kinds.
@@ -86,7 +90,11 @@ def _convolve_along_axis(
     return out.to(data.dtype)
 
 
-@register_transform("slice_profile", modifies=("input", "target"))
+@register_transform(
+    "slice_profile",
+    modifies=("input", "target"),
+    produces=(SLICE_PROFILE_RATIO_KEY, SLICE_PROFILE_Z_AXIS_KEY),
+)
 class SliceProfileTransform(tio.Transform):
     r"""Apply a physically realistic slice-profile blur + decimation.
 
@@ -133,6 +141,7 @@ class SliceProfileTransform(tio.Transform):
         self.keys = tuple(keys)
 
     def apply_transform(self, subject: tio.Subject) -> tio.Subject:
+        ratios: set[int] = set()
         for key in self.keys:
             if key not in subject:
                 continue
@@ -152,6 +161,7 @@ class SliceProfileTransform(tio.Transform):
             if self.decimate:
                 # Decimate by the integer ratio, then nearest-up.
                 ratio = max(int(round(fwhm_voxels)), 1)
+                ratios.add(ratio)
                 if ratio > 1:
                     z_orig = data.shape[self.z_axis]
                     slc = [slice(None)] * data.dim()
@@ -168,4 +178,18 @@ class SliceProfileTransform(tio.Transform):
                     blurred = upsampled[tuple(slc_end)].contiguous()
 
             image.set_data(blurred)
+        if ratios:
+            self._stamp(subject, ratios)
         return subject
+
+    def _stamp(self, subject: tio.Subject, ratios: set[int]) -> None:
+        """Record the decimation so a slice-to-volume anchor can pool back to it."""
+        if len(ratios) != 1:
+            raise ValueError(
+                f"slice_profile decimated keys {self.keys} by different ratios "
+                f"{sorted(ratios)}; their z spacings disagree"
+            )
+        # Python ints survive collation as lists, so reading them never syncs a device.
+        subject[SLICE_PROFILE_RATIO_KEY] = ratios.pop()
+        subject[SLICE_PROFILE_Z_AXIS_KEY] = self.z_axis
+        subject.update_attributes()  # tio.Crop rebuilds patches from __dict__

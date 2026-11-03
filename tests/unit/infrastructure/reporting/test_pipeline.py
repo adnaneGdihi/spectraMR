@@ -156,9 +156,14 @@ def test_generate_report_autoloads_cases(tmp_path):
         )
     rec.write(tmp_path)
     res = pipe.generate_report(
-        tmp_path, task="reconstruction", figures=["mri_a7_kspace_recon"], tables_=[]
+        tmp_path, task="reconstruction", figures=["mri_recon_panel"], tables_=[]
     )
-    assert res["figures"].get("mri_a7_kspace_recon") is not None
+    assert res["figures"].get("mri_recon_panel") is not None
+
+
+def test_a_retired_figure_id_raises_with_its_replacement(tmp_path):
+    with pytest.raises(ValueError, match="mri_a7_kspace_recon -> mri_recon_panel"):
+        pipe.generate_report(tmp_path, task="reconstruction", figures=["mri_a7_kspace_recon"], tables_=[])
 
 
 def test_generate_report_emits_manifest(tmp_path):
@@ -399,7 +404,7 @@ def test_generate_report_emits_qc_html(tmp_path):
     assert res["html"] is not None and res["html"].exists()
     doc = res["html"].read_text()
     assert "QC report" in doc
-    assert "data:image/png;base64," in doc
+    assert "src='figures/" in doc and "base64," not in doc  # linked, not embedded
 
 
 def test_generate_report_html_off(tmp_path):
@@ -487,7 +492,7 @@ def test_generate_report_interactive_false_strips_layer(tmp_path):
     )
     doc = res["html"].read_text()
     assert "Plotly.newPlot" not in doc  # no interactive layer
-    assert "data:image/png;base64," in doc  # static PNGs embedded
+    assert "src='figures/" in doc  # static PNGs linked
 
 
 def test_load_domain_artifacts_routes_csv_and_kwargs(tmp_path):
@@ -553,10 +558,10 @@ class TestFiguresNullResolvesToThePreset:
 
     @pytest.mark.parametrize(
         ("task", "expected"),
-        [("default", 11), ("reconstruction", 31), ("gan", 10)],
+        [("default", 14), ("reconstruction", 35), ("gan", 10)],
     )
     def test_the_preset_not_all_44(self, task, expected):
-        assert len(pipe._all_figure_ids()) == 69, "registry size changed; update below"
+        assert len(pipe._all_figure_ids()) == 72, "registry size changed; update below"
         assert len(self._resolve(task)) == expected
 
     def test_different_tasks_now_give_different_figure_sets(self):

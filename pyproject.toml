@@ -32,7 +32,7 @@ classifiers = [
 dependencies = [
   # FLOOR = 2.8, held by ONE reason since the index moved to cu126 (2026-08-31):
   #   - it is the highest torch floor any dependency actually DECLARES: `monai
-  #     1.6.0` requires `torch>=2.8.0`. Every other declaration in the installed
+  #     1.6.1` requires `torch>=2.8.0`. Every other declaration in the installed
   #     set is lower (diffusers >=2.6, transformers >=2.5, bitsandbytes >=2.4,
   #     torchio >=1.9), so 2.8 is where this graph already sits.
   # The second reason this floor used to have -- "oldest torch on the index" --
@@ -190,7 +190,7 @@ dependencies = [
 # a DICOM series — the one input format the extra's name promises.
 mri = [
   "torchio>=1.2",
-  "monai>=1.5",
+  "monai>=1.6.1",
   "nibabel>=5.4",
   "torchkbnufft>=1.5",
   "pydicom>=3.0",

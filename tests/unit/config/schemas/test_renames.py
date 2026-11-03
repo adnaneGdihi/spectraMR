@@ -800,23 +800,22 @@ def _enclosing_class(lines: list[str], idx: int) -> str | None:
 class TestM4RawPresetSurvivesTheFold:
     """The concrete instance of the ordering rule above.
 
-    ``migrate_legacy_sizes`` injects four M4Raw defaults using the FLAT key
-    names. Phase 9a moved one of them (``coil_processing_mode`` ->
-    ``coils.processing_mode``), so this pairing is live today: get the ordering
-    wrong and every M4Raw arm silently reverts to ``processing_mode='none'``
-    while still reporting a clean load.
+    ``migrate_legacy_sizes`` injects three M4Raw defaults using the FLAT key
+    names, and two of them now live in ``processing.*``, so this
+    pairing is live today: get the ordering wrong and every M4Raw arm silently
+    reverts to the schema defaults while still reporting a clean load.
     """
 
     def test_injected_preset_reaches_the_sub_block(self) -> None:
         from spectramr.config.schemas.data import DataConfigSchema
 
         cfg = DataConfigSchema(dataset_type="m4raw", data_root="/tmp")
-        default = type(cfg.coils).model_fields["processing_mode"].default
-        assert default != "svd", (
+        default = type(cfg.processing).model_fields["enable_kspace_normalization"].default
+        assert default is not True, (
             "the schema default now equals the preset, so this test can no "
             "longer tell injection from default -- pick another witness"
         )
-        assert cfg.coils.processing_mode == "svd"
+        assert cfg.processing.enable_kspace_normalization is True
 
     def test_an_explicit_value_still_wins_over_the_preset(self) -> None:
         from spectramr.config.schemas.data import DataConfigSchema
@@ -828,7 +827,7 @@ class TestM4RawPresetSurvivesTheFold:
     # collision: the preset wrote the legacy key too, and two legacy writes
     # merge. A MIGRATED arm -- the output of `migrate_config_keys.py` -- passes
     # the canonical one, and got `svd` written beside it and a "two spellings
-    # disagree" ValidationError. Three of the four preset knobs are folded, so
+    # disagree" ValidationError. The coil mode and two preset knobs are folded, so
     # all three are pinned here.
     @pytest.mark.parametrize(
         ("kwargs", "read", "expected"),
@@ -864,7 +863,6 @@ class TestM4RawPresetSurvivesTheFold:
         from spectramr.config.schemas.data import DataConfigSchema
 
         cfg = DataConfigSchema(dataset_type="m4raw", data_root="/tmp")
-        assert cfg.coils.processing_mode == "svd"
         assert cfg.processing.enable_kspace_normalization is True
         assert cfg.processing.kspace_percentile == 0.99
         assert cfg.use_repetitions is True

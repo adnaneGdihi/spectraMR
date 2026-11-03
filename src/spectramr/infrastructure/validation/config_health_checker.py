@@ -30,6 +30,7 @@ from spectramr.infrastructure.physics.dc_settings import (
     inert_dc_knobs,
     resolve_effective_dc,
 )
+from spectramr.infrastructure.physics.dispersion import magnitude_stack_unknowns
 from spectramr.infrastructure.training.utils.metric_transform import (
     IMPLEMENTED_METRIC_TRANSFORMS,
     declared_metric_transforms,
@@ -57,6 +58,15 @@ _SHORT_EPOCH_ITERS = 50
 #: crosses repetitions at all -- so a mode added to the Literal is coherent
 #: unless it is this one.
 _INCOHERENT_NEX_TARGET_MODE = "complex_mean"
+
+#: The dataset routes whose builder reads ``data.target_mode``. ``m4raw_triplet``
+#: is not one: its builder hard-wires the registered trees' averaging.
+_NEX_TARGET_MODE_ROUTES = frozenset({"m4raw"})
+
+#: Routes whose builder fixes the target, and the ``target_mode`` the schema requires
+#: them to declare (``DataConfigSchema._triplet_route_serves_phase_aligned_mean``).
+#: Declaring that value states the route's fact; it is not an unread knob.
+_PINNED_TARGET_MODE = {"m4raw_triplet": "phase_aligned_mean"}
 
 #: The config paths that decide WHERE one arm's artifacts land. Every one is
 #: read on a production path -- ``bootstrap.py`` resolves the log sink and the
@@ -284,6 +294,19 @@ class HealthCheckReport:
     def to_json(self, indent: int | None = 2) -> str:
         """Return the report serialised to a JSON string."""
         return json.dumps(self.to_dict(), indent=indent, default=str)
+
+
+_ABSENT = object()
+
+
+def _dotted_get(kwargs: Any, key: str) -> Any:
+    """``kwargs["a"]["b"]`` for ``key="a.b"`` (an OPTION_SCHEMA key may name a nested option)."""
+    node = kwargs
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return _ABSENT
+        node = node[part]
+    return node
 
 
 def _has_enabled_pre_model_adapter(adapters: Any) -> bool:
@@ -1643,6 +1666,20 @@ class ConfigHealthChecker:
             and needs_kspace_to_image_bridge(config)
         )
 
+    @classmethod
+    def _strategy_fft_bridges_kspace_losses(cls, config: Any) -> bool:
+        """Does the arm's strategy fft2c an IMAGE prediction before its k-space losses?"""
+        if not getattr(cls._resolve_strategy_class(config), "fft_bridges_kspace_losses", False):
+            return False
+        from spectramr.infrastructure.training.utils.domain_inference import (
+            infer_output_domain,
+        )
+
+        try:
+            return infer_output_domain(config) == "image"
+        except Exception:  # an inconsistent domain is the domain checks' finding
+            return False
+
     @staticmethod
     def _resolve_strategy_class(config: Any) -> type | None:
         """The arm's strategy class, or ``None`` when it does not resolve.
@@ -1842,6 +1879,23 @@ class ConfigHealthChecker:
             )
             return results
 
+        # A coordinate network (kspace_inr's SIREN) is fed (k_x, k_y) by its strategy and
+        # emits per-coil k-space; neither side is the loader's channel count.
+        if getattr(self._resolve_strategy_class(config), "model_input_is_coordinates", False):
+            results.append(
+                HealthCheckResult(
+                    passed=True,
+                    check_name="domain_alignment",
+                    message=(
+                        f"the strategy feeds '{model_type}' k-space coordinates, so coil-channel "
+                        f"alignment is not applicable (in_channels={in_channels}, "
+                        f"out_channels={out_channels})."
+                    ),
+                    severity="info",
+                )
+            )
+            return results
+
         # Compute expected channel count from data pipeline config.
         # `expected_channels is None` means the count cannot be derived
         # statically (synthetic data, raw passthrough, file-dependent
@@ -1852,6 +1906,7 @@ class ConfigHealthChecker:
             dataset_type=dataset_type,
             num_virtual_coils=config.data.coils.num_virtual_coils,
             in_channels=in_channels,
+            stacked_combine=config.data.pairing.stacked_combine,
         )
 
         # Paired-contrast fusion models consume both source + target
@@ -2215,6 +2270,7 @@ class ConfigHealthChecker:
         dataset_type: str,
         num_virtual_coils: int | None,
         in_channels: int,
+        stacked_combine: str = "joint",
     ) -> tuple[int | None, str]:
         """Compute the expected channel count from data-pipeline config.
 
@@ -2239,6 +2295,8 @@ class ConfigHealthChecker:
         if coil_mode == "magnitude":
             return 1, "coil_processing_mode='magnitude' produces 1 channel (magnitude)"
 
+        if coil_mode == "rss_image" and stacked_combine == "per_contrast":
+            return 2, "rss_image with pairing.stacked_combine='per_contrast': one channel per contrast"
         if coil_mode == "rss_image":
             return (
                 1,
@@ -2246,6 +2304,12 @@ class ConfigHealthChecker:
             )
 
         if coil_mode == "svd":
+            if dataset_type == "m4raw":
+                return (
+                    None,
+                    "coil_processing_mode='svd' is refused on dataset_type='m4raw' "
+                    "(no SVD compression there) — no channel count to derive",
+                )
             if ConfigHealthChecker._is_image_domain_dataset(dataset_type):
                 # _apply_coil_processing's image-domain SVD branch logs a
                 # warning and falls back to RSS magnitude (1 channel).
@@ -2356,7 +2420,11 @@ class ConfigHealthChecker:
                 self._resolve_strategy_class(config), "reads_model_kwargs", None
             )
             severity = "info" if strategy_reads is None else "error"
-            strategy_reads = strategy_reads or frozenset()
+            from spectramr.infrastructure.training.builders.model_builder import (
+                BUILDER_READ_MODEL_KWARGS,
+            )
+
+            strategy_reads = (strategy_reads or frozenset()) | BUILDER_READ_MODEL_KWARGS
             for key in kwargs:
                 if key in schema or key in sig_params or key in strategy_reads:
                     continue
@@ -2383,10 +2451,12 @@ class ConfigHealthChecker:
                     )
                 )
 
+        declared = {key: _dotted_get(kwargs, key) for key in schema}
+        declared = {key: value for key, value in declared.items() if value is not _ABSENT}
         for key, allowed in schema.items():
-            if key not in kwargs:
+            if key not in declared:
                 continue
-            value = kwargs[key]
+            value = declared[key]
             if value not in allowed:
                 results.append(
                     HealthCheckResult(
@@ -2416,7 +2486,7 @@ class ConfigHealthChecker:
         # pitfall-#16 shape this checker exists to catch. `audit` is --strict by
         # default, so an unfounded `info` is not harmless: it is the reassuring
         # noise that hides the real finding. Issue #284.
-        checked = sorted(key for key in schema if key in kwargs)
+        checked = sorted(declared)
         if checked and not results:
             results.append(
                 HealthCheckResult(
@@ -2519,6 +2589,7 @@ class ConfigHealthChecker:
                     and (
                         all(_applies_forward_operator(name) for name in names)
                         or _ei_anchor_scores(config, names)
+                        or self._strategy_fft_bridges_kspace_losses(config)
                     )
                 )
                 severity = "info" if auto_bridged else "error"
@@ -2527,8 +2598,9 @@ class ConfigHealthChecker:
                         f"losses.output_domain={output_domain!r} with "
                         f"losses.{attr_name} ({names}): bridged, by LossBuilder per "
                         "schema contract, by a loss that applies the forward "
-                        "operator to the image itself, or by the EI anchor that "
-                        "scores F S x_hat."
+                        "operator to the image itself, by the EI anchor that "
+                        "scores F S x_hat, or by a strategy that fft2c's the "
+                        "image prediction before its k-space losses."
                     )
                     fix_hint = None
                 else:
@@ -4780,6 +4852,20 @@ class ConfigHealthChecker:
             )
 
         model = getattr(config, "model", None)
+        # The model's prompt table must be as wide as the data's vendor ids.
+        model_nv = ((getattr(model, "model_kwargs", None) or {}) if model else {}).get("n_vendors")
+        if model_nv is not None and int(model_nv) != len(vendor_map or {}):
+            return HealthCheckResult(
+                passed=False,
+                check_name="vendor_model_support",
+                message=(
+                    f"model.model_kwargs.n_vendors={model_nv} but data.multi_contrast.vendor_map "
+                    f"names {len(vendor_map or {})} vendors; the prompt table and the ids disagree."
+                ),
+                severity="error",
+                category="schema",
+                yaml_keys=["model.model_kwargs.n_vendors", "data.multi_contrast.vendor_map"],
+            )
         model_type = getattr(model, "model_type", None) if model is not None else None
         if not model_type:
             return HealthCheckResult(
@@ -6957,45 +7043,52 @@ class ConfigHealthChecker:
         )
 
     def check_m4raw_nex_target_mode_declared(self, config: TrainingSettings) -> HealthCheckResult:
-        """An ``m4raw`` arm should declare ``data.target_mode`` explicitly.
+        """An ``m4raw`` arm must declare ``data.target_mode`` explicitly.
 
-        M4Raw stores several **phase-incoherent** repetitions per anatomy --
-        separate acquisitions with independent global phase drift. The schema
-        default, ``complex_mean``, plain-averages them in complex k-space, which
-        *cancels* signal instead of averaging it: the resulting "high-SNR
-        reference" has SNR **below a single repetition** and scrambled phase.
-        ``.claude/rules/data.md`` records where that led -- k-space cold
-        diffusion learned to predict near-real k-space and produced a 180
-        degree centro-symmetric doubled brain. ``phase_aligned_mean`` aligns each
-        repetition's global phase to rep 0 first, giving the intended sqrt(N).
+        M4Raw stores several **phase-incoherent** repetitions per anatomy, and
+        the schema default ``complex_mean`` plain-averages them in complex
+        k-space, which cancels signal: the "high-SNR" reference ends up below a
+        single repetition, with scrambled phase (``.claude/rules/data.md``).
+        The default is right for every other dataset, so it cannot be flipped;
+        instead an ``m4raw`` arm that says nothing is an **error** (plan
+        decision 15, scoped to the ``m4raw`` route by decision 17). An explicit
+        ``complex_mean`` is a deliberate legacy comparison and stays advisory.
 
-        **Advisory, and deliberately so.** The default is wrong *for M4Raw* but
-        right for every other dataset, so it cannot simply be flipped. Measured
-        2026-08-03 over ``git ls-files experiments`` (110 arms declare
-        ``dataset_type: m4raw``; 107 resolve, 3 are unloadable and so never reach
-        any check): **63 pass, 44 would newly fail**, 5 of them outside
-        ``experiments/inprogress/``. A warning is not the softer option -- the
-        smoke wrapper runs the audit ``--strict``, where warnings exit 2, so
-        ``warning`` and ``error`` have the same blast radius. Ratcheting this to
-        an error is an owner decision once those 44 are triaged (issue #694), the
-        same posture ``check_workflow_declared`` takes for an absent
-        ``workflow:`` block.
-
-        **The vocabulary has one owner: the schema.** This check names only
-        ``complex_mean`` (see ``_INCOHERENT_NEX_TARGET_MODE``) and treats every
-        other member of the Literal as coherent. It used to enumerate the good
-        modes instead, which silently went stale when ``r2r`` was added.
-
-        **Absence is the finding, not the resolved value.** ``target_mode`` is a
-        declared field with a default, so ``config.data.target_mode`` reads
-        ``complex_mean`` whether the arm chose it or said nothing at all. Only
-        ``model_fields_set`` separates a default nobody chose from an affirmative
-        choice -- and those are different findings, so this reports them
-        differently rather than collapsing both into one message.
+        Only ``model_fields_set`` separates a default nobody chose from an
+        affirmative choice, since both resolve to ``complex_mean``. The
+        complementary leg warns on ``target_mode`` declared on a route that
+        never reads it (``m4raw_triplet``, ``kspace``; #1870), so the rule never
+        demands the key where it would be inert. The vocabulary has one owner,
+        the schema Literal: this check names only ``_INCOHERENT_NEX_TARGET_MODE``.
         """
         check_name = "m4raw_nex_target_mode_declared"
         data = getattr(config, "data", None)
-        if data is None or getattr(data, "dataset_type", None) != "m4raw":
+        dataset_type = getattr(data, "dataset_type", None)
+        if (
+            data is not None
+            and "target_mode" in data.model_fields_set
+            and dataset_type not in _NEX_TARGET_MODE_ROUTES
+            and _PINNED_TARGET_MODE.get(dataset_type) != data.target_mode
+        ):
+            # The complementary leg (#1870): only the NEX routes read target_mode.
+            return HealthCheckResult(
+                passed=False,
+                check_name=check_name,
+                message=(
+                    f"data.target_mode: {data.target_mode} is declared on "
+                    f"dataset_type={dataset_type!r}, which never reads it; only "
+                    f"{sorted(_NEX_TARGET_MODE_ROUTES)} build a NEX target, so the "
+                    "arm asserts a reference it does not train against."
+                ),
+                severity="warning",
+                category="data",
+                yaml_keys=["data.target_mode", "data.dataset_type"],
+                fix_hint=(
+                    "Delete data.target_mode, or move the arm to dataset_type: m4raw "
+                    "if it really wants the NEX-averaged reference."
+                ),
+            )
+        if data is None or dataset_type != "m4raw":
             return HealthCheckResult(
                 passed=True,
                 check_name=check_name,
@@ -7041,7 +7134,7 @@ class ConfigHealthChecker:
                 f"SNR than one repetition and corrupted phase, so validation "
                 f"PSNR/SSIM grade against a degraded reference."
             ),
-            severity="info",
+            severity="info" if declared else "error",
             category="data",
             yaml_keys=["data.target_mode"],
             fix_hint=(
@@ -7349,186 +7442,6 @@ class ConfigHealthChecker:
                 "validation.scoring.compute, a key the strategy's validation_step writes "
                 "is legal once it is declared in capabilities.emitted_metrics."
             ),
-        )
-
-    def check_repetition_count_is_achievable(self, config: TrainingSettings) -> HealthCheckResult:
-        """``model_kwargs.num_repetitions`` must match what the data can supply.
-
-        ``ComplexRepetitionFusion`` sizes a 1x1 complex conv at
-        ``num_physical_coils * num_repetitions``, so the declared count is a hard
-        shape contract. M4Raw ships **3** repetitions for T1/T2 and **2** for
-        FLAIR, so ``4`` -- the value four arms declared -- is satisfiable by no
-        contrast at all (#1173).
-
-        Two properties of this check are deliberate:
-
-        * **It reads the DECLARED value, and only fires when one was declared.**
-          Applicability is gated on the same opt-in that now gates building the
-          layer, which keeps the red count equal to the set of arms that
-          actually asked for repetition fusion. The constructor's old
-          ``kwargs.get("num_repetitions", 4)`` default is exactly the silent
-          substitution non-negotiable 3 forbids, so there is no defaulted value
-          left for this check to bless.
-        * **The rep counts come from the producer**, ``m4raw_dataset``'s
-          ``M4RAW_REPETITIONS_BY_CONTRAST``, not from a literal copied into this
-          checker. One owner per invariant (non-negotiable 17); a second copy
-          here would drift silently and each would pass its own tests.
-
-        The sharpest outcome is the heterogeneous one: because the achievable
-        counts differ ACROSS contrasts, an arm spanning T1/T2 and FLAIR has **no
-        correct literal** -- 3 is wrong for FLAIR and 2 is wrong for T1/T2. Such
-        an arm has to resolve the count from the manifest per sample rather than
-        declare it, which is why the fix is an owner decision and not a
-        find-and-replace.
-        """
-        model_cfg = getattr(config, "model", None)
-        kwargs = getattr(model_cfg, "model_kwargs", None) or {}
-        if not isinstance(kwargs, dict) or "num_repetitions" not in kwargs:
-            return HealthCheckResult(
-                passed=True,
-                check_name="repetition_count_is_achievable",
-                message="model_kwargs.num_repetitions not declared; nothing to validate.",
-                severity="info",
-            )
-
-        declared = kwargs["num_repetitions"]
-        data_cfg = getattr(config, "data", None)
-        dataset_type = str(getattr(data_cfg, "dataset_type", "") or "")
-
-        # Only the M4Raw path reads repetitions at all. UniversalMRIDataset --
-        # which serves `dataset_type: kspace` -- has no repetition handling
-        # whatsoever, so a declaration there is inert rather than wrong.
-        if "m4raw" not in dataset_type.lower():
-            return HealthCheckResult(
-                passed=False,
-                check_name="repetition_count_is_achievable",
-                message=(
-                    f"model_kwargs.num_repetitions={declared!r} is declared, but "
-                    f"dataset_type={dataset_type!r} serves no repetitions: only the "
-                    "M4Raw path reads them (UniversalMRIDataset, which backs "
-                    "`kspace`/`fastmri_*`, has no repetition handling). The knob "
-                    "sizes a fusion layer that this data can never feed."
-                ),
-                severity="error",
-                category="model_data_mismatch",
-                yaml_keys=["model.model_kwargs.num_repetitions", "data.dataset_type"],
-                fix_hint=(
-                    "Drop model_kwargs.num_repetitions (and data.use_repetitions, "
-                    "which this dataset also ignores), or switch to "
-                    "dataset_type: m4raw if repetitions are genuinely wanted."
-                ),
-            )
-
-        try:
-            from spectramr.data.datasets.m4raw_dataset import (
-                M4RAW_REPETITIONS_BY_CONTRAST,
-            )
-        except Exception as e:  # pragma: no cover - import guard
-            return HealthCheckResult(
-                passed=True,
-                check_name="repetition_count_is_achievable",
-                message=f"M4Raw repetition map not importable; skipping ({e}).",
-                severity="info",
-            )
-
-        # Which contrasts does this arm actually span?
-        #
-        # ``data.multi_contrast.contrast_map`` is the only field that names them,
-        # and it MUST be read through ``model_fields_set`` rather than by value.
-        # Its default is a fully-populated ``{T1, T2, FLAIR, PD}`` materialised on
-        # every arm, so a truthiness test on it is a tautology -- every config
-        # would look like it declared all four contrasts, and this check could
-        # only ever reach one branch (the `model_dump` presence trap).
-        #
-        # ``data.contrasts`` does NOT exist and must not be reached for: that
-        # field lives on ``DataPairingConfigSchema``, a different block, so
-        # ``getattr(data_cfg, "contrasts", None)`` is a permanent ``None`` -- a
-        # read that looks like contrast resolution and resolves nothing.
-        names: list[str] = []
-        mc = getattr(data_cfg, "multi_contrast", None)
-        if mc is not None and "contrast_map" in getattr(mc, "model_fields_set", set()):
-            names = [str(c).upper() for c in (getattr(mc, "contrast_map", None) or {})]
-
-        if names:
-            # A contrast absent from the producer map (e.g. PD, whose count M4Raw
-            # documents as "variable") is UNKNOWN, not zero -- excluded from the
-            # achievable set and reported, never defaulted.
-            unknown = [n for n in names if n not in M4RAW_REPETITIONS_BY_CONTRAST]
-            achievable = {
-                M4RAW_REPETITIONS_BY_CONTRAST[n]
-                for n in names
-                if n in M4RAW_REPETITIONS_BY_CONTRAST
-            }
-        else:
-            # The arm did not restrict its contrasts, so it draws on the whole
-            # M4Raw corpus and must cope with every count that corpus contains.
-            unknown = []
-            achievable = set(M4RAW_REPETITIONS_BY_CONTRAST.values())
-        declared_contrasts = names or None
-
-        if not achievable:
-            return HealthCheckResult(
-                passed=True,
-                check_name="repetition_count_is_achievable",
-                message=(
-                    f"no contrast with a known repetition count "
-                    f"(declared: {declared_contrasts!r}); cannot validate "
-                    f"num_repetitions={declared!r}."
-                ),
-                severity="info",
-            )
-
-        if len(achievable) > 1:
-            detail = ", ".join(
-                f"{c}={M4RAW_REPETITIONS_BY_CONTRAST[c]}"
-                for c in sorted(M4RAW_REPETITIONS_BY_CONTRAST)
-            )
-            return HealthCheckResult(
-                passed=False,
-                check_name="repetition_count_is_achievable",
-                message=(
-                    f"model_kwargs.num_repetitions={declared!r} is a single literal, "
-                    f"but this arm spans contrasts whose repetition counts DIFFER "
-                    f"({detail}). No literal is correct for all of them: the fusion "
-                    "layer would be mis-sized for whichever contrast it does not "
-                    "match."
-                ),
-                severity="error",
-                category="model_data_mismatch",
-                yaml_keys=[
-                    "model.model_kwargs.num_repetitions",
-                    "data.multi_contrast.contrast_map",
-                ],
-                fix_hint=(
-                    "Resolve the repetition count per sample from the manifest "
-                    "instead of declaring it, or restrict the arm to contrasts "
-                    "that share one count (T1+T2 = 3)."
-                ),
-            )
-
-        only = next(iter(achievable))
-        if declared == only:
-            return HealthCheckResult(
-                passed=True,
-                check_name="repetition_count_is_achievable",
-                message=f"num_repetitions={declared} matches the data ({only}).",
-                severity="info",
-            )
-
-        note = f" (contrasts with unknown counts, excluded: {unknown})" if unknown else ""
-        return HealthCheckResult(
-            passed=False,
-            check_name="repetition_count_is_achievable",
-            message=(
-                f"model_kwargs.num_repetitions={declared!r} but this arm's data "
-                f"supplies {only}{note}. ComplexRepetitionFusion sizes a conv at "
-                f"num_physical_coils * num_repetitions, so the mismatch is a shape "
-                "contract the data cannot satisfy."
-            ),
-            severity="error",
-            category="model_data_mismatch",
-            yaml_keys=["model.model_kwargs.num_repetitions"],
-            fix_hint=f"Set model_kwargs.num_repetitions: {only}, or drop the key.",
         )
 
     def check_loss_domain_block_match(self, config: TrainingSettings) -> list[HealthCheckResult]:
@@ -11356,6 +11269,7 @@ class ConfigHealthChecker:
             dataset_type=dataset_type,
             num_virtual_coils=num_virtual_coils,
             in_channels=in_channels,
+            stacked_combine=getattr(getattr(data, "pairing", None), "stacked_combine", "joint"),
         )
         if expected_input is None:
             return HealthCheckResult(
@@ -12011,16 +11925,16 @@ class ConfigHealthChecker:
                 category="silent_fallback",
                 yaml_keys=["training.settings"],
             )
-        for field in ("real_paired_manifest", "synthetic_paired_manifest"):
-            if getattr(training, field, None) is None:
-                return HealthCheckResult(
-                    False,
-                    check_name,
-                    f"training.{field} is unset.",
-                    "error",
-                    category="silent_fallback",
-                    yaml_keys=[f"training.{field}"],
-                )
+        # The schema validator owns the synthetic manifest (required only when a cell uses it).
+        if getattr(training, "real_paired_manifest", None) is None:
+            return HealthCheckResult(
+                False,
+                check_name,
+                "training.real_paired_manifest is unset.",
+                "error",
+                category="silent_fallback",
+                yaml_keys=["training.real_paired_manifest"],
+            )
         return HealthCheckResult(
             True,
             check_name,
@@ -12468,7 +12382,12 @@ class ConfigHealthChecker:
     def check_acceleration_adaptive_target_rate_consistent(
         self, config: TrainingSettings
     ) -> HealthCheckResult:
-        """Adaptive-mask target_rate should match base_acceleration."""
+        """Adaptive-mask target_rate should match base_acceleration.
+
+        Either budget convention is consistent: the nominal ``1/R``, or the
+        fraction a fixed mask at ``R`` realises with its ACS band,
+        ``cf + (1 - cf)/R`` (the matched budget against a fixed-mask control).
+        """
         check_name = "adaptive_target_rate_consistent"
         accel = getattr(config, "undersampling", None)
         adaptive = getattr(accel, "adaptive", None) if accel else None
@@ -12476,14 +12395,18 @@ class ConfigHealthChecker:
             return HealthCheckResult(True, check_name, "adaptive mask disabled.", "info")
         target = getattr(adaptive, "target_rate", 0.125)
         base = getattr(accel, "base_acceleration", 8.0)
-        expected = 1.0 / max(base, 1e-9)
-        if abs(target - expected) > 0.05:
+        center_fraction = getattr(accel, "center_fraction", 0.0) or 0.0
+        nominal = 1.0 / max(base, 1e-9)
+        with_acs = center_fraction + (1.0 - center_fraction) * nominal
+        if not nominal - 0.05 <= target <= with_acs + 0.05:
             return HealthCheckResult(
                 False,
                 check_name,
                 (
                     f"acceleration.adaptive.target_rate={target} disagrees with "
-                    f"base_acceleration={base} (expected target_rate≈{expected:.3f}). "
+                    f"base_acceleration={base} (expected target_rate between "
+                    f"{nominal:.3f} and {with_acs:.3f} with center_fraction="
+                    f"{center_fraction}). "
                     f"The density penalty will pull toward an inconsistent budget."
                 ),
                 "warning",
@@ -12542,6 +12465,10 @@ class ConfigHealthChecker:
                 ("training", "distillation", "teacher_checkpoint"),
             ),
             ("model.checkpoint_path", ("model", "checkpoint_path")),
+            (
+                "training.privileged.teacher_checkpoint",
+                ("training", "privileged", "teacher_checkpoint"),
+            ),
             (
                 "certification.conformal.marker_basis_path",
                 ("certification", "conformal", "marker_basis_path"),
@@ -12827,210 +12754,6 @@ class ConfigHealthChecker:
             severity="info",
         )
 
-    # ------------------------------------------------------------------
-    # SPECTRA hardware backend checks (implementation plan Workstream C, C4)
-    #
-    # All three no-op (passed=True, severity="info") when no SPECTRA backend
-    # block is configured, so non-SPECTRA configs are entirely unaffected.
-    # ------------------------------------------------------------------
-
-    def check_spectra_backend_schema(self, config: Any) -> HealthCheckResult:
-        """Guard: a SPECTRA backend must be declared via the typed schema block.
-
-        Fires (error) when something selects the spectra backend but the
-        ``backend_acceleration`` block is absent, or when the block is present
-        but its ``backend`` is not ``"spectra"`` — the "selected without schema"
-        invariant. This is the config-time equivalent of the Tier-0
-        ``extra="forbid"`` guard for the *value* (Tier-0 already rejects unknown
-        keys; this rejects a mis-selected/missing backend).
-        """
-        block = getattr(config, "backend_acceleration", None)
-
-        # Detect a stray backend selection elsewhere (e.g. acceleration.backend
-        # == "spectra" pointed at the wrong block) without the typed schema.
-        accel = getattr(config, "undersampling", None)
-        stray = getattr(accel, "backend", None) if accel is not None else None
-        if block is None:
-            if stray == "spectra":
-                return HealthCheckResult(
-                    passed=False,
-                    check_name="spectra_backend_schema",
-                    message=(
-                        "The SPECTRA backend is selected (acceleration.backend="
-                        "'spectra') but the typed 'backend_acceleration' block is "
-                        "missing."
-                    ),
-                    severity="error",
-                    category="backend_acceleration",
-                    yaml_keys=["acceleration.backend", "backend_acceleration"],
-                    fix_hint=(
-                        "Add a 'backend_acceleration:' block with backend: spectra "
-                        "(see spectramr.config.schemas.spectra)."
-                    ),
-                )
-            return HealthCheckResult(
-                passed=True,
-                check_name="spectra_backend_schema",
-                message="No SPECTRA backend configured (not applicable).",
-                severity="info",
-                category="backend_acceleration",
-            )
-
-        backend = getattr(block, "backend", None)
-        if backend != "spectra":
-            return HealthCheckResult(
-                passed=False,
-                check_name="spectra_backend_schema",
-                message=(
-                    f"backend_acceleration.backend={backend!r} is not 'spectra'; "
-                    "this block only configures the SPECTRA backend."
-                ),
-                severity="error",
-                category="backend_acceleration",
-                yaml_keys=["backend_acceleration.backend"],
-                fix_hint="Set backend_acceleration.backend: spectra.",
-            )
-
-        return HealthCheckResult(
-            passed=True,
-            check_name="spectra_backend_schema",
-            message="SPECTRA backend schema present and well-formed.",
-            severity="info",
-            category="backend_acceleration",
-        )
-
-    def check_spectra_precision_envelope(self, config: Any) -> HealthCheckResult:
-        """Guard: reject FP8 *output* precision for a diagnostic recon task.
-
-        Encodes the A7 numerics discipline (implementation plan Workstream C):
-        FP8-E4M3 alone falls below the diagnostic PSNR/SSIM envelope, so it is an
-        inner-loop precision, never an output precision. When the SPECTRA backend
-        is configured with ``pe_mode_policy == fp8`` for a reconstruction-class
-        task, this is an error.
-        """
-        block = getattr(config, "backend_acceleration", None)
-        if block is None:
-            return HealthCheckResult(
-                passed=True,
-                check_name="spectra_precision_envelope",
-                message="No SPECTRA backend configured (not applicable).",
-                severity="info",
-                category="backend_acceleration",
-            )
-
-        policy = getattr(block, "pe_mode_policy", None)
-        policy_val = getattr(policy, "value", policy)  # Enum or raw str
-
-        # Diagnostic reconstruction-class tasks: reading the training mode and
-        # the model type (either signal is sufficient).
-        training = getattr(config, "training", None)
-        mode = getattr(training, "training_mode", None) if training is not None else None
-        mode_val = getattr(mode, "value", mode)
-        model = getattr(config, "model", None)
-        model_type = getattr(model, "model_type", None) if model is not None else None
-        is_diagnostic_recon = str(mode_val).lower() == "reconstruction" or str(
-            model_type
-        ).lower() in {
-            "modl",
-            "deep_cascade",
-            "reconstruction",
-            "varnet",
-            "unrolled_reconstruction",
-        }
-
-        if policy_val == "fp8" and is_diagnostic_recon:
-            return HealthCheckResult(
-                passed=False,
-                check_name="spectra_precision_envelope",
-                message=(
-                    "pe_mode_policy=fp8 is below the diagnostic-fidelity envelope "
-                    f"for a reconstruction task (model={model_type!r}). FP8 is an "
-                    "inner-loop precision, not an output precision."
-                ),
-                severity="error",
-                category="backend_acceleration",
-                yaml_keys=["backend_acceleration.pe_mode_policy", "model.model_type"],
-                fix_hint=(
-                    "Raise the output-precision floor to BF16 or FP32 "
-                    "(pe_mode_policy: bf16 | fp32 | mixed)."
-                ),
-            )
-
-        return HealthCheckResult(
-            passed=True,
-            check_name="spectra_precision_envelope",
-            message=f"SPECTRA precision policy '{policy_val}' meets the fidelity envelope.",
-            severity="info",
-            category="backend_acceleration",
-        )
-
-    def check_spectra_gridding_sized(self, config: Any) -> HealthCheckResult:
-        """Guard: the NUFFT gridding kernel must fit the accumulator depth.
-
-        From the A4 sizing model: each non-uniform sample scatters into a
-        ``J**spatial_dims`` neighbourhood, so the engine must coalesce at least
-        that many in-flight grid addresses. ``J**D`` must not exceed the
-        synthesized accumulator depth bound. Spatial dimensionality is taken
-        from ``data.sampling.patch_size`` length (default 2-D).
-        """
-        block = getattr(config, "backend_acceleration", None)
-        if block is None:
-            return HealthCheckResult(
-                passed=True,
-                check_name="spectra_gridding_sized",
-                message="No SPECTRA backend configured (not applicable).",
-                severity="info",
-                category="backend_acceleration",
-            )
-
-        kernel_width = getattr(block, "gridding_kernel_width", None)
-        if kernel_width is None:
-            kernel_width = 4  # schema default
-
-        data = getattr(config, "data", None)
-        patch_size = data.sampling.patch_size if data is not None else None
-        spatial_dims = len(patch_size) if isinstance(patch_size, (list, tuple)) else 2
-        spatial_dims = max(2, spatial_dims)
-
-        # Synthesized accumulator-depth bound (A4): the gridding engine provides
-        # banked accumulators sized to a fixed J^2_max footprint. The published
-        # first-cut engine targets J up to 6 in 2-D (J^2 = 36), so the bound is
-        # 6**spatial_dims — generous in 2-D, tight in 3-D.
-        accumulator_depth_bound = 6**spatial_dims
-        required_depth = kernel_width**spatial_dims
-
-        if required_depth > accumulator_depth_bound:
-            return HealthCheckResult(
-                passed=False,
-                check_name="spectra_gridding_sized",
-                message=(
-                    f"gridding_kernel_width={kernel_width} over {spatial_dims}-D "
-                    f"requires {required_depth} banked accumulators, exceeding the "
-                    f"synthesized bound of {accumulator_depth_bound}."
-                ),
-                severity="error",
-                category="backend_acceleration",
-                yaml_keys=[
-                    "backend_acceleration.gridding_kernel_width",
-                    "data.sampling.patch_size",
-                ],
-                fix_hint=(
-                    "Reduce gridding_kernel_width (J) so J**spatial_dims <= "
-                    f"{accumulator_depth_bound}, or lower the spatial dimensionality."
-                ),
-            )
-
-        return HealthCheckResult(
-            passed=True,
-            check_name="spectra_gridding_sized",
-            message=(
-                f"SPECTRA gridding sized OK: J**{spatial_dims}={required_depth} "
-                f"<= {accumulator_depth_bound}."
-            ),
-            severity="info",
-            category="backend_acceleration",
-        )
-
     def check_tta_adapter_only(self, config: Any) -> HealthCheckResult:
         """Guard: a SPECTRA-TTA config must run the spectra_tta strategy with a
         frozen backbone.
@@ -13261,6 +12984,51 @@ class ConfigHealthChecker:
                 "score_based_diffusion model), or pick a sampler compatible with the "
                 "paradigm (e.g. cold_mri for kspace_cold_diffusion)."
             ),
+        )
+
+    def check_score_sde_declaration(self, config: "TrainingSettings") -> HealthCheckResult:
+        """A score generator's declared SDE must be one the score-SDE engine can build and run.
+
+        Applies the engine's own rules (``score_sde_config``) at load time, so an unknown
+        ``sde_type``, sigmas without one, an incomplete schedule or an unregistered DC sampler
+        fail the audit instead of the model build.
+        """
+        from spectramr.domain.exceptions import ConfigurationError
+        from spectramr.infrastructure.training.strategies.score_sde_config import (
+            declared_sde,
+            validate_score_sde_config,
+        )
+
+        check_name = "score_sde_declaration"
+        keys = [
+            "model.model_kwargs.sde_type",
+            "model.model_kwargs.sigma_min",
+            "model.model_kwargs.sigma_max",
+            "physics.data_consistency.method",
+            "undersampling.mask_types",
+        ]
+        try:
+            sde, _, _ = declared_sde(config)
+            if sde is None:
+                return HealthCheckResult(
+                    True, check_name, "No sde_type declared; guard not applicable.", "info"
+                )
+            validate_score_sde_config(config)
+        except ConfigurationError as exc:
+            return HealthCheckResult(
+                False,
+                check_name,
+                str(exc),
+                "error",
+                category="score_sde_declaration",
+                yaml_keys=keys,
+                fix_hint=(
+                    "Declare sde_type: vesde with 0 < sigma_min < sigma_max and "
+                    "physics.data_consistency.method: pc_sampler_consistency, or drop all three."
+                ),
+            )
+        return HealthCheckResult(
+            True, check_name, f"sde_type={sde!r} builds on the score-SDE engine.", "info"
         )
 
     @staticmethod
@@ -13990,17 +13758,20 @@ class ConfigHealthChecker:
         return results
 
     def check_mcgi_invariance_declared(self, config: TrainingSettings) -> HealthCheckResult:
-        """Tier-1 for MCGI (bundle M2): the rank transform must be in the pipeline.
+        """Tier-1 for MCGI (bundle M2): the encoder's ``model_kwargs`` validate at load time.
 
-        ``mcgi_encoder``'s invariance to monotone intensity remaps is a property
-        of the rank transform :math:`R` sitting in front of the backbone. An arm
-        that selects the encoder but disables rank normalisation gets an ordinary
-        conv net while still *claiming* exact :math:`G_+\\rtimes\\mathbb Z_2`
-        invariance — a facade mechanism (pitfall #16), so this is an ERROR.
+        ``MCGIConfig`` owns the knobs; this check runs it on the declared
+        ``model_kwargs`` so an illegal value (``hard_rank_eval: false``, the retired
+        ``soft_rank_temperature``, an unknown key) is an ERROR before the build.
+        ``rank_transform: false`` is the declared non-invariant control and is info.
         """
+        from pydantic import ValidationError
+
+        from spectramr.config.schemas.training.mcgi import MCGIConfig
+
         name = "mcgi_invariance_declared"
-        model_name = str(getattr(getattr(config, "model", None), "name", "") or "")
-        if model_name != "mcgi_encoder":
+        model = getattr(config, "model", None)
+        if str(getattr(model, "model_type", "") or "") != "mcgi_encoder":
             return HealthCheckResult(
                 passed=True,
                 check_name=name,
@@ -14008,32 +13779,30 @@ class ConfigHealthChecker:
                 severity="info",
                 category="mcgi",
             )
-        kwargs = getattr(getattr(config, "model", None), "model_kwargs", None) or {}
-        if not isinstance(kwargs, dict):
-            kwargs = dict(getattr(kwargs, "__dict__", {}) or {})
-        # The guarantee needs the exact (hard) rank at inference; a soft rank is
-        # a training-time relaxation only.
-        hard_rank = bool(kwargs.get("hard_rank_eval", True))
+        kwargs = dict(getattr(model, "model_kwargs", None) or {})
+        try:
+            mcgi = MCGIConfig(**kwargs)
+        except ValidationError as exc:
+            return HealthCheckResult(
+                passed=False,
+                check_name=name,
+                message=f"mcgi_encoder model_kwargs are invalid: {exc.errors()[0]['msg']}",
+                severity="error",
+                category="mcgi",
+                yaml_keys=["model.model_kwargs"],
+                fix_hint="Declare only the MCGIConfig fields, with hard_rank_eval: true.",
+            )
         return HealthCheckResult(
-            passed=hard_rank,
+            passed=True,
             check_name=name,
             message=(
-                "mcgi_encoder uses the exact hard rank at inference; G_+ invariance holds exactly."
-                if hard_rank
-                else "mcgi_encoder has hard_rank_eval=false — invariance is only "
-                "approximate, so the exactness claim does not hold."
+                "mcgi_encoder runs the exact midrank; G_+ invariance holds by construction."
+                if mcgi.rank_transform
+                else "mcgi_encoder with rank_transform=false: the non-invariant control."
             ),
-            severity="info" if hard_rank else "error",
+            severity="info",
             category="mcgi",
-            yaml_keys=["model.model_kwargs.hard_rank_eval"],
-            fix_hint=(
-                None
-                if hard_rank
-                else (
-                    "Set model.model_kwargs.hard_rank_eval: true, or stop "
-                    "describing this arm as exactly contrast-invariant."
-                )
-            ),
+            yaml_keys=["model.model_kwargs.rank_transform"],
         )
 
     def check_dispersion_bloch_ae_config(self, config: TrainingSettings) -> list[HealthCheckResult]:
@@ -14041,10 +13810,13 @@ class ConfigHealthChecker:
 
         Only fires when ``training.dispersion_bloch_ae`` is present. Validates:
 
-        * ``dispersion_identifiability`` (ERROR) — a ``P``-pool BPP model has
-          ``2P+1`` free constants per rate, so the arm needs ``M >= 2P+1``
-          *distinct* fields. Below that the fit is rank-deficient and the
-          recovered latent is meaningless, which no amount of training fixes;
+        * ``dispersion_identifiability`` (ERROR) — one magnitude per field must
+          determine the ``2P+3`` latent constants per voxel, so the arm needs
+          ``M >= 2P+3`` *distinct* fields (#2417). Below that the fit is
+          rank-deficient and the recovered latent is meaningless, which no amount
+          of training fixes;
+        * ``dispersion_protocol_declared`` (ERROR) — ``model.model_kwargs`` names
+          one positive TR and TE per field, since the render depends on both (#1712);
         * ``dispersion_monotonicity_weight_positive`` (WARNING) — with the
           hinge disabled the fit may land on a physically impossible
           ``dT1/dB0 < 0``, voiding cross-field extrapolation.
@@ -14063,15 +13835,15 @@ class ConfigHealthChecker:
         n_pools = int(_get("num_pools", 1) or 1)
         fields = tuple(_get("fields_present", ()) or ())
         distinct = len({float(b) for b in fields})
-        required = 2 * n_pools + 1
+        required = magnitude_stack_unknowns(n_pools)
         identifiable = distinct >= required
         results.append(
             HealthCheckResult(
                 passed=identifiable,
                 check_name="dispersion_identifiability",
                 message=(
-                    f"num_pools={n_pools} needs M >= {required} distinct fields; "
-                    f"fields_present supplies {distinct}."
+                    f"num_pools={n_pools} has {required} unknowns per voxel and needs "
+                    f"M >= {required} distinct fields; fields_present supplies {distinct}."
                 ),
                 severity="info" if identifiable else "error",
                 category="dispersion_bloch_ae",
@@ -14083,9 +13855,40 @@ class ConfigHealthChecker:
                     None
                     if identifiable
                     else (
-                        f"Reduce num_pools to {max(1, (distinct - 1) // 2)} or add "
-                        f"fields so fields_present names >= {required} distinct B0 values."
+                        f"Add fields so fields_present names >= {required} distinct B0 "
+                        "values, or reduce num_pools (one pool needs 5 fields)."
                     )
+                ),
+            )
+        )
+
+        model = getattr(config, "model", None)
+        kwargs = getattr(model, "model_kwargs", None)
+        kwargs = kwargs if isinstance(kwargs, dict) else {}
+        n_render = len(kwargs.get("fields_present") or fields)
+        bad = []
+        for key in ("repetition_times_s", "echo_times_s"):
+            times = kwargs.get(key)
+            ok = isinstance(times, list | tuple) and len(times) == n_render
+            if not (ok and all(isinstance(t, int | float) and t > 0 for t in times)):
+                bad.append(key)
+        results.append(
+            HealthCheckResult(
+                passed=not bad,
+                check_name="dispersion_protocol_declared",
+                message=(
+                    "per-field TR/TE declared for every field."
+                    if not bad
+                    else f"model.model_kwargs {bad} must name one positive time (s) per "
+                    f"field ({n_render}); the render has no default protocol."
+                ),
+                severity="info" if not bad else "error",
+                category="dispersion_bloch_ae",
+                yaml_keys=[f"model.model_kwargs.{k}" for k in bad],
+                fix_hint=(
+                    None
+                    if not bad
+                    else "Declare the acquisition TR and TE of each field, in fields_present order."
                 ),
             )
         )
@@ -14964,14 +14767,8 @@ class ConfigHealthChecker:
         report.results.append(self.check_latent_decode_resolution(config))
         report.results.append(self.check_multi_contrast_model_support(config))
         report.results.append(self.check_vendor_model_support(config))
-        # SPECTRA hardware-backend Tier-1 guards (implementation plan
-        # Workstream C, C4). All no-op when backend_acceleration is absent.
-        report.results.append(self.check_spectra_backend_schema(config))
-        report.results.append(self.check_spectra_precision_envelope(config))
-        report.results.append(self.check_spectra_gridding_sized(config))
         report.results.append(self.check_tta_adapter_only(config))
         report.results.append(self.check_metric_names_are_registered(config))
-        report.results.append(self.check_repetition_count_is_achievable(config))
         report.results.append(self.check_transform_names_are_registered(config))
         report.results.append(self.check_declared_keys_are_not_discarded(config))
         report.results.append(self.check_component_kwargs_reach_constructor(config))
@@ -15145,6 +14942,7 @@ class ConfigHealthChecker:
         report.results.append(self.check_checkpoint_existence(config))
         report.results.append(self.check_b0_field_metric_requires_hz_model(config))
         report.results.append(self.check_dds_requires_score_model(config))
+        report.results.append(self.check_score_sde_declaration(config))
         report.results.append(self.check_ei_sensing_margin(config))
         report.results.append(self.check_ei_robust_key_matches_correction(config))
         report.results.append(self.check_ssdu_selection_density_range(config))

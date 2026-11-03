@@ -100,7 +100,10 @@ def declares_inline_objective(cls: type) -> bool:
     UNDECLARED and therefore not exempt -- silence is not a claim of ownership
     (#1918), which is the distinction ``LossBuilder.validate()`` rests on.
     """
-    return declared_inline_losses(cls) is not None and declared_folds_image_losses(cls) is False
+    return declared_inline_losses(cls) is not None and (
+        declared_folds_image_losses(cls) is False
+        or bool(getattr(cls, "empty_loss_stack_is_design", False))
+    )
 
 
 def unreachable_image_losses(

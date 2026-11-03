@@ -27,12 +27,10 @@ import torch
 
 from spectramr.core.metrics.complex_input import PhaseBlindInputError
 from spectramr.core.module_utils import unwrap_model
-from spectramr.infrastructure.physics.spin_history import SpinHistoryStage
-from spectramr.infrastructure.training.strategies.vf_phase_stego import PhaseStegoHook
-from spectramr.infrastructure.training.strategies.vf_null_space import NullSpaceErasureHook
-from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
-from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
+from spectramr.infrastructure.physics.spin_history import SpinHistoryStage
+from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
+from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.mixins.conditioning_mixin import (
     conditioning_block_of,
     conditioning_enabled,
@@ -41,13 +39,21 @@ from spectramr.infrastructure.training.strategies.ood_acceleration_readout impor
     ood_acceleration_readout,
     ood_accelerations,
 )
+from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
 from spectramr.infrastructure.training.strategies.simulator_builder import (
     build_simulator_from_config,
     require_epi_profile,
     undersampling_mask_kwargs,
 )
+from spectramr.infrastructure.training.strategies.vf_null_space import NullSpaceErasureHook
+from spectramr.infrastructure.training.strategies.vf_phase_stego import PhaseStegoHook
+from spectramr.infrastructure.training.utils.held_out_severity import (
+    held_out_severity_points,
+    held_out_severity_readout,
+)
 from spectramr.infrastructure.training.utils.metric_views import MetricViews
 from spectramr.models.conditioning import AdaptiveConditioner, ConditioningContext
+from spectramr.models.losses.build_set import declared_build_set
 from spectramr.models.losses.registry import create_loss
 
 logger = logging.getLogger(__name__)
@@ -90,6 +96,10 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
     # DDP-wrapped conditioner fails the next step's reduction. Without it VF owns nothing.
     parallel_compat = frozenset({"replicated"})
 
+    #: ``_apply_domain_losses`` fft2c's the prediction before every ``kspace_losses``
+    #: entry, so an image-output arm's k-space losses are bridged here, not by LossBuilder.
+    fft_bridges_kspace_losses = True
+
     @classmethod
     def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
         on = conditioning_enabled(conditioning_block_of(config))
@@ -99,6 +109,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
     synthesises_model_input: ClassVar[bool] = True
 
     _spin_history: SpinHistoryStage | None = None
+    _heldout_severities: tuple[float, ...] = ()
 
     _phase_stego_hook: PhaseStegoHook | None = None
     _null_space_hook: NullSpaceErasureHook | None = None
@@ -112,24 +123,6 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
     #: read by ``validation_step`` (``ood_acceleration_readout``).
     reads_ood_acceleration_range = True
 
-    #: The DigitalTwinSimulator corrupts the input INSIDE the step, so
-    #: ``first_steps/input_prepared`` -- captured before the forward pass --
-    #: equals ``input_raw``/``target`` and the markers are invisible in it. The
-    #: model is fed ``corrupted_norm``; see ``_compute_losses_impl``.
-    #:
-    #: The code has said so in a comment since the twin snapshot was added
-    #: ("the base first_steps auto-snapshot captures the PRE-twin input"), but
-    #: the flag stayed at its ``True`` default -- so every VF artifact stamped
-    #: ``prepared_equals_model_input: True`` and asserted the opposite of the
-    #: comment. A caveat in the source mitigates for whoever edits the file; the
-    #: field is what the reader of the artifact actually consumes (pitfall #16).
-    snapshot_prepared_is_model_input: bool = False
-
-    #: ``_snapshot_twin_outputs`` already writes this tag, and
-    #: ``save_debug_snapshot`` marks the model-input requirement met on the way
-    #: through -- so naming it here wires the existing emission to the contract
-    #: rather than adding a second copy of the same tensors.
-    snapshot_model_input_tag: str | None = "vf_twin"
 
     def __init__(
         self,
@@ -143,6 +136,15 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
 
     def _setup_strategy_specific_components(self) -> None:
         """Initialize simulator from config and register losses dynamically."""
+        # ── Held-out severity grid: multipliers of the twin's motion/B0/B1 strengths ──
+        self._heldout_severities = tuple(held_out_severity_points(self.config))
+        bad = [x for x in self._heldout_severities if x <= 1.0]
+        if bad:
+            raise ValueError(
+                f"validation.gates.held_out_severity_grid {bad} is not beyond the training "
+                "severity for virtual_fiducial: values are multipliers and must exceed 1."
+            )
+
         # ── Build simulator from config.physics.digital_twin (SSOT) ──
         self.simulator = build_simulator_from_config(self.config, self.device)
         require_epi_profile(self.simulator)
@@ -184,7 +186,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         # Legacy (non-list) configs: fall back to the flat enabled-loss dict,
         # treating every entry as image-domain (magnitude) as before.
         if not self._loss_specs:
-            for name, weight in self.config.losses.get_enabled_losses().items():
+            for name, weight in declared_build_set(self.config.losses).items():
                 if weight > 0 and name not in seen:
                     self._loss_specs.append(
                         (name, create_loss(name).to(self.device), weight, "image")
@@ -625,19 +627,8 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
                     "twin_marker_residual": marker_residual,
                     "twin_marker_prior": marker_prior_norm,
                 },
-                step=step,
                 tag="vf_twin",
                 extra=_twin_extra,
-                # ``vf_twin`` IS this strategy's ``snapshot_model_input_tag``,
-                # so the snapshot must say which of its four tensors the model
-                # receives; the other three are the clean twin and the marker
-                # halves shown for contrast. It has always been
-                # ``corrupted_norm`` (class docstring, line ~74) -- naming it
-                # here is what makes that checkable instead of documented.
-                # A parameter and not part of ``_twin_extra`` because that dict
-                # is deferred: resolving it to read one key would force the very
-                # ``.item()`` sync the deferral exists to postpone.
-                model_input_key="twin_corrupted_input",
             )
         except Exception as exc:  # diagnostics must never break training
             logger.debug("[VirtualFiducialStrategy] twin snapshot skipped: %s", exc)
@@ -775,8 +766,34 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         g_total_loss = g_total_loss + self._lambda_marker * loss_marker
         loss_dict["loss_marker"] = loss_marker.detach()
         loss_dict["g_total_loss"] = g_total_loss
+        if self.generator_model.training:  # validation_step reuses this impl in eval mode
+            loss_dict.update(self._train_metrics(pred, clean_norm))
 
         return loss_dict
+
+    def _train_metrics(self, pred: torch.Tensor, clean_norm: torch.Tensor) -> dict[str, float]:
+        """``train_*`` metrics on the magnitude pair validation scores (#183)."""
+        step = resolve_loop_iteration(self)
+        if not self._training_metrics_due(self.config, step):
+            return {}
+        domain = getattr(self, "_metric_output_domain", None)
+        if domain is None:
+            from spectramr.infrastructure.training.utils.domain_inference import (
+                infer_output_domain,
+            )
+
+            domain = self._metric_output_domain = infer_output_domain(self.config)
+        pred = self._to_image_domain(pred.detach(), domain, self.device)
+        clean = clean_norm.detach()
+        # The views validation_step scores: magnitudes, plus the complex pair for phase metrics.
+        return self._score_training_views(
+            MetricViews(
+                pred.abs(),
+                clean.abs(),
+                pred if torch.is_complex(pred) else None,
+                clean if torch.is_complex(clean) else None,
+            )
+        )
 
     @staticmethod
     def _to_image_domain(
@@ -820,6 +837,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
         b0_map: torch.Tensor | None = None,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Compute image-quality validation metrics for the VF reconstruction.
@@ -874,6 +892,7 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
                     input_batch=target,
                     target_batch=target,
                     step=batch_idx,
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(
@@ -913,6 +932,15 @@ class ConcreteVirtualFiducialStrategy(BaseTrainingStrategy):
                 ood_acceleration_readout(
                     self.simulator,
                     ood_accelerations(self.config),
+                    lambda: self._score_at_current_twin(
+                        target_complex, b0_map, cache_visuals=False
+                    ),
+                )
+            )
+            result.update(
+                held_out_severity_readout(
+                    self.simulator,
+                    self._heldout_severities,
                     lambda: self._score_at_current_twin(
                         target_complex, b0_map, cache_visuals=False
                     ),

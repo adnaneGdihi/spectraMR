@@ -117,11 +117,17 @@ def cs_recon(
     shape, xp = x.shape, _pad(x, dims, 2**wavelet_levels)
     d, h = xp.shape[-3], xp.shape[-2]
     three_d = len(dims) == 3
-    acs = (max(1, int(center_fraction * d)) if three_d else 1, max(1, int(center_fraction * h)))
+    r = 1.0 + (r_max - 1.0) * float(theta)
+    acs_h = max(1, int(center_fraction * h))
+    if not three_d:
+        # Past R = 1/center_fraction the ACS alone exceeds the line budget; it then takes
+        # the whole budget, so the realised R still reaches the declared one.
+        acs_h = min(acs_h, max(1, round(h / r)))
+    acs = (max(1, int(center_fraction * d)) if three_d else 1, acs_h)
     mask = cartesian_mask_3d(
         d if three_d else 1,
         h,
-        1.0 + (r_max - 1.0) * float(theta),
+        r,
         acs=acs,
         density="variable",
         alpha=alpha,

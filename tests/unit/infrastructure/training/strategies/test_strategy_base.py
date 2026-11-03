@@ -117,16 +117,15 @@ def test_minimal_config_actually_disables_snapshots() -> None:
     Asked of the resolver, not of the attribute we just set -- asserting the
     flag we wrote is what let this rot unnoticed. When the block decomposition
     moved these keys, the old flat spelling stopped being read and
-    ``_resolve_config`` fell through to the MagicMock's auto-vivified
+    the resolver fell through to the MagicMock's auto-vivified
     ``logging.snapshots``, whose leaves are truthy: the fixture silently
     resolved to snapshots ENABLED. Nothing failed, because nothing asked.
     """
-    from spectramr.infrastructure.training.debug_snapshot import _resolve_config
+    from spectramr.infrastructure.training.snapshot.policy import SnapshotSchedule
 
-    resolved = _resolve_config(_make_minimal_config().logging)
-    assert resolved.enabled is False
-    assert resolved.save_images is False
-    assert resolved.save_json is False
+    schedule = SnapshotSchedule.from_logging(_make_minimal_config().logging)
+    assert schedule.enabled is False
+    assert not schedule.due("train", 0)
 
 
 # ---------------------------------------------------------------------------

@@ -8,11 +8,12 @@ this strategy:
 
 - :class:`LesionSampler` produces (B, 1, H, W) Gaussian-blob masks
   with random center / radius / intensity per sample.
-- The strategy composites the lesion onto the input *and* the target,
-  with a per-batch random toggle so a fraction of samples remain clean.
-- Loss = parent recon fidelity + lesion-region-weighted L1 + an
-  auxiliary lesion-classification head loss when ``batch["lesion_logits"]``
-  is supplied.
+- The strategy draws ONE blob per sample and composites it onto the input
+  *and* the target, with a per-sample random toggle so a fraction of
+  samples remain clean.
+- Loss = parent recon fidelity + lesion-region-weighted L1 + an auxiliary
+  lesion-presence classifier on the prediction, built by the strategy when
+  ``lambda_lesion_cls > 0``.
 """
 
 from __future__ import annotations
@@ -40,8 +41,9 @@ class LesionSampler(nn.Module):
         self.max_radius = max_radius
         self.intensity_range = intensity_range
 
-    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        B, C, H, W = image.shape
+    def draw(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """One blob per sample: ``(intensity * soft_mask, binary_mask)``, each (B, 1, H, W)."""
+        B, _, H, W = image.shape
         device = image.device
         cx = torch.rand(B, device=device) * 0.6 - 0.3
         cy = torch.rand(B, device=device) * 0.6 - 0.3
@@ -61,9 +63,27 @@ class LesionSampler(nn.Module):
         r_b = radius.view(-1, 1, 1, 1)
         d2 = (xx - cx_b) ** 2 + (yy - cy_b) ** 2
         mask = torch.exp(-d2 / r_b.pow(2).clamp_min(1e-4))
-        # Composite onto image
-        composite = image + intensity.view(-1, 1, 1, 1) * mask
-        return composite, (mask > 0.4).float()
+        return intensity.view(-1, 1, 1, 1) * mask, (mask > 0.4).float()
+
+    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        blob, mask = self.draw(image)
+        return image + blob, mask
+
+
+def build_lesion_presence_head(in_channels: int) -> nn.Module:
+    """Small strided-conv classifier: (B, C, H, W) image -> (B, 1) lesion-presence logit."""
+    return nn.Sequential(
+        nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+        nn.ReLU(inplace=True),
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),
+        nn.Linear(32, 1),
+    )
+
+
+_LESION_HEAD = "lesion_cls_head"
 
 
 class SyntheticPathologyAugStrategy(ReconstructionTrainingStrategy):
@@ -76,6 +96,7 @@ class SyntheticPathologyAugStrategy(ReconstructionTrainingStrategy):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._sampler: LesionSampler | None = None
+        self.lesion_cls_head: nn.Module | None = None
         # Typed sub-block (pitfall #15: read + validate + stamp). Previously the
         # augmentation probability + lesion-loss weights were hardcoded class
         # attributes that no YAML could override.
@@ -92,6 +113,25 @@ class SyntheticPathologyAugStrategy(ReconstructionTrainingStrategy):
             self.lambda_lesion_l1,
             self.lambda_lesion_cls,
         )
+        if self.lambda_lesion_cls > 0:
+            self._build_lesion_head()
+
+    def _build_lesion_head(self) -> None:
+        """Build the lesion-presence head on the generator output and train it with opt_g."""
+        opt = getattr(self.env, "opt_g", None)
+        if opt is None:
+            raise RuntimeError(
+                "synthetic_pathology_aug: lambda_lesion_cls > 0 needs env.opt_g to train the "
+                "lesion-presence head; set lambda_lesion_cls: 0 to disable the classifier."
+            )
+        head = build_lesion_presence_head(int(self.config.model.out_channels)).to(self.device)
+        self.lesion_cls_head = self.register_owned_module(_LESION_HEAD, head)
+        existing = {p for group in opt.param_groups for p in group["params"]}
+        new = [p for p in head.parameters() if p not in existing]
+        if new:
+            lr = float(opt.param_groups[0]["lr"])
+            opt.add_param_group({"params": new, "lr": lr})
+            self._sync_schedulers_after_param_group_addition(lr)
 
     def _ensure_sampler(self, device: torch.device) -> LesionSampler:
         if self._sampler is None:
@@ -109,23 +149,24 @@ class SyntheticPathologyAugStrategy(ReconstructionTrainingStrategy):
         # See TODO/audit/smoke_audit_20260516.md §F6.
         batch = self._resolve_legacy_batch(input_batch, kwargs)
         if isinstance(batch, dict) and "input" in batch and "target" in batch:
-            sampler = self._ensure_sampler(batch["input"].device)
-            B = batch["input"].shape[0]
-            apply = torch.rand(B, device=batch["input"].device) < self.p_augment
-
-            # Sample lesions for each item; gate via apply mask.
-            lesion_input, lesion_mask_pred = sampler(batch["input"])
-            lesion_target, lesion_mask_target = sampler(batch["target"])
-            gate = apply.view(-1, 1, 1, 1).float()
+            inp, tgt = batch["input"], batch["target"]
+            if inp.shape[0] != tgt.shape[0] or inp.shape[-2:] != tgt.shape[-2:]:
+                raise ValueError(
+                    "synthetic_pathology_aug: input and target must share batch and spatial "
+                    f"shape to carry the same lesion; got {tuple(inp.shape)} vs {tuple(tgt.shape)}."
+                )
+            sampler = self._ensure_sampler(inp.device)
+            apply = torch.rand(inp.shape[0], device=inp.device) < self.p_augment
+            # One draw composited onto both sides: a target-only lesion is not inferable.
+            blob, lesion_mask = sampler.draw(inp)
+            gate = apply.view(-1, 1, 1, 1).to(inp.dtype)
+            gated_blob = gate * blob
             patched = dict(batch)
-            patched["input"] = batch["input"] * (1 - gate) + lesion_input * gate
-            patched["target"] = batch["target"] * (1 - gate) + lesion_target * gate
-            patched["lesion_mask"] = lesion_mask_target * gate
-            # Forward the COMPOSITED lesion tensors as the actual model
-            # input/target (the parent builds lr/hr from these positionals).
-            # The old code forwarded the original input_batch/target_batch, so
-            # the sampled lesions never reached the model or the recon loss —
-            # the augmentation was a no-op.
+            patched["input"] = inp + gated_blob
+            patched["target"] = tgt + gated_blob
+            patched["lesion_mask"] = lesion_mask * gate
+            patched["lesion_present"] = apply.to(inp.dtype)
+            # The composited tensors are the model input/target (the parent builds lr/hr from these).
             base = super()._compute_losses_impl(
                 input_batch=patched["input"],
                 target_batch=patched["target"],
@@ -165,10 +206,14 @@ class SyntheticPathologyAugStrategy(ReconstructionTrainingStrategy):
                     "lesion term would be silently dropped (audit 2026-06)."
                 )
 
-        # Optional auxiliary lesion-presence classifier.
-        logits = patched.get("lesion_logits")
-        if logits is not None and lesion_mask is not None:
-            label = (lesion_mask.amax(dim=(-1, -2, -3)) > 0.5).float()
+        label = patched.get("lesion_present")
+        if self.lambda_lesion_cls > 0 and label is not None and pred is not None:
+            if self.lesion_cls_head is None:
+                raise RuntimeError(
+                    "synthetic_pathology_aug: lambda_lesion_cls > 0 but the lesion-presence "
+                    "head was never built; the classifier term would be silently dropped."
+                )
+            logits = self.call_owned(_LESION_HEAD, pred)
             cls = F.binary_cross_entropy_with_logits(logits.flatten(), label.flatten())
             base["loss_lesion_cls"] = self.lambda_lesion_cls * cls
             for total_key in ("loss_total", "g_total_loss"):

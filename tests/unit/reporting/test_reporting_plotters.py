@@ -262,39 +262,6 @@ class TestPredictedVsTrue:
 
 
 # ---------------------------------------------------------------------------
-# ablation_strip (Fig 1.9)
-# ---------------------------------------------------------------------------
-
-class TestAblationStrip:
-
-    @pytest.mark.unit
-    def test_produces_file(self, tmp_path: Path) -> None:
-        from spectramr.infrastructure.reporting.plotters import ablation_strip
-
-        df = _make_long_df(methods=["full", "no_perceptual", "no_adversarial"],
-                           metrics=["psnr"])
-        out = ablation_strip.make(df, tmp_path / "abl.pdf",
-                                  primary_metric="psnr", full_method="full")
-        assert out is not None
-        assert out.is_file()
-
-    @pytest.mark.unit
-    def test_empty_df_returns_none(self, tmp_path: Path) -> None:
-        from spectramr.infrastructure.reporting.plotters import ablation_strip
-
-        out = ablation_strip.make(pd.DataFrame(), tmp_path / "abl_empty.pdf",
-                                  primary_metric="psnr", full_method="full")
-        assert out is None
-
-    @pytest.mark.unit
-    def test_missing_full_method_returns_none(self, tmp_path: Path) -> None:
-        from spectramr.infrastructure.reporting.plotters import ablation_strip
-
-        df = _make_long_df(methods=["A", "B"], metrics=["psnr"])
-        out = ablation_strip.make(df, tmp_path / "abl_no_full.pdf",
-                                  primary_metric="psnr", full_method="full")
-        assert out is None
-
 
 # ---------------------------------------------------------------------------
 # stratified_performance (Fig 1.11)
@@ -524,38 +491,6 @@ class TestSRTriptych:
 
 
 # ---------------------------------------------------------------------------
-# MRI-specific: kspace_recon
-# ---------------------------------------------------------------------------
-
-class TestKSpaceRecon:
-
-    @pytest.mark.unit
-    def test_produces_file(self, tmp_path: Path) -> None:
-        from spectramr.infrastructure.reporting.plotters.mri_specific import kspace_recon
-
-        rng = np.random.default_rng(6)
-        h, w = 32, 32
-        cases = [
-            {
-                "zero_filled": rng.uniform(0, 1, (h, w)).astype(np.float32),
-                "baseline": rng.uniform(0, 1, (h, w)).astype(np.float32),
-                "pred": rng.uniform(0, 1, (h, w)).astype(np.float32),
-                "fs_ref": rng.uniform(0, 1, (h, w)).astype(np.float32),
-            }
-        ]
-        out = kspace_recon.make(pd.DataFrame(), tmp_path / "ksr.pdf", cases=cases)
-        assert out is not None
-        assert out.is_file()
-
-    @pytest.mark.unit
-    def test_empty_cases_returns_none(self, tmp_path: Path) -> None:
-        from spectramr.infrastructure.reporting.plotters.mri_specific import kspace_recon
-
-        out = kspace_recon.make(pd.DataFrame(), tmp_path / "ksr_empty.pdf", cases=[])
-        assert out is None
-
-
-# ---------------------------------------------------------------------------
 # Registry: all registered plotters are callable
 # ---------------------------------------------------------------------------
 
@@ -605,7 +540,6 @@ class TestPlotterRegistry:
         "fig_1_3_loss_decomposition",
         "fig_1_4_residual_diagnostics",
         "fig_1_5_predicted_vs_true",
-        "fig_1_9_ablation_strip",
         "fig_1_11_stratified_performance",
         "fig_1_12_failure_gallery",
         "fig_1_15_computational_profile",
@@ -613,7 +547,6 @@ class TestPlotterRegistry:
         "gen_gan_diagnostics",
         "gen_vae_diagnostics",
         "mri_a1_sr_triptych",
-        "mri_a7_kspace_recon",
     ])
     def test_plotters_return_none_on_empty_input(self, fig_id: str, tmp_path: Path) -> None:
         """Every registered plotter must return None (not raise) on empty DataFrame."""

@@ -102,3 +102,12 @@ def test_sequence_table_rejects_a_fixed_model_scalar_fields_and_unread_fields():
         CycleBlochConfig(backward_model="ulf_forward", sequences=_T2W_ERNST)
     with pytest.raises(ValidationError, match="empty"):
         CycleBlochConfig(backward_model="epg_tse", sequences={})
+
+
+def test_cycle_criterion_and_segmenter_backend_are_closed_sets():
+    cfg = CycleBlochConfig()
+    assert (cfg.cycle_criterion, cfg.segmenter_backend) == ("l1", "none")
+    with pytest.raises(ValidationError):
+        CycleBlochConfig(cycle_criterion="huber")
+    with pytest.raises(ValidationError):
+        CycleBlochConfig(segmenter_backend="synthseg")

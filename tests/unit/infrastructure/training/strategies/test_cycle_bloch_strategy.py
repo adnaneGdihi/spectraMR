@@ -48,6 +48,7 @@ def mock_env():
     env.config.optimization.precision.dtype = "float32"
     env.config.optimization.gradient.clip.method = "norm"
     env.config.optimization.gradient.clip.value = 1.0
+    env.config.optimization.gradient.activation_offload = "none"
     env.config.model.model_type = "cycle_bloch"
     env.config.losses.gan.lambda_cycle_bloch = 5.0
     env.config.losses.gan.lambda_cycle_adv = 2.0
@@ -256,7 +257,7 @@ def test_unknown_backward_model_raises(mock_env):
 
 def test_first_steps_snapshot_stamps_the_backward_model(mock_env):
     strat = _build(mock_env, _ulf_forward_cfg(), 0.064)
-    assert strat._first_steps_extra(0)["cycle_bloch"]["backward_model"] == "ulf_forward"
+    assert strat._snapshot_context()["cycle_bloch"]["backward_model"] == "ulf_forward"
 
 
 # ── losses.gan.gan_loss_type: the cycle_bloch critic ──────────────────────────
@@ -525,3 +526,20 @@ def test_estimator_is_owned_and_a_resume_rebuilds_it_before_restoring(strategy, 
     pairs = zip(fresh.estimator.parameters(), strategy.estimator.parameters(), strict=True)
     for got, want in pairs:
         assert torch.equal(got, want)
+
+
+def test_the_pre_loss_target_chain_bridges_only_the_measured_input(strategy):
+    """The render is a magnitude image; the k-space chain must not run on it."""
+    rec, real = torch.rand(2, 1, 8, 8), torch.rand(2, 8, 8, 8)
+    strategy.adapter_chains = {"pre_loss_target": ["ifft_kspace_to_image"]}
+    bridged = torch.rand(2, 1, 8, 8)
+    with patch.object(strategy, "apply_adapters", return_value=bridged) as apply:
+        rec_t, real_t = strategy._cycle_pair(rec, real)
+    assert rec_t is rec and real_t is bridged
+    apply.assert_called_once_with("pre_loss_target", real)
+
+
+def test_first_steps_snapshot_stamps_the_generator_sequence(strategy, mock_env):
+    mock_env.generator.sequence_provenance = {"tr_ms": 2000.0, "te_ms": 100.0}
+    extra = strategy._snapshot_context()["cycle_bloch"]
+    assert extra["generator_sequence"] == {"tr_ms": 2000.0, "te_ms": 100.0}

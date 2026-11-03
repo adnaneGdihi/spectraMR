@@ -7,6 +7,7 @@ from spectramr.models.blocks.grad_checkpointing import (
     GradCheckpointingMixin,
     NestedGradCheckpointingMixin,
 )
+from spectramr.models.blocks.graph.node_pooling import pool_nodes, readout_groups
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
@@ -16,7 +17,18 @@ except ImportError:
     tkbn = None
 
 
+_COMPLEX_NODES_MESSAGE = (
+    "graph_unet received complex graph nodes [B, N, F]; taking .real would drop the phase. "
+    "Pass real nodes [Re, Im, Kx, Ky, DCF], or a complex [B, C, H, W] grid."
+)
+
+#: Where ``GraphUNetGenerator`` takes its nodes from. ``lattice``: the pixels of a [B, C, H, W]
+#: grid. ``trajectory``: off-grid k-space samples [B, N, 5] that the strategy builds from the
+#: acquired trajectory; each node then returns one complex sample [Re, Im].
+NODE_SOURCES: frozenset[str] = frozenset({"lattice", "trajectory"})
+
 __all__ = [
+    "NODE_SOURCES",
     "B0AwareGraphUNet",
     "DensityAwareGraphConv",
     "DynamicEdgeConv",
@@ -151,6 +163,33 @@ class DynamicEdgeConv(nn.Module):
         return x_out.max(dim=-1, keepdim=False)[0]
 
 
+def knn_adjacency(points: torch.Tensor, k: int, chunk_size: int = 1024) -> torch.Tensor:
+    """Exact k-nearest-neighbour adjacency over ``points`` [N, D], self loop included.
+
+    Query rows are processed in chunks against ALL points, so neighbourhoods cross chunk
+    boundaries (#2389). Every point tied with the (k+1)-th nearest distance is kept, so a
+    lattice node gets whole distance shells: a deterministic, D4-symmetric stencil.
+
+    Returns:
+        Coalesced sparse [N, N] tensor with unit values.
+    """
+    if torch.is_complex(points):
+        raise ValueError("knn_adjacency needs real coordinates; got a complex tensor.")
+    n = points.shape[0]
+    kk = min(k + 1, n)
+    rows, cols = [], []
+    for start in range(0, n, chunk_size):
+        dists = torch.cdist(points[start : start + chunk_size], points)
+        kth = torch.topk(dists, kk, dim=1, largest=False).values[:, -1:]
+        r, c = torch.nonzero(dists <= kth * (1.0 + 1e-4) + 1e-12, as_tuple=True)
+        rows.append(r + start)
+        cols.append(c)
+    index = torch.stack([torch.cat(rows), torch.cat(cols)])
+    values = torch.ones(index.shape[1], device=points.device, dtype=points.dtype)
+    # Indices are in range by construction; the invariant check would only add overhead.
+    return torch.sparse_coo_tensor(index, values, (n, n), check_invariants=False).coalesce()
+
+
 # =============================================================================
 # Graph Attention Components (GAT-style)
 # =============================================================================
@@ -228,13 +267,8 @@ class GraphAttentionLayer(nn.Module):
         # Efficient GAT usually works on edges.
         # Given we might have full graph or dense blocks, let's optimize for density
 
-        # For memory efficiency with large N (~4096+), we calculate attention per edge
-        if adj.is_sparse:
-            # GAT on sparse adj
-            # Not fully implemented here for brevity; assume dense block or limited N
-            # Fallback to simple mean if sparse for now to avoid OOM
-            # Real GAT requires edge index handling which is complex without PyG
-            pass
+        if adj is not None and adj.is_sparse:
+            return self._sparse_attention(h, adj)
 
         # For this experiment, we will use a simplified attention mechanism
         # Attention = softmax(LeakyReLU(a^T [Wh_i || Wh_j]))
@@ -276,11 +310,7 @@ class GraphAttentionLayer(nn.Module):
                 adj = adj.unsqueeze(-1)  # [B, N, N, 1]
 
             zero_vec = -9e15 * torch.ones_like(e)
-            if adj.is_sparse:
-                adj_dense = adj.to_dense()  # Warning: Dense conversion
-                attention = torch.where(adj_dense > 0, e, zero_vec)
-            else:
-                attention = torch.where(adj > 0, e, zero_vec)
+            attention = torch.where(adj > 0, e, zero_vec)
         else:
             attention = e
 
@@ -298,6 +328,31 @@ class GraphAttentionLayer(nn.Module):
         else:
             # [B, N, F] (mean)
             return h_prime.mean(dim=2)
+
+    def _sparse_attention(self, h: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """Edge-wise attention over a sparse [N, N] adjacency: O(E) memory, no dense mask.
+
+        The B*H attention graphs are stacked block-diagonally so one ``sparse.softmax`` and
+        one ``sparse.mm`` serve every batch item and head.
+        """
+        b, n, heads, f_out = h.shape
+        row, col = adj.coalesce().indices()
+        a1 = self.a[:, : self.out_features, 0]  # [H, F]
+        a2 = self.a[:, self.out_features :, 0]
+        e1 = torch.einsum("bnhf,hf->bhn", h, a1)
+        e2 = torch.einsum("bnhf,hf->bhn", h, a2)
+        scores = self.leakyrelu(e1[..., row] + e2[..., col])  # [B, H, E]
+        offset = (torch.arange(b * heads, device=h.device) * n).view(-1, 1)
+        index = torch.stack([(row + offset).flatten(), (col + offset).flatten()])
+        att = torch.sparse_coo_tensor(
+            index, scores.reshape(-1), (b * heads * n, b * heads * n), check_invariants=False
+        )
+        att = torch.sparse.softmax(att, dim=1)
+        h_flat = h.permute(0, 2, 1, 3).reshape(b * heads * n, f_out)
+        h_prime = torch.sparse.mm(att, h_flat).view(b, heads, n, f_out).permute(0, 2, 1, 3)
+        if self.concat:
+            return h_prime.reshape(b, n, heads * f_out)
+        return h_prime.mean(dim=2)
 
 
 class GraphAttentionUNet(GradCheckpointingMixin, nn.Module):
@@ -403,7 +458,7 @@ class GraphAttentionUNet(GradCheckpointingMixin, nn.Module):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         if torch.is_complex(x):
-            x = x.real
+            raise ValueError(_COMPLEX_NODES_MESSAGE)
 
         # Entry-point shape contract.  The 2026-05-10 smoke (exp_42c_gat)
         # crashed deep in ``final_layer`` with the cryptic message
@@ -536,7 +591,6 @@ class DynamicGraphUNet(nn.Module):
         out_channels: int = 2,
         hidden_dim: int = 64,
         depth: int = 3,
-        trajectory_points: torch.Tensor | None = None,
         k_neighbors: int = 8,
         im_size: tuple[int, int] = (256, 256),
         time_embedding_dim: int = 128,
@@ -550,7 +604,6 @@ class DynamicGraphUNet(nn.Module):
             out_channels (int): Description.
             hidden_dim (int): Description.
             depth (int): Description.
-            trajectory_points (torch.Tensor | None): Description.
             k_neighbors (int): Description.
             im_size (tuple[int, int]): Description.
             time_embedding_dim (int): Description.
@@ -562,23 +615,7 @@ class DynamicGraphUNet(nn.Module):
         self.im_size = im_size
         self.time_embedding_dim = time_embedding_dim
         self.num_classes = num_classes
-
-        # [ECO-42] Pre-compute topology from trajectory coordinates
-        if trajectory_points is not None:
-            adj = self._build_knn_graph(trajectory_points, k=k_neighbors)
-            self.register_buffer("static_adjacency", adj, persistent=False)
-        else:
-            self.register_buffer("static_adjacency", None)
-
         self.k_neighbors = k_neighbors
-        self.use_dynamic_graph = True
-
-        # [ECO-42] Physics Input Embeddings
-        # [STABILITY FIX] LayerNorm on raw signal BEFORE embedding.
-        # K-space signal has extreme dynamic range (center ~1000x periphery).
-        # Without normalization, feature_embedder amplifies this into magnitude
-        # explosion that compounds through every encoder layer.
-        self.signal_norm = nn.LayerNorm(2)
 
         # 1. Signal Embedding (Real/Imag) — operates on normalized signal
         self.feature_embedder = nn.Linear(2, hidden_dim)
@@ -700,9 +737,8 @@ class DynamicGraphUNet(nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # [FIX] Handle complex input from k-space dataloaders
         if torch.is_complex(x):
-            x = x.real
+            raise ValueError(_COMPLEX_NODES_MESSAGE)
 
         signal = x[..., 0:2]  # Real, Imag
         coords = x[..., 2:4]  # Kx, Ky
@@ -715,11 +751,10 @@ class DynamicGraphUNet(nn.Module):
         dcf_weight = dcf_weight.clamp(min=1e-6, max=1e3)
         dcf_weight = dcf_weight / (dcf_weight.mean(dim=1, keepdim=True) + 1e-8)
 
-        # [STABILITY FIX] Normalize signal BEFORE embedding.
-        # K-space center has 100-1000x larger values than periphery.
-        # Without normalization, feature_embedder amplifies this into
-        # exponential magnitude growth through the encoder stack.
-        signal_normed = self.signal_norm(signal)
+        # One RMS scale per image, shared by Re and Im over all nodes: bounds the dynamic
+        # range while keeping contrast and phase (a per-node LayerNorm(2) kept one bit, #2390).
+        scale = signal.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-8)
+        signal_normed = signal / scale
         signal_weighted = signal_normed * dcf_weight
 
         # Store raw signal for residual output connection
@@ -786,66 +821,6 @@ class DynamicGraphUNet(nn.Module):
         return x
 
 
-    # Internal _build_knn_graph logic duplicated or inherited?
-    # Since we are moving class, we should copy the method or make it a mixin.
-    # For simplicity, we assume the wrapper handles graph construction or we copy logic.
-    # Actually, DynamicGraphUNet implementation above removed the `_build_knn_graph` method.
-    # We must restore it or delegate.
-
-    def _build_knn_graph(
-        self, points: torch.Tensor, k: int, block_size: int = 1024
-    ) -> torch.Tensor:
-        # Same implementation as before
-        """_build_knn_graph.
-
-        Args:
-            points (torch.Tensor): Description.
-            k (int): Description.
-            block_size (int): Description.
-        Returns:
-            torch.Tensor: Description.
-        """
-        N, D = points.shape
-        device = points.device
-
-        # [FIX] Ensure points are real for torch.cdist
-        if torch.is_complex(points):
-            points = points.real
-
-        if block_size >= N:
-            dists = torch.cdist(points, points)
-            _, indices = torch.topk(-dists, min(k + 1, N), dim=1)
-            row = torch.arange(N, device=device).view(-1, 1).repeat(1, indices.shape[1]).flatten()
-            col = indices.flatten()
-            edge_index = torch.stack([row, col], dim=0)
-            values = torch.ones(edge_index.shape[1], device=device)
-            return torch.sparse_coo_tensor(edge_index, values, (N, N))
-
-        num_blocks = (N + block_size - 1) // block_size
-        all_rows, all_cols = [], []
-        for i in range(num_blocks):
-            start = i * block_size
-            end = min((i + 1) * block_size, N)
-            block_n = end - start
-            if block_n <= 0:
-                continue
-
-            block_points = points[start:end]
-            dists = torch.cdist(block_points, block_points)
-            local_k = min(k + 1, block_n)
-            _, local_indices = torch.topk(-dists, local_k, dim=1)
-            global_indices = local_indices + start
-            local_rows = torch.arange(block_n, device=device).view(-1, 1).repeat(1, local_k) + start
-            all_rows.append(local_rows.flatten())
-            all_cols.append(global_indices.flatten())
-
-        row = torch.cat(all_rows)
-        col = torch.cat(all_cols)
-        edge_index = torch.stack([row, col], dim=0)
-        values = torch.ones(edge_index.shape[1], device=device)
-        return torch.sparse_coo_tensor(edge_index, values, (N, N))
-
-
 @register_model(
     name="graph_unet",
     training_mode="reconstruction",
@@ -891,7 +866,8 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
         backbone_type: str = "dynamic_graph_unet",
         time_embedding_dim: int = 128,
         num_classes: int = 0,
-        gat_max_nodes: int = 4096,
+        gat_max_nodes: int | None = None,
+        node_source: str = "lattice",
         **kwargs,
     ):
         """__init__.
@@ -913,10 +889,29 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
         self.out_channels = out_channels
         self.im_size = im_size
         self.backbone_type = backbone_type
-        # GAT path: dense softmax over [B, N, N, H] is O(N^2) memory.
-        # Cap node count to keep memory feasible; full-res output is
-        # recovered by bilinear upsampling after the backbone.
-        self.gat_max_nodes = int(gat_max_nodes)
+        # Optional declared cap for the GAT path: above it the grid is pooled and the output
+        # upsampled. None (default) runs edge-wise attention at full resolution (#2391).
+        if gat_max_nodes is not None and (
+            isinstance(gat_max_nodes, bool) or not isinstance(gat_max_nodes, int) or gat_max_nodes < 1
+        ):
+            raise ValueError(f"gat_max_nodes must be a positive integer or None; got {gat_max_nodes!r}")
+        self.gat_max_nodes = gat_max_nodes
+        self._grid_adjacency: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        if node_source not in NODE_SOURCES:
+            raise ValueError(f"node_source must be one of {sorted(NODE_SOURCES)}; got {node_source!r}")
+        self.node_source = node_source
+        self._node_adjacency: dict[tuple, torch.Tensor] = {}
+        if node_source == "trajectory":
+            # out_channels names the image the strategy's adjoint NUFFT makes (one magnitude
+            # channel); each node returns one complex sample.
+            if out_channels != 1:
+                raise ValueError(
+                    f"node_source='trajectory' reconstructs one magnitude image; got out_channels={out_channels}."
+                )
+            out_channels = 2
+            # Nodes come from the batch's trajectory, so a synthetic image batch has nothing
+            # to probe; the strategy's off-grid path is tested on simulated spiral samples.
+            self.synthetic_forward_probe_skip = {"forward"}
 
         # [ECO-42] Optional Adjoint for Visualization/Validation
         if tkbn:
@@ -931,7 +926,6 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
                 out_channels=out_channels,
                 hidden_dim=hidden_dim,
                 depth=depth,
-                trajectory_points=trajectory_points,
                 k_neighbors=k_neighbors,
                 im_size=im_size,
                 time_embedding_dim=time_embedding_dim,
@@ -951,96 +945,22 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
         else:
             raise ValueError(f"Unknown backbone_type: {backbone_type}")
 
-        # Graph Construction Helpers (Delegated to Backbone if possible, or managed here)
-        # We manage graph construction here to share between backbones
         self.k_neighbors = k_neighbors
-        self.use_dynamic_graph = True
-
         if trajectory_points is not None:
-            # Use DynamicGraphUNet's helper or move it to util?
-            # For now we use the method attached to the wrapper for shared utility
-            adj = self._build_knn_graph(trajectory_points, k=k_neighbors)
+            adj = knn_adjacency(trajectory_points, k=k_neighbors)
             self.register_buffer("static_adjacency", adj, persistent=False)
         else:
             self.register_buffer("static_adjacency", None)
 
-    def dynamic_knn_graph(self, trajectory: torch.Tensor, k: int = 8) -> torch.Tensor:
-        """
-        [FIX 11] Build k-NN graph dynamically from ACTUAL trajectory coordinates.
-        """
-        if trajectory.dim() == 3:
-            trajectory = trajectory[0]
-
-        # [FIX] Ensure trajectory is real for torch.cdist
-        if torch.is_complex(trajectory):
-            trajectory = trajectory.real
-
-        N = trajectory.shape[0]
-        device = trajectory.device
-
-        if N > 4096:
-            return self._build_knn_graph(trajectory, k=k)
-
-        dist = torch.cdist(trajectory, trajectory)
-        _, indices = torch.topk(-dist, min(k + 1, N), dim=1)
-        row = torch.arange(N, device=device).view(-1, 1).expand(-1, indices.shape[1]).flatten()
-        col = indices.flatten()
-        edge_index = torch.stack([row, col], dim=0)
-        values = torch.ones(edge_index.shape[1], device=device)
-        return torch.sparse_coo_tensor(edge_index, values, (N, N))
-
-    def _build_knn_graph(
-        self, points: torch.Tensor, k: int, block_size: int = 1024
-    ) -> torch.Tensor:
-        # Duplicated helper for wrapper context
-        """_build_knn_graph.
-
-        Args:
-            points (torch.Tensor): Description.
-            k (int): Description.
-            block_size (int): Description.
-        Returns:
-            torch.Tensor: Description.
-        """
-        N, D = points.shape
-        device = points.device
-
-        # [FIX] Ensure points are real for torch.cdist
-        if torch.is_complex(points):
-            points = points.real
-
-        if block_size >= N:
-            dists = torch.cdist(points, points)
-            _, indices = torch.topk(-dists, min(k + 1, N), dim=1)
-            row = torch.arange(N, device=device).view(-1, 1).repeat(1, indices.shape[1]).flatten()
-            col = indices.flatten()
-            edge_index = torch.stack([row, col], dim=0)
-            values = torch.ones(edge_index.shape[1], device=device)
-            return torch.sparse_coo_tensor(edge_index, values, (N, N))
-
-        num_blocks = (N + block_size - 1) // block_size
-        all_rows, all_cols = [], []
-        for i in range(num_blocks):
-            start = i * block_size
-            end = min((i + 1) * block_size, N)
-            block_n = end - start
-            if block_n <= 0:
-                continue
-
-            block_points = points[start:end]
-            dists = torch.cdist(block_points, block_points)
-            local_k = min(k + 1, block_n)
-            _, local_indices = torch.topk(-dists, local_k, dim=1)
-            global_indices = local_indices + start
-            local_rows = torch.arange(block_n, device=device).view(-1, 1).repeat(1, local_k) + start
-            all_rows.append(local_rows.flatten())
-            all_cols.append(global_indices.flatten())
-
-        row = torch.cat(all_rows)
-        col = torch.cat(all_cols)
-        edge_index = torch.stack([row, col], dim=0)
-        values = torch.ones(edge_index.shape[1], device=device)
-        return torch.sparse_coo_tensor(edge_index, values, (N, N))
+    def _lattice_adjacency(self, grid_nodes: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """The grid's kNN adjacency, built once per (H, W, device): the lattice is fixed."""
+        key = (h, w, grid_nodes.device)
+        if key not in self._grid_adjacency:
+            coords = grid_nodes[0, :, 2:4].detach().contiguous()
+            self._grid_adjacency[key] = (knn_adjacency(coords, k=self.k_neighbors), coords)
+        adj, coords = self._grid_adjacency[key]
+        self.register_buffer("cached_coords", coords, persistent=False)
+        return adj
 
     def _grid_to_graph(self, grid: torch.Tensor) -> torch.Tensor:
         """Convert grid image to graph nodes."""
@@ -1061,7 +981,10 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
         if C == 1:
             signal = torch.cat([signal, torch.zeros_like(signal)], dim=-1)
         elif C > 2:
-            signal = signal[..., :2]
+            raise ValueError(
+                f"graph_unet nodes carry one complex or two real signal entries; got {C} "
+                "grid channels. Combine coils before the model."
+            )
         kx = torch.linspace(-1, 1, W, device=device)
         ky = torch.linspace(-1, 1, H, device=device)
         grid_y, grid_x = torch.meshgrid(ky, kx, indexing="ij")
@@ -1111,15 +1034,12 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # [FIX] Handle complex input early
-        if torch.is_complex(x):
-            if x.dim() == 4:
-                # Grid input - will be handled in _grid_to_graph
-                pass
-            else:
-                # Graph input - assume it's already in the right format but promoted to complex?
-                # Or maybe it needs splitting? For now, just take real.
-                x = x.real
+        # A complex grid is split into Re/Im channels by _grid_to_graph; complex nodes have
+        # no such split and their imaginary part would be lost (#2111).
+        if torch.is_complex(x) and x.dim() != 4:
+            raise ValueError(_COMPLEX_NODES_MESSAGE)
+        if self.node_source == "trajectory":
+            return self._forward_trajectory_nodes(x, adj, timesteps, class_labels)
 
         # Pre-process inputs (Grid -> Graph)
         is_grid_input = x.dim() == 4
@@ -1132,6 +1052,7 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
         if (
             is_grid_input
             and isinstance(self.backbone, GraphAttentionUNet)
+            and self.gat_max_nodes is not None
             and (x.shape[-2] * x.shape[-1]) > self.gat_max_nodes
         ):
             B, _, H, W = x.shape
@@ -1149,21 +1070,18 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
             gat_downsampled = True
 
         if is_grid_input:
+            grid_hw = (x.shape[-2], x.shape[-1])
             x = self._grid_to_graph(x)
 
-        # Graph Construction (Shared)
         if adj is None:
-            coords = x[0, :, 2:4].detach()
-            if getattr(self, "use_dynamic_graph", True):
-                adj = self.dynamic_knn_graph(coords, k=self.k_neighbors)
-                self.register_buffer("cached_coords", coords.contiguous(), persistent=False)
-            elif self.static_adjacency is not None:
+            if self.static_adjacency is not None:
                 adj = self.static_adjacency
+            elif is_grid_input:
+                adj = self._lattice_adjacency(x, *grid_hw)
             else:
-                adj = self._build_knn_graph(coords, k=self.k_neighbors)
-                if adj is not None and adj.dim() >= 2:
-                    self.register_buffer("static_adjacency", adj, persistent=False)
-                    self.register_buffer("cached_coords", coords.contiguous(), persistent=False)
+                coords = x[0, :, 2:4].detach().contiguous()
+                adj = knn_adjacency(coords, k=self.k_neighbors)
+                self.register_buffer("cached_coords", coords, persistent=False)
 
         # Forward through backbone, passing conditioning signals if supported
         if isinstance(self.backbone, DynamicGraphUNet):
@@ -1187,6 +1105,37 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
             x = F.interpolate(x, size=gat_orig_hw, mode="bilinear", align_corners=False)
 
         return x
+
+    def _trajectory_adjacency(self, nodes: torch.Tensor) -> torch.Tensor:
+        """kNN over the nodes' k-space coordinates, built once per (N, device).
+
+        The loader draws one trajectory per (pattern, im_size), so N identifies it.
+        """
+        key = (nodes.shape[1], nodes.device)
+        if key not in self._node_adjacency:
+            coords = nodes[0, :, 2:4].detach().contiguous()
+            self._node_adjacency[key] = knn_adjacency(coords, k=self.k_neighbors)
+        return self._node_adjacency[key]
+
+    def _forward_trajectory_nodes(self, x, adj, timesteps, class_labels) -> torch.Tensor:
+        """Off-grid path: [B, N, 5] sample nodes in, [B, N, 2] complex samples out."""
+        if x.dim() != 3 or x.shape[-1] != 5:
+            raise ValueError(
+                "node_source='trajectory' takes off-grid nodes [B, N, 5] = [Re, Im, Kx, Ky, DCF] "
+                f"built from the acquired trajectory; got shape {tuple(x.shape)}."
+            )
+        groups = None
+        if isinstance(self.backbone, GraphAttentionUNet) and self.gat_max_nodes is not None:
+            groups = readout_groups(x.shape[1], self.gat_max_nodes, x.device)
+            if groups is not None:
+                x = pool_nodes(x, groups, self.gat_max_nodes)
+        if adj is None:
+            adj = self._trajectory_adjacency(x)
+        if isinstance(self.backbone, DynamicGraphUNet):
+            out = self.backbone(x, adj, timesteps=timesteps, class_labels=class_labels)
+        else:
+            out = self.backbone(x, adj)
+        return out if groups is None else out[:, groups]
 
     def get_parameter_count(self) -> int:
         """get_parameter_count.
@@ -1227,6 +1176,11 @@ class GraphUNetGenerator(NestedGradCheckpointingMixin, nn.Module, IGenerator):
         Returns:
             torch.Tensor: Description.
         """
+        if self.node_source == "trajectory":
+            raise NotImplementedError(
+                "node_source='trajectory' images come from the strategy's OffGridGraphPath, "
+                "which holds the trajectory and DCF; predict_image has neither."
+            )
         if self.adjoint_op is None:
             return torch.zeros(x_nodes.shape[0], 1, *self.im_size, device=x_nodes.device)
 

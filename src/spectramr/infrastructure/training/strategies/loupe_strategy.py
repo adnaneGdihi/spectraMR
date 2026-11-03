@@ -143,6 +143,14 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
             return keep.reshape(logits.shape)
         raise ValueError(f"undersampling.adaptive.budget must be soft|hard_topk, got {budget!r}")
 
+    def _needs_kspace_adjoint(self, batch_context: dict[str, Any]) -> bool:
+        """Never: the arm's ``pre_model`` chain is the adjoint, and the learned mask acts on its image.
+
+        The image-domain registration would otherwise ``ifft2c`` the context's
+        fully sampled ``measured_kspace`` and hand the backbone an unmasked image.
+        """
+        return False
+
     def _validation_forward(
         self,
         input_batch: torch.Tensor,
@@ -166,13 +174,21 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
         layout/channel-count so the result drops straight into the recon
         backbone. The per-line mask (shape ``(W,)`` or ``(n_coils, W)``)
         broadcasts over the phase-encode columns of k-space.
+
+        A single real channel (a magnitude image) returns the zero-filled magnitude:
+        keeping ``.real`` would symmetrise the mask, since a real image's spectrum is
+        Hermitian, and leak every mirrored, unacquired column into the input.
         """
         complex_in = torch.is_complex(image)
         even_channels = image.ndim == 4 and not complex_in and image.shape[1] % 2 == 0
 
         kspace = fft2c(image)  # complex (..., H, W); shares grad with mask
-        # Broadcast the per-line mask over the column (phase-encode) axis.
-        mask = mask_line.reshape(*([1] * (kspace.ndim - 1)), -1)
+        # Broadcast the per-line mask over the column (phase-encode) axis; a mask already
+        # shaped like k-space (SCAS's per-sample (B, 1, 1, W)) broadcasts as given.
+        if mask_line.ndim == kspace.ndim:
+            mask = mask_line
+        else:
+            mask = mask_line.reshape(*([1] * (kspace.ndim - 1)), -1)
         masked = ifft2c(kspace * mask)  # complex (..., H, W)
 
         if complex_in:
@@ -185,6 +201,8 @@ class LOUPEStrategy(ReconstructionTrainingStrategy):
             ri = torch.view_as_real(masked)  # (B, C//2, H, W, 2)
             recon = ri.permute(0, 1, 4, 2, 3).reshape(b, c_half * 2, h, w)
             return recon.to(image.dtype).reshape(image.shape)
+        if image.ndim == 4 and image.shape[1] == 1:
+            return masked.abs().to(image.dtype).reshape(image.shape)
         # Pure-real input (zero-phase): magnitude/real channel round-trips 1:1.
         return masked.real.to(image.dtype).reshape(image.shape)
 

@@ -141,3 +141,30 @@ def test_nonpositive_delta_rejected() -> None:
         min_samples_for_gap(0.0, 0.05)
     with pytest.raises(ValueError):
         min_samples_for_gap(-0.2, 0.05)
+
+
+class TestHolmAcrossPairs:
+    """The per-pair alpha holds per pair only; Holm controls the family of pairs."""
+
+    def test_one_pair_under_holm_matches_the_uncorrected_gate(self) -> None:
+        n, alpha = 200, 0.05
+        t = powered_gap_threshold(n, alpha)
+        for gap in (0.999 * t, 1.001 * t):
+            plain = certify_partial_order({"a": gap, "b": 0.0}, n, alpha)
+            holm = certify_partial_order({"a": gap, "b": 0.0}, n, alpha, correction="holm")
+            assert plain.certified == holm.certified
+
+    def test_holm_withholds_a_pair_the_per_pair_gate_certifies(self) -> None:
+        n, alpha = 200, 0.05
+        t = powered_gap_threshold(n, alpha)
+        scores = {f"m{i}": i * 1.05 * t for i in range(6)}
+        plain = certify_partial_order(scores, n, alpha)
+        holm = certify_partial_order(scores, n, alpha, correction="holm")
+        assert ("m1", "m0") in plain.certified
+        assert ("m1", "m0") not in holm.certified
+        assert set(holm.certified) < set(plain.certified)
+        assert holm.correction == "holm"
+
+    def test_an_unknown_correction_raises(self) -> None:
+        with pytest.raises(ValueError, match="correction"):
+            certify_partial_order({"a": 1.0, "b": 0.0}, 100, 0.05, correction="bonferonni")

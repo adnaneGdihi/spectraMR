@@ -24,6 +24,8 @@ import torch
 import torchio as tio
 
 from spectramr.data.transforms.slice_profile import (
+    SLICE_PROFILE_RATIO_KEY,
+    SLICE_PROFILE_Z_AXIS_KEY,
     SliceProfileTransform,
     _convolve_along_axis,
 )
@@ -224,12 +226,14 @@ class TestSliceProfileIsConfigDeclarable:
 
         assert get_transform("slice_profile").cls is SliceProfileTransform
 
-    def test_it_declares_that_it_adds_no_keys(self):
-        """It rewrites ``input``/``target`` in place rather than adding a key,
-        so an empty ``produces`` is the honest declaration -- not an oversight."""
+    def test_it_declares_the_decimation_stamp_it_adds(self):
+        """It rewrites ``input``/``target`` in place and adds only the stamp keys."""
         from spectramr.data.transforms.registry import get_transform
 
-        assert get_transform("slice_profile").produces == ()
+        assert get_transform("slice_profile").produces == (
+            SLICE_PROFILE_RATIO_KEY,
+            SLICE_PROFILE_Z_AXIS_KEY,
+        )
 
     def test_it_builds_with_the_kwargs_the_committed_arm_declares(self):
         """Pinned against the arm, not against the signature: a default that
@@ -358,3 +362,29 @@ def test_output_matches_pre_move_golden(profile: str) -> None:
     expected = torch.tensor(_GOLDEN_B1428B57D[profile]).view(2, 4).repeat_interleave(3, dim=-1)
     # Bit-identical on the capturing machine; 1e-6 leaves room for another CPU's conv1d order.
     torch.testing.assert_close(out, expected.view(1, 1, 2, 12), rtol=0.0, atol=1e-6)
+
+
+class TestDecimationStamp:
+    """The stamp is what lets SliceToVolumeStrategy pool back to the input plane."""
+
+    def test_decimate_stamps_ratio_and_axis_that_survive_patching(self) -> None:
+        vol = torch.rand(1, 8, 8, 16)
+        t = SliceProfileTransform(profile="gauss", slice_thickness_mm=4.0, keys=("input",))
+        out = t(_make_subject(vol))
+        patch = next(iter(tio.UniformSampler((4, 4, 8))(out)))
+        assert patch[SLICE_PROFILE_RATIO_KEY] == 4
+        assert patch[SLICE_PROFILE_Z_AXIS_KEY] == 3
+
+    def test_blur_only_adds_no_stamp(self) -> None:
+        t = SliceProfileTransform(slice_thickness_mm=4.0, decimate=False, keys=("input",))
+        out = t(_make_subject(torch.rand(1, 4, 4, 8)))
+        assert SLICE_PROFILE_RATIO_KEY not in out
+
+    def test_keys_decimated_by_different_ratios_raise(self) -> None:
+        subject = tio.Subject(
+            input=tio.ScalarImage(tensor=torch.rand(1, 4, 4, 16)),
+            target=tio.ScalarImage(tensor=torch.rand(1, 4, 4, 16), affine=np.diag([1, 1, 2, 1])),
+        )
+        t = SliceProfileTransform(slice_thickness_mm=4.0)
+        with pytest.raises(ValueError, match="different ratios"):
+            t(subject)

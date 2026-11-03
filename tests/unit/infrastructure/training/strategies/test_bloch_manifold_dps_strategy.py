@@ -411,6 +411,19 @@ class TestForwardScoreIsIntrospectedNotSwallowed:
         assert seen["timesteps"] is not None
         assert int(seen["timesteps"][0]) == 7
 
+    def test_a_model_naming_t_behind_kwargs_receives_it_as_t(self):
+        """#2086: a `forward(x, t, **kwargs)` score net was trained at t=None."""
+
+        class _NamedT(torch.nn.Module):
+            def forward(self, x, t=None, **kwargs):
+                assert "timesteps" not in kwargs
+                return t
+
+        out = BlochManifoldDPSStrategy._forward_score(
+            _NamedT(), torch.randn(2, 1, 8, 8), torch.full((2,), 7, dtype=torch.long)
+        )
+        assert int(out[0]) == 7
+
 
 def test_the_sampler_walks_the_schedule_the_score_network_trained_on(generator):
     """PLANTED (#2441): the sampler rebuilt its schedule over sampling_steps, not T."""

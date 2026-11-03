@@ -17,6 +17,7 @@ from spectramr.infrastructure.reporting.plotters.distributions import _frame
 from spectramr.infrastructure.reporting.style import (
     column_width,
     panel_label,
+    panel_letter,
     pretty_label,
     use_default_style,
 )
@@ -74,7 +75,7 @@ def make(
         ax.set_ylabel(arm)
         sparse_ticks(ax)
         if len(others) > 1:
-            panel_label(ax, chr(ord("a") + i))
+            panel_label(ax, panel_letter(i))
         drawn = True
     for k in range(len(others), rows * cols):
         axes[k // cols][k % cols].set_axis_off()

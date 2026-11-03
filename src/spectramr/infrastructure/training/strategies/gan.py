@@ -4,6 +4,8 @@ This module contains the GANTrainingStrategy for adversarial training.
 """
 
 import logging
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -25,6 +27,7 @@ from spectramr.infrastructure.training.strategy_helpers import (
 
 from ..utils.training_utils import clamp_to_range
 from .base import BaseTrainingStrategy
+from .mixins.generator_conditioning import conditioning_kwargs
 
 if TYPE_CHECKING:
     pass
@@ -108,6 +111,9 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         - Gradient penalty for stabilization
         - Early stopping if discriminator dominates
     """
+
+    #: The batch's conditioning ids for this step (``conditioning_kwargs``); none until a step.
+    _gen_conditioning: Mapping[str, torch.Tensor] = MappingProxyType({})
 
     def __init__(
         self,
@@ -288,7 +294,9 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             set_critic_trainable(discriminator, True)
 
             with torch.no_grad():
-                hr_fakes, _ = self._split_generator_output(self.env.generator(input_batch))
+                hr_fakes, _ = self._split_generator_output(
+                    self.env.generator(input_batch, **self._gen_conditioning)
+                )
 
             if hr_fakes.device != target_batch.device:
                 hr_fakes = hr_fakes.to(target_batch.device)
@@ -363,7 +371,9 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
             # Keeps D's grads clean of the generator's objective; the D step re-enables.
             set_critic_trainable(discriminator, False)
 
-            hr_fakes, auxiliary = self._split_generator_output(self.env.generator(input_batch))
+            hr_fakes, auxiliary = self._split_generator_output(
+                self.env.generator(input_batch, **self._gen_conditioning)
+            )
 
             if hr_fakes.device != target_batch.device:
                 hr_fakes = hr_fakes.to(target_batch.device)
@@ -486,6 +496,10 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         # every step of every r1_interval-th epoch (review 2026-07-01). This is
         # the same seam already used for ``current_step`` below.
         iteration = resolve_loop_iteration(self)
+        # Read once per step: both closures run after train_step returns.
+        self._gen_conditioning = conditioning_kwargs(
+            self.env.generator, batch, getattr(self, "device", None)
+        )
         config = self.env.config if self.env else self.config
         num_d_updates = _resolve_disc_updates(config, iteration=iteration)
 
@@ -566,6 +580,8 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        *,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Perform a single validation step for GANs.
@@ -591,8 +607,9 @@ class GANTrainingStrategy(BaseTrainingStrategy, AdversarialMixin):
         with torch.no_grad():
             self.generator_model.eval()
 
-            # Single inference pass
-            hr_fakes = self.generator_model(input_batch)
+            # Single inference pass, with the batch's conditioning ids
+            cond = conditioning_kwargs(self.generator_model, batch_data, getattr(self, "device", None))
+            hr_fakes = self.generator_model(input_batch, **cond)
             if hr_fakes.device != target_batch.device:
                 hr_fakes = hr_fakes.to(target_batch.device)
 

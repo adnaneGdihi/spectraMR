@@ -10,6 +10,7 @@ from spectramr.models.generators.latent_cfg import (
     axis_keep_masks,
     guided_noise,
     resolve_latent_cfg,
+    reverse_progress,
 )
 
 
@@ -110,3 +111,75 @@ class TestGuidedNoise:
         out = self._run(spec, calls)
         assert torch.allclose(out, torch.full_like(out, 2.0 * 3.0 + 1.5 * 10.0))
         assert calls == [6]
+
+
+class TestSchedule:
+    """``cfg_schedule`` multiplies each guided weight by s_i(progress)."""
+
+    def _spec(self, schedule):
+        return resolve_latent_cfg(
+            {"condition": 0.1, "contrast": 0.1},
+            {"condition": 2.0, "contrast": 1.5},
+            has_condition=True,
+            has_contrast=True,
+            schedule=schedule,
+        )
+
+    def _run(self, spec, progress):
+        z = torch.zeros(2, 1, 2, 2)
+        cond = torch.full((2, 1, 2, 2), 3.0)
+        return guided_noise(
+            TestGuidedNoise._denoiser([]),
+            z,
+            torch.zeros(2, dtype=torch.long),
+            cond,
+            True,
+            spec,
+            progress=progress,
+        )
+
+    def test_progress_runs_from_the_noisiest_step_to_the_cleanest(self):
+        assert reverse_progress(999, 1000) == 0.0
+        assert reverse_progress(0, 1000) == 1.0
+        assert reverse_progress(0, 1) == 1.0
+
+    def test_linear_schedule_is_6_at_the_first_reverse_step_and_1_at_the_last(self):
+        """eps = 2*s(p)*3 + 1.5*10 with s linear 6 -> 1."""
+        spec = self._spec({"condition": {"type": "linear", "start": 6.0, "end": 1.0}})
+        first = self._run(spec, reverse_progress(999, 1000))
+        last = self._run(spec, reverse_progress(0, 1000))
+        assert torch.allclose(first, torch.full_like(first, 2.0 * 6.0 * 3.0 + 15.0))
+        assert torch.allclose(last, torch.full_like(last, 2.0 * 1.0 * 3.0 + 15.0))
+
+    def test_no_schedule_matches_the_constant_weight_output_bit_exact(self):
+        unscheduled = self._run(self._spec(None), 0.37)
+        z = torch.zeros(2, 1, 2, 2)
+        legacy = guided_noise(
+            TestGuidedNoise._denoiser([]),
+            z,
+            torch.zeros(2, dtype=torch.long),
+            torch.full((2, 1, 2, 2), 3.0),
+            True,
+            self._spec(None),
+        )
+        assert torch.equal(unscheduled, legacy)
+
+    def test_scheduling_an_unguided_axis_raises(self):
+        with pytest.raises(ValueError, match="does not guide"):
+            resolve_latent_cfg(
+                {"condition": 0.1, "contrast": 0.1},
+                {"condition": 2.0},
+                has_condition=True,
+                has_contrast=True,
+                schedule={"contrast": {"type": "constant"}},
+            )
+
+    def test_an_unknown_schedule_type_raises(self):
+        with pytest.raises(ValueError, match="Unknown CFG schedule type"):
+            self._spec({"condition": {"type": "sigmoid"}})
+
+    def test_the_schedule_reaches_the_record(self):
+        spec = self._spec({"contrast": {"type": "cosine", "amplitude": 0.5, "baseline": 1.5}})
+        assert spec.to_dict()["cfg_schedule"] == {
+            "contrast": {"type": "cosine", "amplitude": 0.5, "baseline": 1.5}
+        }

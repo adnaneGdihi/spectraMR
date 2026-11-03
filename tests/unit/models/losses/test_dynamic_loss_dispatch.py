@@ -264,7 +264,19 @@ def test_unified_gan_must_not_silently_drop_a_failing_loss() -> None:
 
 
 class _VAECfg(_Cfg):
-    pass
+    """The VAE computer refuses an arm without a declared reconstruction loss (decision 16)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        from spectramr.config.schemas.loss import LossComponentConfig, LossConfigSchema
+
+        self.losses = LossConfigSchema(
+            output_domain="image",
+            image_losses=[
+                LossComponentConfig(name="mse", weight=1.0),
+                LossComponentConfig(name="sense_adjoint_l1", weight=1.0),
+            ],
+        )
 
 
 def test_unified_vae_forwards_smaps_to_sense_adjoint_l1() -> None:

@@ -18,6 +18,7 @@ from spectramr.infrastructure.reporting.plotters.distributions import _frame
 from spectramr.infrastructure.reporting.style import (
     column_width,
     panel_label,
+    panel_letter,
     pretty_label,
     use_default_style,
 )
@@ -63,7 +64,7 @@ def make(
         ax.set_ylabel(pretty_label(metric))
         sparse_ticks(ax, axes="y")
         if len(cols) > 1:
-            panel_label(ax, chr(ord("a") + i))
+            panel_label(ax, panel_letter(i))
     if not drawn:
         plt.close(fig)
         return None

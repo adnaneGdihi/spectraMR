@@ -57,7 +57,7 @@ class SeparableBeltrami4DSolver(torch.nn.Module):
         self.planar = LinearBeltramiSolver(max_iter=planar_max_iter, tol=tol)
 
     @staticmethod
-    def _time_warp(nu: torch.Tensor, T: int) -> torch.Tensor:
+    def time_warp(nu: torch.Tensor, T: int) -> torch.Tensor:
         """Convert a per-step temporal dilatation ``ν[B, T]`` (with
         ``|ν| < 1``) to a cumulative reparameterisation
         ``φ_temporal[B, T] ∈ [0, T-1]``."""
@@ -90,7 +90,7 @@ class SeparableBeltrami4DSolver(torch.nn.Module):
             spatial.append(r.phi)
             total_iters = max(total_iters, r.iterations)
         phi_spatial = torch.stack(spatial, dim=1)
-        phi_temporal = self._time_warp(nu, T)
+        phi_temporal = self.time_warp(nu, T)
         k = max(mu.abs().amax().item(), nu.abs().amax().item())
         K = (1.0 + k) / max(1.0 - k, 1e-6)
         return Beltrami4DResult(

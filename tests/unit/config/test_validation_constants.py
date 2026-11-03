@@ -91,3 +91,7 @@ def test_advertised_modes_are_all_dispatchable() -> None:
         f"advertised but undispatchable: {sorted(orphans)} -- either register a "
         "strategy or remove the name"
     )
+
+
+def test_cascaded_diffusion_mode_registered() -> None:
+    assert "cascaded_diffusion" in VALID_TRAINING_MODES

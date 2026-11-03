@@ -769,7 +769,7 @@ def _dispatch(
     # absence of a cap.
     if prod:
         print("[MODE] PROD — actual experiment: full config max_iterations, no smoke cap")
-        # A production arm does not fit in one 120h allocation, so a production
+        # A production arm does not fit in one 96 h allocation, so a production
         # run is a CHAIN by definition and every link must continue the last.
         # Without this a yielded task requeues, starts from iteration 0, yields
         # again, and burns the allocation forever without ever finishing.
@@ -987,7 +987,7 @@ def _dispatch(
     #
     # Except when the launch carried no --resume. The requeued task would then
     # re-run this same command, start at iteration 0, yield at the next wall and
-    # repeat -- an allocation burned forever without ever passing 120h of
+    # repeat -- an allocation burned forever without ever passing 96 h of
     # training. Refuse loudly instead; the checkpoint on disk is still good.
     # The fresh first link of a campaign chain is exempt: its script spells
     # --resume on every requeued link, so the requeue continues, not restarts.

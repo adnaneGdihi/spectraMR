@@ -99,16 +99,48 @@ def _scenario_mesh_ddp_end_to_end(rank: int) -> None:
     ctx = ParallelContext(
         config=SimpleNamespace(), device=torch.device("cpu"), parallel=parallel, mesh=mesh
     )
+    from spectramr.infrastructure.optimization.ema import ModelEma
+
     torch.manual_seed(0)
     model = _TinyDiT()
     reference = copy.deepcopy(model)
+    ema, ref_ema = ModelEma(model, decay=0.5, warmup=False), ModelEma(reference, 0.5, warmup=False)
     plugin = DDPStrategy()
     models = plugin.prepare_models({"generator": model}, ctx)
+    plugin.prepare_ema(ema, models, ctx)  # the shadow is split like the generator
     wrapped = plugin.adopt(models, {}, {}, ctx).models["generator"]
     _sgd(wrapped, 2, rank_batch=dp_rank())
     _sgd(reference, 2)
     for key, value in reference.state_dict().items():
         torch.testing.assert_close(model.state_dict()[key], value, atol=1e-5, rtol=1e-4)
+    ema.update(model)
+    ref_ema.update(reference)
+    _check_optimizer_state_round_trip(wrapped, reference)
+    shadow = ema.shadow_state_dict()
+    for key, value in ref_ema.shadow_state_dict().items():
+        torch.testing.assert_close(shadow[key], value, atol=1e-5, rtol=1e-4)
+
+
+def _check_optimizer_state_round_trip(wrapped, reference) -> None:
+    """Momentum buffers save in the unsplit shapes and load back into each rank's slice."""
+    from spectramr.core.parallel_groups import dp_rank
+    from spectramr.infrastructure.distributed.state_io import PassthroughStateIO
+
+    io = PassthroughStateIO()
+    opts = [torch.optim.SGD(m.parameters(), lr=0.1, momentum=0.9) for m in (wrapped, reference)]
+    for module, opt, shard in zip((wrapped, reference), opts, (dp_rank(), None), strict=True):
+        x = torch.randn(4, 6, WIDTH, generator=torch.Generator().manual_seed(7))
+        module(x if shard is None else x[shard * 2 : (shard + 1) * 2]).square().mean().backward()
+        opt.step()
+    saved, expected = io.optimizer_state(wrapped, opts[0]), opts[1].state_dict()
+    for index, entry in expected["state"].items():
+        torch.testing.assert_close(
+            saved["state"][index]["momentum_buffer"], entry["momentum_buffer"]
+        )
+    live = {i: e["momentum_buffer"].clone() for i, e in opts[0].state_dict()["state"].items()}
+    io.load_optimizer_state(wrapped, opts[0], saved)
+    for index, buffer in opts[0].state_dict()["state"].items():
+        torch.testing.assert_close(buffer["momentum_buffer"], live[index])
 
 
 def _scenario_refusals(rank: int) -> None:

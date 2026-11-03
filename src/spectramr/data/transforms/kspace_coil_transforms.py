@@ -140,6 +140,9 @@ class CoilCombineTransform(tio.Transform):
         "measured_kspace",
         "input",
         "target",
+        # The separate-layout source contrast is combined like the target, so both are
+        # cropped as images of the same geometry.
+        "kspace_source",
     }
 
     def __init__(
@@ -147,6 +150,7 @@ class CoilCombineTransform(tio.Transform):
         method: Literal["rss", "rss_image", "rss_per_channel", "sense"] = "rss",
         keys: list[str] | None = None,
         sensitivity_key: str = "sensitivity",
+        channel_groups: int = 1,
     ):
         """Initialize coil combine transform.
 
@@ -173,8 +177,19 @@ class CoilCombineTransform(tio.Transform):
                   → FFT back to k-space (preserves phase).
             keys: Image keys to transform. If None, uses KSPACE_KEYS.
             sensitivity_key: Key for sensitivity maps (used with SENSE method)
+            channel_groups: ``rss_image`` only: split the coil axis into this many
+                contiguous groups (e.g. the stacked contrasts of the M4Raw
+                cross-contrast route) and RSS each, giving one channel per group.
         """
         super().__init__()
+        if channel_groups < 1:
+            raise ValueError(f"channel_groups must be >= 1, got {channel_groups}.")
+        if channel_groups > 1 and method != "rss_image":
+            raise ValueError(
+                f"channel_groups={channel_groups} is implemented for method='rss_image' "
+                f"only, got method={method!r}."
+            )
+        self.channel_groups = channel_groups
         self.method = method
         self.keys = keys or list(self.KSPACE_KEYS)
         self.sensitivity_key = sensitivity_key
@@ -343,12 +358,22 @@ class CoilCombineTransform(tio.Transform):
             kspace: ``(Coils, H, W, D)`` complex k-space.
 
         Returns:
-            ``(1, H, W, D)`` real magnitude image.
+            ``(channel_groups, H, W, D)`` real magnitude image.
         """
         kspace_transposed = kspace.permute(0, 3, 1, 2)
         images = ifft2c(kspace_transposed)
 
-        rss_combined = torch.sqrt(torch.sum(torch.abs(images) ** 2, dim=0, keepdim=True))
+        groups = self.channel_groups
+        if groups == 1:
+            rss_combined = torch.sqrt(torch.sum(torch.abs(images) ** 2, dim=0, keepdim=True))
+        else:
+            if images.shape[0] % groups:
+                raise ValueError(
+                    f"[CoilCombine] {images.shape[0]} coils do not split into "
+                    f"channel_groups={groups} equal groups."
+                )
+            power = (torch.abs(images) ** 2).reshape(groups, -1, *images.shape[1:])
+            rss_combined = torch.sqrt(power.sum(dim=1))
         # ``rss_combined`` is real-valued already; return as image.
         # Transpose back: (1, D, H, W) -> (1, H, W, D)
         return rss_combined.permute(0, 2, 3, 1)

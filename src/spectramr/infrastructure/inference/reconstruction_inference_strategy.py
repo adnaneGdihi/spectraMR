@@ -6,6 +6,7 @@ Inference strategy for standard reconstruction models (autoencoders, U-Net, etc.
 import torch
 
 from spectramr.config.schemas.enums import TrainingModeTypes
+from spectramr.infrastructure.inference.predict_contrast import CONDITIONING_KEYS
 
 from .base_inference_strategy import BaseInferenceStrategy
 
@@ -19,6 +20,8 @@ class ReconstructionInferenceStrategy(BaseInferenceStrategy):
 
     # Phase 2: single-pass forward — fully compatible with tiling.
     supports_grid_tiling: bool = True
+    #: ``run_inference`` hands ``contrast_idx`` / ``acquisition_params`` to the forward (#2410).
+    forwards_contrast_conditioning: bool = True
 
     @property
     def training_mode(self) -> TrainingModeTypes:
@@ -62,8 +65,8 @@ class ReconstructionInferenceStrategy(BaseInferenceStrategy):
             Model output tensor
         """
         with torch.no_grad():
-            # Standard forward pass
-            output = self.model(input_tensor)
+            conditioning = {k: kwargs[k] for k in CONDITIONING_KEYS if k in kwargs}
+            output = self.model(input_tensor, **conditioning)
 
             # Handle different model output formats
             if isinstance(output, dict):

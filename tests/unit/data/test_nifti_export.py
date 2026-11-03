@@ -28,7 +28,9 @@ from spectramr.data.nifti_export import (
     load_export_spacings,
     parse_ismrmrd_geometry,
     verify_slice_first_nifti,
+    verify_slice_last_nifti,
     write_slice_first_nifti,
+    write_slice_last_nifti,
     zooms_from_affine,
 )
 
@@ -483,3 +485,39 @@ class TestTheLabelsMustComeBackAtTheImagesScale:
     def test_a_non_affine_input_raises(self) -> None:
         with pytest.raises(GridMismatchError, match="4x4"):
             zooms_from_affine(np.eye(3))
+
+
+def _geom_shw(s: int, h: int, w: int) -> VoxelGeometry:
+    return VoxelGeometry(
+        slice_mm=3.0,
+        row_mm=0.5,
+        col_mm=0.75,
+        n_slices=s,
+        rows=h,
+        cols=w,
+        slice_gap_assumed_zero=True,
+        source="test",
+    )
+
+
+def test_slice_last_write_is_sliced_on_depth_by_the_training_loader(tmp_path):
+    # The paired-NIfTI loader takes the LAST on-disk axis as depth; a slice-first file
+    # would hand it (S, H) cuts through the volume.
+    from spectramr.data.io_strategies import NiftiStrategy
+
+    vol = torch.arange(3 * 5 * 7, dtype=torch.float32).reshape(3, 5, 7)
+    path = write_slice_last_nifti(tmp_path / "v.nii.gz", vol, _geom_shw(3, 5, 7))
+    loaded = NiftiStrategy().load(str(path))["data"]
+    assert tuple(loaded.shape) == (1, 5, 7, 3)
+    assert torch.equal(loaded[0, :, :, 1], vol[1])
+    ref = NiftiStrategy.load_reference_volume(path)
+    assert torch.equal(ref["data"], vol)
+    assert ref["spacing_mm"] == pytest.approx((3.0, 0.5, 0.75))
+    verify_slice_last_nifti(path, vol, (3.0, 0.5, 0.75))
+
+
+def test_slice_last_verify_rejects_a_slice_first_file(tmp_path):
+    vol = torch.rand(3, 5, 7)
+    path = write_slice_first_nifti(tmp_path / "v.nii.gz", vol, _geom_shw(3, 5, 7))
+    with pytest.raises(ExportVerificationError, match="slice axis moved"):
+        verify_slice_last_nifti(path, vol, (3.0, 0.5, 0.75))

@@ -93,10 +93,11 @@ class BlochSchrodingerBridgeStrategy(StochasticInterpolantsStrategy):
         **kwargs: Forwarded to :class:`StochasticInterpolantsStrategy`.
     """
 
-    #: Loss ownership (issue #1918). mse_loss(pred, true_velocity) regresses the bridge DRIFT, not the target
-    #: image; the hook routes to neither the parent nor the computer.
+    #: Loss ownership (issue #1918). mse_loss(pred, true_velocity) regresses the drift; declared
+    #: ``losses.image_losses`` fold onto the endpoint estimate x1_hat = x0 + pred.
     inline_losses: ClassVar[frozenset[str]] = frozenset()
-    folds_image_losses: ClassVar[bool] = False
+    folds_image_losses: ClassVar[bool] = True
+    empty_loss_stack_is_design: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -212,11 +213,14 @@ class BlochSchrodingerBridgeStrategy(StochasticInterpolantsStrategy):
             bloch_loss = x1.new_zeros(())
 
         total = velocity_loss + self.lambda_bloch * bloch_loss
-        return {
-            "loss_total": total,
+        components = {
             "loss_sb_velocity": velocity_loss.detach(),
             "loss_bloch_manifold": bloch_loss.detach(),
         }
+        aux = self._apply_builder_image_losses(x1_hat, x1, components)
+        if aux is not None:
+            total = total + aux
+        return {"loss_total": total, **components}
 
     @torch.no_grad()
     def sample(

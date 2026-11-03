@@ -10,7 +10,12 @@ from spectramr.models.generators.field_cocycle_generator import FieldCocycleGene
 def test_forward_preserves_shape() -> None:
     g = FieldCocycleGenerator()
     x = torch.rand(2, 1, 16, 16)
-    y = g(x, field_strength=torch.tensor([3.0, 7.0]), contrast_id=torch.tensor([0, 1]))
+    y = g(
+        x,
+        field_strength=torch.tensor([0.1, 1.5]),
+        field_strength_target=torch.tensor([3.0, 7.0]),
+        contrast_id=torch.tensor([0, 1]),
+    )
     assert y.shape == x.shape
 
 
@@ -22,7 +27,7 @@ def test_single_model_attribute() -> None:
 def test_encode_stamps_canonical_repr() -> None:
     g = FieldCocycleGenerator()
     assert g.last_canonical_repr is None
-    q = g.encode(torch.rand(2, 1, 16, 16))
+    q = g.encode(torch.rand(2, 1, 16, 16), torch.tensor([0.1, 3.0]))
     assert g.last_canonical_repr is not None
     assert g.last_canonical_repr.shape == q.shape
 

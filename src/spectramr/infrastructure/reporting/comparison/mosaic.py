@@ -16,6 +16,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.font_manager import FontProperties
 
 from ..metadata import RunMetadata, stamp_figure, write_sidecar
 from ..plotters._mosaic import (
@@ -36,6 +37,9 @@ def _rows(arms: Arms, keys: list[str]) -> list[dict[str, dict]]:
     by_key = {lab: {_target_key(c): c for c in cs} for lab, cs in arms.cases.items()}
     return [{lab: by_key[lab][k] for lab in arms.labels} for k in keys]
 
+
+_MIN_COLUMN_INCHES = 0.75
+_MAX_WIDTH_PAGES = 2.0
 
 def make(
     df: pd.DataFrame,
@@ -68,7 +72,10 @@ def make(
     # One scale per slice, shared by every arm on it: a single figure-wide scale
     # is set by the hardest R and turns the low-R error maps black.
     vmaxes = [shared_vmax(list(row.values())) for row in errs]
-    width = column_width("double")
+    # A column narrower than ~0.75 in cannot hold a wrapped arm name; widen up to two
+    # page widths (the bar grids' cap) before shrinking the columns further.
+    page = column_width("double")
+    width = min(max(page, k * _MIN_COLUMN_INCHES), page * _MAX_WIDTH_PAGES)
     fig, axes = plt.subplots(
         2 * len(rows),
         k,
@@ -95,8 +102,10 @@ def make(
         axes[2 * i + 1][1].set_ylabel("|error|", fontsize="x-small")
         fig.colorbar(artist, ax=axes[2 * i + 1, 1:].tolist(), shrink=0.9, pad=0.01, aspect=12)
     size = "small" if k <= 7 else "x-small"
+    points = FontProperties(size=size).get_size_in_points()
+    chars = max(6, int(width / k * 72 / (points * 0.6)))
     for j, lab in enumerate(["reference", *labels]):
-        axes[0][j].set_title(textwrap.fill(lab.replace("_", " "), 14), fontsize=size)
+        axes[0][j].set_title(textwrap.fill(lab.replace("_", " "), chars), fontsize=size)
     steps = sorted(set(arms.steps.values()))
     where = (
         f"validation step {steps[0]}" if len(steps) == 1 else f"each arm at its {arms.view} step"

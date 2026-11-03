@@ -9,14 +9,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .base import BaseTrainingConfigSchema
 
-VALID_FED_AGGREGATIONS = (
-    "fed_avg",
-    "fed_prox",
-    "fed_opt",
-    "fed_adam",
-    "scaffold",
-    "fed_nova",
-)
+#: The rules FederatedRoundController implements; nothing reads FedProx/FedOpt/SCAFFOLD/FedNova
+#: knobs, so they are not advertised.
+VALID_FED_AGGREGATIONS = ("fed_avg", "fed_bn")
 
 
 class FederatedConfig(BaseModel):
@@ -39,31 +34,24 @@ class FederatedConfig(BaseModel):
         le=1000,
         description="Number of local epochs per round",
     )
-    aggregation_strategy: Literal[
-        "fed_avg", "fed_prox", "fed_opt", "fed_adam", "scaffold", "fed_nova"
-    ] = Field(
+    aggregation_strategy: Literal["fed_avg", "fed_bn"] = Field(
         default="fed_avg",
-        description=f"Aggregation strategy. One of: {VALID_FED_AGGREGATIONS}",
+        description=(
+            "fed_avg: n_k-weighted mean of every parameter and buffer. fed_bn: the same, "
+            "but each site keeps its own normalisation layers and is validated with them."
+        ),
     )
     client_fraction: float = Field(
         default=1.0,
         gt=0.0,
         le=1.0,
-        description="Fraction of clients to select per round (in (0, 1])",
+        description="Fraction of clients per round. Only 1.0: client subsampling is not implemented.",
     )
     num_rounds: int = Field(
         default=10,
         ge=1,
         le=100000,
-        description="Number of federated rounds (must be >= 1)",
-    )
-    fed_prox_mu: float = Field(
-        default=0.01,
-        ge=0.0,
-        description=(
-            "Proximal regularization weight (FedProx only). Ignored for other "
-            "aggregation strategies."
-        ),
+        description="Number of federated rounds; one round is one training epoch, so it must equal training.epochs.",
     )
 
     @field_validator("aggregation_strategy")
@@ -77,12 +65,10 @@ class FederatedConfig(BaseModel):
 
     @model_validator(mode="after")
     def _enforce_min_active_clients(self) -> "FederatedConfig":
-        active = max(1, int(self.client_fraction * self.num_clients))
-        if active < 2 and self.num_clients >= 2:
+        if self.client_fraction != 1.0:
             raise ValueError(
-                f"client_fraction={self.client_fraction} with num_clients={self.num_clients} "
-                f"yields only {active} active client(s) per round. Set client_fraction "
-                f">= {2 / self.num_clients:.3f} so at least 2 clients participate."
+                f"client_fraction={self.client_fraction}: client subsampling is not "
+                "implemented; every client trains every round (1.0)"
             )
         return self
 

@@ -236,6 +236,27 @@ def test_data_consistency_soft_returns_residual_when_requested() -> None:
     assert residual.item() >= 0
 
 
+def test_a_learnable_dc_step_starts_at_lambda_and_trains() -> None:
+    """``learnable=True`` reproduces the fixed step at init and gives it a gradient."""
+    coils = _identity_coils(1, 8, 8)
+    fwd = MultiCoilForwardOperator(coil_sensitivities=coils, mask=_full_mask(8, 8))
+    fixed = MultiCoilDataConsistency(fwd, mode="soft", lambda_dc=0.3)
+    learned = MultiCoilDataConsistency(fwd, mode="soft", lambda_dc=0.3, learnable=True)
+    x = torch.complex(torch.randn(1, 1, 8, 8), torch.randn(1, 1, 8, 8))
+    y = torch.complex(torch.randn(1, 1, 8, 8), torch.randn(1, 1, 8, 8))
+    out = learned(x, y)
+    assert torch.allclose(out, fixed(x, y), atol=1e-5)
+    out.abs().sum().backward()
+    assert learned.lambda_raw.grad is not None and learned.lambda_raw.grad.abs() > 0
+
+
+@pytest.mark.parametrize("mode,lam", [("hard", 1.0), ("soft", 0.0)])
+def test_a_learnable_dc_step_without_a_positive_soft_step_raises(mode, lam) -> None:
+    fwd = MultiCoilForwardOperator(coil_sensitivities=_identity_coils(1, 8, 8), mask=None)
+    with pytest.raises(ValueError, match="learnable DC step"):
+        MultiCoilDataConsistency(fwd, mode=mode, lambda_dc=lam, learnable=True)
+
+
 # ---------------------------------------------------------------------------
 # Mask helpers
 # ---------------------------------------------------------------------------

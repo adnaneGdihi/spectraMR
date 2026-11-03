@@ -129,3 +129,11 @@ def test_a_declared_mask_degradation_still_builds_the_ladder():
     doc = _doc()
     doc["training"]["diffusion"]["degradation"] = "kspace_mask"
     assert build_process_from_config(doc) is not None
+
+
+def test_the_gaussian_cold_diffusion_wrapper_has_no_ladder():
+    """``cold_diffusion`` noises by q_sample; only the mask-cascade generators are certified."""
+    doc = _doc()
+    doc["model"]["model_type"] = "cold_diffusion"
+    assert build_process_from_config(doc) is None
+    assert build_process_from_config(_doc()) is not None

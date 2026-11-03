@@ -67,7 +67,8 @@ import torch
 import torchio as tio
 from torch.utils.data import Dataset
 
-from spectramr.core.coil_map_names import REFERENCE_MAPS_KEY
+from spectramr.core import snapshot_trace
+from spectramr.data.transforms.traced_compose import plane
 from spectramr.data.datasets.h5_handle_cache import open_h5
 from spectramr.data.datasets.m4raw_coil_map_recipe import DEFAULT_RECIPE
 from spectramr.data.datasets.m4raw_identity import (
@@ -804,6 +805,7 @@ class M4RawRepetitionDataset(Dataset):
         num_virtual_coils: int = 4,
         single_contrast: bool = False,
         source_layout: str = "stacked",
+        stacked_combine: str = "joint",
         source_contrast: str = _FEDERATED_SOURCE_CONTRAST,
         target_contrasts: Sequence[str] | None = None,
         log_scaling: bool = False,
@@ -821,7 +823,6 @@ class M4RawRepetitionDataset(Dataset):
         emit_alternate_input: bool = False,
         n2n_pairing: str | None = None,
         coil_maps_root: str | Path | None = None,
-        coil_maps_reference_root: str | Path | None = None,
         coil_maps_missing: str = "raise",
         noise_fit_support_policy: str = "band",
         noise_covariance_root: str | Path | None = None,
@@ -848,6 +849,9 @@ class M4RawRepetitionDataset(Dataset):
                 contrast's acquired repetition as ``kspace_source`` beside a
                 target-only ``input``/``target``/``kspace``; ``target_only``
                 serves the same target without the source.
+            stacked_combine: ``stacked`` layout only. ``per_contrast`` means the
+                ``rss_image`` transform combines each contrast to its own channel,
+                so the target contrast starts at channel 1.
             source_contrast: cross-contrast route only, the contrast every
                 pair takes its source from (``T1`` by default; ``T2`` for
                 T2-guided FLAIR).
@@ -951,6 +955,16 @@ class M4RawRepetitionDataset(Dataset):
                 "contrast to serve."
             )
         self.source_layout = source_layout
+        if stacked_combine not in ("joint", "per_contrast"):
+            raise ValueError(f"[M4Raw] Unknown stacked_combine: {stacked_combine!r}.")
+        if stacked_combine == "per_contrast" and (single_contrast or source_layout != "stacked"):
+            raise ValueError(
+                "[M4Raw] stacked_combine='per_contrast' needs the cross-contrast route "
+                f"with source_layout='stacked'; got single_contrast={single_contrast}, "
+                f"source_layout={source_layout!r}."
+            )
+        # The transform layer RSS-combines each contrast to one channel (rss_image).
+        self.stacked_combine = stacked_combine
         self.source_contrast, self.target_contrasts = _validate_federated_contrasts(
             source_contrast, target_contrasts, single_contrast
         )
@@ -1012,15 +1026,6 @@ class M4RawRepetitionDataset(Dataset):
                 "[M4Raw] target_mode='nullspace_r2r' splits the PHYSICAL coil vector "
                 f"and needs coil_processing_mode='none', got {coil_processing_mode!r}."
             )
-        # Scoring-only maps (#2664): published under a key no operator, loss or
-        # model input reads; the instantiator passes them to the validation split.
-        from spectramr.data.datasets.m4raw_coil_map_source import CoilMapSource
-
-        self._reference_maps = (
-            None
-            if coil_maps_reference_root is None
-            else CoilMapSource.declared(Path(coil_maps_reference_root), "raise")
-        )
         self._coil_maps = self._coil_map_source(
             coil_maps_root,
             coil_maps_missing,
@@ -1099,7 +1104,7 @@ class M4RawRepetitionDataset(Dataset):
             use_repetitions=use_repetitions,
             single_contrast=single_contrast,
             nex_target_exclude_input=nex_target_exclude_input,
-            has_coil_maps=self._coil_maps is not None or self._reference_maps is not None,
+            has_coil_maps=self._coil_maps is not None,
         )
         self._draw_input = InputRepetitionDraw(self.input_repetition)
         self.slice_level_records = bool(slice_level_records)
@@ -1169,11 +1174,10 @@ class M4RawRepetitionDataset(Dataset):
         self._refuse_groups_without_an_alternate()
         # The same for the precomputed coil maps: every group's file must exist now, not when
         # the first affected sample is drawn.
-        for source in (self._coil_maps, self._reference_maps):
-            if source is not None:
-                source.refuse_absent_maps(
-                    Path(g["paths"][0]).stem for g in self._groups if g.get("paths")
-                )
+        if self._coil_maps is not None:
+            self._coil_maps.refuse_absent_maps(
+                Path(g["paths"][0]).stem for g in self._groups if g.get("paths")
+            )
 
         # F1: stamp each group with its raw k-space shape (header read only) so
         # the queue-build patch-compat filter can run its no-voxel-load fast
@@ -2006,6 +2010,22 @@ class M4RawRepetitionDataset(Dataset):
                 else (None, None)
             )
 
+            if snapshot_trace.is_active():
+                snapshot_trace.record(
+                    "loader",
+                    "m4raw_repetitions",
+                    {
+                        **{f"rep{j}": plane(r) for j, r in enumerate(kspace_reps)},
+                        "coil_maps": None if maps is None else plane(maps),
+                    },
+                    params={
+                        "files": [str(rep_paths[i]) for i in loaded],
+                        "slice_index": slice_index,
+                        "input_repetition": k,
+                        "coil_maps_source": maps_source,
+                    },
+                )
+
             # Input = one repetition (noisy), Target = averaged reps (high-SNR)
             input_kspace = kspace_reps[k].clone()
             # The repetition as acquired, kept when the split below replaces the
@@ -2036,6 +2056,21 @@ class M4RawRepetitionDataset(Dataset):
                     None
                     if self.n2n_pairing is not None
                     else self._nex_target(kspace_reps, context, input_index=k, shifts=shifts)
+                )
+
+            if snapshot_trace.is_active():
+                snapshot_trace.record(
+                    "loader",
+                    "m4raw_input_and_target",
+                    {
+                        "input": plane(input_kspace),
+                        "target": None if target_kspace is None else plane(target_kspace),
+                        "measured_kspace": None if measured_kspace is None else plane(measured_kspace),
+                    },
+                    params={
+                        "target_mode": self.target_mode,
+                        "registered": shifts is not None,
+                    },
                 )
 
             # Slot 0 is the served input; the rest are the split's target half or
@@ -2077,6 +2112,17 @@ class M4RawRepetitionDataset(Dataset):
                     alt_kspace = _rss_combine(alt_kspace)
                 if measured_kspace is not None:
                     measured_kspace = _rss_combine(measured_kspace)
+
+            if snapshot_trace.is_active() and self.coil_processing_mode == "rss":
+                snapshot_trace.record(
+                    "loader",
+                    "m4raw_coil_processing",
+                    {
+                        "input": plane(input_kspace),
+                        "target": None if target_kspace is None else plane(target_kspace),
+                    },
+                    params={"coil_processing_mode": self.coil_processing_mode},
+                )
 
             # NOTE: k-space normalization is NOT applied here. The dataset
             # matches and serves; morphing belongs to the transform layer
@@ -2137,14 +2183,6 @@ class M4RawRepetitionDataset(Dataset):
                 )
             if maps is not None:
                 _attach_coil_maps(subject, maps, maps_source, self._coil_maps.calibration, affine)
-            if self._reference_maps is not None:
-                reference, _ = self._reference_maps.maps_for(
-                    rep_paths[0].stem, kspace_reps, slice_index=slice_index
-                )
-                subject.add_image(
-                    tio.ScalarImage(tensor=reference.permute(1, 2, 3, 0).contiguous(), affine=affine),
-                    REFERENCE_MAPS_KEY,
-                )
             if self._publishes_noise_covariance():
                 # The scan's own Sigma_n in raw units, so a validation-time
                 # recorruption draws from the source the training split used.
@@ -2165,6 +2203,8 @@ class M4RawRepetitionDataset(Dataset):
             # The served input's repetition, which `input_repetition: random` makes
             # differ from the group's first file.
             subject["repetition_index"] = parse_m4raw_file_id(rep_paths[loaded[k]].stem).repetition
+            # The served file, for transforms that read its header (in-memory images carry no path).
+            subject["source_path"] = str(rep_paths[loaded[k]])
             # The contrast NAME, beside the index. `contrast_idx` alone forces
             # every consumer to carry a copy of the 0=T1/1=T2/2=FLAIR mapping,
             # and the per-case CSV writer is a generic reporting component that
@@ -2319,6 +2359,8 @@ class M4RawRepetitionDataset(Dataset):
         # and stacked automatically by ImageCollateStrategy
         subject["contrast_idx"] = torch.tensor(contrast_idx, dtype=torch.long)
         subject["file_id"] = target_paths[0].stem
+        # The target contrast's file: its header states the protocol this sample is reconstructed into.
+        subject["source_path"] = str(target_paths[0])
         # See the single-contrast branch: `subject_id` is the independence unit.
         _identity = parse_m4raw_file_id(target_paths[0].stem)
         subject["subject_id"] = _identity.subject
@@ -2332,9 +2374,8 @@ class M4RawRepetitionDataset(Dataset):
         if self.source_layout == "stacked":
             # Source and target carry the same coil count, so the target starts
             # at the channel midpoint; the image renderer slices there.
-            subject["federated_target_channel_start"] = torch.tensor(
-                int(target_t.shape[0]) // 2, dtype=torch.long
-            )
+            start = 1 if self.stacked_combine == "per_contrast" else int(target_t.shape[0]) // 2
+            subject["federated_target_channel_start"] = torch.tensor(start, dtype=torch.long)
         if slice_index is not None:
             subject["slice_index"] = torch.tensor(slice_index, dtype=torch.long)
 

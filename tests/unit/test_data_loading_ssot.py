@@ -12,8 +12,8 @@ The five sites the audit flagged are all now routed through the SSOT:
 - ``src/cli/app.py:_load_clean_volumes_from_pt`` — delegates to
   ``spectramr.data.datasets.meta_eval_clean_refs.load_clean_volumes``.
 - ``src/cli/app.py:_load_clean_volumes_from_h5`` — imports
-  ``synthesize_pseudo_gt`` from ``spectramr.infrastructure.physics.m4raw_pseudo_gt``
-  instead of ``scripts.sim2rank.ground_truth``.
+  ``synthesize_pseudo_gt`` from ``spectramr.data.datasets.pseudo_gt_reference``
+  instead of ``scripts.sim2rank.ground_truth``; the physics module opens no file.
 - ``src/infrastructure/inference/streaming_inference.py`` — uses
   ``spectramr.data.io_strategies.lazy_load_nifti`` instead of ``nibabel.load``.
 """
@@ -57,24 +57,25 @@ def test_cli_meta_eval_pt_loader_delegates_to_dataset_ssot() -> None:
     assert "spectramr.data.datasets.meta_eval_clean_refs" in src
 
 
-def test_cli_h5_loader_imports_pseudo_gt_from_physics_ssot() -> None:
-    """The CLI's H5 path imports ``synthesize_pseudo_gt`` from infrastructure/physics."""
+def test_cli_h5_loader_imports_pseudo_gt_from_the_data_layer() -> None:
+    """The CLI's H5 path imports ``synthesize_pseudo_gt`` from ``data/`` (rule 7)."""
     from spectramr.cli import app
 
     src = inspect.getsource(app._load_clean_volumes_from_h5)
     assert (
-        "from spectramr.infrastructure.physics.m4raw_pseudo_gt import synthesize_pseudo_gt"
+        "from spectramr.data.datasets.pseudo_gt_reference import synthesize_pseudo_gt"
         in src
     )
 
 
 def test_synthesize_pseudo_gt_canonical_home() -> None:
-    """``synthesize_pseudo_gt`` lives under ``spectramr.infrastructure.physics``."""
-    from spectramr.infrastructure.physics.m4raw_pseudo_gt import synthesize_pseudo_gt
+    """``synthesize_pseudo_gt`` lives in ``data/``; the physics module keeps no file read."""
+    import spectramr.infrastructure.physics.m4raw_pseudo_gt as physics
+    from spectramr.data.datasets.pseudo_gt_reference import synthesize_pseudo_gt
 
-    assert synthesize_pseudo_gt.__module__ == (
-        "spectramr.infrastructure.physics.m4raw_pseudo_gt"
-    )
+    assert synthesize_pseudo_gt.__module__ == "spectramr.data.datasets.pseudo_gt_reference"
+    assert "h5py" not in inspect.getsource(physics)
+    assert not hasattr(physics, "synthesize_pseudo_gt")
 
 
 def test_scripts_ground_truth_is_thin_shim() -> None:
@@ -83,7 +84,7 @@ def test_scripts_ground_truth_is_thin_shim() -> None:
     from scripts.sim2rank.ground_truth import (
         synthesize_pseudo_gt as legacy,
     )
-    from spectramr.infrastructure.physics.m4raw_pseudo_gt import (
+    from spectramr.data.datasets.pseudo_gt_reference import (
         synthesize_pseudo_gt as canonical,
     )
 

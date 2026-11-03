@@ -49,7 +49,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..renames import reject_renamed_keys
 
@@ -148,6 +148,14 @@ class AdaptiveSFCHSSCTrainingConfigSchema(BaseModel):
     lambda_traj: float = Field(
         default=0.01, ge=0.0, description="Weight of the trajectory-fidelity term."
     )
+    learn_scan_order: bool = Field(
+        default=True,
+        description=(
+            "True scans the bottleneck along the learned Beltrami order; False "
+            "scans the fixed Hilbert curve and builds no Beltrami head (the "
+            "fixed-Hilbert control)."
+        ),
+    )
 
 
 class ConformalDiffusionReconTrainingConfigSchema(BaseModel):
@@ -203,6 +211,33 @@ class CRLBMRFPulseDesignTrainingConfigSchema(BaseModel):
         ge=0.0,
         description="Weight of the Beltrami smoothness term on the pulse train.",
     )
+    # The prior and echo time default to the in-repo MRF dictionary grid
+    # (infrastructure/physics/multi_acquisition.py: _MRF_T1_LOG, _MRF_T2_LOG, _MRF_TE_MS).
+    t1_range_ms: tuple[float, float] = Field(
+        default=(100.0, 3000.0),
+        description="Log-uniform T1 prior (ms) the expected CRLB is averaged over.",
+    )
+    t2_range_ms: tuple[float, float] = Field(
+        default=(20.0, 500.0),
+        description="Log-uniform T2 prior (ms) the expected CRLB is averaged over.",
+    )
+    prior_samples: int = Field(
+        default=64,
+        ge=4,
+        description="Prior draws per training step; validation uses a fixed log grid of this size.",
+    )
+    te_ms: float = Field(
+        default=2.0,
+        gt=0.0,
+        description="Echo time (ms) of the IR-FISP EPG model; below the shortest reachable TR.",
+    )
+
+    @field_validator("t1_range_ms", "t2_range_ms")
+    @classmethod
+    def _ordered_positive(cls, value: tuple[float, float]) -> tuple[float, float]:
+        if not 0.0 < value[0] < value[1]:
+            raise ValueError(f"prior range must satisfy 0 < lo < hi; got {value}")
+        return value
 
 
 class CrossScannerMRFHarmonisationTrainingConfigSchema(BaseModel):
@@ -265,12 +300,13 @@ class BlochEquivariantTranslationTrainingConfigSchema(BaseModel):
 
 
 class IBActiveAcquisitionTrainingConfigSchema(BaseModel):
-    """Information-bottleneck weight and forward-model mode for active acquisition.
+    """Information-bottleneck weight, forward-model mode and line budget for active acquisition.
 
-    Read by ``ib_active_acquisition_strategy`` (``:54-55``). ``mode`` is a
-    ``Literal`` here so an unknown value is refused at LOAD; the strategy's own
-    ``VALID_MODES`` check then never fires in practice, which is the point — a
-    typo should not survive until construction.
+    Read by ``ib_active_acquisition_strategy``. ``mode`` is a ``Literal`` here so an
+    unknown value is refused at LOAD. ``acceleration`` and ``center_fraction`` set the
+    phase-encode line budget the strategy masks to in training and in the validation
+    rollouts; the loader's ``undersampling:`` block stays at 1.0 so the full k-space
+    the rollout chooses from reaches the strategy.
     """
 
     model_config = _KNOB_BLOCK
@@ -278,6 +314,12 @@ class IBActiveAcquisitionTrainingConfigSchema(BaseModel):
     beta: float = Field(default=1.0, ge=0.0, description="Information-bottleneck trade-off weight.")
     mode: Literal["linear_gaussian", "nonlinear"] = Field(
         default="linear_gaussian", description="Forward-model family."
+    )
+    acceleration: float = Field(
+        default=4.0, gt=1.0, description="Phase-encode budget: round(W / acceleration) lines."
+    )
+    center_fraction: float = Field(
+        default=0.08, gt=0.0, lt=1.0, description="Fully sampled centre band, within the budget."
     )
 
 
@@ -316,6 +358,14 @@ class RiemannianBlochDiffusionTrainingConfigSchema(BaseModel):
     enable_bloch_checkpoint: bool = Field(
         default=False, description="Gradient-checkpoint the Bloch manifold ops."
     )
+    heldout_eval_t: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Diffusion time at which held-out maps are noised before the learned field "
+            "denoises them for val_geodesic_qmap_error; required when validation runs."
+        ),
+    )
 
 
 class PrivilegedLearningTrainingConfigSchema(BaseModel):
@@ -334,10 +384,24 @@ class PrivilegedLearningTrainingConfigSchema(BaseModel):
     )
 
     alpha: float = Field(
-        default=1.0, ge=0.0, description="Weight of the privileged-distillation term."
+        default=1.0, ge=0.0, description="Weight of the student-vs-target reconstruction term."
     )
-    beta: float = Field(default=0.5, ge=0.0, description="Weight of the domain-adversarial term.")
-    delta: float = Field(default=0.1, ge=0.0, description="Weight of the feature-alignment term.")
+    beta: float = Field(
+        default=0.5, ge=0.0, description="Weight of the student-vs-teacher distillation term."
+    )
+    delta: float = Field(
+        default=0.1, ge=0.0, description="Weight of the gradient-reversal domain-adversarial term."
+    )
+    stage: Literal["teacher", "student"] = Field(
+        default="student",
+        description="'teacher' trains f(input + marker) on the target alone (stage 1); "
+        "'student' trains the markerless student against the loaded teacher.",
+    )
+    teacher_checkpoint: str | None = Field(
+        default=None,
+        description="Stage-1 teacher checkpoint; its generator part is loaded exactly into a "
+        "copy of the student architecture. Required when beta > 0 in the student stage.",
+    )
     curriculum_tau0: float = Field(
         default=5.0,
         gt=0.0,

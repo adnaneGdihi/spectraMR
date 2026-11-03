@@ -21,6 +21,7 @@ from typing import Any, ClassVar
 
 import torch
 
+from spectramr.config.schemas.training.motion import MotionConfig
 from spectramr.infrastructure.physics.kinematic_forward import KinematicForwardOperator
 from spectramr.infrastructure.physics.virtual_fiducial import VirtualFiducial
 from spectramr.infrastructure.training.utils.held_out_severity import held_out_severity_points
@@ -45,6 +46,9 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
         loss_ssim: Structural similarity loss.
         loss_hfen: High-frequency error norm loss.
     """
+
+    # #183: the training step never scores train_* metrics; declare none.
+    reports_train_metrics = False
 
     synthesises_model_input: ClassVar[bool] = True
 
@@ -112,15 +116,7 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
         self._lambda_ssim = declared.get("ssim", 0.0)
         self._lambda_hfen = declared.get("hfen", 0.0)
 
-        # Motion parameters from config or defaults
-        if hasattr(self.config.training, "motion"):
-            self._max_translation = self.config.training.motion.max_translation
-            self._max_rotation = self.config.training.motion.max_rotation
-            self._motion_type = getattr(self.config.training.motion, "motion_type", "smooth")
-        else:
-            self._max_translation = 5.0
-            self._max_rotation = 0.05
-            self._motion_type = "smooth"
+        self._setup_motion()
 
         logger.info(
             "[MotionMetaTraining] Setup complete: im_size=%s, "
@@ -131,6 +127,42 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
             self._lambda_hfen,
             self._max_translation,
             self._max_rotation,
+        )
+
+    def _setup_motion(self) -> None:
+        """Read ``training.motion``; an undeclared block means the schema defaults."""
+        motion = getattr(self.config.training, "motion", None) or MotionConfig()
+        self._max_translation = motion.max_translation
+        self._max_rotation = motion.max_rotation
+        self._motion_type = motion.motion_type
+        self._fixed_theta: torch.Tensor | None = None
+        if motion.fixed_trajectory_seed is not None:
+            gen = torch.Generator().manual_seed(motion.fixed_trajectory_seed)
+            self._fixed_theta = self.kinematic_op.generate_random_motion(
+                batch_size=1,
+                max_translation=self._max_translation,
+                max_rotation=self._max_rotation,
+                motion_type=self._motion_type,
+                device=self.device,
+                generator=gen,
+            )
+        logger.info(
+            "[MotionMetaTraining] training motion: %s",
+            "random per batch (meta)"
+            if self._fixed_theta is None
+            else f"fixed trajectory, seed={motion.fixed_trajectory_seed} (single-task)",
+        )
+
+    def _training_motion(self, batch_size: int, validation: bool) -> torch.Tensor:
+        """Motion θ for the loss pass; validation always draws random motion."""
+        if self._fixed_theta is not None and not validation:
+            return self._fixed_theta.expand(batch_size, -1, -1)
+        return self.kinematic_op.generate_random_motion(
+            batch_size=batch_size,
+            max_translation=self._max_translation,
+            max_rotation=self._max_rotation,
+            motion_type=self._motion_type,
+            device=self.device,
         )
 
     def _compute_losses_impl(
@@ -161,14 +193,8 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
         """
         B = target_batch.shape[0]
 
-        # 1. Generate random motion trajectory
-        theta = self.kinematic_op.generate_random_motion(
-            batch_size=B,
-            max_translation=self._max_translation,
-            max_rotation=self._max_rotation,
-            motion_type=self._motion_type,
-            device=self.device,
-        )
+        # 1. Motion trajectory (fixed for the single-task control, random otherwise)
+        theta = self._training_motion(B, validation=bool(kwargs.get("validation", False)))
 
         # 2. Convert target to complex for kinematic operator
         from spectramr.infrastructure.physics.fft_ops import ifft2c
@@ -290,12 +316,15 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Run validation with fixed motion for reproducibility.
 
         Args:
             val_batch: Validation batch.
+            batch_data: The loader's batch, forwarded so the snapshot can read
+                its normalization markers.
             batch_idx: Batch index.
 
         Returns:
@@ -332,12 +361,14 @@ class ConcreteMotionMetaTrainingStrategy(BaseTrainingStrategy):
                     input_batch=target,
                     target_batch=target,
                     step=batch_idx,
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(
                     input_batch=target,
                     target_batch=target,
                     epoch=0,
+                    validation=True,
                 )
 
             # Compute image quality metric (PSNR) for early stopping

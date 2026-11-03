@@ -88,10 +88,22 @@ class MetricContext:
     # The model's output on a second repetition of the same slice, same layout as
     # the prediction (rep_variance, bias_squared).
     pred_alt: Tensor | None = None
+    # The tensor the model was handed, for metrics that re-run ``reconstructor`` on a
+    # transformed copy of it (monotone_remap_invariance).
+    model_input: Tensor | None = None
     # What prediction/target/pred_alt ARE -- 'kspace' or 'image' -- as the caller
     # states it; None leaves the metric's documented default (null_space_residual,
     # rep_variance and the rest of the coil-manifold family read k-space).
     signal_domain: str | None = None
+    # --- phase-contrast flow ------------------------------------------------
+    # Spacing of the velocity field's spatial axes, in axis order (divergence).
+    voxel_size_mm: Tensor | None = None
+    # Measurement planes as area-weighted normals, [n_dir, *spatial] in mm^2, so
+    # sum(v . plane) is a flow rate in mL/s (mass_conservation, net_flow_error).
+    inlet_mask: Tensor | None = None
+    outlet_mask: Tensor | None = None
+    # Static tissue, where the true velocity is zero (vnr).
+    static_mask: Tensor | None = None
 
     def has(self, *names: str) -> bool:
         """True iff every named field is non-None.

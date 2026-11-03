@@ -857,7 +857,6 @@ def _input_repetition_violation(doc: dict) -> str | None:
         and (data.get("pairing") or {}).get("single_contrast", True) is not False
         and not data.get("nex_target_exclude_input")
         and data.get("coil_maps_root") is None
-        and data.get("coil_maps_reference_root") is None
     )
     if honoured and data.get("input_repetition") != "random":
         return f"input_repetition={data.get('input_repetition')!r}, the cohort draws 'random'"

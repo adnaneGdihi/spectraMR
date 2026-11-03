@@ -181,3 +181,26 @@ def test_conformal_result_is_dataclass() -> None:
     assert hasattr(out, "n_calibration")
     assert hasattr(out, "coverage_lower")
     assert hasattr(out, "coverage_upper")
+
+
+# ---------------------------------------------------------------------------
+# privileged_learning_loss: per-sample weights
+# ---------------------------------------------------------------------------
+
+
+def test_privileged_loss_sample_weight_drops_zero_weight_samples() -> None:
+    from spectramr.infrastructure.physics.marker_estimators import privileged_learning_loss
+
+    student = torch.randn(4, 1, 3, 3)
+    teacher = torch.randn(4, 1, 3, 3)
+    target = torch.randn(4, 1, 3, 3)
+    weight = torch.tensor([1.0, 1.0, 0.0, 0.0])
+    weighted = privileged_learning_loss(student, teacher, target, sample_weight=weight)
+    subset = privileged_learning_loss(student[:2], teacher[:2], target[:2])
+    assert torch.allclose(weighted["g_priv_recon"], subset["g_priv_recon"])
+    assert torch.allclose(weighted["g_priv_distill"], subset["g_priv_distill"])
+    uniform = privileged_learning_loss(student, teacher, target, sample_weight=torch.ones(4))
+    plain = privileged_learning_loss(student, teacher, target)
+    assert torch.allclose(uniform["g_total_loss"], plain["g_total_loss"])
+    with pytest.raises(ValueError, match="sample_weight"):
+        privileged_learning_loss(student, teacher, target, sample_weight=torch.ones(3))

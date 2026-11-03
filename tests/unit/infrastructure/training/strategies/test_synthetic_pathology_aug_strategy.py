@@ -18,6 +18,9 @@ They are written so they FAIL on the pre-fix code and PASS now.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
 import torch
 import torch.nn as nn
 
@@ -53,8 +56,9 @@ def _make_strategy() -> tuple[SyntheticPathologyAugStrategy, _TinyGenerator]:
     # Plain class-attr defaults the child declares.
     strat.p_augment = 1.0  # force augmentation so a lesion mask always exists
     strat.lambda_lesion_l1 = 0.5
-    strat.lambda_lesion_cls = 0.1
+    strat.lambda_lesion_cls = 0.0
     strat._sampler = None
+    strat.lesion_cls_head = None
 
     gen = _TinyGenerator()
 
@@ -65,6 +69,7 @@ def _make_strategy() -> tuple[SyntheticPathologyAugStrategy, _TinyGenerator]:
         return kwargs.get("batch")
 
     def _parent_impl(*, input_batch, target_batch, epoch, **kwargs):  # noqa: ANN001
+        strat._seen = (input_batch, target_batch)  # type: ignore[attr-defined]
         # Run the generator on the composited input (grad-carrying).
         pred = gen(input_batch)
         total = (pred - target_batch).abs().mean()
@@ -179,3 +184,129 @@ def test_lesion_sampler_shapes() -> None:
     assert composite.shape == img.shape
     assert mask.shape == img.shape
     assert torch.all((mask == 0.0) | (mask == 1.0))
+
+
+def _patch_parent(monkeypatch):
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+
+    def _patch(impl):
+        monkeypatch.setattr(
+            ReconstructionTrainingStrategy,
+            "_compute_losses_impl",
+            lambda self, **kw: impl(**kw),
+        )
+
+    return _patch
+
+
+def test_same_lesion_composited_onto_input_and_target(monkeypatch) -> None:
+    """One draw: the lesion added to the input equals the lesion added to the target."""
+    strat, _gen = _make_strategy()
+    B, C, H, W = 2, 1, 16, 16
+    batch = {"input": torch.randn(B, C, H, W), "target": torch.randn(B, C, H, W)}
+    _patch_parent(monkeypatch)(strat._test_parent_impl)
+    strat._compute_losses_impl(input_batch=batch, batch=batch, epoch=0)
+    seen_in, seen_tgt = strat._seen
+    added_in = seen_in - batch["input"]
+    added_tgt = seen_tgt - batch["target"]
+    assert added_in.abs().amax() > 0.1
+    torch.testing.assert_close(added_in, added_tgt)
+
+
+def test_mismatched_input_target_shape_raises(monkeypatch) -> None:
+    strat, _gen = _make_strategy()
+    batch = {"input": torch.randn(2, 1, 16, 16), "target": torch.randn(2, 1, 8, 8)}
+    _patch_parent(monkeypatch)(strat._test_parent_impl)
+    with pytest.raises(ValueError, match="same lesion"):
+        strat._compute_losses_impl(input_batch=batch, batch=batch, epoch=0)
+
+
+def _strategy_via_factory(monkeypatch, gen: nn.Module, lambda_cls: float):
+    """Resolve the class through the production factory and run its real ``__init__``.
+
+    Only the heavy parent ``__init__`` is stubbed; the child's config read and head gate run.
+    """
+    from spectramr.config.schemas.training.strategy_knobs_2026_06 import (
+        SyntheticPathologyAugTrainingConfigSchema,
+    )
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+    knobs = SyntheticPathologyAugTrainingConfigSchema(lambda_lesion_cls=lambda_cls)
+    config = SimpleNamespace(
+        training=SimpleNamespace(
+            strategy_class=None,
+            training_mode="synthetic_pathology_aug",
+            synthetic_pathology_aug=knobs,
+        ),
+        model=SimpleNamespace(out_channels=1),
+        parallel=None,
+    )
+    opt = torch.optim.Adam(gen.parameters(), lr=1e-3)
+
+    def _stub_init(self, *args, **kwargs):
+        self.config = config
+        self.env = SimpleNamespace(opt_g=opt, schedulers={})
+        self.device = torch.device("cpu")
+        self._owned_modules = {}
+        self._owned_wrappers = {}
+
+    monkeypatch.setattr(ReconstructionTrainingStrategy, "__init__", _stub_init)
+    cls = TrainingStrategyFactory().get_strategy_class(config)
+    assert cls is SyntheticPathologyAugStrategy
+    return cls(), opt
+
+
+def test_lambda_zero_builds_no_head(monkeypatch) -> None:
+    _, gen = _make_strategy()
+    strat, opt = _strategy_via_factory(monkeypatch, gen, 0.0)
+    assert strat.lesion_cls_head is None
+    assert len(opt.param_groups) == 1
+
+
+def test_lesion_cls_head_trains_and_folds_into_total(monkeypatch) -> None:
+    """Reachability: factory -> strategy -> head built on opt_g -> loss_lesion_cls fires."""
+    _, gen = _make_strategy()
+    strat, opt = _strategy_via_factory(monkeypatch, gen, 0.1)
+
+    def _parent_impl(*, input_batch, target_batch, epoch, **kwargs):
+        pred = gen(input_batch)
+        total = (pred - target_batch).abs().mean()
+        strat._last_prediction = pred
+        strat._last_target = target_batch
+        return {"g_total_loss": total, "loss": total}
+
+    head_params = list(strat.lesion_cls_head.parameters())
+    in_opt = {id(p) for g in opt.param_groups for p in g["params"]}
+    assert all(id(p) in in_opt for p in head_params)
+
+    batch = {"input": torch.randn(4, 1, 16, 16), "target": torch.randn(4, 1, 16, 16)}
+    _patch_parent(monkeypatch)(_parent_impl)
+    out = strat._compute_losses_impl(input_batch=batch, batch=batch, epoch=0)
+    assert "loss_lesion_cls" in out and out["loss_lesion_cls"].item() > 0.0
+    expected = out["loss_lesion_cls"] + out["loss_lesion_weighted"]
+    assert out["g_total_loss"].item() >= expected.item() - 1e-6
+
+    out["loss_lesion_cls"].backward()
+    assert any(p.grad is not None and torch.any(p.grad != 0) for p in head_params)
+    assert any(p.grad is not None and torch.any(p.grad != 0) for p in gen.parameters())
+
+
+def test_lesion_cls_without_head_raises(monkeypatch) -> None:
+    strat, _gen = _make_strategy()
+    strat.lambda_lesion_cls = 0.1
+    batch = {"input": torch.randn(2, 1, 16, 16), "target": torch.randn(2, 1, 16, 16)}
+    _patch_parent(monkeypatch)(strat._test_parent_impl)
+    with pytest.raises(RuntimeError, match="never built"):
+        strat._compute_losses_impl(input_batch=batch, batch=batch, epoch=0)
+
+
+def test_head_builder_raises_without_optimizer() -> None:
+    strat, _ = _make_strategy()
+    strat.env = SimpleNamespace(opt_g=None)
+    with pytest.raises(RuntimeError, match="opt_g"):
+        strat._build_lesion_head()

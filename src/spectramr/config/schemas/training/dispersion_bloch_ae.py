@@ -10,13 +10,12 @@ Bloembergen-Purcell-Pound dispersion law
 (:mod:`spectramr.infrastructure.physics.dispersion`) followed by the existing Bloch
 render.
 
-Identifiability is a *hard* constraint, not a preference: a :math:`P`-pool BPP
-model has :math:`2P+1` free constants per rate, so recovering them needs
-measurements at :math:`M \ge 2P+1` distinct fields. The Tier-1
-``dispersion_identifiability`` check enforces
-``2*num_pools + 1 <= len(fields_present)`` as an ERROR -- an under-determined arm
-would otherwise train happily to a meaningless latent (pitfall #9: no silent
-degradation).
+Identifiability is a *hard* constraint, not a preference: one magnitude per field
+must determine the :math:`2P+3` latent constants per voxel, so the arm needs
+:math:`M \ge 2P+3` distinct fields (#2417). The Tier-1
+``dispersion_identifiability`` check enforces ``2*num_pools + 3 <=
+len(fields_present)`` as an ERROR -- an under-determined arm would otherwise train
+happily to a meaningless latent (pitfall #9: no silent degradation).
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ class DispersionBlochAEConfig(BaseModel):
         ge=1,
         le=4,
         description=(
-            "Number of BPP relaxation pools P. Needs M >= 2P+1 distinct fields "
+            "Number of BPP relaxation pools P. Needs M >= 2P+3 distinct fields "
             "to be identifiable (Tier-1 dispersion_identifiability)."
         ),
     )

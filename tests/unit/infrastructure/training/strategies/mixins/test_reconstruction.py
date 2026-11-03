@@ -210,3 +210,9 @@ def test_generator_input_preparation_has_one_owner() -> None:
     assert "_prepare_generator_inputs" in vars(ReconstructionStepMixin)
     for strategy in (ReconstructionTrainingStrategy, NoiseToNoiseStrategy):
         assert "_prepare_generator_inputs" not in vars(strategy)
+
+
+def test_patch_location_reaches_the_batch_context():
+    from spectramr.infrastructure.training.strategies.mixins.reconstruction import AUX_KEY_MAPPING
+
+    assert AUX_KEY_MAPPING["location"] == ("location",)

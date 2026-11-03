@@ -501,8 +501,8 @@ class ValidationMetricsComputer:
             # error surfacing here is a device fault, not "metric X is bad", and
             # attributing it to whichever metric happens to be next would be a
             # worse lie than letting it propagate (pitfall #9).
-            for key, host_value in zip(pending_keys, fuse_to_host(pending_scalars), strict=True):
-                metrics[key] = host_value
+            for name, host_value in zip(pending_keys, fuse_to_host(pending_scalars), strict=True):
+                metrics[name] = host_value
 
         return metrics
 
@@ -699,17 +699,24 @@ def create_validation_metrics_computer(
         metrics = None
         primary = "psnr"
 
-        if hasattr(config, "metrics"):
-            # Scenario 1: config is the validation sub-config or metrics config
-            metrics = config.metrics
-            primary = config.primary_metric if hasattr(config, "primary_metric") else "psnr"
-        elif getattr(config, "validation", None) is not None:
+        # The top-level training config also has a ``.metrics`` block (a schema
+        # object, not a name list), so it must be matched before Scenario 1.
+        if getattr(config, "validation", None) is not None:
             # Scenario 2: config is the top-level training config
             val_config = config.validation
             metrics = val_config.scoring.compute
             # The schema default IS "psnr", so the old hasattr fallback was
             # restating it; the field cannot be absent.
             primary = val_config.scoring.primary
+        elif hasattr(config, "metrics"):
+            # Scenario 1: config is the validation sub-config or metrics config
+            metrics = config.metrics
+            if not isinstance(metrics, (list, tuple, dict)):
+                raise TypeError(
+                    f"{type(config).__name__}.metrics is a {type(metrics).__name__}, not a "
+                    "list or dict of metric names; it would build a computer with no metrics."
+                )
+            primary = config.primary_metric if hasattr(config, "primary_metric") else "psnr"
 
         if metrics is not None:
             metrics_config = ValidationMetricsConfig.from_dict(

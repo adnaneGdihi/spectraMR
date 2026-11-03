@@ -198,3 +198,67 @@ class TestDegenerateInputs:
         )
         assert math.isnan(d.rho_lesion)
         assert not d.significant
+
+
+class TestSubjectResampling:
+    """Slices of one volume share anatomy, so the bootstrap unit is the subject."""
+
+    def test_the_resampling_units_are_the_subjects(self) -> None:
+        sev, les, ctl, sids = _paired(lesion_gain=1.0, n_slices=6)
+        subject_of = {s: f"subj{int(s.split('_')[-1]) // 3}" for s in set(sids)}
+        d = lesion_vs_control(
+            "psnr",
+            "gaussian",
+            "AXT2",
+            severity=sev,
+            lesion_scores=les,
+            control_scores=ctl,
+            slice_ids=sids,
+            subject_ids=[subject_of[s] for s in sids],
+            n_boot=50,
+            seed=0,
+        )
+        assert d.n_slices == 6
+        assert d.resampling_unit == "subject"
+        assert d.n_units == 2
+        assert d.as_row()["n_units"] == 2
+
+    def test_without_subjects_the_unit_is_the_slice(self) -> None:
+        sev, les, ctl, sids = _paired(lesion_gain=1.0, n_slices=6)
+        d = lesion_vs_control(
+            "psnr",
+            "gaussian",
+            "AXT2",
+            severity=sev,
+            lesion_scores=les,
+            control_scores=ctl,
+            slice_ids=sids,
+            n_boot=20,
+        )
+        assert (d.resampling_unit, d.n_units) == ("slice", 6)
+
+    def test_a_slice_under_two_subjects_raises(self) -> None:
+        with pytest.raises(ValueError, match="subject"):
+            lesion_vs_control(
+                "psnr",
+                "gaussian",
+                "AXT2",
+                severity=[0.0, 1.0],
+                lesion_scores=[1.0, 2.0],
+                control_scores=[1.0, 2.0],
+                slice_ids=["a", "a"],
+                subject_ids=["s1", "s2"],
+            )
+
+    def test_an_empty_subject_raises(self) -> None:
+        with pytest.raises(ValueError, match="empty subject"):
+            lesion_vs_control(
+                "psnr",
+                "gaussian",
+                "AXT2",
+                severity=[0.0, 1.0],
+                lesion_scores=[1.0, 2.0],
+                control_scores=[1.0, 2.0],
+                slice_ids=["a", "b"],
+                subject_ids=["s1", ""],
+            )

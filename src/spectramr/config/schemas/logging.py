@@ -219,7 +219,7 @@ class LoggingTrackingConfigSchema(BaseModel):
 
 
 class LoggingSnapshotsConfigSchema(BaseModel):
-    """Debug snapshots -- the per-step tensor/JSON dumps.
+    """Debug snapshots -- one trace per selected step, from loader to model output.
 
     Named `snapshots`, not `debug_snapshots`: that is the retired scalar's own
     name, and a destination block may not share it (a migrated arm would fold
@@ -242,13 +242,43 @@ class LoggingSnapshotsConfigSchema(BaseModel):
         default=8,
         ge=1,
         description=(
-            "Cap on snapshot CALLS per (run, tag) -- a call budget, not a step "
-            "bound. Counted per tag since #706, and reset per process, so a "
-            "resumed run gets a fresh allowance at whatever step it restarts."
+            "Snapshot steps per phase (train and val each get this many). Counted "
+            "per process, so a resumed run, which writes under its own run id, "
+            "gets a fresh allowance."
         ),
     )
-    save_images: bool = Field(default=True, description="Include images.")
-    save_json: bool = Field(default=True, description="Include a JSON dump.")
+    validation: bool = Field(
+        default=True,
+        description="Also snapshot the first batch of each validation pass.",
+    )
+    max_model_calls: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Model calls kept per model and stage name within one snapshot step; "
+            "later calls overwrite one `#last` slot, so a sampling loop records "
+            "its first calls and its final one."
+        ),
+    )
+    save_images: bool = Field(default=True, description="Write a PNG per stage tensor and overview.png.")
+    save_json: bool = Field(default=True, description="Write manifest.json (stages, stats, provenance).")
+    save_tensors: bool = Field(
+        default=False,
+        description="Also write tensors.pt holding every recorded stage tensor (sample 0).",
+    )
+    trace_loader: bool = Field(
+        default=True,
+        description=(
+            "Re-fetch one dataset sample in the main process on each snapshot step, so "
+            "the dataset output and every loader transform's output are recorded. All "
+            "random states are restored after, so training is unchanged."
+        ),
+    )
+    trace_index: int = Field(
+        default=0,
+        ge=0,
+        description="Dataset index the loader trace re-fetches (modulo the dataset length).",
+    )
     log_steps: list[Any] = Field(
         default_factory=lambda: [0, 1, 2, 10],
         description=(

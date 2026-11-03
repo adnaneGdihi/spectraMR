@@ -1168,3 +1168,10 @@ def test_forward_noise_is_stamped_from_the_process_it_trained_with() -> None:
 
 def test_forward_noise_is_absent_without_a_kspace_process() -> None:
     assert snapshot_provenance.forward_noise_scope(SimpleNamespace()) is None
+
+
+def test_the_loader_sampling_pattern_is_stamped_as_declared() -> None:
+    record = build_snapshot_provenance(
+        _undersampling_config(base_acceleration=8.0, sampling_pattern="variable_density_1d")
+    )
+    assert record["declared"]["undersampling"]["sampling_pattern"] == "variable_density_1d"

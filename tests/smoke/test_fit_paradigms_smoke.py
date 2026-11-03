@@ -171,7 +171,6 @@ def test_reconstruction_smoke():
         "masked",
         "cartoon_texture_safe",
         "generative",
-        "universal_reconstruction",
     ],
 )
 def test_recon_compatible_paradigms_smoke(paradigm):

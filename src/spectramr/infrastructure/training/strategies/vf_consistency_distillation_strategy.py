@@ -97,9 +97,10 @@ class VFConsistencyDistillationStrategy(DiffusionTrainingStrategy):
     parallel_compat = frozenset({"replicated"})
 
     #: Loss ownership (issue #1918). mse_loss(student_pred, teacher_pred) is a DISTILLATION term against the
-    #: teacher, not the target; the hook folds nothing from the builder.
+    #: teacher; declared ``losses.image_losses`` are folded onto the student's clean estimate against x0.
     inline_losses: ClassVar[frozenset[str]] = frozenset()
-    folds_image_losses: ClassVar[bool] = False
+    folds_image_losses: ClassVar[bool] = True
+    empty_loss_stack_is_design: ClassVar[bool] = True
     #: The student and teacher inputs are noised copies of ``target``;
     #: ``input_batch`` never reaches the network.
     synthesises_model_input: ClassVar[bool] = True
@@ -331,17 +332,20 @@ class VFConsistencyDistillationStrategy(DiffusionTrainingStrategy):
             loss_vf_anchor = (beta * l1).mean()
 
         loss_total = loss_consistency + loss_vf_anchor
-
-        # EMA update AFTER computing the targets for this step.
-        self._update_ema(gen)
-
-        return {
-            "loss_total": loss_total,
+        components = {
             "loss_consistency": loss_consistency.detach()
             if loss_total is not loss_consistency
             else loss_consistency,
             "loss_vf_anchor": loss_vf_anchor.detach(),
         }
+        aux = self._apply_builder_image_losses(student_pred, x0, components)
+        if aux is not None:
+            loss_total = loss_total + aux
+
+        # EMA update AFTER computing the targets for this step.
+        self._update_ema(gen)
+
+        return {"loss_total": loss_total, **components}
 
     # ------------------------------------------------------------- few-step sample
     @torch.no_grad()

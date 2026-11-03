@@ -243,25 +243,28 @@ supports; set ``reporting.figures`` in a ``--config`` YAML to restrict. It reads
    spectramr report -e <run>/ --qc --task reconstruction
    spectramr report -e <run>/ --no-interactive     # static-only HTML (no plotly layer)
 
-   # Batch: report EVERY run under a cohort root + a linking report_index.html
+   # Batch: report EVERY run under a cohort root + the linking dashboard index.html
    spectramr report --exp-dir experiments/results/ --recursive
    spectramr report -e experiments/results/vf/ --all -c <arm>.yaml   # config parity per run
 
+   # Re-render the campaign dashboard from reports already on disk (no new figures)
+   spectramr report -e <campaign>/ --dashboard
+
 Outputs land under ``<exp-dir>/<out-subdir>/`` (default ``report/``): the vector
 + raster figures, ``report_summary.md``, ``report_manifest.json``, and the
-self-contained ``qc_report.html``. When :mod:`plotly` is installed
+``qc_report.html`` (figures linked from ``figures/``). When :mod:`plotly` is installed
 (``pip install spectramr[viz]``) and ``--interactive`` is on (the default) the HTML
 carries an interactive layer — hoverable group IQMs, interactive learning curves /
 metric distributions / Bland-Altman, and **2-D + 3-D MRIQC-style slice viewers**
-(scrub subjects/slices, flick Prediction/Target/\|Error\|). plotly.js is inlined
-once so the report works **offline** (no CDN); ``--no-interactive`` or a missing
+(scrub subjects/slices, flick Prediction/Target/\|Error\|). plotly.js is written
+once to ``_assets/`` so the report works **offline** (no CDN); ``--no-interactive`` or a missing
 plotly falls back to static PNGs. The 3-D viewer appears only when the run
 recorded volumes (``reporting.record_volumes``); see :doc:`reporting`.
 Both ``--interactive`` and the config's ``reporting.interactive`` are forwarded
 (CLI wins). With ``--recursive`` (alias ``--all``/``-r``) ``--exp-dir`` is treated
 as a *cohort root*: every run beneath it (any dir carrying
 ``logs/training_metrics.csv`` / ``final_metrics.json`` / ...) is reported and a
-top-level ``report_index.html`` links them all; a failing run is logged and
+top-level dashboard ``index.html`` links them all; a failing run is logged and
 skipped rather than aborting the batch. To fire the single-run report
 automatically at the end of training, add a ``reporting:`` block
 (``enabled: true``) to the run's YAML; see :doc:`reporting`.

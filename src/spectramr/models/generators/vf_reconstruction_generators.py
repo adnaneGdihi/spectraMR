@@ -543,6 +543,55 @@ class _WienerFilterLayer(nn.Module):
         return _complex_to_ri(ifft2c(X))
 
 
+_SWINIR_REFINER_KEYS = frozenset(
+    {"embed_dim", "depths", "num_heads", "window_size", "mlp_ratio", "img_size"}
+)
+
+
+def _build_resnet_refiner(
+    m: nn.Module, cin: int, cout: int, features: int, num_resblocks: int, **_: Any
+) -> None:
+    m.stem = nn.Conv2d(cin, features, 3, padding=1)
+    m.resblocks = nn.Sequential(*[_ResBlock2D(features) for _ in range(num_resblocks)])
+    m.head = nn.Conv2d(features, cout, 1)
+    _zero_init_conv(m.head)
+
+
+def _apply_resnet_refiner(m: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return m.head(m.resblocks(m.stem(x)))
+
+
+def _build_swinir_refiner(
+    m: nn.Module, cin: int, cout: int, refiner_kwargs: dict[str, Any], **_: Any
+) -> None:
+    from spectramr.models.generators.swinir_generator import SwinIRGenerator
+
+    unknown = set(refiner_kwargs) - _SWINIR_REFINER_KEYS
+    if unknown:
+        raise ValueError(
+            f"wiener_unet: unknown refiner_kwargs {sorted(unknown)} for refiner='swinir'; "
+            f"allowed: {sorted(_SWINIR_REFINER_KEYS)}"
+        )
+    kw = dict(refiner_kwargs)
+    for key in ("depths", "num_heads"):
+        if key in kw:
+            kw[key] = tuple(kw[key])
+    m.swinir = SwinIRGenerator(in_channels=cin, out_channels=cout, in_chans=cin, upscale=1, **kw)
+    _zero_init_conv(m.swinir.upsample[-1])
+
+
+def _apply_swinir_refiner(m: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return m.swinir(x)
+
+
+#: wiener_unet's post-Wiener refiner by ``model_kwargs.refiner``: (build, apply). The ResNet
+#: keeps its original attribute names so existing checkpoints still load.
+_WIENER_REFINERS = {
+    "resnet": (_build_resnet_refiner, _apply_resnet_refiner),
+    "swinir": (_build_swinir_refiner, _apply_swinir_refiner),
+}
+
+
 @register_model(name="wiener_unet", training_mode="reconstruction")
 class WienerUNetGenerator(_Task1Mixin, IGenerator, nn.Module):
     """Dual-domain Wiener-UNet with marker-derived PSF extraction.
@@ -554,8 +603,10 @@ class WienerUNetGenerator(_Task1Mixin, IGenerator, nn.Module):
     Args:
         in_channels: Input channels.
         out_channels: Output channels.
-        num_resblocks: Number of ResNet blocks.
-        features: Hidden feature width.
+        num_resblocks: Number of ResNet blocks (``refiner='resnet'``).
+        features: Hidden feature width (``refiner='resnet'``).
+        refiner: Post-Wiener refiner, ``'resnet'`` or ``'swinir'``.
+        refiner_kwargs: SwinIR hyper-parameters (``refiner='swinir'`` only).
     """
 
     def __init__(
@@ -564,9 +615,18 @@ class WienerUNetGenerator(_Task1Mixin, IGenerator, nn.Module):
         out_channels: int = 2,
         num_resblocks: int = 8,
         features: int = 64,
+        refiner: str = "resnet",
+        refiner_kwargs: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        if refiner not in _WIENER_REFINERS:
+            raise ValueError(
+                f"wiener_unet: unknown refiner {refiner!r}; expected one of {sorted(_WIENER_REFINERS)}"
+            )
+        if refiner_kwargs and refiner != "swinir":
+            raise ValueError("wiener_unet: refiner_kwargs is read only with refiner='swinir'")
+        self.refiner_name = refiner
         # use_marker=False forces the no-marker path (blind Wiener — the model
         # already branches on ``marker_prior is None``), making the paired
         # ablation baseline a one-knob config change (pitfall #17).
@@ -576,10 +636,15 @@ class WienerUNetGenerator(_Task1Mixin, IGenerator, nn.Module):
         # probe checks still apply). Same as SiameseEPITracker.
         self.synthetic_forward_probe_skip = {"identity_collapse"}
         self.wiener = _WienerFilterLayer()
-        self.stem = nn.Conv2d(in_channels, features, 3, padding=1)
-        self.resblocks = nn.Sequential(*[_ResBlock2D(features) for _ in range(num_resblocks)])
-        self.head = nn.Conv2d(features, out_channels, 1)
-        _zero_init_conv(self.head)
+        build, self._apply_refiner = _WIENER_REFINERS[refiner]
+        build(
+            self,
+            in_channels,
+            out_channels,
+            features=features,
+            num_resblocks=num_resblocks,
+            refiner_kwargs=refiner_kwargs or {},
+        )
 
     @property
     def name(self) -> str:
@@ -607,10 +672,8 @@ class WienerUNetGenerator(_Task1Mixin, IGenerator, nn.Module):
         # Wiener deconvolution (dynamically extracts PSF from marker)
         x_wiener = self.wiener(x, psf_fft, marker_prior=marker_prior)
 
-        # Spatial ResNet to clean amplified high-frequency AWGN
-        h = self.stem(x_wiener)
-        h = self.resblocks(h)
-        return self.head(h) + x  # global residual
+        # Spatial refiner (ResNet or SwinIR) cleans the amplified high-frequency noise
+        return self._apply_refiner(self, x_wiener) + x  # global residual
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -851,6 +914,8 @@ class DirichletESPIRiTGenerator(_Task1Mixin, IGenerator, nn.Module):
         out_channels: Output channels.
         num_power_iters: Number of power iteration steps.
         chans: Internal channels.
+        use_marker: ``False`` drops the Dirichlet marker anchoring, so the same
+            power-iteration network calibrates natively: the marker-off control.
     """
 
     def __init__(
@@ -859,18 +924,44 @@ class DirichletESPIRiTGenerator(_Task1Mixin, IGenerator, nn.Module):
         out_channels: int = 2,
         num_power_iters: int = 6,
         chans: int = 18,
+        use_marker: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        if not isinstance(use_marker, bool):
+            raise TypeError(f"use_marker must be a bool, got {use_marker!r}.")
+        self.use_marker = use_marker
         self.stem = nn.Conv2d(in_channels, chans, 3, padding=1)
         self.power_iters = nn.ModuleList(
             [_PowerIterationBlock(chans) for _ in range(num_power_iters)]
         )
         self.recon = _SmallUNet(chans + in_channels, out_channels, 32)
+        # Learned boundary value from the marker amplitude; built only when used so
+        # the marker-off control carries no parameter outside the autograd graph.
+        self.marker_embed = nn.Conv2d(1, chans, 3, padding=1) if use_marker else None
 
     @property
     def name(self) -> str:
         return "dirichlet_espirit"
+
+    def _marker_boundary(
+        self, marker_prior: torch.Tensor, batch: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the binary marker footprint ``w`` and the unit-norm boundary value ``g``.
+
+        The footprint uses the embedder's own rule (``|m| > 0.01 max|m|``), which is
+        scale-invariant, so it reproduces ``CornerFiducialEmbedder.marker_mask``.
+        """
+        mp = _ensure_real_stacked(marker_prior)
+        if mp.shape[0] != batch:
+            mp = mp.expand(batch, -1, -1, -1)
+        mag = mp.abs().amax(dim=1, keepdim=True)
+        mag = mag / mag.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+        w = (mag > 0.01).to(mag.dtype)
+        if self.marker_embed is None:
+            raise RuntimeError("_marker_boundary called on a use_marker=False model.")
+        g = F.normalize(self.marker_embed(mag), dim=1)
+        return w, g
 
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """forward method for DirichletESPIRiTGenerator.
@@ -888,21 +979,19 @@ class DirichletESPIRiTGenerator(_Task1Mixin, IGenerator, nn.Module):
         x = _ensure_real_stacked(x)  # guard: complex64 → [B, 2, H, W] real
         marker_prior = kwargs.get("marker_prior")
 
+        boundary = None
+        if marker_prior is not None and self.use_marker:
+            boundary = self._marker_boundary(marker_prior, x.shape[0])
+
+        # Dirichlet condition: S is pinned to g on the marker footprint and re-imposed
+        # after every power iteration, so the conv steps carry it into the interior.
         S = self.stem(x)
+        if boundary is not None:
+            S = S * (1.0 - boundary[0]) + boundary[1] * boundary[0]
         for pi in self.power_iters:
             S = pi(S)
-
-        # Dirichlet boundary: use marker spatial footprint to anchor CSM
-        if marker_prior is not None:
-            mp = _ensure_real_stacked(marker_prior)
-            if mp.shape[0] != x.shape[0]:
-                mp = mp.expand(x.shape[0], -1, -1, -1)
-            # Marker spatial weight: [B, 1, H, W] — where markers exist
-            marker_weight = mp.abs().mean(dim=1, keepdim=True)
-            marker_weight = marker_weight / (marker_weight.max() + 1e-8)
-            # At marker corners, reduce CSM uncertainty (Dirichlet anchoring)
-            # Spatial modulation only — preserves channel dimension
-            S = S * (1.0 - 0.1 * marker_weight) + S.detach() * (0.1 * marker_weight)
+            if boundary is not None:
+                S = S * (1.0 - boundary[0]) + boundary[1] * boundary[0]
 
         # Concatenate refined CSM features with input + global residual
         return self.recon(torch.cat([S, x], dim=1)) + x

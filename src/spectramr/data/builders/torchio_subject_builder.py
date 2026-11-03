@@ -50,6 +50,8 @@ import numpy as np
 import torch
 import torchio as tio
 
+from spectramr.core import snapshot_trace
+from spectramr.data.transforms.traced_compose import plane
 from spectramr.data.metadata.physics_registry import get_physics_vector
 from spectramr.data.transforms.image_domain_crop import (
     crop_or_pad_kspace_in_image_domain,
@@ -655,8 +657,21 @@ class FastMRISubjectBuilder(SubjectBuilder):
             except Exception as e:
                 logger.debug(f"Failed to load sensitivity maps: {e}")
 
+        if snapshot_trace.is_active():
+            snapshot_trace.record(
+                "loader",
+                "fastmri_loaded",
+                {
+                    "primary": plane(primary_tensor),
+                    "sensitivity": None if sensitivity is None else plane(sensitivity),
+                },
+                params={"path": str(record["primary_path"]), "is_kspace": is_kspace},
+            )
         if self.image_domain_crop_or_pad is not None:
             primary_tensor = self._crop_or_pad_primary(primary_tensor, is_kspace, sensitivity)
+            snapshot_trace.record(
+                "loader", "fastmri_crop_or_pad", {"primary": plane(primary_tensor)}
+            )
 
         # Apply coil processing at load time (critical for TorchIO sampling)
         logger.debug(
@@ -666,6 +681,13 @@ class FastMRISubjectBuilder(SubjectBuilder):
             primary_tensor, sensitivity, is_kspace=is_kspace
         )
         logger.debug(f"[BUILD] After coil processing: shape={primary_tensor.shape}")
+        if snapshot_trace.is_active():
+            snapshot_trace.record(
+                "loader",
+                "fastmri_coil_processing",
+                {"primary": plane(primary_tensor)},
+                params={"coil_processing_mode": self.coil_processing_mode},
+            )
 
         # K-space normalization is NOT applied here. It is owned by
         # KSpaceNormalizationTransform, which TorchIOTransformBuilder appends for

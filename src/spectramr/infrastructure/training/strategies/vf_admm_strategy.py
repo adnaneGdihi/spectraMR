@@ -28,6 +28,9 @@ import torch
 from spectramr.infrastructure.physics.vf_operators import MarkerPriorProjection
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.training.strategies.coil_map_metric_context import (
+    coil_map_metric_context,
+)
 from spectramr.infrastructure.training.strategies.ood_acceleration_readout import (
     ood_acceleration_readout,
     ood_accelerations,
@@ -36,6 +39,7 @@ from spectramr.infrastructure.training.strategies.simulator_builder import (
     build_simulator_from_config,
     undersampling_mask_kwargs,
 )
+from spectramr.infrastructure.training.utils.metric_views import MetricViews
 from spectramr.models.blocks.vf_modules import NoiseVarianceEstimator
 from spectramr.models.losses.registry import create_loss
 
@@ -278,6 +282,23 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
             "loss_marker": loss_marker.detach(),
             "noise_var": noise_var.mean().detach(),
         }
+        step = resolve_loop_iteration(self)
+        # validation_step reuses this impl in eval mode; #183 scores training steps only,
+        # on the magnitude pair ``_score_at_current_twin`` scores, with the complex pair
+        # kept for the phase metrics.
+        if self.generator_model.training and self._training_metrics_due(self.config, step):
+            pred_ri = pred.detach()
+            pred_c, clean = torch.complex(pred_ri[:, 0::2], pred_ri[:, 1::2]), clean_norm.detach()
+            result.update(
+                self._score_training_views(
+                    MetricViews(
+                        pred_c.abs(),
+                        clean.abs(),
+                        pred_c,
+                        clean if torch.is_complex(clean) else None,
+                    )
+                )
+            )
         for k, v in loss_output.components.items():
             result[k] = v.detach() if hasattr(v, "detach") else v
 
@@ -287,6 +308,7 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Validate with deterministic degradation and image quality metrics."""
@@ -320,6 +342,7 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
                     input_batch=target,
                     target_batch=target,
                     step=batch_idx,
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(target, target, epoch=0)
@@ -413,8 +436,15 @@ class ConcreteVFADMMStrategy(BaseTrainingStrategy):
         # silently swallowed (CLAUDE.md #9/#10).
         computer = getattr(self, "validation_metrics_computer", None)
         if computer is not None:
+            # Outside the ``try``: an unmeasurable g-factor is a config defect, not a skipped metric.
+            context = coil_map_metric_context(
+                computer, self.config, target_complex, float(self.simulator.acceleration)
+            )
+            extra = {} if context is None else {"context": context}
             try:
-                scores.update({k: float(v) for k, v in computer.compute(pm, tm).items()})
+                scores.update(
+                    {k: float(v) for k, v in computer.compute(pm, tm, **extra).items()}
+                )
             except Exception as exc:
                 logger.warning(
                     "[VFADMMStrategy] validation_metrics_computer failed; "

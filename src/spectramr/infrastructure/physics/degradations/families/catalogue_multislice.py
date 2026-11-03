@@ -62,7 +62,11 @@ ENTRIES: tuple[DegradationSpec, ...] = (
         MAG,
         description="Inter-slice RF crosstalk: neighbouring slice profiles saturate each slice",
         severity=SeveritySpec(
-            (_P("profile_transition_sigma", "x slice thickness", 0.0, 0.5),),
+            (_P(
+                "profile_transition_sigma", "x slice thickness", 0.0, 0.5,
+                endpoint_kwargs=(None, "max_sigma_per_thickness"),
+                valid_min=0.0,
+            ),),
             notes="Slice profile = rect(thk) convolved with a Gaussian of std sigma = theta*thk/2, "
             "overlapping the adjacent slabs; the gap is voxel_mm[0] - slice_thickness_mm "
             "(thickness = pitch when unset). Slice k is scaled by prod over neighbours "
@@ -112,7 +116,11 @@ ENTRIES: tuple[DegradationSpec, ...] = (
         BOTH,
         description="Spin history: magnetisation carried between slices by through-plane motion",
         severity=SeveritySpec(
-            (_P("peak_through_plane_displacement", "mm", 0.0, 5.0),),
+            (_P(
+                "peak_through_plane_displacement", "mm", 0.0, 5.0,
+                endpoint_kwargs=(None, "peak_dz_mm"),
+                valid_min=0.0,
+            ),),
             notes="One rigid dz per shot (8 shots), |dz| <= 5 mm*theta. A spin from slice j gets signal "
             "gain 1 + a q^n (q = E1 cos a): a = M_0/M_ss - 1, M_0 = 1 - (1 - M_ss cos a) exp(-dt'/T1) at its first "
             "excitation, M_n = M_ss + (M_0 - M_ss)(E1 cos a)^n after n more; defaults TR 50 ms, "

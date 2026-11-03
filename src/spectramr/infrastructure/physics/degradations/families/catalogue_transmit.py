@@ -96,6 +96,7 @@ ENTRIES: tuple[DegradationSpec, ...] = (
         volume=b1_transmit_volume,
         description="Smooth B1+ transmit scale map (flip-angle error)",
         severity=SeveritySpec(
+            # No endpoint kwarg: mean calibration makes kappa - 1 nonlinear in kappa_peak.
             (_P("peak_b1_scale_error", "fraction of nominal B1+", 0.0, 0.4),),
             notes="a seeded smooth, centre-bright B1+ scale map k(r) = 1 + 0.4 s(r), s of unit "
             "peak, referenced to the transmit calibration: kappa = 1 + theta (k / <k> - 1) inside "
@@ -114,6 +115,7 @@ ENTRIES: tuple[DegradationSpec, ...] = (
         volume=dielectric_b1_volume,
         description="Dielectric standing-wave B1+ pattern",
         severity=SeveritySpec(
+            # No endpoint kwarg: mean calibration makes kappa - 1 nonlinear in the amplitude.
             (_P("standing_wave_amplitude", "fraction of nominal B1+", 0.0, 0.5),),
             notes="k(r) = 1 + A cos(2 pi |r - r0| / lambda), A = 0.5, referenced to the transmit "
             "calibration: kappa = 1 + theta (k / <k> - 1) inside the object support (magnitude "
@@ -134,7 +136,11 @@ ENTRIES: tuple[DegradationSpec, ...] = (
         volume=imperfect_fat_sat_volume,
         description="Imperfect CHESS fat saturation (residual fat)",
         severity=SeveritySpec(
-            (_P("peak_abs_db0", "Hz", 0.0, 300.0),),
+            (_P(
+                "peak_abs_db0", "Hz", 0.0, 300.0,
+                endpoint_kwargs=(None, "max_db0_hz"),
+                valid_min=0.0,
+            ),),
             notes="the input is the fat-saturated (water) image; residual fat F (1 - eta) is added "
             "in phase with it, eta = exp(-(dB0 / w)^2), w = 100 Hz. dB0 = 300 Hz theta s(r) for a "
             "seeded smooth s of unit peak, or theta b0_map_hz. F is the kwarg fat_map, or the "
@@ -153,7 +159,12 @@ ENTRIES: tuple[DegradationSpec, ...] = (
         volume=imperfect_inversion_volume,
         description="Imperfect inversion pulse efficiency (IR contrast, shifted null)",
         severity=SeveritySpec(
-            (_P("inversion_inefficiency", "1 - kappa", 0.0, 0.3),),
+            (_P(
+                "inversion_inefficiency", "1 - kappa", 0.0, 0.3,
+                endpoint_kwargs=(None, "max_inefficiency"),
+                valid_min=0.0,
+                valid_max=1.0,
+            ),),
             notes="Mz(TI) = 1 - (1 + kappa) exp(-TI / T1), kappa = 1 - 0.3 theta, TR >> T1; the "
             "null moves from T1 ln 2 to T1 ln(1 + kappa). Requires qmaps = {t1 (ms), pd (the "
             "equilibrium image, in the units of x)} and TI (ti_ms or the profile's, no default): "
@@ -172,7 +183,12 @@ ENTRIES: tuple[DegradationSpec, ...] = (
         volume=sar_limited_flip_volume,
         description="SAR-limited TSE refocusing angle (reweighted echo train)",
         severity=SeveritySpec(
-            (_P("refocusing_flip_reduction", "degrees", 0.0, 120.0),),
+            (_P(
+                "refocusing_flip_reduction", "degrees", 0.0, 120.0,
+                endpoint_kwargs=(None, "max_reduction_deg"),
+                valid_min=0.0,
+                valid_max=180.0,
+            ),),
             notes="refocusing angle 180 - 120 theta degrees, down to 60 (90 degree excitation); "
             "each k-space line is scaled by the EPG echo amplitude of its echo over the 180 degree "
             "train's, so the axis carries the PSF change and the signal-level change at TE_eff. "

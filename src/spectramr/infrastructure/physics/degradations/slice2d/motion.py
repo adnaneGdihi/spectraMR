@@ -7,7 +7,11 @@ import math
 import torch
 import torch.nn.functional as F
 
-from spectramr.infrastructure.physics.degradations._common import _ensure_complex, _generator
+from spectramr.infrastructure.physics.degradations._common import (
+    _ensure_complex,
+    _generator,
+    reject_override_with_endpoint,
+)
 from spectramr.infrastructure.physics.digital_twin_simulator import simulate_rigid_motion_kspace
 from spectramr.infrastructure.physics.fft_ops import centred_freqs, fft2c, ifft2c
 
@@ -154,12 +158,16 @@ def degrade_random_motion(
     return _apply_pe_line_shift(x, dx)
 
 
-def _delegate_rigid_motion(x, theta, seed=0, **kw):
+def _delegate_rigid_motion(x, theta, seed=0, max_translation_px=10.0, **kw):
     x = _ensure_complex(x)
+    reject_override_with_endpoint(
+        "rigid_motion", "max_translation", kw.get("max_translation"),
+        "max_translation_px", max_translation_px, 10.0,
+    )
     g = _generator(x.device, seed)
     kspace = simulate_rigid_motion_kspace(
         fft2c(x),
-        max_translation=float(kw.get("max_translation", float(theta) * 10.0)),
+        max_translation=float(kw.get("max_translation", float(theta) * float(max_translation_px))),
         max_rotation=float(kw.get("max_rotation", float(theta) * 0.1)),
         generator=g,
     )

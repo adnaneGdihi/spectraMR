@@ -641,7 +641,7 @@ _REP_EI_KNOB = {
     "optimization.gradient.enable_checkpointing",
 }
 #: Both select on the corrected MSE and score the repetition decomposition; the
-#: metric list and the scoring store differ from the same-mask arm's.
+#: metric list differs from the same-mask arm's.
 _PROTOCOL_V2_RECONSTRUCTION_ONLY = {
     "validation.scoring.compute",
     "early_stopping.metric",
@@ -650,7 +650,6 @@ _PROTOCOL_V2_RECONSTRUCTION_ONLY = {
     "metrics.best_metric_mode",
     "metadata.primary_metric",
     "data.emit_alternate_input",
-    "data.coil_maps_reference_root",
 }
 
 
@@ -873,17 +872,14 @@ def _route_error(cfg: dict[str, Any]) -> str | None:
     return None
 
 
-_SCORING_STORE = "databases/m4raw/coil_maps"
+_TRAINING_STORE = "databases/m4raw/coil_maps_input_rep_acs24"
 
 
 def _map_leak_error(cfg: dict[str, Any]) -> str | None:
     """Why an arm's coil maps could carry the reference, or None."""
     data = cfg.get("data") or {}
-    reference = data.get("coil_maps_reference_root")
-    if reference is not None and reference == data.get("coil_maps_root"):
-        return "coil_maps_reference_root is the training store: the scoring maps would train."
-    if reference is not None and reference != _SCORING_STORE:
-        return f"coil_maps_reference_root={reference!r}; every family scores on {_SCORING_STORE!r}"
+    if "coil_maps_reference_root" in data:
+        return "coil_maps_reference_root is retired: every arm scores with its training maps."
     if data.get("coil_maps_root") is not None:
         if data.get("coil_maps_recipe") != "input_repetition":
             return (
@@ -1003,23 +999,21 @@ _SCORED_ON_THE_STORE = [*_DECOMPOSED_R4, _REP_EI]
 @pytest.mark.parametrize(
     "arm", _SCORED_ON_THE_STORE, ids=[p.stem for p in _SCORED_ON_THE_STORE]
 )
-def test_sense_columns_score_on_the_shared_store(arm: Path) -> None:
-    """#2664: the arms whose training maps are not that store score on it."""
-    assert (_load(arm).get("data") or {}).get("coil_maps_reference_root") == _SCORING_STORE
+def test_sense_columns_score_on_the_training_store(arm: Path) -> None:
+    """The SENSE, Rep-BV and certificate columns score on the maps the arm trains on."""
+    data = _load(arm).get("data") or {}
+    assert data.get("coil_maps_root") == _TRAINING_STORE
+    assert "coil_maps_reference_root" not in data
 
 
-@pytest.mark.parametrize(
-    ("root", "reason"),
-    [
-        ("databases/m4raw/coil_maps_input_rep_acs24", "coil_maps_reference_root is the training"),
-        ("databases/m4raw/other_store", "coil_maps_reference_root="),
-    ],
-    ids=["the-training-store", "another-store"],
-)
-def test_the_scoring_store_predicate_rejects_a_planted_root(root: str, reason: str) -> None:
-    cfg = _planted("data.coil_maps_reference_root", root)
-    error = _map_leak_error(cfg)
-    assert error is not None and error.startswith(reason), error
+@pytest.mark.parametrize("arm", _ARMS, ids=[a.stem for a in _ARMS])
+def test_no_arm_declares_the_retired_reference_root(arm: Path) -> None:
+    assert "coil_maps_reference_root" not in (_load(arm).get("data") or {}), arm.stem
+
+
+def test_the_retired_reference_root_predicate_rejects_a_planted_root() -> None:
+    error = _map_leak_error(_planted("data.coil_maps_reference_root", _TRAINING_STORE))
+    assert error is not None and error.startswith("coil_maps_reference_root is retired"), error
 
 
 @pytest.mark.parametrize("arm", _DECOMPOSED_R4, ids=[p.stem for p in _DECOMPOSED_R4])
@@ -1029,6 +1023,12 @@ def test_the_four_coil_r4_arms_report_variance_and_bias(arm: Path) -> None:
 
 
 #: (treatment, control) -> the only dotted paths they may differ on.
+_RES_LDC = {"model.model_kwargs.residual", "model.model_kwargs.learnable_dc"}
+_UNROLLED = _RES_LDC | {
+    "model.model_type",
+    *(f"model.model_kwargs.{k}" for k in ("num_unrolls", "lambda_dc", "num_coils", "img_size")),
+    "model.model_kwargs.output_activation",
+}
 _ONE_KNOB_PAIRS = {
     ("ei_unet_m4raw_r4", "ei_control_mc_only_m4raw_r4"): {
         "training.equivariant_imaging.alpha_equivariance",
@@ -1071,6 +1071,14 @@ _ONE_KNOB_PAIRS = {
         "training.ssdu.score_structural_zeros",
         "losses.kspace_losses",
     },
+    # The 2026-11-01 review arms (ssl_backbone_fixes_m4raw): each moves its parent
+    # by the loss or the backbone, nothing else.
+    ("ssdu_l2_m4raw_r4", "ssdu_m4raw_r4"): {"losses.kspace_losses"},
+    ("ssdu_res_ldc_m4raw_r4", "ssdu_m4raw_r4"): _RES_LDC,
+    ("ssdu_l2_res_ldc_m4raw_r4", "ssdu_l2_m4raw_r4"): _RES_LDC,
+    ("robust_ssdu_selfcal_res_ldc_m4raw_r4", "robust_ssdu_selfcal_m4raw_r4"): _RES_LDC,
+    ("ei_unrolled_m4raw_r4", "ei_multicoil_m4raw_r4"): _UNROLLED,
+    ("supervised_bound_unrolled_m4raw_r4", "supervised_bound_mc_m4raw_r4"): _UNROLLED,
 }
 
 
@@ -1238,6 +1246,15 @@ _ITERATIONS_R4 = 100_000
 _ALPHA_SWEEP = ("ei_multicoil_m4raw_r4_alpha01", "ei_multicoil_m4raw_r4_alpha10")
 #: The trained iterative-CS arms, siblings of ``ei_multicoil_m4raw_r4``.
 _CS_LEARNED = ("cs_pnp_unet_sense_m4raw_r4", "cs_lista_wavelet_sense_m4raw_r4")
+#: The 2026-11-01 review arms, at their R4 parents' budget.
+_REVIEW_ARMS = (
+    "ssdu_l2_m4raw_r4",
+    "ssdu_res_ldc_m4raw_r4",
+    "ssdu_l2_res_ldc_m4raw_r4",
+    "robust_ssdu_selfcal_res_ldc_m4raw_r4",
+    "ei_unrolled_m4raw_r4",
+    "supervised_bound_unrolled_m4raw_r4",
+)
 
 
 def _slice_route_error(cfg: dict[str, Any], expected_iterations: int) -> str | None:
@@ -1260,12 +1277,14 @@ def _slice_route_error(cfg: dict[str, Any], expected_iterations: int) -> str | N
 def _expected_iterations(arm: Path) -> int:
     """The sweep cells, CS cells included, inherit their R4 sibling's budget."""
     sweep = {name for name, *_ in (*_SWEEP, *_CS_SWEEP)} | set(_ALPHA_SWEEP) | set(_CS_LEARNED)
+    sweep |= set(_REVIEW_ARMS)
     return _ITERATIONS_R4 if arm.stem in _R4_ARMS or arm.stem in sweep else _ITERATIONS_R2
 
 
 def test_the_m4raw_arms_are_the_thirteen_plus_the_cs_baseline_plus_the_sweep() -> None:
     """Thirteen moved for #2673, the CS baseline that arrived on it, and the sweeps."""
     expected = 14 + len(_SWEEP) + len(_CS_SWEEP) + len(_ALPHA_SWEEP) + len(_CS_LEARNED)
+    expected += len(_REVIEW_ARMS)
     assert len(_M4RAW_ARMS) == expected, [a.stem for a in _M4RAW_ARMS]
 
 

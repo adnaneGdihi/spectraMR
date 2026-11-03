@@ -1950,6 +1950,33 @@ def test_count_parameters_stamps_a_solver_record() -> None:
     assert "solver" not in count_parameters(nn.Linear(2, 2))
 
 
+def test_count_parameters_stamps_a_mechanism_record() -> None:
+    """A model's mechanism knobs (e.g. neural_cache's cache_mode) ride with its count."""
+    import torch.nn as nn
+
+    class _Cached(nn.Linear):
+        @property
+        def mechanism_record(self) -> dict:
+            return {"cache_mode": "sequential"}
+
+    assert prov.count_parameters(_Cached(2, 2))["mechanism"] == {"cache_mode": "sequential"}
+    assert "mechanism" not in prov.count_parameters(nn.Linear(2, 2))
+
+
+def test_count_parameters_stamps_a_cfg_guidance_record() -> None:
+    """A multi-axis CFG generator's resolved dropout/weights/schedule reach provenance."""
+    import torch.nn as nn
+
+    class _Guided(nn.Module):
+        @property
+        def cfg_guidance_record(self) -> dict:
+            return {"cfg_weights": {"condition": 2.0}, "cfg_schedule": {}}
+
+    record = prov.count_parameters(_Guided())
+    assert record["cfg_guidance"] == {"cfg_weights": {"condition": 2.0}, "cfg_schedule": {}}
+    assert "cfg_guidance" not in prov.count_parameters(nn.Linear(2, 2))
+
+
 def test_data_split_provenance_writes_the_applied_partition():
     """The director's partition stamp reaches provenance.json intact (subjects, counts, sha256)."""
     from spectramr.data.metadata.paired_partition import build_partition_stamp

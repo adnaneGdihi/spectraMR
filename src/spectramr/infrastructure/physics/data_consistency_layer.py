@@ -6,6 +6,7 @@ fidelity to measured k-space data within the network.
 """
 
 import logging
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
@@ -31,6 +32,9 @@ class MaskedReplacementDataConsistency(nn.Module):
         M: Sampling mask (1 at sampled locs, 0 elsewhere)
         y: Measured k-space (0 at unsampled locs)
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self, noise_robust: bool = False):
         """
@@ -121,7 +125,7 @@ class MaskedReplacementDataConsistency(nn.Module):
 
         else:
             # For 2-channel real representation
-            # We need measured_kspace to also be 2-channel real or convertable
+            # We need measured_kspace to also be 2-channel real or convertible
             if torch.is_complex(measured_kspace):
                 # Unlikely if image is real-stacked, but handle it
                 measured_kspace_complex = measured_kspace

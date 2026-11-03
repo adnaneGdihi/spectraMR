@@ -59,8 +59,17 @@ class EquivarianceConformalConfig(BaseModel):
     exchangeability_test: Literal["ks_test", "none"] = Field(
         default="ks_test",
         description=(
-            "Post-hoc check that calibration and a held-out split share a "
-            "score distribution (a borderline-exchangeability safety net)."
+            "Post-hoc KS check that the compared score sets share a distribution; "
+            "which sets are compared is exchangeability_split."
+        ),
+    )
+    exchangeability_split: Literal["within_sample", "held_out"] = Field(
+        default="within_sample",
+        description=(
+            "within_sample: KS between the two halves of the calibration scores (a "
+            "self-consistency proxy blind to deployment shift). held_out: the "
+            "data.source.test_index_path loader is scored separately; KS compares "
+            "calibration vs held-out scores and coverage is measured on held-out."
         ),
     )
     exchangeability_ks_pvalue_threshold: float = Field(

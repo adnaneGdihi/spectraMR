@@ -390,3 +390,21 @@ def test_the_bridge_wrapper_table_covers_exactly_the_two_bridged_modes() -> None
         "ifft_magnitude": (False, "iFFT→magnitude bridge"),
         "ifft_complex": (True, "iFFT→complex bridge"),
     }
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [("kspace_losses", "image_losses"), ("image_losses", "complex_losses")],
+)
+def test_one_name_in_two_domain_lists_raises(first: str, second: str) -> None:
+    """#2039: modules are keyed by bare name, so the later list used to overwrite the earlier."""
+    with pytest.raises(ConfigurationError, match="declared in both"):
+        _build(**{first: [_entry("l1")], second: [_entry("l1")]})
+
+
+def test_a_disabled_duplicate_is_not_a_collision() -> None:
+    builder = _build(
+        kspace_losses=[LossComponentConfig(name="l1", weight=1.0, enabled=False)],
+        image_losses=[_entry("l1")],
+    )
+    assert set(builder._losses) == {"l1"}

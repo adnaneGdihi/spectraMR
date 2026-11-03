@@ -88,13 +88,16 @@ class RDPAccountant:
         self,
         noise_multiplier: float,
         sample_rate: float,
+        num_steps: int = 1,
     ) -> None:
-        """Record one application of the sub-sampled Gaussian mechanism.
+        """Record ``num_steps`` applications of the sub-sampled Gaussian mechanism.
 
         Args:
-            noise_multiplier: ``σ`` in ``N(0, σ² Δ²)``. Must be > 0.
+            noise_multiplier: ``sigma`` in ``N(0, sigma^2 Delta^2)``. Must be > 0.
             sample_rate: Per-sample inclusion probability ``q``.
                 Must lie in ``(0, 1]``.
+            num_steps: Identical rounds to compose; RDP is additive, so this
+                equals ``num_steps`` single calls. Must be >= 1.
 
         Raises:
             ValueError: invalid arguments.
@@ -103,10 +106,14 @@ class RDPAccountant:
             raise ValueError(f"noise_multiplier must be > 0; got {noise_multiplier}")
         if not 0.0 < sample_rate <= 1.0:
             raise ValueError(f"sample_rate must lie in (0, 1]; got {sample_rate}")
+        if num_steps < 1:
+            raise ValueError(f"num_steps must be >= 1; got {num_steps}")
 
         for i, order in enumerate(self._orders):
-            self._rdp[i] += _compute_rdp_subsampled_gaussian(noise_multiplier, sample_rate, order)
-        self._steps += 1
+            self._rdp[i] += num_steps * _compute_rdp_subsampled_gaussian(
+                noise_multiplier, sample_rate, order
+            )
+        self._steps += num_steps
 
     def get_epsilon(self, delta: float) -> float:
         """Convert accumulated RDP into the tightest ``(ε, δ)``-DP value.

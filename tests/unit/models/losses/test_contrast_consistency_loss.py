@@ -37,6 +37,14 @@ from spectramr.models.losses.contrast_consistency_loss import (
 # ---------------------------------------------------------------------------
 
 
+def _cc(loss, t1, probs, b0):
+    """Call the loss as the strategy does: the model's aux maps and a per-sample B0."""
+    field = torch.full((t1.shape[0],), float(b0))
+    return loss(
+        t1, None, aux_maps={"t1_ms": t1, "tissue_probabilities": probs}, field_strength=field
+    )
+
+
 def test_negative_weight_rejected() -> None:
     """``weight < 0`` raises."""
     with pytest.raises(ValueError, match="weight"):
@@ -75,7 +83,7 @@ def test_zero_loss_when_prediction_matches_bottomley_for_wm() -> None:
     pred = torch.full((1, 1, 4, 4), target)
     probs = _wm_only_probs(1, 4, 4)
     loss = ContrastConsistencyLoss(weight=1.0)
-    val = loss(pred, probs, field_strength_T=b0).item()
+    val = _cc(loss, pred, probs, b0).item()
     assert pytest.approx(val, abs=1e-6) == 0.0
 
 
@@ -87,8 +95,8 @@ def test_loss_grows_with_deviation_from_bottomley() -> None:
     pred_far = torch.full((1, 1, 4, 4), target + 500.0)
     probs = _wm_only_probs(1, 4, 4)
     loss = ContrastConsistencyLoss(weight=1.0)
-    val_close = loss(pred_close, probs, field_strength_T=b0).item()
-    val_far = loss(pred_far, probs, field_strength_T=b0).item()
+    val_close = _cc(loss, pred_close, probs, b0).item()
+    val_far = _cc(loss, pred_far, probs, b0).item()
     assert val_far > val_close > 0.0
 
 
@@ -102,7 +110,7 @@ def test_zero_loss_when_no_tissue_mass() -> None:
     pred = torch.full((1, 1, 4, 4), 1234.0)
     probs = torch.zeros(1, 3, 4, 4)
     loss = ContrastConsistencyLoss(weight=1.0)
-    val = loss(pred, probs, field_strength_T=1.5).item()
+    val = _cc(loss, pred, probs, 1.5).item()
     assert val == 0.0
 
 
@@ -116,8 +124,8 @@ def test_predicted_t1_wrong_channel_count_rejected() -> None:
     pred = torch.zeros(1, 2, 4, 4)
     probs = torch.zeros(1, 3, 4, 4)
     loss = ContrastConsistencyLoss()
-    with pytest.raises(ValueError, match="predicted_t1_ms"):
-        loss(pred, probs, field_strength_T=1.5)
+    with pytest.raises(ValueError, match="t1_ms must be"):
+        _cc(loss, pred, probs, 1.5)
 
 
 def test_tissue_probabilities_3d_rejected() -> None:
@@ -126,7 +134,7 @@ def test_tissue_probabilities_3d_rejected() -> None:
     probs = torch.zeros(3, 4, 4)
     loss = ContrastConsistencyLoss()
     with pytest.raises(ValueError, match="tissue_probabilities"):
-        loss(pred, probs, field_strength_T=1.5)
+        _cc(loss, pred, probs, 1.5)
 
 
 def test_tissue_channel_count_mismatch_rejected() -> None:
@@ -134,8 +142,8 @@ def test_tissue_channel_count_mismatch_rejected() -> None:
     pred = torch.zeros(1, 1, 4, 4)
     probs = torch.zeros(1, 5, 4, 4)  # too many
     loss = ContrastConsistencyLoss()
-    with pytest.raises(ValueError, match="tissue_probabilities has"):
-        loss(pred, probs, field_strength_T=1.5)
+    with pytest.raises(ValueError, match="tissue_probabilities"):
+        _cc(loss, pred, probs, 1.5)
 
 
 def test_zero_field_strength_rejected() -> None:
@@ -143,8 +151,8 @@ def test_zero_field_strength_rejected() -> None:
     pred = torch.zeros(1, 1, 4, 4)
     probs = torch.zeros(1, 3, 4, 4)
     loss = ContrastConsistencyLoss()
-    with pytest.raises(ValueError, match="field_strength_T"):
-        loss(pred, probs, field_strength_T=0.0)
+    with pytest.raises(ValueError, match="b0_T must be > 0"):
+        _cc(loss, pred, probs, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +165,7 @@ def test_gradient_flows_to_predicted_t1() -> None:
     pred = torch.full((1, 1, 4, 4), 500.0, requires_grad=True)
     probs = _wm_only_probs(1, 4, 4)
     loss = ContrastConsistencyLoss()
-    loss(pred, probs, field_strength_T=3.0).backward()
+    _cc(loss, pred, probs, 3.0).backward()
     assert pred.grad is not None
     assert torch.isfinite(pred.grad).all()
 

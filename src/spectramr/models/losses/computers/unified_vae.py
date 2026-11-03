@@ -89,6 +89,48 @@ _NON_PRED_TARGET_LOSS_NAMES = frozenset(
 )
 
 
+def _refuse_undeclared_reconstruction(config: Any) -> None:
+    """Refuse a VAE/VQ-VAE arm that declares no live reconstruction term (decision 16).
+
+    Without one the objective is the latent term alone and the decoder never learns to
+    reconstruct; the computer no longer substitutes an undeclared L1 (#2280).
+    """
+    from spectramr.models.losses.weights import build_loss_weight_table
+
+    if config is None:
+        raise ConfigurationError(
+            "A VAE/VQ-VAE loss computer needs a config: no reconstruction loss is declared "
+            "without one, and it no longer substitutes an L1."
+        )
+    table = build_loss_weight_table(getattr(config, "losses", None))
+    # Canonical names: a declared ``mse`` is ``l2`` here even where the builder keys it ``mse``.
+    if any(n in table and table[n].enabled and table[n].weight > 0 for n in ("l1", "l2")):
+        return
+    spec = table.get("reconstruction")
+    declared = (
+        f"losses.reconstruction ({spec.source}) is declared at weight {spec.weight}, but "
+        if spec is not None and spec.enabled and spec.weight > 0
+        else ""
+    )
+    raise ConfigurationError(
+        f"{declared}no reconstruction loss is declared to carry the VAE objective. Declare "
+        "`- {name: mse, weight: <w>}` (or l1) under losses.image_losses; the computer no "
+        "longer substitutes an L1."
+    )
+
+
+def _declared_reconstruction(losses: Mapping[str, Any]) -> tuple[str | None, Any]:
+    """The reconstruction term the arm DECLARED (``l1`` or ``l2``), as the builder built it.
+
+    A computer may not fall back to an L1 the arm never declared (#2280). ``None`` when
+    the arm declares neither, which the caller turns into a refusal or an absent term.
+    """
+    for name in ("l1", "l2"):
+        if name in losses:
+            return name, losses[name]
+    return None, None
+
+
 class UnifiedVAELossComputer(BaseLossComputer):
     """Unified VAE loss computer implementing SSOT pattern."""
 
@@ -100,6 +142,7 @@ class UnifiedVAELossComputer(BaseLossComputer):
             device: Compute device
         """
         self.reconstruction_loss_fn: nn.Module | None = None
+        self.reconstruction_name: str | None = None
         self.perceptual_loss_fn: nn.Module | None = None
         # Duck-typed: the GAN loss library object exposing ``compute_generator_loss``.
         self.adversarial_loss_fn: Any = None
@@ -107,32 +150,17 @@ class UnifiedVAELossComputer(BaseLossComputer):
         super().__init__(config, device)
 
     def _initialize_losses(self) -> None:
-        """Initialize loss functions using LossBuilder.
-
-        Uses the LossBuilder pattern for SSOT loss creation.
-        Falls back to defaults if config is missing.
-        """
+        """Initialize loss functions using LossBuilder; raise when no reconstruction is declared."""
         from spectramr.infrastructure.training.builders.loss_builder import LossBuilder
 
-        if self.config is not None:
-            # Build errors with a real config MUST propagate (pitfall #9). The
-            # old `try/except Exception: pass` silently collapsed the
-            # perceptual/adversarial/latent stack to a bare L1 on any builder
-            # failure (a typo'd loss key, a missing sub-block) — review
-            # 2026-07-01. Fail loud instead.
-            builder = LossBuilder(self.config, self.device)
-            losses = builder.build_reconstruction_losses().build_latent_losses().build()
-            self.reconstruction_loss_fn = losses.get("l1", nn.L1Loss())
-            self.perceptual_loss_fn = losses.get("perceptual")
-            self.adversarial_loss_fn = losses.get("adversarial")
-            # KL loss is typically computed inline, not as a module.
-            return
-
-        # No config supplied (direct construction in a test/script) — the ONLY
-        # sanctioned minimal fallback.
-        self.reconstruction_loss_fn = nn.L1Loss()
-        self.perceptual_loss_fn = None
-        self.adversarial_loss_fn = None
+        _refuse_undeclared_reconstruction(self.config)
+        # Build errors with a real config MUST propagate (pitfall #9): a swallowed
+        # builder failure once collapsed the whole stack to a bare L1.
+        builder = LossBuilder(self.config, self.device)
+        losses = builder.build_reconstruction_losses().build_latent_losses().build()
+        self.reconstruction_name, self.reconstruction_loss_fn = _declared_reconstruction(losses)
+        self.perceptual_loss_fn = losses.get("perceptual")
+        self.adversarial_loss_fn = losses.get("adversarial")
 
     def _get_loss_weight(
         self, loss_name: str, epoch: int = 0, iteration: int = 0, **kwargs: Any
@@ -235,7 +263,7 @@ class UnifiedVAELossComputer(BaseLossComputer):
         """
         key = name.lower()
         out: torch.Tensor
-        if key in ("kl", "kl_divergence", "vq_kl"):
+        if key in ("kl", "kl_divergence"):
             out = loss_fn(mu, logvar)
             return out
         z = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
@@ -273,17 +301,18 @@ class UnifiedVAELossComputer(BaseLossComputer):
             LossOutput with total loss and components
         """
         components: dict[str, torch.Tensor] = {}
+        # Weights resolved at the declared name, so stacking never looks up "reconstruction".
+        stack_weights: dict[str, float] = {}
 
-        # 1. RECONSTRUCTION LOSS
-        lambda_rec = self._get_loss_weight("reconstruction", epoch, iteration)
-        if lambda_rec > 0:
-            # Use provided loss function or default to L1
-            if self.reconstruction_loss_fn:
-                rec_loss = self.reconstruction_loss_fn(pred, target)
-            else:
-                rec_loss = torch.nn.functional.l1_loss(pred, target)
-
-            components["reconstruction"] = rec_loss
+        # 1. RECONSTRUCTION LOSS: the declared l1/l2 term, weighted by its own declaration.
+        rec_weight = (
+            self._get_loss_weight(self.reconstruction_name, epoch, iteration)
+            if self.reconstruction_name is not None and self.reconstruction_loss_fn is not None
+            else 0.0
+        )
+        if rec_weight > 0:
+            components["reconstruction"] = self.reconstruction_loss_fn(pred, target)
+            stack_weights["reconstruction"] = rec_weight
 
         # 2. LATENT REGULARIZATION (KL by default; configurable via
         #    ``losses.latent.latent_loss_type`` and dispatched through the loss
@@ -330,7 +359,7 @@ class UnifiedVAELossComputer(BaseLossComputer):
         # 5. DYNAMIC COMPONENT LOSSES (from losses_dict)
         if losses_dict:
             for loss_name, loss_fn in losses_dict.items():
-                if loss_name in components or loss_name in [
+                if loss_name in components or loss_name == self.reconstruction_name or loss_name in [
                     "reconstruction",
                     "kl",
                     "kl_divergence",
@@ -395,7 +424,9 @@ class UnifiedVAELossComputer(BaseLossComputer):
         # ``iteration`` reaches the stack as it reaches every gate above: resolved
         # at step 0, the KL anneal would sit at ``kl_beta_start`` and every
         # warm-up-gated term would weigh 0.0 for the whole run (#1648).
-        total = self._stack_components(components, epoch=epoch, iteration=iteration)
+        total = self._stack_components(
+            components, weights=stack_weights, epoch=epoch, iteration=iteration
+        )
 
         return LossOutput(total=total, components=components, metrics={})
 
@@ -409,14 +440,30 @@ class UnifiedVQVAELossComputer(BaseLossComputer):
     def __init__(self, config: Any, device: torch.device = DEFAULT_LOSS_DEVICE):
         """Initialize VQ-VAE loss computer."""
         self.reconstruction_loss_fn: nn.Module | None = None
+        self.reconstruction_name: str | None = None
         self.perceptual_loss_fn: nn.Module | None = None
         self.adversarial_loss_fn: nn.Module | None = None
 
         super().__init__(config, device)
 
     def _initialize_losses(self) -> None:
-        """Initialize loss functions."""
-        pass
+        """Bind the declared reconstruction term (l1/l2) from the weight table.
+
+        The VQ term is weighted by ``lambda_vq`` at compute time; this computer builds no
+        modules of its own beyond the reconstruction term.
+        """
+        _refuse_undeclared_reconstruction(self.config)
+        from spectramr.models.losses.registry import create_loss
+        from spectramr.models.losses.weights import build_loss_weight_table
+
+        table = build_loss_weight_table(getattr(self.config, "losses", None))
+        name = next(
+            (n for n in ("l1", "l2") if n in table and table[n].enabled and table[n].weight > 0),
+            None,
+        )
+        if name is not None:
+            self.reconstruction_name = name
+            self.reconstruction_loss_fn = create_loss(name)
 
     def compute(
         self,
@@ -435,38 +482,33 @@ class UnifiedVQVAELossComputer(BaseLossComputer):
             epoch: Current epoch
             iteration: Current iteration
             losses_dict: Optional dictionary of additional losses
-            **kwargs: quantized, codebook_loss, etc.
+            **kwargs: vq_loss (the quantiser term, codebook plus commitment), etc.
 
         Returns:
             LossOutput with total loss and components
         """
         components: dict[str, torch.Tensor] = {}
+        # Weights resolved at the declared name, so stacking never looks up "reconstruction".
+        stack_weights: dict[str, float] = {}
 
-        # 1. RECONSTRUCTION LOSS
-        lambda_rec = self._get_loss_weight("reconstruction", epoch, iteration)
-        if lambda_rec > 0:
-            if self.reconstruction_loss_fn:
-                rec_loss = self.reconstruction_loss_fn(pred, target)
-            else:
-                rec_loss = torch.nn.functional.l1_loss(pred, target)
+        # 1. RECONSTRUCTION LOSS: the declared l1/l2 term (no undeclared L1 fallback, #2280).
+        rec_weight = (
+            self._get_loss_weight(self.reconstruction_name, epoch, iteration)
+            if self.reconstruction_name is not None and self.reconstruction_loss_fn is not None
+            else 0.0
+        )
+        if rec_weight > 0:
+            components["reconstruction"] = self.reconstruction_loss_fn(pred, target)
+            stack_weights["reconstruction"] = rec_weight
 
-            components["reconstruction"] = rec_loss
+        # 1b. VQ LOSS: the quantiser term the VQ strategy hands in, weighted by lambda_vq (#2280).
+        vq_loss = kwargs.get("vq_loss")
+        vq_weight = self._get_loss_weight("vq", epoch, iteration)
+        if vq_loss is not None and vq_weight > 0:
+            components["vq_loss"] = vq_loss
+            stack_weights["vq_loss"] = vq_weight
 
-        # 2. CODEBOOK LOSS (VQ loss)
-        lambda_codebook = self._get_loss_weight("codebook", epoch, iteration)
-        if lambda_codebook > 0:
-            codebook_loss = kwargs.get("codebook_loss")
-            if codebook_loss is not None:
-                components["codebook"] = codebook_loss
-
-        # 3. COMMITMENT LOSS
-        lambda_commit = self._get_loss_weight("commitment", epoch, iteration)
-        if lambda_commit > 0:
-            commitment_loss = kwargs.get("commitment_loss")
-            if commitment_loss is not None:
-                components["commitment"] = commitment_loss
-
-        # 4. PERCEPTUAL LOSS
+        # 2. PERCEPTUAL LOSS
         lambda_percep = self._get_loss_weight("perceptual", epoch, iteration)
         if lambda_percep > 0 and self.perceptual_loss_fn:
             percep_loss = self.perceptual_loss_fn(pred, target)
@@ -475,7 +517,7 @@ class UnifiedVQVAELossComputer(BaseLossComputer):
         # 5. DYNAMIC COMPONENT LOSSES (from losses_dict)
         if losses_dict:
             for loss_name, loss_fn in losses_dict.items():
-                if loss_name in components or loss_name in [
+                if loss_name in components or loss_name == self.reconstruction_name or loss_name in [
                     "reconstruction",
                     "codebook",
                     "commitment",
@@ -510,7 +552,9 @@ class UnifiedVQVAELossComputer(BaseLossComputer):
                     logger.debug("Suppressed exception traceback:", exc_info=True)
 
         # ``iteration`` threaded for the same reason as in ``UnifiedVAELossComputer``.
-        total = self._stack_components(components, epoch=epoch, iteration=iteration)
+        total = self._stack_components(
+            components, weights=stack_weights, epoch=epoch, iteration=iteration
+        )
 
         return LossOutput(total=total, components=components, metrics={})
 

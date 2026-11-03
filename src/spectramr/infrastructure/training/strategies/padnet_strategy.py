@@ -151,22 +151,6 @@ class PaDNetTrainingStrategy(DiffusionTrainingStrategy):
         own = (("generator.predict_q_maps", OWNED_CALL),)
         return (*super().owned_module_declarations(config), *own)
 
-    #: PaDNet does NOT degrade its input inside the step, so the base contract
-    #: holds and ``first_steps/input_prepared`` really is the model input:
-    #: ``_compute_losses_impl`` hands ``input_batch`` to ``predict_q_maps``
-    #: verbatim, and the physics happen downstream of the network (Bloch solver
-    #: on the predicted q-maps), not on the input.
-    #:
-    #: Restated here because it is inherited WRONG. ``DiffusionTrainingStrategy``
-    #: sets ``False`` + ``diffusion_step`` for the cold-diffusion forward
-    #: process, which this strategy does not run -- so every PaDNet artifact
-    #: carried ``prepared_equals_model_input: False`` and pointed readers at a
-    #: ``diffusion_step`` snapshot that neither exists nor should. Wrong in the
-    #: opposite direction to the usual facade: it under-claims a snapshot that
-    #: is in fact honest (non-negotiable 14).
-    snapshot_prepared_is_model_input: bool = True
-    snapshot_model_input_tag: str | None = None
-
     def __init__(
         self,
         env=None,

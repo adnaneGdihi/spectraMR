@@ -35,6 +35,7 @@ from spectramr.infrastructure.reporting.plotters.qc._strip_series import (  # no
 from spectramr.infrastructure.reporting.style import (
     column_width,
     panel_label,
+    panel_letter,
     pretty_label,
     save_figure,
     use_default_style,
@@ -192,7 +193,7 @@ def make(
             ax.set_yticks(range(1, len(levels[i]) + 1))
             ax.set_yticklabels([f"{lv:g}\u00d7" for lv in levels[i]], fontsize=4.5)
         ax.set_ylabel(pretty_label(name), rotation=0, ha="right", va="center", fontsize=6)
-        panel_label(ax, chr(ord("a") + i)) if n > 1 else None
+        panel_label(ax, panel_letter(i)) if n > 1 else None
     fig.suptitle("Group IQM distribution", fontsize=8)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     if metadata is not None:

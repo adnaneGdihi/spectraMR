@@ -64,6 +64,10 @@ class TestSliceSelection:
         b = M4RawSource._group_id([Path("2022091411_T102.h5"), Path("2022091411_T101.h5")])
         assert a == b == "2022091411_T1"
 
+    def test_every_contrast_of_a_scan_is_one_subject(self, src) -> None:
+        assert M4RawSource._subject_id("2022091411_T1") == "2022091411"
+        assert M4RawSource._subject_id("2022091411_FLAIR") == "2022091411"
+
 
 class TestNoPathologyRegions:
     def test_m4raw_never_emits_lesion_regions(self, tmp_path, monkeypatch) -> None:
@@ -126,3 +130,19 @@ def test_iter_yields_a_well_formed_slice(tmp_path) -> None:
         "the same field name."
     )
     assert sl.provenance["normalisation"]["mode"] == "p99"
+
+
+class TestContrastsUseTheOneParser:
+    def test_t1_and_t2_are_distinct_and_unparseable_names_raise(self, tmp_path, monkeypatch) -> None:
+        groups = [
+            [Path("2022_T101.h5"), Path("2022_T102.h5")],
+            [Path("2022_T201.h5"), Path("2022_T202.h5")],
+        ]
+        monkeypatch.setattr(
+            "spectramr.data.sources.m4raw_source.discover_repetition_groups",
+            lambda *_a, **_k: groups,
+        )
+        assert M4RawSource(tmp_path).contrasts == ("T1", "T2")
+        groups[:] = [[Path("mystery01.h5"), Path("mystery02.h5")]]
+        with pytest.raises(ValueError, match="not an M4Raw"):
+            _ = M4RawSource(tmp_path).contrasts

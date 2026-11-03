@@ -13,7 +13,7 @@ on per-sample tensors would dominate.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -66,6 +66,9 @@ class DegradationSample:
     severity: dict[str, float]  # parameter name -> value (Sobol coordinate)
     content_id: str  # subject / slice identifier — used as covariate C
     seed: int
+    # The person scanned; slices and contrasts of one subject are not independent
+    # replicates. ``None`` means unknown, and consumers fall back to ``content_id``.
+    subject_id: str | None = field(default=None, kw_only=True)
     # Real acquisition assets for this content (coil maps, acquired k-space,
     # reconstructor, noise cov, acq params). Populated by the asset-preparation
     # stage when the input carries them (multi-coil k-space); ``None`` for a
@@ -89,8 +92,8 @@ class DegradationSample:
 
         PROVENANCE / diagnostic ONLY: it is a monotone function of the L2-family
         metrics (mse / psnr / nrmse / nmse), so ranking those against it would be
-        circular. See ``scripts/sim2rank/severity_calibration.YARDSTICKS``, which
-        declares exactly that disqualification. Mirrors that module's ``_rel_l2``.
+        circular. See ``meta_evaluation.damage.YARDSTICKS``, which
+        declares exactly that disqualification. Mirrors its ``rel_l2``.
         """
         den = torch.linalg.vector_norm(self.clean).clamp_min(1e-12)
         return float((torch.linalg.vector_norm(self.residual) / den).item())
@@ -154,28 +157,35 @@ class RankingResult:
     ranks: list[str]
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
-    def standardize(self) -> dict[str, float]:
-        """Return z-scored per-metric scores.
+    def standardize(self, universe: Iterable[str] = ()) -> dict[str, float]:
+        """Return z-scored per-metric scores, covering ``scores`` and ``universe``.
 
         Used by the aggregator. The sign of the score is preserved — ranker
         implementations are responsible for ensuring "higher score = better
-        metric" before this point.
+        metric" before this point. The mean and std come from the finite scores
+        only, so one crash cannot poison every z. Under the crash→NaN contract a
+        metric that is NaN, ``-inf`` or absent from ``scores`` (but named in
+        ``universe``) did not score on this axis and is placed one unit **below**
+        the worst finite z; ``+inf`` (a legitimate best case, e.g. SCVR) one unit
+        above the best. Omitting a crash instead let a metric average over only the
+        axes where it worked, and so rise (the same contract as
+        :func:`ranking_guards.order_from_scores`).
         """
-        # crash→NaN contract: a metric that crashed on its cohort is recorded as
-        # NaN. Standardize over the FINITE scores only and omit the non-finite ones
-        # — otherwise a single NaN turns mean/std NaN (and ``std < 1e-12`` is False
-        # for NaN), poisoning every metric's z-score. An omitted metric is treated
-        # as "absent on this axis" downstream (aggregation skips missing keys;
-        # calibration masks via ``~np.isnan``), which is the correct neutral.
         finite = {k: v for k, v in self.scores.items() if math.isfinite(v)}
-        if not finite:
-            return {}
-        values = torch.tensor(list(finite.values()), dtype=torch.float64)
-        mean = float(values.mean().item())
-        std = float(values.std(unbiased=False).item())
-        if std < 1e-12:
-            return dict.fromkeys(finite, 0.0)
-        return {k: (v - mean) / std for k, v in finite.items()}
+        z: dict[str, float] = {}
+        if finite:
+            values = torch.tensor(list(finite.values()), dtype=torch.float64)
+            mean = float(values.mean().item())
+            std = float(values.std(unbiased=False).item())
+            if std < 1e-12:
+                z = dict.fromkeys(finite, 0.0)
+            else:
+                z = {k: (v - mean) / std for k, v in finite.items()}
+        worst = min(z.values(), default=0.0) - 1.0
+        best = max(z.values(), default=0.0) + 1.0
+        for k in (set(self.scores) | set(universe)) - set(finite):
+            z[k] = best if self.scores.get(k) == math.inf else worst
+        return z
 
 
 @dataclass
@@ -223,6 +233,8 @@ class AggregateRankingResult:
     # Stamped so a bundle is self-describing and downstream consumers
     # (to_summary / comparison) never compare flags across incompatible semantics.
     defensibility_semantics: str = "breadth"
+    # 1-indexed mid-ranks aligned with ``final_ranks``: equal scores share a rank.
+    final_mid_ranks: dict[str, float] = field(default_factory=dict)
 
 
 def asdict_safe(obj: Any) -> Any:

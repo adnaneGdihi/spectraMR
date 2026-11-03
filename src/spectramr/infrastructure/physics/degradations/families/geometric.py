@@ -34,7 +34,16 @@ ENTRIES = (
         fn=degrade_geometric_warp,
         description="Low-frequency geometric warp",
         severity=SeveritySpec(
-            (_P("peak_displacement", "px", 0.0, 16.0),),
+            (
+                _P(
+                    "peak_displacement",
+                    "px",
+                    0.0,
+                    16.0,
+                    endpoint_kwargs=(None, "max_amplitude_px"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="smooth 5-mode elastic deformation, normalised so the peak displacement "
             "magnitude is exactly the declared value for every seed and grid size. Volume "
             "modes draw a 3-D (dz, dy, dx) field isotropic in mm whose peak |d| is the declared "
@@ -51,7 +60,11 @@ ENTRIES = (
         fn=_delegate_gradient_nl,
         description="Gradient non-linearity (delegated)",
         severity=SeveritySpec(
-            (_P("severity", "polynomial coeff scale", 0.0, 7e-5),),
+            (_P(
+                "severity", "polynomial coeff scale", 0.0, 7e-5,
+                endpoint_kwargs=(None, "max_severity"),
+                valid_min=0.0,
+            ),),
             notes="order >= 2 polynomial displacement only (no translation or gradient "
             "scaling), the same fraction of the FOV at every grid size. Peak |d| over the whole "
             "2-D FOV at theta=1: 2.3-7.0% of FOV, median 4.4% over 20 seeds (128 x 128; "

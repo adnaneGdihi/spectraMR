@@ -115,11 +115,12 @@ class StandardOptimizerStepper:
         if self.max_grad_norm is None:
             return
 
-        parameters = model.parameters()
         if self.gradient_clip_method == "value":
-            torch.nn.utils.clip_grad_value_(parameters, self.max_grad_norm)
+            torch.nn.utils.clip_grad_value_(model.parameters(), self.max_grad_norm)
         else:
-            torch.nn.utils.clip_grad_norm_(parameters, self.max_grad_norm)
+            from spectramr.infrastructure.distributed.grad_norm import clip_grad_norm_global_
+
+            clip_grad_norm_global_(model, self.max_grad_norm)
 
     def _maybe_warn_disabled_clipping(
         self,

@@ -9,7 +9,8 @@
 * :class:`CRLBMRFPulseDesignStrategy`
   (``crlb_mrf_pulse_design``) — bilevel optimisation that designs a
   Beltrami-parameterised MRF pulse sequence by minimising the
-  expected Cramér-Rao bound over a target parameter prior (MRF §4).
+  expected relative Cramér-Rao bound of an IR-FISP fingerprint over a T1/T2
+  prior, inside the declared SAR/slew proxies (MRF §4).
 * :class:`CrossScannerMRFHarmonisationStrategy`
   (``cross_scanner_mrf_harmonisation``) — learns a per-scanner
   square-root-velocity time reparameterisation τ_s to align
@@ -32,15 +33,29 @@ import torch
 import torch.nn.functional as F
 
 from spectramr.config.schemas.enums import Regime, Task
+from spectramr.core.module_utils import unwrap_model
 from spectramr.domain.services.mrf_dictless_matching import (
     MRFDictlessMatcher,
+)
+from spectramr.infrastructure.physics.acquisition.mrf_acquisition_manifold import (
+    AcquisitionBound,
+    project_pulse_to_bound,
+    sar_estimate,
+    slew_estimate,
+)
+from spectramr.infrastructure.physics.acquisition.mrf_crlb import (
+    expected_relative_crlb,
+    log_grid_prior,
+    sample_log_uniform_prior,
 )
 from spectramr.infrastructure.physics.manifolds.time_reparameterisation import (
     apply_time_reparam,
 )
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.training.strategies.rng_streams import rank_seeded_generator
 from spectramr.models.capabilities import StrategyCapabilities
+from spectramr.models.generators.mrf_pulse_design import MRFPulseDesign
 
 
 class ConformalMRFDictlessReconStrategy(BaseTrainingStrategy):
@@ -63,8 +78,8 @@ class ConformalMRFDictlessReconStrategy(BaseTrainingStrategy):
     #: Fingerprinting: dictionary-free fingerprint matching (MRFDictlessMatcher,
     #: a KD-tree over the learned 5-D Bloch-parameter embedding) IS the defining
     #: MRF operation. Its two siblings here are deliberately UNTAGGED --
-    #: CRLBMRFPulseDesign is a self-admitted toy Fisher surrogate whose
-    #: ACQUISITION_DESIGN task the fingerprinting profile does not support, and
+    #: CRLBMRFPulseDesign designs an acquisition, an ACQUISITION_DESIGN task the
+    #: fingerprinting profile does not support, and
     #: CrossScannerMRFHarmonisation has no Task member describing harmonisation.
     capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
         workflows=frozenset({Regime.FINGERPRINTING}),
@@ -179,71 +194,83 @@ class ConformalMRFDictlessReconStrategy(BaseTrainingStrategy):
 class CRLBMRFPulseDesignStrategy(BaseTrainingStrategy):
     """Beltrami-CRLB-optimal MRF pulse-sequence design (MRF §4).
 
-    Treats ``input_batch[B, T, 2]`` as the current (α, TR) pulse-sequence
-    representation and ``target_batch[B, 5]`` as the parameter prior
-    sample. Inner Fisher trace is approximated by the squared
-    sensitivity of a toy Bloch surrogate to first-order; full
-    integration with ``differentiable_bloch`` is left as an inference-time
-    step.
+    The generator (``mrf_pulse_design``) emits one ``[T, 2]`` (flip angle rad, TR ms) train,
+    broadcast over the batch. Each step projects it onto the declared ``mrf`` SAR and slew
+    proxies and minimises the expected relative CRLB (T1/T2 block, M0 a nuisance) of an
+    IR-FISP EPG fingerprint over a log-uniform T1/T2 prior drawn by the strategy
+    (:mod:`...physics.acquisition.mrf_crlb`).
+    The data batch only clocks the steps: the prior, not the image, is the design's input.
     """
 
-    #: ``validation_step`` writes the CRLB objective on the held-out prior
-    #: samples itself; the metrics registry cannot, since it needs the generator
-    #: and autograd through the Bloch surrogate.
+    # The CRLB is the whole objective; a declared image loss would be a decoy.
+    inline_losses: ClassVar[frozenset[str] | None] = frozenset()
+    folds_image_losses: ClassVar[bool | None] = False
+    checkpointed_streams: ClassVar[tuple[str, ...]] = ("_prior_rng",)
+    reports_train_metrics: ClassVar[bool] = False
+
+    #: ``validation_step`` writes these itself on a fixed prior grid; the metrics registry
+    #: cannot, since they need the generator's design and the Bloch model.
     capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
-        emitted_metrics=frozenset({"crlb_objective"}),
+        emitted_metrics=frozenset(
+            {"crlb_objective", "crlb_objective_initial", "pulse_sar_proxy", "pulse_slew_proxy"}
+        ),
     )
 
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)
         cfg = getattr(self.config.training, "crlb_mrf_pulse_design", None)
-        self.lambda_beltrami = float(getattr(cfg, "lambda_beltrami", 1e-3)) if cfg else 1e-3
+        self.lambda_beltrami = float(getattr(cfg, "lambda_beltrami", 1e-3))
+        self.t1_range_ms = tuple(getattr(cfg, "t1_range_ms", (100.0, 3000.0)))
+        self.t2_range_ms = tuple(getattr(cfg, "t2_range_ms", (20.0, 500.0)))
+        self.prior_samples = int(getattr(cfg, "prior_samples", 64))
+        self.te_ms = float(getattr(cfg, "te_ms", 2.0))
+        self.bound = self._resolve_bound(getattr(self.config, "mrf", None))
+        self._prior_rng = rank_seeded_generator(int(self.config.run.seed))
+        self._check_te_below_tr(unwrap_model(self.generator_model), self.te_ms)
 
     @staticmethod
-    def _toy_fisher_trace(pulse: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        """First-order Fisher-trace surrogate: ``Σ_n (∂_θ s_n)²`` for a
-        closed-form Bloch signal stand-in."""
-        alpha = pulse[..., 0]
-        TR = pulse[..., 1].clamp_min(1e-3)
-        T1, T2 = params[..., 0].clamp_min(1e-3), params[..., 1].clamp_min(1e-3)
-        signal = (
-            alpha.sin().unsqueeze(0)
-            * (1.0 - (-TR.unsqueeze(0) / T1.unsqueeze(-1)).exp())
-            * (-TR.unsqueeze(0) / T2.unsqueeze(-1)).exp()
+    def _check_te_below_tr(design: Any, te_ms: float) -> None:
+        """The EPG reads at TE inside every TR; checked once against the reachable TR floor."""
+        if not isinstance(design, MRFPulseDesign):
+            raise TypeError(
+                "crlb_mrf_pulse_design needs the mrf_pulse_design generator; got "
+                f"{type(design).__name__}"
+            )
+        if te_ms >= design.min_tr_ms:
+            raise ValueError(
+                f"crlb_mrf_pulse_design.te_ms={te_ms} must be below the shortest reachable TR "
+                f"({design.min_tr_ms:.3f} ms = tr_init_ms * (1 - k_max / 2))"
+            )
+
+    @staticmethod
+    def _resolve_bound(mrf_cfg: Any) -> AcquisitionBound:
+        sar = getattr(mrf_cfg, "sar_max_w_per_kg", None)
+        slew = getattr(mrf_cfg, "gradient_slew_rate_t_per_m_per_s", None)
+        if sar is None or slew is None:
+            raise ValueError(
+                "crlb_mrf_pulse_design needs mrf.sar_max_w_per_kg and "
+                "mrf.gradient_slew_rate_t_per_m_per_s: the design is projected onto them."
+            )
+        return AcquisitionBound(float(sar), float(slew))
+
+    def declared_metric_keys(self) -> frozenset[str]:
+        return frozenset(
+            {"crlb_objective", "pulse_beltrami_smoothness", "pulse_sar_proxy", "pulse_slew_proxy"}
         )
-        # create_graph=True keeps the second-order graph: signal depends on
-        # `pulse` (alpha=pulse[...,0], TR=pulse[...,1]), so ∂signal/∂θ still
-        # carries a path back to the generator output. With create_graph=False
-        # the Fisher trace (and thus -CRLB) was detached from `pulse`, so the
-        # generator learned ONLY the smoothness term (2026-05-31 audit).
-        d_T1 = torch.autograd.grad(
-            signal.sum(),
-            T1,
-            create_graph=True,
-            retain_graph=True,
-            allow_unused=True,
-        )[0]
-        d_T2 = torch.autograd.grad(
-            signal.sum(),
-            T2,
-            create_graph=True,
-            allow_unused=True,
-        )[0]
-        zero = T1.new_zeros(())
-        sq_T1 = d_T1.pow(2).sum() if d_T1 is not None else zero
-        sq_T2 = d_T2.pow(2).sum() if d_T2 is not None else zero
-        return sq_T1 + sq_T2
 
-    @classmethod
-    def _crlb_objective(cls, pulse: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
-        """``-Fisher`` (CRLB ≈ 1/Fisher, minimised) of ``pulse`` over the prior ``params``.
+    def _design(self, model_out: torch.Tensor) -> torch.Tensor:
+        """The single ``[T, 2]`` design from the generator's ``[B, T, 2]`` broadcast."""
+        if model_out.dim() != 3 or model_out.shape[-1] != 2:
+            raise ValueError(
+                "crlb_mrf_pulse_design needs a [B, T, 2] pulse-train generator "
+                f"(model_type mrf_pulse_design); got output {tuple(model_out.shape)}"
+            )
+        return model_out[0]
 
-        The one definition training and validation share. It differentiates the
-        signal with respect to ``params``, so callers under ``no_grad`` must
-        re-enable gradients around it.
-        """
-        params_req = params.detach().clone().requires_grad_(True)
-        return -cls._toy_fisher_trace(pulse, params_req)
+    def _crlb_objective(self, pulse: torch.Tensor, t1: torch.Tensor, t2: torch.Tensor) -> torch.Tensor:
+        """Expected relative CRLB of the bound-projected ``pulse``; shared by train and val."""
+        legal = project_pulse_to_bound(pulse, self.bound)
+        return expected_relative_crlb(legal, t1, t2, te_ms=self.te_ms)
 
     def validation_step(
         self,
@@ -251,20 +278,33 @@ class CRLBMRFPulseDesignStrategy(BaseTrainingStrategy):
         target_batch: torch.Tensor,
         **kwargs: Any,
     ) -> dict[str, float]:
-        """Registry metrics the arm requests, plus ``crlb_objective`` on the val batch."""
+        """Registry metrics the arm requests, plus the design's CRLB on a fixed prior grid."""
         metrics = super().validation_step(input_batch, target_batch, **kwargs)
-
         generator = self.generator_model
         was_training = generator.training
         generator.eval()
         try:
-            pulse = generator(input_batch.to(self.device, non_blocking=True)).detach()
-            # The caller validates under no_grad; the Fisher trace needs ∂s/∂θ.
-            with torch.enable_grad():
-                crlb = self._crlb_objective(pulse, target_batch.to(pulse.device))
+            pulse = self._design(generator(input_batch.to(self.device, non_blocking=True)))
+            t1, t2 = log_grid_prior(
+                self.prior_samples, self.t1_range_ms, self.t2_range_ms, device=pulse.device
+            )
+            crlb = self._crlb_objective(pulse, t1, t2)
+            values = {"crlb_objective": crlb}
+            design_module = unwrap_model(generator)
+            if not isinstance(design_module, MRFPulseDesign):
+                raise TypeError(
+                    "crlb_objective_initial needs the mrf_pulse_design generator; got "
+                    f"{type(design_module).__name__}"
+                )
+            values["crlb_objective_initial"] = self._crlb_objective(
+                design_module.initial_design(), t1, t2
+            )
+            values["pulse_sar_proxy"] = sar_estimate(pulse)
+            values["pulse_slew_proxy"] = slew_estimate(pulse)
         finally:
             generator.train(was_training)
-        metrics["crlb_objective"] = float(crlb.detach())
+        # Validation is outside the training loop; one host transfer per pass.
+        metrics.update({k: float(v) for k, v in values.items()})
         return metrics
 
     def _compute_losses_impl(
@@ -274,16 +314,22 @@ class CRLBMRFPulseDesignStrategy(BaseTrainingStrategy):
         epoch: int,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
-        del epoch
-        pulse = self.generator_model(input_batch)  # [B, T, 2]
-        crlb = self._crlb_objective(pulse, target_batch)
-        # Beltrami-style smoothness: penalise large per-step pulse change.
-        smooth = (pulse.diff(dim=1)).pow(2).mean()
+        del epoch, target_batch
+        pulse = self._design(self.generator_model(input_batch))
+        t1, t2 = sample_log_uniform_prior(
+            self.prior_samples, self.t1_range_ms, self.t2_range_ms, generator=self._prior_rng
+        )
+        t1 = t1.to(pulse.device, non_blocking=True)
+        t2 = t2.to(pulse.device, non_blocking=True)
+        crlb = self._crlb_objective(pulse, t1, t2)
+        smooth = pulse.diff(dim=0).pow(2).mean()
         total = crlb + self.lambda_beltrami * smooth
         return {
             "g_total_loss": total,
             "crlb_objective": crlb.detach(),
             "pulse_beltrami_smoothness": smooth.detach(),
+            "pulse_sar_proxy": sar_estimate(pulse).detach(),
+            "pulse_slew_proxy": slew_estimate(pulse).detach(),
         }
 
 
@@ -308,6 +354,8 @@ class CrossScannerMRFHarmonisationStrategy(BaseTrainingStrategy):
         # reaches the model), so it is deliberately not read here; wiring it
         # would require a model-construction change (2026-05-31 audit).
         self.lambda_anchor = float(getattr(cfg, "lambda_anchor", 1e-3)) if cfg else 1e-3
+        expose = getattr(getattr(self.config, "data", None), "expose", None)
+        self.requires_scanner_id = bool(getattr(expose, "scanner_id", False))
 
     def _compute_losses_impl(
         self,
@@ -321,11 +369,17 @@ class CrossScannerMRFHarmonisationStrategy(BaseTrainingStrategy):
         b = input_batch.shape[0]
         # Per-scanner conditioning: pass scanner_id (when the batch provides it)
         # so the model indexes its per-scanner τ table instead of a single
-        # global vector (audit 2026-06). Absent → scanner 0 broadcast (legacy).
+        # global vector. Absent is allowed only when the arm does not declare
+        # data.expose.scanner_id; otherwise every vendor would share scanner 0's τ.
         resolved = self._resolve_legacy_batch(input_batch, kwargs)
         scanner_id = resolved.get("scanner_id") if isinstance(resolved, dict) else None
         if scanner_id is None:
             scanner_id = kwargs.get("scanner_id")
+        if scanner_id is None and self.requires_scanner_id:
+            raise ValueError(
+                "cross_scanner_mrf_harmonisation: data.expose.scanner_id is declared but the "
+                "batch carries no scanner_id, so every scanner would share one τ."
+            )
         tau = self.generator_model(batch_size=b, scanner_id=scanner_id)
         # Warp the canonical fingerprint by τ; ``input_batch`` is the observed.
         warped = apply_time_reparam(target_batch, tau)

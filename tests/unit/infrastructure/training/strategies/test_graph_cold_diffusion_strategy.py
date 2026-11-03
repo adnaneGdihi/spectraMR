@@ -435,6 +435,54 @@ class TestTheSupportReachesAGeometryModel:
         )
         assert "mask" not in kwargs
 
+    def test_a_model_naming_t_receives_the_timestep_as_t(self) -> None:
+        """#2086: `timesteps=` into `**kwargs` was dropped and `t` ran at None."""
+        import types
+
+        class _NamedT(torch.nn.Module):
+            def forward(self, x, t=None, **kwargs):
+                return x
+
+        st = object.__new__(S)
+        st.env = types.SimpleNamespace(generator=_NamedT())
+        t = torch.full((1,), 3)
+        kwargs = st._build_forward_kwargs(
+            torch.zeros(1, 2, 4, 4), t, None, mask=torch.ones(1, 1, 4, 4)
+        )
+        assert kwargs.get("t") is t and "timesteps" not in kwargs
+
+    def test_the_called_outer_forward_decides_over_an_inner_model(self) -> None:
+        """An outer `forward(x, timesteps)` wrapping an inner `forward(x, t)` gets `timesteps=`."""
+        import types
+
+        class _Inner(torch.nn.Module):
+            def forward(self, x, t=None):
+                return x
+
+        class _Outer(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.model = _Inner()
+
+            def forward(self, x, timesteps=None, **kwargs):
+                return self.model(x, t=timesteps)
+
+        class _Delegator(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.model = _Inner()
+
+            def forward(self, x, **kwargs):
+                return self.model(x, **kwargs)
+
+        t = torch.full((1,), 3)
+        args = (torch.zeros(1, 2, 4, 4), t, None)
+        st = object.__new__(S)
+        st.env = types.SimpleNamespace(generator=_Outer())
+        assert set(st._build_forward_kwargs(*args, mask=torch.ones(1, 1, 4, 4))) == {"timesteps"}
+        st.env = types.SimpleNamespace(generator=_Delegator())
+        assert set(st._build_forward_kwargs(*args, mask=torch.ones(1, 1, 4, 4))) == {"t"}
+
 
 class TestRicianForwardProcess:
     """``training.diffusion.degradation: rician`` builds x_t from noise, not a mask."""

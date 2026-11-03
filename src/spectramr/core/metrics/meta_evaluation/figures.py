@@ -31,10 +31,12 @@ from __future__ import annotations
 import logging
 import math
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
 from . import _report_style as rs
+from .axis_limits import padded_limits
 from .normalization import direction_aware_minmax
 from .pipeline import MetaEvaluationOutput
 
@@ -58,7 +60,7 @@ class FigureRenderError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def _find_method(output: MetaEvaluationOutput, name: str):
+def _find_method(output: MetaEvaluationOutput, name: str) -> Any:
     for r in output.per_method:
         if r.method == name:
             return r
@@ -170,7 +172,7 @@ def lgdr_eigenscale_curve(output: MetaEvaluationOutput, out_dir: Path) -> Path |
         ax.plot(times, _y_for(name), color=_DIM_GREY, alpha=0.30, linewidth=0.8, marker=None)
 
     # 2. Extremes — bold + markered.
-    legend_handles: list = []
+    legend_handles: list[Any] = []
     for i in top:
         (h,) = ax.plot(
             times,
@@ -570,6 +572,25 @@ def _per_family_trajectory(
     return severities, out
 
 
+def _physical_x(
+    output: MetaEvaluationOutput, severities: list[float]
+) -> tuple[list[float], str, bool] | None:
+    """``(x values, label, log)`` when the run is one family whose samples carry ``physical``.
+
+    Families have different physical units, so several of them share a θ axis instead.
+    """
+    samples = output.dataset.samples
+    families = {s.degradation_family for s in samples}
+    if len(families) != 1 or not all("physical" in s.severity for s in samples):
+        return None
+    by_theta = {float(s.severity.get("theta", 0.0)): float(s.severity["physical"]) for s in samples}
+    (family,) = families
+    meta = (getattr(output, "degradation_provenance", None) or {}).get("severity_axes") or {}
+    rec = meta.get(family) or {}
+    xs = [by_theta[t] for t in severities]
+    return xs, str(rec.get("units") or "physical value"), rec.get("schedule") == "log" and min(xs) > 0
+
+
 def metric_trajectories(output: MetaEvaluationOutput, out_dir: Path) -> Path | None:
     """Per-metric trajectories across severity, one line per family.
 
@@ -578,6 +599,10 @@ def metric_trajectories(output: MetaEvaluationOutput, out_dir: Path) -> Path | N
     small severity-curve thumbnails so a reader can scan every metric at a
     glance instead of opening dozens of files. The full-size panels stay in
     ``trajectories/`` for slides / LaTeX.
+
+    Each metric has one fixed y-range over all its families, shared by its panel and its
+    thumbnail. A single-family run whose samples carry ``physical`` plots that on x (log for
+    a log schedule). There is no response floor here: this path has no seed repeats.
     """
     dataset = output.dataset
     if dataset.n_samples == 0 or not dataset.metric_values:
@@ -593,12 +618,21 @@ def metric_trajectories(output: MetaEvaluationOutput, out_dir: Path) -> Path | N
     # Cache each metric's trajectory so the contact sheet doesn't recompute.
     traj_cache: dict[str, tuple[list[float], dict[str, list[float]]]] = {}
     for name in metric_names:
-        severities, traj = _per_family_trajectory(output, name)
-        traj_cache[name] = (severities, traj)
+        traj_cache[name] = _per_family_trajectory(output, name)
+    thetas = traj_cache[metric_names[0]][0]
+    phys = _physical_x(output, thetas)
+    x_label, x_log = ("severity θ", False) if phys is None else (phys[1], phys[2])
+    xs = thetas if phys is None else phys[0]
+    ylims = {
+        name: padded_limits([v for ys in traj.values() for v in ys])
+        for name, (_, traj) in traj_cache.items()
+    }
+    for name in metric_names:
+        _, traj = traj_cache[name]
         fig, ax = rs.figure(figsize=(6.0, 4.0))
         for fam, ys in traj.items():
             ax.plot(
-                severities,
+                xs,
                 ys,
                 marker="o",
                 markersize=4,
@@ -606,8 +640,12 @@ def metric_trajectories(output: MetaEvaluationOutput, out_dir: Path) -> Path | N
                 color=family_color[fam],
                 label=fam,
             )
+        if x_log:
+            ax.set_xscale("log")
+        if ylims[name] is not None:
+            ax.set_ylim(*ylims[name])
         ax.set_title(f"{rs.human_label(name)} — trajectory across severity")
-        ax.set_xlabel("severity θ")
+        ax.set_xlabel(x_label)
         ax.set_ylabel("metric value")
         ax.grid(alpha=0.3)
         ax.legend(
@@ -622,19 +660,24 @@ def metric_trajectories(output: MetaEvaluationOutput, out_dir: Path) -> Path | N
 
     return _trajectory_contact_sheet(
         metric_names,
-        traj_cache,
+        {n: (xs, traj_cache[n][1]) for n in metric_names},
         family_color,
         traj_dir,
         out_dir / "fig9_metric_trajectories_index.png",
+        ylims=ylims,
+        x_log=x_log,
     )
 
 
 def _trajectory_contact_sheet(
     metric_names: list[str],
     traj_cache: dict[str, tuple[list[float], dict[str, list[float]]]],
-    family_color: dict,
+    family_color: dict[str, Any],
     traj_dir: Path,
     index_path: Path,
+    *,
+    ylims: dict[str, tuple[float, float] | None],
+    x_log: bool,
 ) -> Path:
     """Grid of small per-metric trajectory thumbnails for fast scanning."""
     k = len(metric_names)
@@ -646,6 +689,10 @@ def _trajectory_contact_sheet(
         severities, traj = traj_cache[name]
         for fam, ys in traj.items():
             ax.plot(severities, ys, linewidth=1.2, color=family_color[fam])
+        if x_log:
+            ax.set_xscale("log")
+        if ylims[name] is not None:
+            ax.set_ylim(*ylims[name])
         ax.set_title(rs.human_label(name), fontsize=8)
         ax.tick_params(labelsize=6)
         ax.grid(alpha=0.25)
@@ -769,25 +816,25 @@ def metric_correlation_clustering(output: MetaEvaluationOutput, out_dir: Path) -
         return None
     distance = 1.0 - np.abs(corr)
     order = _single_linkage_order(distance)
-    reord = corr[np.ix_(order, order)]
-    reord_names = [rs.human_label(names[i]) for i in order]
+    ordered = corr[np.ix_(order, order)]
+    ordered_names = [rs.human_label(names[i]) for i in order]
 
     fig, ax = rs.figure(figsize=(max(4, 0.45 * len(names) + 2), max(4, 0.45 * len(names) + 2)))
-    im = ax.imshow(reord, cmap=rs.DIVERGING_CMAP, vmin=-1, vmax=1, aspect="auto")
-    ax.set_xticks(range(len(reord_names)))
-    ax.set_xticklabels(reord_names, rotation=45, ha="right", fontsize=9)
-    ax.set_yticks(range(len(reord_names)))
-    ax.set_yticklabels(reord_names, fontsize=9)
-    for i in range(len(reord_names)):
-        for j in range(len(reord_names)):
+    im = ax.imshow(ordered, cmap=rs.DIVERGING_CMAP, vmin=-1, vmax=1, aspect="auto")
+    ax.set_xticks(range(len(ordered_names)))
+    ax.set_xticklabels(ordered_names, rotation=45, ha="right", fontsize=9)
+    ax.set_yticks(range(len(ordered_names)))
+    ax.set_yticklabels(ordered_names, fontsize=9)
+    for i in range(len(ordered_names)):
+        for j in range(len(ordered_names)):
             ax.text(
                 j,
                 i,
-                f"{reord[i, j]:+.2f}",
+                f"{ordered[i, j]:+.2f}",
                 ha="center",
                 va="center",
                 fontsize=7,
-                color="white" if abs(reord[i, j]) > 0.6 else "black",
+                color="white" if abs(ordered[i, j]) > 0.6 else "black",
             )
     fig.colorbar(im, ax=ax, label="Pearson r")
     ax.set_title(
@@ -856,7 +903,7 @@ def sensitivity_scatter(output: MetaEvaluationOutput, out_dir: Path) -> Path | N
 # ---------------------------------------------------------------------------
 
 
-def _as_2d(t):
+def _as_2d(t: Any) -> np.ndarray:
     """Best-effort projection of a sample tensor to a 2-D magnitude image."""
     import torch as _torch
 
@@ -914,6 +961,8 @@ def degradation_mosaic(output: MetaEvaluationOutput, out_dir: Path) -> Path | No
     # makes the θ progression incomparable (each gets its own contrast), and
     # autoscaling to .max() on p99-normalised data lets the sparse bright tail
     # crush the brain to black. Percentile clipping fixes both.
+    vmin: float | None
+    vmax: float | None
     if clean_np is not None:
         vmin = float(np.percentile(clean_np, 1.0))
         vmax = float(np.percentile(clean_np, 99.5))

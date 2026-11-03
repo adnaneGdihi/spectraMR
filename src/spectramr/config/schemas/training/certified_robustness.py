@@ -1,6 +1,8 @@
 """Config schema for the certified-robust reconstruction strategy (A-8.3 CertRob).
 
-Read by ``CertifiedRobustnessStrategy`` via ``config.training.certified_robustness``.
+Read via ``config.training.certified_robustness``: the adversarial and smoothing knobs by
+``AdversarialRobustnessStrategy`` (and so by its subclass), the Lipschitz knobs by
+``CertifiedRobustnessStrategy`` only; the parent raises on a Lipschitz knob it would not read.
 The headline one-knob ablation is ``lambda_lipschitz`` (``0`` = the adversarial-
 training-only control; ``>0`` = also penalise the global Lipschitz bound). The
 adversarial knobs are wired here too so the strategy reads every knob from config
@@ -55,4 +57,12 @@ class CertifiedRobustnessConfig(StrictSchema):
     clean_weight: float = Field(default=0.1, ge=0.0, description="Weight of the clean loss term.")
     adv_weight: float = Field(
         default=0.9, ge=0.0, description="Weight of the adversarial loss term."
+    )
+
+    # --- attack-time validation certificate --------------------------------
+    sigma_smooth: float = Field(
+        default=0.25, gt=0.0, description="Randomized-smoothing noise std for certified_radius."
+    )
+    n_smooth_samples: int = Field(
+        default=32, ge=1, description="Monte-Carlo draws per input for certified_radius."
     )

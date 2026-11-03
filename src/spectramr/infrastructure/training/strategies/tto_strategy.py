@@ -48,6 +48,9 @@ class ConcreteTTOStrategy(BaseTrainingStrategy):
         motion_traj: Learnable motion trajectory (the ONLY optimized parameters).
     """
 
+    # #183: the training step never scores train_* metrics; declare none.
+    reports_train_metrics = False
+
     # parallel_compat: Owns the motion trajectory and freezes the wrapped generator.
     parallel_compat = frozenset()
 
@@ -285,12 +288,15 @@ class ConcreteTTOStrategy(BaseTrainingStrategy):
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """TTO validation: report motion parameters and DC-based metrics.
 
         Args:
             val_batch: Validation batch.
+            batch_data: The loader's batch, forwarded so the snapshot can read
+                its normalization markers.
             batch_idx: Batch index.
 
         Returns:
@@ -329,6 +335,7 @@ class ConcreteTTOStrategy(BaseTrainingStrategy):
                     input_batch=input_data,
                     target_batch=input_data,
                     step=batch_idx,
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(input_data, input_data, epoch=0)

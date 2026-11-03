@@ -30,8 +30,10 @@ runs:
       # `pip install torchvision` takes the default-index wheel, which is linked
       # against a different libtorch and dies at import with
       # `RuntimeError: operator torchvision::nms does not exist`.
+      env:
+        INPUT_TORCHVISION: ${{ inputs.torchvision }}
       run: |
-        if [ "${{ inputs.torchvision }}" = "true" ]; then
+        if [ "$INPUT_TORCHVISION" = "true" ]; then
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         else
           pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -39,7 +41,9 @@ runs:
 
     - name: Install spectramr
       shell: bash
-      run: pip install -e ".[${{ inputs.extras }}]"
+      env:
+        INPUT_EXTRAS: ${{ inputs.extras }}
+      run: pip install -e ".[${INPUT_EXTRAS}]"
 
     - name: Install the prior-method baselines plugin
       shell: bash

@@ -89,9 +89,11 @@ class VendorPromptEmbedding(nn.Module):
                 f"vendor_id batch ({vendor_id.shape[0]}) does not match "
                 f"acquisition_embedding batch ({acquisition_embedding.shape[0]})"
             )
-        if int(vendor_id.max().item()) >= self.n_vendors:
+        # On CUDA nn.Embedding's own device assert catches this; a host read here would
+        # sync every training step.
+        if not vendor_id.is_cuda and int(vendor_id.max()) >= self.n_vendors:
             raise IndexError(
-                f"vendor_id contains index {int(vendor_id.max().item())} >= "
+                f"vendor_id contains index {int(vendor_id.max())} >= "
                 f"n_vendors={self.n_vendors}. Check ``data.multi_contrast.vendor_map``."
             )
         offset = self.vendor_lookup(vendor_id)

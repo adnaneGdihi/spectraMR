@@ -224,6 +224,7 @@ class TttAdaptationStrategy(BaseTrainingStrategy):
                 input_batch=input_batch,
                 target_batch=target_batch,
                 step=int(kwargs.get("iteration", 0) or 0),
+                batch=batch,
             ):
                 final_losses = self._compute_losses_impl(
                     input_batch,

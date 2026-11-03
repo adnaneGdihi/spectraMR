@@ -71,6 +71,7 @@ def slice_crosstalk(
     geometry: AcquisitionGeometry,
     tr_ms: float = DEFAULT_TR_MS,
     t1_ms: float = DEFAULT_T1_MS,
+    max_sigma_per_thickness: float = SIGMA_PER_THICKNESS,
 ) -> Tensor:
     """Scale each slice by the saturation its adjacent slices left in it."""
     check_volume(x, geometry, "slice_crosstalk")
@@ -82,7 +83,7 @@ def slice_crosstalk(
     if float(theta) <= 0.0:
         return x
     thk = thickness_over_pitch(geometry, "slice_crosstalk")
-    s = neighbour_saturation(thk, float(theta) * SIGMA_PER_THICKNESS * thk)
+    s = neighbour_saturation(thk, float(theta) * max_sigma_per_thickness * thk)
     d, h = x.shape[-3], x.shape[-2]
     dt = hop_intervals(geometry, d, h, tr_ms / 1000.0, (-1, 1))
     remaining = torch.exp(-dt / (t1_ms / 1000.0))

@@ -392,13 +392,9 @@ def test_load_clean_volumes_from_h5_populates_real_assets(monkeypatch, tmp_path)
     x_gt_mag = torch.ones(1, 1, h, w)
     p99 = torch.tensor(1.0)
 
+    (tmp_path / "2022091411_T201.h5").write_bytes(b"")
     monkeypatch.setattr(
-        "spectramr.data.datasets.m4raw_repetition_groups.discover_repetition_groups",
-        lambda *a, **k: [[_Path("2022091411_T201.h5")]],
-        raising=True,
-    )
-    monkeypatch.setattr(
-        "spectramr.infrastructure.physics.m4raw_pseudo_gt.synthesize_pseudo_gt",
+        "spectramr.data.datasets.pseudo_gt_reference.synthesize_pseudo_gt",
         lambda *a, **k: (coil_images, smaps, x_gt_mag, p99),
         raising=True,
     )
@@ -978,3 +974,27 @@ def test_infer_test_split_refuses_a_checkpoint_outside_a_run(tmp_path):
     )
     with pytest.raises(SystemExit, match="checkpoints/"):
         args.func(args)
+
+
+@pytest.mark.parametrize(
+    ("argv", "flag"),
+    [
+        (["--compare", "--no-qc"], "--qc"),
+        (["--compare", "--task", "gan"], "--task"),
+        (["--contrast-pairs", "vs_baseline", "--labels", "a,b"], "--labels"),
+        (["--contrast-pairs", "vs_baseline", "-c", "a.yaml"], "--config"),
+    ],
+)
+def test_report_cross_run_modes_refuse_flags_they_do_not_read(tmp_path, capsys, argv, flag):
+    args = build_parser().parse_args(["report", "-e", str(tmp_path), *argv])
+    assert args.func(args) == 2
+    assert flag in capsys.readouterr().out
+
+
+def test_report_dashboard_builds_the_site_and_refuses_render_flags(tmp_path, capsys):
+    args = build_parser().parse_args(["report", "-e", str(tmp_path), "--dashboard", "--compare"])
+    assert args.func(args) == 2
+    assert "--compare" in capsys.readouterr().out
+    args = build_parser().parse_args(["report", "-e", str(tmp_path), "--dashboard"])
+    assert args.func(args) == 0
+    assert (tmp_path / "index.html").exists()

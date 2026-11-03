@@ -9,9 +9,12 @@ from spectramr.data.transforms.layout import (
     check_pe_axis,
     tio_to_canonical,
 )
+from spectramr.data.transforms.sle_trajectory import build_sle_budget_mask
 from spectramr.infrastructure.physics.degradations.geometry import AcquisitionMode
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.infrastructure.physics.line_axis import line_axis_for
+from spectramr.infrastructure.physics.sampling import MaskGenerator
+from spectramr.infrastructure.physics.sampling_registry import SamplingPatternRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,9 @@ MEASURED_KSPACE_KEY = "measured_kspace"
 #: the transform never builds a mask when the loader runs workers.
 REALISED_ACCELERATION_KEY = "realised_acceleration"
 
+#: SLE parameter of ``undersampling.sampling_pattern: sle_kappa`` (Hausdorff dimension 1.25).
+SLE_KAPPA = 2.0
+
 
 def loader_masks_lines(acceleration: float) -> bool:
     """Whether the loader undersamples with :class:`PhysicsInformedMasking`.
@@ -35,6 +41,38 @@ def loader_masks_lines(acceleration: float) -> bool:
     ``mask_direction``. The audit asks the same question (#1082).
     """
     return acceleration != 1
+
+
+#: ``undersampling.sampling_pattern`` names this loader mask can draw its outer
+#: lines from (canonical, after :class:`SamplingPatternRegistry` aliasing). Unset
+#: keeps the uniform-random draw every existing arm was trained on.
+LOADER_SAMPLING_PATTERNS: tuple[str, ...] = ("random_cartesian", "variable_density_1d", "sle_kappa")
+
+#: What each loader pattern draws, as the snapshot provenance states it.
+_PATTERN_RECORD: dict[str, str] = {
+    "random_cartesian": "uniform_random_outer_lines",
+    "variable_density_1d": "variable_density_1d_outer_lines",
+    "sle_kappa": "acs_lines_plus_mirrored_multishot_sle_kappa_points",
+}
+
+
+def _resolve_loader_pattern(name: str | None) -> str:
+    """Canonical loader pattern for ``undersampling.sampling_pattern``; raises on the rest."""
+    if name is None:
+        return "random_cartesian"
+    # sle_kappa is a MaskType, not an accelerator, so the alias registry does not know it.
+    key = str(name).strip().lower()
+    pattern = key if key in LOADER_SAMPLING_PATTERNS else SamplingPatternRegistry.resolve(key)
+    if pattern not in LOADER_SAMPLING_PATTERNS:
+        raise ValueError(
+            f"undersampling.sampling_pattern={name!r} resolves to {pattern!r}, which the "
+            f"loader Cartesian mask cannot draw. Accepted: {', '.join(LOADER_SAMPLING_PATTERNS)} "
+            "(or their aliases)."
+        )
+    return pattern
+
+#: Decay exponent of the 1-D variable-density line PDF, ``(1 - |k|/k_max)^p``.
+VD_DENSITY_POWER = 2.0
 
 
 class PhysicsInformedMasking(tio.transforms.Transform):
@@ -91,6 +129,7 @@ class PhysicsInformedMasking(tio.transforms.Transform):
         validate_shapes=True,
         mask_direction: str | None = None,
         phase_encode_axis: int | None = None,
+        sampling_pattern: str | None = None,
         **kwargs,
     ):
         """Cartesian line undersampling at ``acceleration`` with an ACS of ``center_fraction``.
@@ -102,16 +141,31 @@ class PhysicsInformedMasking(tio.transforms.Transform):
         first spatial axis of the ``(C, W, H, D)`` subject tensor (dim -2 of
         the training batch plane), ``x`` the second (dim -1). Unset keeps the
         first spatial axis.
+
+        ``sampling_pattern`` (``undersampling.sampling_pattern``) selects the outer
+        samples: unset or ``random_cartesian`` draws uniform random lines,
+        ``variable_density_1d`` (alias ``cartesian_vd``) draws lines from a
+        centre-weighted PDF, and ``sle_kappa`` spends the same sample count on
+        multi-shot SLE curves. The ACS band and budget are the same for all three.
+        Any other pattern raises.
         """
         super().__init__(**kwargs)
         self.acceleration = acceleration
         self.center_fraction = center_fraction
         self.mask_direction = mask_direction
         self.phase_encode_axis = phase_encode_axis
+        self.sampling_pattern = sampling_pattern
+        self._pattern = _resolve_loader_pattern(sampling_pattern)
         # TorchIO's reproducibility contract, and what the snapshot provenance
         # reads as the applied parameters. The names are the constructor's own
         # because history replay passes them back as keyword arguments.
-        self.args_names = ["acceleration", "center_fraction", "mask_direction", "phase_encode_axis"]
+        self.args_names = [
+            "acceleration",
+            "center_fraction",
+            "mask_direction",
+            "phase_encode_axis",
+            "sampling_pattern",
+        ]
         self.validate_shapes = validate_shapes
         self.line_axis = (
             "y" if mask_direction is None else line_axis_for(mask_direction, phase_encode_axis)
@@ -125,26 +179,37 @@ class PhysicsInformedMasking(tio.transforms.Transform):
         # Generator built lazily / non-stored key).
         self._mask_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._realised_cache: dict[tuple[int, int], float] = {}
+        self._sle_shots: dict[tuple[int, int], int] = {}
 
     def applied_record(self) -> dict[str, str]:
         """What the mask does beyond the arguments, read by the snapshot provenance.
 
         ``undersampling.acceleration_type`` and ``undersampling_pattern`` are not
-        read on this path, so the applied pattern is stated here instead (#2508).
+        read on this path, so the applied pattern is stated here instead (#2508);
+        ``undersampling.sampling_pattern`` is.
         """
         if self.phase_encode_axis is None:
             lines_along = "undeclared (data.acquisition.phase_encode_axis is not set)"
         else:
             phase = line_axis_for("phase", self.phase_encode_axis)
             lines_along = "phase_encode" if self.line_axis == phase else "readout"
-        return {
-            "pattern": "uniform_random_outer_lines",
+        record = {
+            "pattern": _PATTERN_RECORD[self._pattern],
             "acceleration_applies_to": "non_acs_lines",
             "mask_seed": "1234 + n_lines",
             "line_axis": self.line_axis,
             "line_axis_plane_dim": "-2" if self.line_axis == "y" else "-1",
             "lines_along": lines_along,
         }
+        if self._pattern == "variable_density_1d":
+            record["density_power"] = str(VD_DENSITY_POWER)
+        if self._pattern == "sle_kappa":
+            record["acceleration_applies_to"] = "non_acs_samples (same count as the line mask)"
+            record["sle_kappa"] = str(SLE_KAPPA)
+            record["sle_shots"] = ", ".join(
+                f"{w}x{h}: {n}" for (w, h), n in sorted(self._sle_shots.items())
+            ) or "not built yet"
+        return record
 
     def realised_acceleration(self, width: int, height: int) -> float:
         """``N / sampled lines`` of the mask this transform builds for the shape."""
@@ -364,38 +429,73 @@ class PhysicsInformedMasking(tio.transforms.Transform):
         end = min(n_lines, center + cf_width // 2)
         mask[start:end] = 1
 
-        # Random sampling outside center — deterministic via a scoped generator
-        # seeded per line count (reproducible across items/runs, no global RNG).
-        outer_indices = torch.where(mask == 0)[0]
-        if len(outer_indices) > 0 and self.acceleration > 0:
-            num_samples = int(len(outer_indices) / self.acceleration)
-            gen = torch.Generator(device="cpu").manual_seed(1234 + int(n_lines))
-            perm = torch.randperm(len(outer_indices), generator=gen)[:num_samples]
-            mask[outer_indices[perm]] = 1
-
-        # Expand the line to (W, H), constant along the other axis. ``contiguous``
-        # so the cached tensor is not an expand-view aliasing ``mask``.
-        if self.line_axis == "y":
-            mask_2d = mask.unsqueeze(1).expand(width, height).contiguous()
-        else:
-            mask_2d = mask.unsqueeze(0).expand(width, height).contiguous()
+        mask_2d = _OUTER_PATTERNS[self._pattern](self, mask, width, height)
         self._mask_cache[(width, height)] = mask_2d
 
         # Counted off the mask actually built, not predicted from R and cf: the
         # ACS width and the outer count are both truncated, so a closed form drifts.
-        sampled = int(mask.sum())
-        realised = n_lines / max(sampled, 1)
+        sampled = float(mask_2d.sum()) / (height if self.line_axis == "y" else width)
+        realised = n_lines / max(sampled, 1.0)
         self._realised_cache[(width, height)] = realised
         logger.info(
             "[PHYSICS] PhysicsInformedMasking mask over %d lines: %d sampled, "
             "declared R=%s (outer lines), realised R=%.3f",
             n_lines,
-            sampled,
+            round(sampled),
             self.acceleration,
             realised,
         )
 
         return mask_2d
+
+    def _expand_lines(self, mask: torch.Tensor, width: int, height: int) -> torch.Tensor:
+        """The 1-D line pattern as ``(W, H)``, constant along the other axis."""
+        # ``contiguous`` so the cached tensor is not an expand-view aliasing ``mask``.
+        if self.line_axis == "y":
+            return mask.unsqueeze(1).expand(width, height).contiguous()
+        return mask.unsqueeze(0).expand(width, height).contiguous()
+
+    def _outer_random_lines(self, mask: torch.Tensor, width: int, height: int) -> torch.Tensor:
+        """ACS plus ``1/R`` of the outer lines, uniform at random (the default)."""
+        # Deterministic via a scoped generator seeded per line count (no global RNG).
+        n_lines = mask.numel()
+        outer_indices = torch.where(mask == 0)[0]
+        if len(outer_indices) > 0 and self.acceleration > 0:
+            num_samples = int(len(outer_indices) / self.acceleration)
+            gen = torch.Generator(device="cpu").manual_seed(1234 + int(n_lines))
+            if self._pattern == "variable_density_1d":
+                pdf = torch.from_numpy(
+                    MaskGenerator.get_variable_density_pdf(n_lines, VD_DENSITY_POWER)
+                ).float()[outer_indices]
+                # The PDF is 0 at the far edge, which a no-replacement draw cannot exceed.
+                pdf = pdf.clamp_min(torch.finfo(pdf.dtype).tiny)
+                perm = torch.multinomial(pdf, num_samples, replacement=False, generator=gen)
+            else:
+                perm = torch.randperm(len(outer_indices), generator=gen)[:num_samples]
+            mask[outer_indices[perm]] = 1
+        return self._expand_lines(mask, width, height)
+
+    def _outer_sle_kappa(self, mask: torch.Tensor, width: int, height: int) -> torch.Tensor:
+        """ACS lines plus the line mask's outer sample count drawn along SLE shots."""
+        n_lines = mask.numel()
+        n_other = height if self.line_axis == "y" else width
+        outer_lines = int((mask == 0).sum())
+        budget = (int(outer_lines / self.acceleration) if self.acceleration > 0 else 0) * n_other
+        acs_2d = self._expand_lines(mask, width, height).bool()
+        gen = torch.Generator(device="cpu").manual_seed(1234 + int(n_lines))
+        sle, shots = build_sle_budget_mask(
+            SLE_KAPPA, (width, height), budget, allowed=~acs_2d, generator=gen
+        )
+        self._sle_shots[(width, height)] = shots
+        return (acs_2d | sle).to(mask.dtype)
+
+
+#: Outer-sample draw per canonical ``undersampling.sampling_pattern``.
+_OUTER_PATTERNS = {
+    "random_cartesian": PhysicsInformedMasking._outer_random_lines,
+    "variable_density_1d": PhysicsInformedMasking._outer_random_lines,
+    "sle_kappa": PhysicsInformedMasking._outer_sle_kappa,
+}
 
 
 class DigitalTwinDegradation(tio.transforms.Transform):

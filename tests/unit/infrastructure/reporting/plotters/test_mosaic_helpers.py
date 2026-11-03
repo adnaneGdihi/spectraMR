@@ -73,25 +73,24 @@ def test_recon_panel_renders_with_and_without_an_input(tmp_path):
         assert res is not None and res.exists()
 
 
-def test_kspace_recon_skips_without_a_recorded_input(tmp_path):
-    cases = [{"pred": c["prediction"], "fs_ref": c["target"]} for c in _cases(False)]
-    assert (
-        get("mri_a7_kspace_recon")(
-            pd.DataFrame(), tmp_path / "k.png", cases=cases, formats=("png",)
-        )
-        is None
-    )
+def test_recon_panel_draws_a_baseline_column_only_when_one_was_recorded(tmp_path):
+    """The merged A.7 behaviour: a column titled "baseline" only for a recorded baseline."""
+    import matplotlib.pyplot as plt
 
+    from spectramr.infrastructure.reporting.plotters.mri_specific import recon_panel
 
-def test_kspace_recon_draws_a_baseline_column_only_when_one_was_recorded(tmp_path):
-    cases = [
-        {"zero_filled": c["input"], "pred": c["prediction"], "fs_ref": c["target"]}
-        for c in _cases()
-    ]
-    res = get("mri_a7_kspace_recon")(
-        pd.DataFrame(), tmp_path / "k.png", cases=cases, formats=("png",), dpi=60
-    )
-    assert res is not None and res.exists()
+    seen = []
+    real = plt.subplots
+    plt.subplots = lambda *a, **k: seen.append(a[:2]) or real(*a, **k)
+    try:
+        for with_base in (False, True):
+            cases = [dict(c, **({"baseline": c["prediction"]} if with_base else {})) for c in _cases()]
+            assert recon_panel.make(pd.DataFrame(), tmp_path / f"r{with_base}.png", cases=cases,
+                                    formats=("png",), dpi=40) is not None
+    finally:
+        plt.subplots = real
+    # columns: input, [baseline], prediction, target, |error|, radial k-error
+    assert [k for _, k in seen] == [5, 6]
 
 
 def test_failure_gallery_reads_the_recorders_prediction_key(tmp_path):

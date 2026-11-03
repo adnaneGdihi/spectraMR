@@ -72,6 +72,9 @@ logger = logging.getLogger(__name__)
 class HamiltonianAcquisitionStrategy(BaseTrainingStrategy, KspaceMixin, ReconstructionMixin):
     """Joint trajectory-potential + reconstruction-surrogate training strategy."""
 
+    # #183: the training step never scores train_* metrics; declare none.
+    reports_train_metrics = False
+
     def __init__(
         self,
         env: Any,
@@ -144,6 +147,19 @@ class HamiltonianAcquisitionStrategy(BaseTrainingStrategy, KspaceMixin, Reconstr
                 + "; ".join(mismatches)
             )
 
+    def _matrix_size(self) -> int:
+        """In-plane grid size N for the loss's cycles/pixel -> physical conversion (#2276)."""
+        sampling = getattr(self.config.data, "sampling", None)
+        patch = getattr(sampling, "patch_size", None)
+        in_plane = tuple(patch[:2]) if isinstance(patch, (list, tuple)) else ()
+        if len(in_plane) != 2 or in_plane[0] != in_plane[1] or int(in_plane[0]) <= 0:
+            raise ValueError(
+                f"[HamiltonianAcquisitionStrategy] data.sampling.patch_size={patch!r}; the "
+                "gradient hardware loss needs one positive in-plane matrix size N "
+                "(square grid) to convert cycles/pixel to physical gradient units."
+            )
+        return int(in_plane[0])
+
     def _setup_strategy_specific_components(self) -> None:
         self.ham_cfg = self._coerce_config()
         self._assert_model_kwargs_consistent()
@@ -157,6 +173,7 @@ class HamiltonianAcquisitionStrategy(BaseTrainingStrategy, KspaceMixin, Reconstr
             dt_seconds=self.ham_cfg.dt_seconds,
             gamma_hz_per_t=self.ham_cfg.gamma_hz_per_t,
             fov_m=self.ham_cfg.fov_m,
+            matrix_size=self._matrix_size(),
         ).to(self.device)
 
         # Image-domain reconstruction losses from the declarative loss schema.
@@ -312,6 +329,7 @@ class HamiltonianAcquisitionStrategy(BaseTrainingStrategy, KspaceMixin, Reconstr
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Validate: recompute the surrogate recon and report PSNR + diagnostics."""
@@ -335,6 +353,7 @@ class HamiltonianAcquisitionStrategy(BaseTrainingStrategy, KspaceMixin, Reconstr
                     input_batch=target_batch,
                     target_batch=target_batch,
                     step=int(kwargs.get("batch_idx", 0) or 0),
+                    batch=batch_data,
                 ),
             ):
                 losses = self._compute_losses_impl(target_batch, target_batch, epoch=0)

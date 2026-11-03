@@ -18,6 +18,7 @@ Output blending is identical to the CNN ADC:
 from __future__ import annotations
 
 import math
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -38,6 +39,9 @@ class KANAdaptiveDataConsistency(nn.Module):
         kan_spline_order: B-spline order (3 = cubic).
         eps: Small constant for log-magnitude stability.
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(
         self,

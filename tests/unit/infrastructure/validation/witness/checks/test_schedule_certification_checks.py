@@ -100,6 +100,34 @@ class TestApplicability:
     def test_build_process_returns_none_off_scope(self):
         assert build_process_from_config({"model": {"model_type": "unet"}}) is None
 
+    @staticmethod
+    def _fixed_4x_doc(model_type):
+        """A fixed 4x mask (base == max): every level after t=0 repeats the mask."""
+        return {
+            "model": {"model_type": model_type},
+            "data": {"sampling": {"patch_size": [64, 64]}},
+            "undersampling": {
+                "acceleration_type": "variable_density",
+                "base_acceleration": 4.0,
+                "max_acceleration": 4.0,
+                "center_fraction": 0.08,
+            },
+            "training": {"diffusion": {"timesteps": 8}},
+        }
+
+    def test_gaussian_cold_diffusion_builds_no_ladder(self):
+        """The Gaussian ``cold_diffusion`` wrapper noises by q_sample and owns no mask cascade."""
+        doc = self._fixed_4x_doc("cold_diffusion")
+        assert build_process_from_config(doc) is None
+        verdict = schedule_no_inert_steps(_subject(doc))
+        assert verdict.passed and "does not apply" in verdict.message
+
+    def test_kspace_cold_diffusion_with_the_same_block_still_fires(self):
+        """Anti-vacuity: the mask-cascade generator on the same fixed mask is inert."""
+        verdict = schedule_no_inert_steps(_subject(self._fixed_4x_doc("kspace_cold_diffusion")))
+        assert not verdict.passed
+        assert "inert" in verdict.message
+
     def test_build_process_honours_config_timesteps(self):
         process = build_process_from_config(_exp11_doc(enforce_nested=True))
         assert process is not None

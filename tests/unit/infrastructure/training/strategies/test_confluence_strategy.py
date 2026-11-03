@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import types
 
+import pytest
 import torch
 
 from spectramr.infrastructure.training.strategies.confluence_strategy import (
@@ -20,6 +21,8 @@ def _net() -> AnatomyFieldRenderer:
 def _batch(n: int = 4) -> dict:
     return {
         "sources": torch.rand(2, n, 1, 16, 16),
+        "source_field_strengths": torch.tensor([0.1, 1.5, 3.0, 5.0][:n]).repeat(2, 1),
+        "field_strength": torch.tensor([0.1, 0.1]),
         "input": torch.rand(2, 1, 16, 16),
         "target": torch.rand(2, 1, 16, 16),
         "field_strength_target": torch.tensor([7.0, 7.0]),
@@ -109,13 +112,15 @@ def test_validation_renders_consensus_mean() -> None:
             batch["input"],
             {
                 "sources": batch["sources"],
+                "source_field_strengths": batch["source_field_strengths"],
                 "field_strength_target": batch["field_strength_target"],
                 "contrast_id": batch["contrast_id"],
             },
         )
         # the consensus mean equals the average of the per-source renders
         gen = net
-        preds = [gen.render(gen.encode(batch["sources"][:, i]), torch.tensor([7.0, 7.0]), batch["contrast_id"]) for i in range(4)]
+        b_s = batch["source_field_strengths"]
+        preds = [gen.render(gen.encode(batch["sources"][:, i], b_s[:, i]), torch.tensor([7.0, 7.0]), batch["contrast_id"]) for i in range(4)]
         expect = torch.stack(preds, 0).mean(0).clamp(0.0, 1.0)
     assert pred.shape == (2, 1, 16, 16)
     assert torch.allclose(pred, expect, atol=1e-5)
@@ -137,6 +142,7 @@ def test_validation_exposes_collapse_monitor_and_caches_visual() -> None:
             batch["input"],
             {
                 "sources": batch["sources"],
+                "source_field_strengths": batch["source_field_strengths"],
                 "field_strength_target": batch["field_strength_target"],
                 "contrast_id": batch["contrast_id"],
             },
@@ -154,7 +160,11 @@ def test_validation_falls_back_to_single_input_without_tuple() -> None:
     strat._cf_contrast = True
     pred = strat._validation_forward(
         torch.rand(2, 1, 16, 16),
-        {"field_strength_target": torch.tensor([7.0, 7.0]), "contrast_id": torch.tensor([0, 1])},
+        {
+            "field_strength": torch.tensor([0.1, 3.0]),
+            "field_strength_target": torch.tensor([7.0, 7.0]),
+            "contrast_id": torch.tensor([0, 1]),
+        },
     )
     assert pred.shape == (2, 1, 16, 16)
 
@@ -205,3 +215,26 @@ def test_strategy_registered_and_config_mounted() -> None:
 
     assert "confluence" in TrainingStrategyFactory.STRATEGY_CLASS_PATHS
     assert "confluence" in TrainingStrategyConfigSchema.model_fields
+
+
+def test_each_source_is_encoded_at_its_own_field() -> None:
+    # #197: the target is pinned at 7 T, so the per-source fields are the only field signal.
+    seen: list[torch.Tensor] = []
+
+    class _Rec:
+        def encode(self, x, b_s):
+            seen.append(b_s)
+            return x
+
+        def render(self, q, b_t, cid):
+            return q
+
+    compute_confluence_losses(_Rec(), _batch(), lambda_consensus=1.0)
+    assert [float(b[0]) for b in seen] == pytest.approx([0.1, 1.5, 3.0, 5.0])
+
+
+def test_missing_source_fields_raise() -> None:
+    batch = _batch()
+    del batch["source_field_strengths"]
+    with pytest.raises(ValueError, match="source_field_strengths"):
+        compute_confluence_losses(_net(), batch, lambda_consensus=1.0)

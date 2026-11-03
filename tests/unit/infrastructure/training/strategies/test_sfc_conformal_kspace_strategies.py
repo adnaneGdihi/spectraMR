@@ -139,6 +139,67 @@ class TestAdaptiveSFCStrictGeneratorForward:
         assert isinstance(gen.received_sfc_indices, torch.Tensor)
 
 
+class TestAdaptiveSFCScanOrderKnob:
+    """``learn_scan_order`` switches between the learned order and the fixed-Hilbert control."""
+
+    def test_soft_perm_reaches_a_generator_that_names_it(self) -> None:
+        received: dict[str, object] = {}
+
+        class _Gen(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.conv = torch.nn.Conv2d(1, 1, kernel_size=1)
+
+            def forward(self, x, sfc_indices=None, sfc_soft_perm=None):
+                received["soft"] = sfc_soft_perm
+                return self.conv(x)
+
+        strategy = _make_sfc_strategy(_Gen())
+        strategy._compute_losses_impl(
+            torch.randn(2, 1, 16, 16), torch.randn(2, 1, 16, 16), epoch=0
+        )
+        assert isinstance(received["soft"], torch.Tensor)
+        assert received["soft"].shape == (2, 256, 256)
+
+    def test_fixed_hilbert_control_calls_without_an_order(self) -> None:
+        gen = _SFCAwareGenerator()
+        strategy = _bare_strategy(AdaptiveSFCHSSCStrategy)
+        strategy.sfc = None
+        strategy.env = _StubEnv(gen)
+        out = strategy._compute_losses_impl(
+            torch.randn(2, 1, 16, 16), torch.randn(2, 1, 16, 16), epoch=0
+        )
+        assert gen.received_sfc_indices is None
+        assert set(out) == {"g_total_loss", "adaptive_sfc_recon"}
+
+    def test_validation_scans_the_learned_order_without_a_soft_perm(self) -> None:
+        received: dict[str, object] = {}
+
+        class _Gen(torch.nn.Module):
+            def forward(self, x, sfc_indices=None, sfc_soft_perm=None):
+                received["indices"] = sfc_indices
+                received["soft"] = sfc_soft_perm
+                return x
+
+        strategy = _make_sfc_strategy(_Gen())
+        with torch.no_grad():
+            strategy._validation_generator_forward(torch.randn(2, 1, 16, 16))
+        assert isinstance(received["indices"], torch.Tensor)
+        assert received["indices"].shape == (2, 256)
+        assert received["soft"] is None
+        assert strategy.sfc.training
+
+    def test_control_declares_no_owned_module(self) -> None:
+        def _cfg(flag: bool) -> SimpleNamespace:
+            knobs = SimpleNamespace(learn_scan_order=flag)
+            return SimpleNamespace(training=SimpleNamespace(adaptive_sfc_hssc=knobs))
+
+        on = AdaptiveSFCHSSCStrategy.owned_module_declarations(_cfg(True))
+        off = AdaptiveSFCHSSCStrategy.owned_module_declarations(_cfg(False))
+        assert any(name == "sfc" for name, _ in on)
+        assert not any(name == "sfc" for name, _ in off)
+
+
 class TestConformalDiffusionReconStrategy:
     """The conformal DC step is the strategy's whole point — it must fail loud
     when the batch lacks the keys it needs, not silently run plain MSE."""

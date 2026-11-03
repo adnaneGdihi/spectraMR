@@ -190,12 +190,8 @@ _BOTH = _ARM_A.is_file() and _ARM_D.is_file()
 #: Knobs D is allowed to differ from A on: the two halves of the barrier, and
 #: the per-arm identity/path fields every arm necessarily spells for itself.
 #: The map source of an arm whose objective reads the maps (the split, the barrier,
-#: the projection): maps from the input repetition alone, and the all-repetitions
-#: store kept as the scoring maps (audit 2026-10-09).
-_MAP_SOURCE_DIFFS = frozenset(
-    {"data.coil_maps_root", "data.coil_maps_recipe", "data.coil_maps_reference_root"}
-)
-_SCORING_STORE = "databases/m4raw/coil_maps"
+#: the projection): maps from the input repetition alone.
+_MAP_SOURCE_DIFFS = frozenset({"data.coil_maps_root", "data.coil_maps_recipe"})
 
 
 _D_EXPECTED_DIFFS = frozenset(
@@ -257,6 +253,8 @@ def _reads_maps_in_its_objective(cfg: dict[str, Any]) -> bool:
 def _map_leak_error(cfg: dict[str, Any]) -> str | None:
     """Why the maps an arm reads (objective or null-space certificate) could contain the reference, or None."""
     data = cfg.get("data") or {}
+    if "coil_maps_reference_root" in data:
+        return "coil_maps_reference_root is retired: every arm scores with its training maps"
     if not data.get("coil_maps_root"):
         return None
     if data.get("coil_maps_recipe") != "input_repetition":
@@ -264,8 +262,6 @@ def _map_leak_error(cfg: dict[str, Any]) -> str | None:
             f"coil_maps_recipe={data.get('coil_maps_recipe')!r} (unset is all_reps_mean): "
             "the objective reads maps averaged over the leave-one-out reference"
         )
-    if data.get("coil_maps_reference_root") != _SCORING_STORE:
-        return f"coil_maps_reference_root is not the shared scoring store {_SCORING_STORE!r}"
     return None
 
 
@@ -281,7 +277,7 @@ def test_the_map_leak_predicate_rejects_a_planted_store() -> None:
     cfg["data"].pop("coil_maps_recipe")
     assert (_map_leak_error(cfg) or "").startswith("coil_maps_recipe=None")
     cfg = yaml.safe_load(_ARM_G.read_text()) or {}
-    cfg["data"].pop("coil_maps_reference_root")
+    cfg["data"]["coil_maps_reference_root"] = "databases/m4raw/coil_maps"
     assert (_map_leak_error(cfg) or "").startswith("coil_maps_reference_root")
 
 

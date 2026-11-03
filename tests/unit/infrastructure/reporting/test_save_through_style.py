@@ -63,15 +63,3 @@ def test_a_former_bypasser_writes_every_requested_format(tmp_path, fmt):
     )
     assert out is not None
     assert all((tmp_path / f"g.{f}").exists() for f in fmt)
-
-def test_the_acquisition_pareto_honours_the_requested_formats(tmp_path):
-    import pandas as pd
-
-    from spectramr.infrastructure.reporting.catalog.examples_payloads import make_acquisition_arms
-    from spectramr.infrastructure.reporting.plotters import get
-
-    out = get("learnable_acquisition_pareto")(
-        pd.DataFrame(), tmp_path / "p.png", acquisition_arms=make_acquisition_arms(),
-        formats=("png",), dpi=40,
-    )
-    assert out is not None and out.suffix == ".png" and not (tmp_path / "p.pdf").exists()

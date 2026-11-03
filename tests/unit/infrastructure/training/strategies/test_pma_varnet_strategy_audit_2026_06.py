@@ -127,7 +127,7 @@ def test_simulator_unpack_order_and_marker_mask_source() -> None:
     src = inspect.getsource(ConcretePMAVarNetStrategy._compute_losses_impl)
 
     # The corrected unpack: second slot is marker_prior, third is discarded.
-    assert "corrupted_complex, marker_prior, _joint_clean = self.simulator(" in src, (
+    assert "corrupted_complex, _marker_prior, _joint_clean = self.simulator(" in src, (
         "the simulator 3-tuple unpack is not in the corrected "
         "(corrupted, marker_prior, joint) order."
     )
@@ -137,3 +137,83 @@ def test_simulator_unpack_order_and_marker_mask_source() -> None:
     )
     # The old swapped form must not be present.
     assert "corrupted_complex, marker_mask, marker_prior = self.simulator(" not in src
+
+
+def _identity_pma_varnet(num_cascades: int = 2) -> torch.nn.Module:
+    """A PMAVarNet with identity regularisers: no Swin blocks are built."""
+    from spectramr.infrastructure.physics.m4_operator import Operator_A_m4
+    from spectramr.models.generators.pma_varnet import PMAVarNet
+
+    model = object.__new__(PMAVarNet)
+    torch.nn.Module.__init__(model)
+    model.num_cascades = num_cascades
+    model.operator = Operator_A_m4()
+    model.eta = torch.nn.ParameterList(
+        [torch.nn.Parameter(torch.tensor(0.5)) for _ in range(num_cascades)]
+    )
+    model.regularizers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(num_cascades)])
+    return model
+
+
+def test_dc_operator_matches_the_fft2c_measurement() -> None:
+    """#2380: the strategy's maps make A^H(Ax - y) vanish at the measured image.
+
+    Fully sampled, the cascade with identity regularisers returns the measured image
+    exactly; under the twin's line mask, the zero-filled start stays data-consistent.
+    """
+    from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+    from spectramr.infrastructure.training.strategies.pma_varnet_strategy import cartesian_maps
+
+    torch.manual_seed(0)
+    B, C, H, W = 2, 3, 16, 12
+    x = torch.randn(B, C, H, W, dtype=torch.complex64)
+    model = _identity_pma_varnet()
+
+    y = fft2c(x).reshape(B, C, 1, H * W)
+    out = model(x=y, y_meas=y, maps_dict=cartesian_maps(None, (H, W)))
+    assert torch.allclose(out, x, atol=1e-5)
+
+    mask = torch.zeros(1, 1, 1, W)
+    mask[..., ::2] = 1.0
+    k = fft2c(x) * mask
+    y = k.reshape(B, C, 1, H * W)
+    out = model(x=y, y_meas=y, maps_dict=cartesian_maps(mask, (H, W)))
+    assert torch.allclose(out, ifft2c(k), atol=1e-5)
+
+
+def test_cascade_does_not_overwrite_the_marker_region() -> None:
+    """#2381: no hard projection; marker kwargs leave the reconstruction untouched."""
+    from spectramr.infrastructure.physics.fft_ops import fft2c
+    from spectramr.infrastructure.training.strategies.pma_varnet_strategy import cartesian_maps
+
+    torch.manual_seed(1)
+    B, C, H, W = 1, 2, 8, 8
+    x = torch.randn(B, C, H, W, dtype=torch.complex64)
+    y = fft2c(x).reshape(B, C, 1, H * W)
+    mask = torch.zeros(1, 1, H, W)
+    mask[..., :2, :2] = 1.0
+    prior = torch.full((1, 1, H, W), 7.0, dtype=torch.complex64)
+    out = _identity_pma_varnet()(
+        x=y,
+        y_meas=y,
+        maps_dict=cartesian_maps(None, (H, W)),
+        marker_mask=mask,
+        marker_prior=prior,
+    )
+    assert torch.allclose(out, x, atol=1e-5)
+
+
+def test_marker_term_is_live_and_agrees_with_the_target() -> None:
+    """#2381: with the target as the prior, the marker term is zero only at the target."""
+    from spectramr.models.losses.m4_losses import PMAGlobalLoss
+
+    src = inspect.getsource(ConcretePMAVarNetStrategy._compute_losses_impl)
+    assert "marker_prior=joint_clean" in src
+
+    torch.manual_seed(2)
+    target = torch.randn(1, 3, 8, 8, dtype=torch.complex64)
+    mask = torch.zeros(1, 1, 8, 8)
+    mask[..., :2, :2] = 1.0
+    loss = PMAGlobalLoss(lambda_l1=0.0, lambda_ssim=0.0, lambda_marker=1.0)
+    assert loss(target, target, marker_mask=mask, marker_prior=target) == 0
+    assert loss(target * 0.5, target, marker_mask=mask, marker_prior=target) > 0

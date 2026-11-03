@@ -37,7 +37,10 @@ class _ConfigShim:
 
 
 def _composite(**gan: object):
-    losses = LossConfigSchema(gan={"enable_adversarial": True, "gan_loss_type": "hinge", **gan})
+    # The weight is written: the build set (#1966) reads declarations, not schema defaults.
+    losses = LossConfigSchema(
+        gan={"enable_adversarial": True, "lambda_adv": 1.0, "gan_loss_type": "hinge", **gan}
+    )
     built = LossBuilder(_ConfigShim(losses), device="cpu").build_adversarial_losses().build()
     composite = built.get("adversarial")
     assert composite is not None, "the adversarial composite must be built at all"

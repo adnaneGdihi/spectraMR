@@ -25,10 +25,9 @@ axis, and a depth-1 map on a depth-D subject also makes TorchIO's sampler raise
 ``check_consistent_space`` before a patch is ever drawn. The depth axis maps
 onto the estimator's batch axis, so the whole volume is one vectorised call.
 
-**No coil compression.** The maps describe the PHYSICAL array, so an arm using
-them must serve its coils uncompressed (``data.coils.processing_mode: none``).
-Compressing to virtual coils after estimating maps for the physical ones would
-leave the two describing different arrays, which nothing downstream can detect.
+**It calibrates whatever coils the subject carries.** Coil compression runs
+upstream in the subject builder, so under ``physics.coil_processing`` SVD the maps
+describe the virtual array (#2349); the arm's own config declares that choice.
 
 **Precomputed maps win, and are checked.** Under ``data.coil_maps_root`` the
 M4Raw loader has already attached the group's maps and stamped the calibration

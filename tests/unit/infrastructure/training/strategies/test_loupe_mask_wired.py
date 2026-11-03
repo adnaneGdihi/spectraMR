@@ -298,3 +298,40 @@ def test_unknown_budget_raises() -> None:
     s._adaptive_cfg = _adaptive_cfg(enabled=True, budget="greedy")
     with pytest.raises(ValueError, match="budget"):
         s._eval_mask(torch.zeros(16))
+
+
+def test_backbone_is_registered_on_the_image_and_the_bridge_stays_off() -> None:
+    # The pre_model chain is the adjoint; a strategy-side ifft2c would replace the
+    # masked image with the context's fully sampled k-space.
+    import spectramr.models._v6_1_registrations  # noqa: F401  (registers loupe/pilot)
+    from spectramr.models.registry import get_model_capabilities
+
+    assert get_model_capabilities("loupe").input_domain == "image"
+    assert _make_strategy()._needs_kspace_adjoint({"measured_kspace": torch.ones(1)}) is False
+
+
+def test_a_mask_shaped_like_kspace_broadcasts_per_sample() -> None:
+    # SCAS hands a per-sample (B, 1, 1, W) mask; flattening it would mix the samples' columns.
+    s = _make_strategy()
+    x = torch.randn(2, 2, 16, 16)
+    mask = torch.zeros(2, 1, 1, 16)
+    mask[0, ..., 3] = 1.0
+    mask[1, ..., 9] = 1.0
+    k = fft2c(s._apply_learned_mask(x, mask))
+    assert k[0, ..., [c for c in range(16) if c != 3]].abs().max().item() < 1e-4
+    assert k[1, ..., [c for c in range(16) if c != 9]].abs().max().item() < 1e-4
+
+
+def test_single_real_channel_returns_the_zero_filled_magnitude() -> None:
+    """A magnitude input keeps no mirrored column: ``.real`` would symmetrise the mask."""
+    from spectramr.infrastructure.physics.fft_ops import ifft2c
+
+    s = _make_strategy()
+    x = torch.randn(1, 1, 8, 8)
+    mask = torch.zeros(8)
+    mask[1] = 1.0  # off-centre, so its Hermitian mirror (column 7) is unacquired
+    out = s._apply_learned_mask(x, mask)
+    expected = ifft2c(fft2c(x) * mask.view(1, 1, 1, -1)).abs()
+    assert out.dtype == x.dtype and out.shape == x.shape
+    assert torch.allclose(out, expected, atol=1e-6)
+    assert not torch.allclose(out, ifft2c(fft2c(x) * mask.view(1, 1, 1, -1)).real, atol=1e-3)

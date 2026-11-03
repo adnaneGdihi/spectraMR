@@ -113,6 +113,7 @@ def adc_clipping(
     dims: tuple[int, ...],
     *,
     depth: float = 0.9,
+    min_clip_level: float = 0.1,
 ) -> Tensor:
     """ADC saturation: Re and Im of k-space clipped at ``(1 - theta depth)`` of the subject's peak.
 
@@ -120,6 +121,13 @@ def adc_clipping(
     2004, ch. 13); the clip level is relative to the per-subject peak ``|Re|`` or ``|Im|``, so
     theta = 0 clips nothing.
     """
+    if min_clip_level != 0.1:
+        if depth != 0.9:
+            raise ValueError(
+                f"adc_clipping: depth={depth} and min_clip_level={min_clip_level} both set the "
+                "theta=1 clip level (depth = 1 - min_clip_level); pass one"
+            )
+        depth = 1.0 - min_clip_level
     if not 0.0 < depth < 1.0:
         raise ValueError(
             f"depth must lie in (0, 1) so the clip level stays positive, got {depth!r}"
@@ -146,6 +154,8 @@ def adc_quantization(
     seed: int,
     geometry: AcquisitionGeometry,
     dims: tuple[int, ...],
+    *,
+    min_enob: float = 4.0,
 ) -> Tensor:
     """Uniform ADC quantisation of Re and Im at ``ENOB = 16 - 12 theta`` effective bits.
 
@@ -159,7 +169,7 @@ def adc_quantization(
         return x
     x = _ensure_complex(x)
     k = fftnc(x, dims)
-    step = subject_peak(k) / 2.0 ** (adc_enob(theta) - 1.0)
+    step = subject_peak(k) / 2.0 ** (adc_enob(theta, span=16.0 - min_enob) - 1.0)
 
     def quantise(v: Tensor) -> Tensor:
         return torch.round(v / step) * step

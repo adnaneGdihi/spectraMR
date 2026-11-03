@@ -45,9 +45,9 @@ class CocycleConsistencyLoss(nn.Module):
 
     This is the quantitative form of Theorem 6 (a flat groupoid cocycle over a
     connected base is a coboundary) for the encode-once / render-anywhere
-    ``AnatomyFieldRenderer``: because ``encode`` is field-invariant, the composite
-    map ``G(G(x;s,t);t,u) = R(E(R(E(x),b_t)),b_u)`` must equal the direct map
-    ``G(x;s,u) = R(E(x),b_u)``. The :class:`FieldCocycleTranslationStrategy` builds
+    ``AnatomyFieldRenderer``: because ``encode`` factors the source field out of the latent, the
+    composite map ``G(G(x;s,t);t,u) = R(E(R(E(x,b_s),b_t),b_t),b_u)`` must equal the direct map
+    ``G(x;s,u) = R(E(x,b_s),b_u)``. The :class:`FieldCocycleTranslationStrategy` builds
     both images (``prediction`` = composite, ``target`` = direct) over a freely
     sampled intermediate field and passes them here. Exactly zero on a family that
     factorises through a single canonicaliser; the running value is the logged

@@ -88,45 +88,17 @@ class MatrixProductStateAttention(nn.Module):
             ``(B, N, d)`` tensor, the MPS-contracted attention output.
         """
         b, n, d = v.shape
-        # Reshape to (B, 2, 2, ..., 2, d) using L binary axes.
-        v_tensor = v.view(b, *([2] * self.n_log_tokens), d)
-        out_shape = [b] + [2] * self.n_log_tokens + [d]
-        # Sweep through cores left to right, contracting one binary axis.
-        # We'll output to a fresh tensor; for clarity, we contract sequentially
-        # along the i-axis, with j-summation embedded in the core.
-        # The MPS attention has structure:
-        # out[i_1, ..., i_L] = Σ_{j_1, ..., j_L} A[i_1...i_L, j_1...j_L] * v[j_1...j_L]
-        # We compute this by sweeping through L cores.
-
-        # Start with a "carry" tensor that absorbs the bond dimensions.
-        # carry: (B, 1, 2^L, d) — first index is left bond (initially 1).
-        carry = v_tensor.reshape(b, 1, n, d)
-        for level, core in enumerate(self.cores):
-            # core: (left_bond, 2, 2, right_bond) — left, i_level, j_level, right
-            # carry shape: (B, left_bond, N/(2^level), d)
-            # We want to contract j_level over the next binary index of v.
-            left_bond, _, _, right_bond = core.shape
-            current_chunks = carry.shape[2] // 2
-            # Reshape carry to expose the next binary axis.
-            carry_split = carry.view(b, left_bond, 2, current_chunks, d)
-            # Sum over j_level: contract carry_split's 2-axis with core's j axis.
-            # core[l, i, j, r] * carry_split[b, l, j, n, d] -> (b, r, i, n, d)
-            new_carry = torch.einsum("lijr,bljnd->brind", core, carry_split)
-            # Reshape: combine (r, i) -> (right_bond_*_2). The 'i' axis carries
-            # the consumed binary index, which becomes part of the output's
-            # token positioning. We absorb 'i' into the chunk axis: output
-            # chunk indexing is (i_1, ..., i_{level+1}, remainder).
-            # For simplicity we keep the i axis explicit and merge at the end.
-            new_carry = new_carry.reshape(b, right_bond, 2 * current_chunks, d)
-            carry = new_carry
-        # After L sweeps, carry has shape (b, 1, N, d). Reorder so the
-        # accumulated i-indices reproduce the natural token order — they
-        # appear left-most in the natural reshape.
-        carry = carry.squeeze(1)
-        # carry now has shape (b, N, d) with token-order reflecting the
-        # natural left-to-right binary indexing — which matches the input
-        # ordering by construction.
-        return carry
+        # Carry layout (B, bond, I_out, J_rest, d): token bits are most-significant
+        # first, level l consumes j_l from the front of J_rest and appends i_l as the
+        # least-significant bit of I_out, so every core sees its own physical index.
+        carry = v.reshape(b, 1, 1, n, d)
+        for core in self.cores:
+            right_bond = core.shape[-1]
+            n_out, n_rest = carry.shape[2], carry.shape[3] // 2
+            carry_split = carry.reshape(b, carry.shape[1], n_out, 2, n_rest, d)
+            new_carry = torch.einsum("lijr,blojmd->broimd", core, carry_split)
+            carry = new_carry.reshape(b, right_bond, 2 * n_out, n_rest, d)
+        return carry.reshape(b, n, d)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:

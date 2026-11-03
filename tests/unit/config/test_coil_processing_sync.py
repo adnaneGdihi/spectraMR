@@ -12,7 +12,6 @@ use ``data.coil_processing_mode`` / ``physics.coil_sensitivity`` load unchanged.
 ``data.coil_processing_mode`` is the live mechanism, not a deprecated one.
 """
 
-import pathlib
 
 import pytest
 
@@ -20,7 +19,6 @@ from spectramr.config.schemas.loader import (
     _derive_coil_processing_from_legacy,
     _sync_coil_processing_to_legacy,
 )
-from tests.utils.corpus import tracked_yamls
 
 # ---------------------------------------------------------------------------
 # _derive_coil_processing_from_legacy — legacy mode → full 4-axis block.
@@ -195,65 +193,6 @@ def test_sync_does_not_warn():
         _sync_coil_processing_to_legacy(raw)
 
 
-# ---------------------------------------------------------------------------
-# Anti-regrowth: no shipped arm may pair dataset_type: m4raw with svd.
-# ---------------------------------------------------------------------------
-
-
-def _resolved_coil_mode(raw: dict) -> str | None:
-    """The mode as the DATASET will see it, after the loader's two-way sync.
-
-    Reading ``data.coil_processing_mode`` off the raw YAML is not enough:
-    ``_sync_coil_processing_to_legacy`` re-synthesizes it from
-    ``physics.coil_processing.compression.method``, so an arm can look migrated
-    and still arrive at the dataset as ``svd``. Two of the eight arms migrated
-    in this change were exactly that case.
-    """
-    raw = _derive_coil_processing_from_legacy(raw) or raw
-    raw = _sync_coil_processing_to_legacy(raw) or raw
-    return (raw.get("data") or {}).get("coil_processing_mode")
-
-
-def test_no_shipped_arm_pairs_m4raw_with_svd():
-    """``svd`` on the m4raw path raises ``NotImplementedError`` at construction.
-
-    SVD virtual-coil compression is wired only on ``dataset_type: kspace``
-    (``UniversalMRIDataset``). On the m4raw path it used to be accepted and then
-    silently ignored — a facade (pitfall #16) that trained on uncompressed coils
-    while the YAML advertised compression. Now it fails loud, which means any arm
-    still carrying the pairing is a train-time crash rather than a quiet lie.
-
-    This sweep is the guard: ``spectramr audit`` is Tier 0/1 static and does NOT
-    catch the pairing, so without it a regrown arm passes pre-flight and dies
-    only after cluster submission.
-    """
-    import yaml
-
-    offenders = []
-    for path in tracked_yamls(pathlib.Path("experiments")):
-        if "archive" in path.parts:
-            continue
-        try:
-            raw = yaml.safe_load(path.read_text())
-        except Exception:
-            continue  # not our concern here; schema tests cover unparseable YAML
-        if not isinstance(raw, dict):
-            continue
-        dataset_type = (raw.get("data") or {}).get("dataset_type")
-        if dataset_type != "m4raw":
-            continue
-        if _resolved_coil_mode(raw) == "svd":
-            offenders.append(str(path))
-
-    assert offenders == [], (
-        "these arms pair dataset_type: m4raw with an svd coil mode, which now "
-        "raises at dataset construction — set coil_processing_mode: none AND "
-        "physics.coil_processing.compression.method: none (the loader "
-        "re-synthesizes the legacy key from the unified block):\n  "
-        + "\n  ".join(offenders)
-    )
-
-
 class TestTheDeriveReaderFollowsTheDrain:
     """`_derive_coil_processing_from_legacy` must see a drained arm's key.
 
@@ -345,4 +284,3 @@ class TestTheDeriveReaderFollowsTheDrain:
             "compression"
         ]
         assert comp["num_virtual_coils"] == 4
-

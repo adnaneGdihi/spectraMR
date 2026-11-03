@@ -52,9 +52,12 @@ def test_palette_is_stable_across_calls_and_order():
     assert len(set(first.values())) == 3
 
 
-def test_twelve_unregistered_arms_get_twelve_distinct_colours():
-    arms = [f"arm_{i}" for i in range(12)]
-    assert len(set(arm_palette(arms).values())) == 12
+def test_unregistered_arms_take_eight_distinct_hues_then_fold_to_grey():
+    from spectramr.core.design_tokens import CATEGORICAL, OVERFLOW
+
+    colours = list(arm_palette([f"arm_{i}" for i in range(12)]).values())
+    assert colours[:8] == list(CATEGORICAL)  # fixed order, never cycled
+    assert set(colours[8:]) == {OVERFLOW}
 
 
 def test_long_labels_use_fewer_columns_so_the_legend_stays_narrow():

@@ -518,11 +518,10 @@ class TestPMAVarNetAfterFFTFix:
         assert PMAVarNet is not None
 
     def test_pma_varnet_imports_canonical_fft(self):
-        """PMAVarNet module must import from fft_ops, not raw torch.fft."""
+        """PMAVarNet module must not use raw torch.fft (its FFTs live in Operator_A_m4)."""
         import spectramr.models.generators.pma_varnet as mod
 
         source = Path(mod.__file__).read_text()
-        assert "from spectramr.infrastructure.physics.fft_ops import" in source
         assert "torch.fft.fft2" not in source
         assert "torch.fft.ifft2" not in source
 """Full test for config_builder lazy import pattern."""

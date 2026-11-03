@@ -64,7 +64,11 @@ ENTRIES = (
         fn=flow_ghosts_2d,
         description="Pulsatile-flow ghosts: vessel signal modulated line by line" + _FALLBACK,
         severity=SeveritySpec(
-            (_P("modulation_depth", "dimensionless", 0.0, FLOW_GHOST_MAX_DEPTH),),
+            (_P(
+                "modulation_depth", "dimensionless", 0.0, FLOW_GHOST_MAX_DEPTH,
+                endpoint_kwargs=(None, "max_depth"),
+                valid_min=0.0,
+            ),),
             notes="vessel signal times 1 + a cos(2 pi t_n / T_card + phi0) per phase-encode line "
             "(T_card = 1000 ms, TR = 50 ms, or the profile's TR); discrete ghosts of the vessel "
             "alone at +/- N_pe TR / T_card px along phase-encode. Line time: ky (slice); "
@@ -83,7 +87,11 @@ ENTRIES = (
         fn=VoxelSliceKernel(flow_voids_2d),
         description="Flow voids: spin-echo washout of the vessel signal" + _FALLBACK,
         severity=SeveritySpec(
-            (_P("through_plane_velocity", "cm/s", 0.0, FLOW_VOID_MAX_CM_S),),
+            (_P(
+                "through_plane_velocity", "cm/s", 0.0, FLOW_VOID_MAX_CM_S,
+                endpoint_kwargs=(None, "max_velocity_cm_s"),
+                valid_min=0.0,
+            ),),
             notes="vessel signal times max(0, 1 - v (TE / 2) / thk), TE = 20 ms or the profile's; "
             "thk is voxel_mm[0] for a slice; slice_thickness_mm, else voxel_mm[0] - slice_gap_mm "
             "for a stack; 5 mm for either without them; the slab D x voxel_mm[0] for a volume "
@@ -102,7 +110,11 @@ ENTRIES = (
         family="motion",
         description="Inflow enhancement: fresh unsaturated spins brighten the vessel" + _FALLBACK,
         severity=SeveritySpec(
-            (_P("through_plane_velocity", "cm/s", 0.0, INFLOW_MAX_CM_S),),
+            (_P(
+                "through_plane_velocity", "cm/s", 0.0, INFLOW_MAX_CM_S,
+                endpoint_kwargs=(None, "max_velocity_cm_s"),
+                valid_min=0.0,
+            ),),
             notes="vessel signal times M_n / M_ss, the spoiled-GRE recursion M_{n+1} = M_n cos(a) "
             "E1 + (1 - E1) from M_0 = 1 after n = depth / (v TR) pulses (T1 = 1500 ms, "
             "TR = 30 ms, a = 30 deg, or the profile's TR and flip angle; a <= 90 deg). Depth is "

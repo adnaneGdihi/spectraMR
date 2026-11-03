@@ -16,6 +16,7 @@ from . import qmap_ulf_operator_transform as _qmap_ulf_operator_transform  # noq
 from . import scout_acquisition as _scout_acquisition  # noqa: F401
 from . import slab_transforms as _slab_transforms  # noqa: F401
 from . import slice_profile as _slice_profile  # noqa: F401
+from . import spiral_trajectory_sim as _spiral_trajectory_sim  # noqa: F401
 from . import svd_coil_compression as _svd_coil_compression  # noqa: F401
 from . import synthetic_marker as _synthetic_marker  # noqa: F401
 from . import synthetic_ulf_simulator as _synthetic_ulf_simulator  # noqa: F401

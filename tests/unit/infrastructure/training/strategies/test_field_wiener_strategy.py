@@ -162,3 +162,22 @@ def test_source_field_knob_validated() -> None:
     assert FieldWienerConfig().source_field is None
     with pytest.raises(ValidationError):
         FieldWienerConfig(source_field=-0.1)
+
+
+def test_target_conditioned_net_gets_the_batch_target_field() -> None:
+    # #196: the Task-3 arms pair one input with every target field; the loss must hand the
+    # net the per-sample target field, and refuse a batch that lacks it.
+    seen: list = []
+
+    class _Rec(torch.nn.Module):
+        use_target_field = True
+
+        def forward(self, x, *, field_strength, field_strength_target):
+            seen.append(field_strength_target)
+            return x
+
+    batch = {**_batch(), "field_strength_target": torch.tensor([7.0, 3.0])}
+    compute_field_wiener_loss(_Rec(), batch)
+    torch.testing.assert_close(seen[0], torch.tensor([7.0, 3.0]))
+    with pytest.raises(ValueError, match="field_strength_target"):
+        compute_field_wiener_loss(_Rec(), _batch())

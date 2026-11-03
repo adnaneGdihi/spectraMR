@@ -4,7 +4,7 @@ The framework has two kinds of forward model, and conflating them is what kept
 three regimes off LIVE:
 
 * A :class:`~spectramr.infrastructure.physics.registry.BaseForwardOperator` is a
-  **linear measurement operator** (``fft2d``, ``nufft``, ``phase_contrast``). Its
+  **linear measurement operator** (``fft2d``, ``nufft``, ``multi_coil_fft``). Its
   contract *promises* ``adjoint()``, and generic callers — ``OperatorProjectionDataConsistency``,
   ``FISTAMBIRSolver``, ``NullSpaceProjection`` — consume that promise assuming
   ``<Ax, y> = <x, A'y>``.

@@ -5,6 +5,7 @@ based on training paradigm and configuration.
 """
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -26,6 +27,11 @@ from spectramr.infrastructure.checkpointing.restore import read_part, weights
 from spectramr.infrastructure.optimization.ema import ModelEma  # [FIX] Added for EMA
 
 from .base import Builder
+
+#: model_kwargs keys this builder reads itself (warm-start), not the model's constructor.
+BUILDER_READ_MODEL_KWARGS: frozenset[str] = frozenset(
+    {"vae_checkpoint_path", "freeze_vae", "backbone_checkpoint"}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +60,12 @@ class ModelBuilder(Builder):
     """
 
     def __init__(
-        self, config: TrainingSettings, device: torch.device, *, warm_start: bool = False
+        self,
+        config: TrainingSettings,
+        device: torch.device,
+        *,
+        warm_start: bool = False,
+        checkpoint_layout: Mapping[str, Any] | None = None,
     ):
         """Initialize ModelBuilder.
 
@@ -63,10 +74,13 @@ class ModelBuilder(Builder):
             device: Device where models will be placed
             warm_start: Load the stage-1 VAE and ``model.checkpoint_path`` into the
                 generator. Only the training environment director sets it.
+            checkpoint_layout: Generator kwargs that rebuild the module layout of the
+                checkpoint a resume will load (``checkpointing.legacy_layout``).
         """
         self._config = config
         self._device = device
         self._warm_start_enabled = warm_start
+        self._checkpoint_layout = dict(checkpoint_layout or {})
         self._models: dict[str, nn.Module] = {}
         self._ema: ModelEma | None = None
 
@@ -95,7 +109,10 @@ class ModelBuilder(Builder):
             ValueError: If model creation fails
         """
         try:
-            gen_kwargs = resolve_generator_kwargs(self._config, device=self._device)
+            gen_kwargs = {
+                **resolve_generator_kwargs(self._config, device=self._device),
+                **self._checkpoint_layout,
+            }
 
             generator_builder = (
                 GeneratorBuilder(self._config, self._device)
@@ -148,6 +165,16 @@ class ModelBuilder(Builder):
                     "scripts/migrations/convert_checkpoints_v1.py."
                 ) from exc
             loader(state, freeze=freeze, source=str(vae))
+        backbone = (getattr(model_cfg, "model_kwargs", None) or {}).get("backbone_checkpoint")
+        if backbone:
+            # A stage-2 model built on a pretrained stage-1 network (frozen_backbone_with_head).
+            loader = getattr(generator, "load_backbone_state", None)
+            if loader is None:
+                raise ValueError(
+                    f"model_kwargs.backbone_checkpoint is set but {type(generator).__name__} "
+                    "has no load_backbone_state; nothing would load it"
+                )
+            loader(read_part(backbone, "generator"), source=str(backbone))
         ckpt_path = getattr(model_cfg, "checkpoint_path", None)
         if ckpt_path:
             weights(ckpt_path, "generator", generator, policy="overlap")

@@ -83,8 +83,11 @@ def test_full_pipeline_smoke() -> None:
     # Powered certification gate is attached per method.
     assert set(output.powered.keys()) == {"CDSCR", "FSPD"}
     for po in output.powered.values():
-        assert po.n_samples == output.dataset.n_samples
+        # Certified at the independent contents, not the correlated samples.
+        assert po.n_samples == summary["n_eff"] == len({s.content_id for s in output.dataset.samples})
+        assert po.correction == "holm"
         # Every pair is either certified or ambiguous, never both.
         assert po.n_certified + po.n_ambiguous == 1  # C(2, 2) over {mse, constant}
     assert "powered" in summary
+    assert summary["degradation_provenance"]["seed_scheme"] == "blake2b_v1"
     assert set(summary["powered"]) == {"CDSCR", "FSPD"}

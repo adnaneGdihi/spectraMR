@@ -13,10 +13,10 @@ module docstring in :mod:`.registry` for why a signal model is deliberately NOT
 an ``OperatorRegistry`` operator — the short version is that an operator's
 contract promises ``adjoint()``, and these maps are nonlinear and have none.
 
-Note ``flow_encoding`` is NOT registered here: phase contrast has a genuine
-linear operator (``phase_contrast``, whose ``pc_adjoint`` is a true inverse
-within ``|v| < venc``), so it belongs in the ``OperatorRegistry``. The split is
-about whether an adjoint exists, not about which regime is fashionable.
+``flow_encoding`` registers ``phase_contrast`` here: ``v -> m exp(i pi v / venc)``
+is nonlinear, and ``pc_adjoint`` is an inverse within ``|v| < venc``, not an
+adjoint, so ``<Ax, y> = <x, A'y>`` does not hold. The linear part of a flow
+acquisition is the per-encoding multicoil Fourier operator.
 
 The submodule imports below are load-bearing side effects, not re-exports: drop
 one and its physics silently vanishes from the registry, and the maturity ledger
@@ -24,6 +24,7 @@ reports that regime as declaring a forward model it cannot resolve.
 """
 
 from . import diffusion_models as diffusion_models  # side effect: register
+from . import flow_encoding as flow_encoding  # side effect: register
 from . import perfusion_kinetics as perfusion_kinetics  # side effect: register
 from . import spectroscopy as spectroscopy  # side effect: register
 from .registry import (

@@ -280,8 +280,8 @@ class ColdDiffusionInferenceStrategy(BaseInferenceStrategy):
 
         Args:
             input_tensor: Normalized measured k-space ``[B, C, H, W]``.
-            **kwargs: ``mask`` (observed support; inferred from the non-zeros
-                when absent), ``start_timestep`` (the rung the input is degraded
+            **kwargs: ``mask`` (observed support; absent, ``sample()`` takes the
+                arm's cascade mask at ``start_timestep`` or raises), ``start_timestep`` (the rung the input is degraded
                 at; ``None`` starts at ``T - 1``), ``contrast_idx`` and
                 ``reference`` (per-row conditioning), and ``measured_lines``
                 (``[B, N]`` bool: the phase-encode lines the scan acquired, from
@@ -343,7 +343,7 @@ class ColdDiffusionInferenceStrategy(BaseInferenceStrategy):
 
         # A hard-DC reverse loop given the mask pins those bins at every step, so
         # the predict-time projection in ``infer`` would apply the same pin twice.
-        # Without a mask the loop pins an inferred support, which is not the
+        # Without a mask the loop pins the cascade's support, which is not the
         # declared one, so the projection is left to raise for its missing mask.
         physics = getattr(generator, "_reverse_physics", None)
         unconstrained = getattr(physics, "reverse_dc", None) == "unconstrained"

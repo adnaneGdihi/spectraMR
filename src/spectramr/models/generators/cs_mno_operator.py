@@ -38,13 +38,20 @@ ARC_STEP_MODES = ("physical", "fixed_resolution")
 
 
 def _arc_delta(
-    linearizer: ImageTopologyLinearizer, spatial_shape: tuple[int, ...], arc_step: str
+    linearizer: ImageTopologyLinearizer,
+    spatial_shape: tuple[int, ...],
+    arc_step: str,
+    reference_shape: tuple[int, ...],
 ) -> torch.Tensor:
-    """Per-token Δt for ``spatial_shape`` under the declared ``arc_step`` mode."""
+    """Per-token Δt for ``spatial_shape`` under ``arc_step``, in units of ``reference_shape``.
+
+    The reference is the construction grid, so a 221² validation slice keeps the
+    per-voxel step of the 128² training crop (#2365).
+    """
     if arc_step == "physical":
-        return linearizer.physical_arc_delta()
-    n_tokens = math.prod(spatial_shape)
-    return torch.full((n_tokens,), n_tokens ** (-1.0 / len(spatial_shape)), dtype=torch.float32)
+        return linearizer.physical_arc_delta(reference_shape)
+    step = math.prod(reference_shape) ** (-1.0 / len(reference_shape))
+    return torch.full((math.prod(spatial_shape),), step, dtype=torch.float32)
 
 __all__ = ["CSMNOOperator"]
 
@@ -184,7 +191,7 @@ class CSMNOOperator(GradCheckpointingMixin, nn.Module):
         self.register_buffer("inverse_idx", linearizer.inverse_idx.clone())
         self.register_buffer(
             "delta_phys",
-            _arc_delta(linearizer, self.spatial_shape, arc_step)
+            _arc_delta(linearizer, self.spatial_shape, arc_step, self.spatial_shape)
             if use_physical_arc
             else torch.zeros(0),
         )
@@ -235,7 +242,7 @@ class CSMNOOperator(GradCheckpointingMixin, nn.Module):
             fwd = linearizer.forward_idx.clone().to(device)
             inv = linearizer.inverse_idx.clone().to(device)
             delta = (
-                _arc_delta(linearizer, spatial_shape, self.arc_step).to(device)
+                _arc_delta(linearizer, spatial_shape, self.arc_step, self.spatial_shape).to(device)
                 if self.use_physical_arc
                 else torch.zeros(0, device=device)
             )

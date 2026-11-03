@@ -53,3 +53,10 @@ def test_strategy_threads_scanner_id() -> None:
         CrossScannerMRFHarmonisationStrategy._compute_losses_impl
     )
     assert "scanner_id=scanner_id" in src
+
+
+def test_out_of_range_scanner_id_raises_instead_of_collapsing() -> None:
+    """An unset num_scanners must not fold every vendor onto row 0."""
+    m = ScannerTimeReparam(fingerprint_length=9)  # num_scanners=1
+    with pytest.raises(IndexError):
+        m(batch_size=2, scanner_id=torch.tensor([0, 1]))

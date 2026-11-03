@@ -1,166 +1,158 @@
 """Universal / foundation reconstruction strategy (PR-7).
 
-One model, many regimes. This thin subclass of
-:class:`ReconstructionTrainingStrategy` adds the framework's foundation-recon
-differentiator: the generator is conditioned on a **physics-derived prompt
-embedding** (from acquisition parameters TR / TE / flip-angle / field-strength)
-rather than on empirically-learned prompt tokens, so a single model
-generalises across mixed contrast / field-strength / acceleration cohorts.
+The generator is conditioned on the scan's physical acquisition parameters (TR, TE, flip
+angle, B0) rather than on learned prompt tokens, so one model can serve mixed contrast,
+field-strength and acceleration cohorts.
 
-Data side (not reimplemented here)
-----------------------------------
-The actual multi-manifold / multi-domain loading routes through
-:meth:`DataPipelineDirector.build_multi_domain_dataloaders` (see
-``.claude/rules/data.md``). This strategy does **not** touch data loading; it
-only *accepts and stamps* a ``task_mixture`` config (a per-cohort sampling
-weight map) so the resolved mixture is recorded in the run's provenance, per
-CLAUDE.md pitfall #15 (every exposed knob is read + stamped).
+The strategy only carries the prompt: it stacks the per-sample ``acquisition_metadata`` dict
+that ``data.acquisition_metadata`` emits into a ``[B, 4]`` vector and hands it to the
+generator under :data:`PROMPT_KWARG`, in training, validation and the validation image
+capture alike. The embedding and the LoRA adapters that consume it belong to the
+prompt-aware backbone (``prompt_lora_hermitian_fno``), so they are optimised and
+checkpointed with the generator. Everything else, including the declared ``losses:`` block,
+runs through :class:`ReconstructionTrainingStrategy` unchanged.
 
-Override pattern follows
-``stochastic_interpolants_strategy.StochasticInterpolantsStrategy``: a thin
-``_compute_losses_impl`` that reads the generator via
-``getattr(self.env, "generator", None)``, the batch via
-``self._resolve_legacy_batch``, and ``self.device``.
-
-Registration (returned to the caller — do NOT edit strategy_factory.py here)::
+Registration::
 
     "universal_reconstruction": "spectramr.infrastructure.training.strategies.universal_reconstruction_strategy.UniversalReconstructionStrategy",
 """
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from collections.abc import Mapping
+from typing import Any
 
 import torch
-from torch.nn.functional import l1_loss
 
+from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import read_batch_field
-from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
-from spectramr.models.blocks.physics_prompt import PhysicsPromptEmbedding
+from spectramr.models.generators.prompt_lora_fno import PROMPT_KWARG
 
-from .mixins.utils import _callable_accepts_kwarg
-from .owned_param_groups import add_owned_param_group
-from .reconstruction import ReconstructionTrainingStrategy
+from .mixins.reconstruction import _as_aux_mapping
+from .mixins.utils import _names_parameter
+from .reconstruction import ReconstructionTrainingStrategy, _batch_contrast_id
+
+#: Batch key of the per-sample header dict ``data.acquisition_metadata`` attaches.
+ACQUISITION_METADATA_KEY = "acquisition_metadata"
+
+
+def acquisition_prompt(
+    metadata: Any, fields: tuple[str, ...], rows: int, device: torch.device
+) -> torch.Tensor:
+    """Stack the collated ``acquisition_metadata`` into a finite ``[rows, len(fields)]`` vector.
+
+    The collate yields one dict of columns, or one dict per sample; both are accepted.
+
+    Raises:
+        KeyError: when the batch carries no metadata or a field is absent.
+        ValueError: on a row-count mismatch or a non-finite value (the lenient reader's NaN).
+    """
+    if (
+        isinstance(metadata, list | tuple)
+        and metadata
+        and all(isinstance(m, Mapping) for m in metadata)
+    ):
+        metadata = {k: [m.get(k) for m in metadata] for k in fields}
+    if not isinstance(metadata, Mapping):
+        raise KeyError(
+            f"universal_reconstruction needs the batch's '{ACQUISITION_METADATA_KEY}' dict to "
+            "build the acquisition prompt; enable data.acquisition_metadata with fields "
+            f"{list(fields)}."
+        )
+    columns = []
+    for name in fields:
+        if name not in metadata or metadata[name] is None:
+            raise KeyError(
+                f"'{ACQUISITION_METADATA_KEY}' lacks '{name}' (has {sorted(metadata)!r}); list "
+                "it under data.acquisition_metadata.fields."
+            )
+        columns.append(torch.as_tensor(metadata[name], dtype=torch.float32).reshape(-1))
+    prompt = torch.stack(columns, dim=-1)
+    if prompt.shape[0] != rows:
+        raise ValueError(
+            f"acquisition prompt has {prompt.shape[0]} row(s) for {rows} input row(s); "
+            "refusing to broadcast a scan's parameters onto rows it was not recorded for."
+        )
+    message = (
+        "acquisition prompt is not finite: the metadata source gave no value for one of "
+        f"{list(fields)} (strict=false falls back to NaN). Set "
+        "data.acquisition_metadata.strict: true and point source at the scan header."
+    )
+    finite = torch.isfinite(prompt).all()
+    if prompt.device.type == "cpu":
+        if not bool(finite):
+            raise ValueError(message)
+    else:
+        # The loop may already have moved the metadata to the GPU: assert without a host sync.
+        torch._assert_async(finite, message)
+    return prompt.to(device, non_blocking=True)
 
 
 class UniversalReconstructionStrategy(ReconstructionTrainingStrategy):
-    """Foundation reconstruction conditioned on a physics-derived prompt.
+    """Reconstruction whose generator consumes a physics-derived acquisition prompt."""
 
-    The prompt embedding is lazily constructed on first use so the strategy
-    can be instantiated through the standard ``ReconstructionTrainingStrategy``
-    path without any new schema keys (``training_mode`` alone selects it).
-    """
-
-    # parallel_compat: The prompt embedder is a bare group on opt_g, refused under ddp. It is
-    # built only when a batch carries acquisition_params, which a multi-domain mixture supplies
-    # per domain, so ranks need not build it at the same step.
     parallel_compat = frozenset({"replicated"})
 
-    @classmethod
-    def owned_module_declarations(cls, config: Any) -> tuple[tuple[str, str], ...]:
-        own = (("_prompt_embedder", OWNED_PARAM_GROUP),)
-        return (*super().owned_module_declarations(config), *own)
+    #: Acquisition-metadata fields of the prompt, in the order the backbone receives them.
+    PROMPT_FIELDS: tuple[str, ...] = ("TR", "TE", "FA", "B0")
 
-    #: Loss ownership (issue #1918). Computes l1_loss(pred, target) inline -- image space, against the target --
-    #: and returns it as the whole objective. Declared so the fold skips it.
-    #: CAVEAT: the weight is hardcoded 1.0, not the declared lambda_l1.
-    inline_losses: ClassVar[frozenset[str]] = frozenset({"l1"})
-    folds_image_losses: ClassVar[bool] = False
-
-    #: Acquisition-parameter layout the physics prompt expects.
-    PROMPT_PARAM_ORDER = ("TR", "TE", "flip_angle", "field_strength_T")
-    #: Conditioning embedding dimension (constructor-default knob).
-    PROMPT_EMBED_DIM = 128
-
-    def _get_prompt_embedder(self, in_features: int) -> PhysicsPromptEmbedding:
-        embedder = getattr(self, "_prompt_embedder", None)
-        if embedder is None or embedder.in_features != in_features:
-            embedder = PhysicsPromptEmbedding(
-                in_features=in_features,
-                embed_dim=self.PROMPT_EMBED_DIM,
-            ).to(self.device)
-            self._prompt_embedder = embedder
-            # The prompt embedder is learnable (two nn.Linear heads); register
-            # it on opt_g or the physics-derived conditioning stays at random
-            # init. The in_features rebuild guard above prevents a double-add.
-            opt = getattr(self.env, "opt_g", None)
-            if opt is not None:
-                existing = {p for g in opt.param_groups for p in g["params"]}
-                new_params = [p for p in embedder.parameters() if p not in existing]
-                if new_params:
-                    add_owned_param_group(
-                        self, opt, {"params": new_params}, owner="its prompt embedder"
-                    )
-        return embedder
-
-    def _compute_losses_impl(
+    def _prepare_batch_context(
         self,
-        input_batch: Any = None,
-        target_batch: Any = None,
-        epoch: int = 0,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
         **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:
-        # Stamp the task-mixture knob (read from kwarg, else keep any preset
-        # attr) into run provenance — pitfall #15: an advertised knob must be
-        # read and recorded, even though the actual multi-domain sampling is
-        # done upstream by DataPipelineDirector.build_multi_domain_dataloaders.
-        if "task_mixture" in kwargs:
-            self.task_mixture = kwargs["task_mixture"]
-        elif not hasattr(self, "task_mixture"):
-            self.task_mixture = None
+    ) -> dict[str, Any]:
+        context = super()._prepare_batch_context(input_batch, target_batch, **kwargs)
+        metadata = _as_aux_mapping(kwargs.get("batch", {})).get(ACQUISITION_METADATA_KEY)
+        if metadata is not None:
+            context[ACQUISITION_METADATA_KEY] = metadata
+        return context
 
-        batch = self._resolve_legacy_batch(input_batch, kwargs)
-        gen = getattr(self.env, "generator", None)
+    def _prepare_generator_inputs(
+        self,
+        batch_context: dict[str, Any],
+        input_batch: torch.Tensor,
+        *,
+        validation: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        lr_image, forward_kwargs = super()._prepare_generator_inputs(
+            batch_context, input_batch, validation=validation
+        )
+        forward = getattr(unwrap_model(self.env.generator), "forward", None)
+        if not _names_parameter(forward, PROMPT_KWARG):
+            raise ValueError(
+                f"universal_reconstruction conditions the generator on '{PROMPT_KWARG}', but "
+                f"{type(unwrap_model(self.env.generator)).__name__}.forward does not take it, so "
+                "the prompt would be inert. Use a prompt-aware backbone "
+                "(model_type: prompt_lora_hermitian_fno) or training_mode: reconstruction."
+            )
+        forward_kwargs[PROMPT_KWARG] = acquisition_prompt(
+            batch_context.get(ACQUISITION_METADATA_KEY),
+            self.PROMPT_FIELDS,
+            lr_image.shape[0],
+            lr_image.device,
+        )
+        return lr_image, forward_kwargs
 
-        target = batch.get("target") if isinstance(batch, dict) else target_batch
-        source = batch.get("input") if isinstance(batch, dict) else input_batch
-        if source is None and isinstance(batch, dict):
-            source = batch.get("source")
-
-        if gen is None or target is None or source is None:
-            return {"loss_total": torch.tensor(0.0, device=self.device)}
-
-        # Physics-derived conditioning — only when the batch carries the
-        # acquisition parameters. Absent params => unconditioned forward
-        # (graceful skip, no silent default tokens).
-        prompt = None
-        acq = read_batch_field(batch, "acquisition_params")
-        if acq is not None:
-            acq = acq.to(self.device)
-            embedder = self._get_prompt_embedder(acq.shape[-1])
-            prompt = embedder(acq)
-
-        pred = self._forward_generator(gen, source, prompt)
-        loss = l1_loss(pred, target)
-        return {"loss_total": loss, "loss_recon_l1": loss.detach()}
-
-    @staticmethod
-    def _forward_generator(
-        gen: Any,
-        source: torch.Tensor,
-        prompt: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Forward the generator, passing ``prompt`` only when supported.
-
-        A plain reconstruction backbone whose ``forward`` does not accept a
-        ``prompt`` kwarg is run unconditioned — the conditioning is skipped
-        gracefully rather than crashing.
-
-        Introspection is the whole decision (SAQ-001). A ``try:
-        gen(source, prompt=prompt) except TypeError: gen(source)`` tail used to
-        follow this check and contradicted it twice: it re-attempted the kwarg
-        call that ``_callable_accepts_kwarg`` had just ruled out, and when
-        ``prompt`` was ``None`` it retried ``gen(source)`` with the identical
-        ``gen(source)`` — a call that can only raise the same error again, so
-        the sole effect either way was to swallow a genuine in-forward
-        ``TypeError`` and blame it on the signature.
-
-        One behavioural consequence, deliberate: a generator whose signature
-        cannot be introspected makes ``_callable_accepts_kwarg`` return
-        ``False``, so it is now run unconditioned instead of being probed with
-        the kwarg first. That matches how every other conditioning gate in this
-        package resolves an unreadable signature.
-        """
-        if prompt is not None and _callable_accepts_kwarg(gen.forward, "prompt"):
-            return gen(source, prompt=prompt)
-        return gen(source)
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        *,
+        batch_data: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Validate under the batch's own prompt, as the training step conditions."""
+        if batch_data is not None:
+            context = dict(
+                kwargs.get("batch_context") or {"use_dc": False, "measured_kspace": None}
+            )
+            if "contrast_id" not in context:
+                contrast = _batch_contrast_id(batch_data, input_batch)
+                if contrast is not None:
+                    context["contrast_id"] = contrast
+            metadata = read_batch_field(batch_data, ACQUISITION_METADATA_KEY)
+            if metadata is not None:
+                context[ACQUISITION_METADATA_KEY] = metadata
+            kwargs["batch_context"] = context
+        return super().validation_step(input_batch, target_batch, batch_data=batch_data, **kwargs)

@@ -26,6 +26,7 @@ from spectramr.infrastructure.reporting.plotters._curve_panels import Panel, def
 from spectramr.infrastructure.reporting.style import (
     column_width,
     panel_label,
+    panel_letter,
     pretty_label,
     save_figure,
     use_default_style,
@@ -87,7 +88,7 @@ def _default_figure(df: pd.DataFrame):
         ax = axes[0][idx]
         _draw_panel(ax, panel, methods, selected)
         if len(panels) > 1:
-            panel_label(ax, chr(ord("a") + idx))
+            panel_label(ax, panel_letter(idx))
     handles, labels = collect_handles(axes[0])
     if len(methods) > 1 and len(methods) <= 3 and any(not p.train.empty for p in panels):
         # several arms: colour is the arm, line style is the split
@@ -133,7 +134,7 @@ def _explicit_figure(df: pd.DataFrame, metrics: list[str], log_y: bool, band: bo
         if idx + cols >= n:
             ax.set_xlabel(pretty_label("step"))
         if n > 1:
-            panel_label(ax, chr(ord("a") + idx))
+            panel_label(ax, panel_letter(idx))
         sparse_ticks(ax)
     for empty in range(n, rows * cols):
         axes[empty // cols][empty % cols].set_axis_off()

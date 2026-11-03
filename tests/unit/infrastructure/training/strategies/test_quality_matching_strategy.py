@@ -544,6 +544,11 @@ def test_synthesise_pairs_writes_readable_pairs_and_a_v4_manifest(tmp_path):
 
     assert Path(rec["primary_path"]).exists()
     assert Path(rec["target_path"]).exists()
+    # Slice-last on disk: the paired-NIfTI loader 02a uses takes the last axis as depth.
+    from spectramr.data.io_strategies import NiftiStrategy
+
+    for key in ("primary_path", "target_path"):
+        assert tuple(NiftiStrategy().load(rec[key])["data"].shape) == (1, 32, 32, 2)
 
 
 def test_synthesised_manifest_loads_through_the_paired_loader(tmp_path):
@@ -1399,6 +1404,7 @@ def test_explicit_nifti_pairs_run_end_to_end_and_write_a_manifest(tmp_path):
         },
         max_evals=10,
         min_gap_closed=0.0,
+        max_residual=None,  # plumbing test on random volumes: no fit-quality gate
         match_spacing=False,
         enable_acquisition_prior=False,
         output_dir=str(tmp_path / "out"),
@@ -1468,6 +1474,7 @@ def _explicit_cfg(tmp_path, manifest, **kw):
         },
         "max_evals": 10,
         "min_gap_closed": 0.0,
+        "max_residual": None,  # plumbing tests on random volumes: no fit-quality gate
         "match_spacing": False,
         "enable_acquisition_prior": False,
         "output_dir": str(tmp_path / "out"),
@@ -1538,3 +1545,21 @@ def test_fit_policy_is_stamped_so_the_artifact_shows_its_units(tmp_path):
     policy = yaml.safe_load((tmp_path / "out" / "calibration.yaml").read_text())["fit_policy"]
     assert policy["intensity_percentile"] == 95.0
     assert policy["max_residual"] == 5.0
+
+
+def test_default_residual_ceiling_reaches_the_fit_and_raises_on_a_missed_target(tmp_path):
+    # Planted (#2411): with min_gap_closed=0 only the default ceiling stands between a
+    # fit that misses its target and a calibration artifact that looks successful.
+    from spectramr.config.schemas.training.quality_matching import QualityMatchingConfig
+    from spectramr.infrastructure.physics.chain_fitter import DegenerateFitError
+    from spectramr.infrastructure.training.strategies.quality_matching_strategy import (
+        run_quality_matching,
+    )
+
+    manifest = _explicit_manifest(tmp_path, n=2)
+    fields = _explicit_cfg(tmp_path, manifest).model_dump(exclude={"max_residual"})
+    cfg = QualityMatchingConfig(**fields)
+    assert cfg.max_residual == 0.1
+    with pytest.raises(DegenerateFitError, match="absolute ceiling"):
+        run_quality_matching(cfg, torch.zeros(1), hq_manifest=None)
+    assert not (tmp_path / "out" / "calibration.yaml").exists()

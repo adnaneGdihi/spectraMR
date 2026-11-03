@@ -37,6 +37,7 @@ from typing import Any, ClassVar
 import torch
 
 from spectramr.infrastructure.physics.fft_ops import ifft2c
+from spectramr.infrastructure.physics.hermitian import enforce_hermitian
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.models.losses.computers import UnifiedReconstructionLossComputer
@@ -70,10 +71,14 @@ class HSSCStrategy(BaseTrainingStrategy):
         return
 
     def _hermitian_project(self, k: torch.Tensor) -> torch.Tensor:
-        """``k ← (k + conj(flip(k))) / 2`` — enforces conjugate symmetry."""
+        """``k ← (k + conj(k[-f])) / 2``: projects onto real images (``x → Re x``).
+
+        The partner of index ``j`` on the centred grid is ``(N - j) mod N``; a plain
+        ``flip`` pairs ``f`` with ``-f - 1`` and twists real images (#2408).
+        """
         if not torch.is_complex(k):
             return k
-        return 0.5 * (k + torch.conj(torch.flip(k, dims=[-2, -1])))
+        return enforce_hermitian(k)
 
     def _data_consistency(
         self,

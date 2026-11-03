@@ -8,6 +8,7 @@ This module provides physics-based components for MRI reconstruction including:
 """
 
 import logging
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -45,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 class OperatorProjectionDataConsistency(nn.Module):
     """Data consistency layer for reconstruction networks."""
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self, operator: IForwardOperator, lambda_dc: float = 1.0):
         """__init__.
@@ -687,7 +691,15 @@ def create_physics_operator(operator_type: str = "fft2d", **kwargs) -> IForwardO
     try:
         return create_operator(operator_type, **kwargs)
     except KeyError as exc:
-        raise ValueError(f"Unknown operator type: {operator_type}") from exc
+        from spectramr.infrastructure.physics.signal_models.registry import list_signal_models
+
+        hint = (
+            f" {operator_type!r} is a signal model (nonlinear, no adjoint); resolve it "
+            "with signal_models.registry.get_signal_model, not as an operator."
+            if operator_type in list_signal_models()
+            else ""
+        )
+        raise ValueError(f"Unknown operator type: {operator_type}.{hint}") from exc
 
 
 def create_dc_layer(

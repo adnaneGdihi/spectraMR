@@ -8,6 +8,8 @@ A campaign automates: define → submit → track → evaluate → compare.
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -34,7 +36,7 @@ class SlurmDefaultsSchema(BaseModel):
     # requested via --gres). A default of "gpu" silently overrode that None for
     # every campaign job → ``sbatch: invalid partition specified`` (pitfall #15).
     partition: str | None = Field(default=None)
-    time: str = Field(default="120:00:00")
+    time: str = Field(default="96:00:00")
     mem: str = Field(default="64GB")
     cpus_per_task: int = Field(default=8, gt=0)
     gpus: int = Field(default=1, ge=0)
@@ -68,6 +70,9 @@ class CheckpointFromSchema(BaseModel):
     )
 
 
+_SEED_SUFFIX = re.compile(r"_seed\d+$")
+
+
 class CampaignExperimentSchema(BaseModel):
     """A single experiment within a campaign."""
 
@@ -89,6 +94,13 @@ class CampaignExperimentSchema(BaseModel):
             "Only used when campaign execution is 'sequential'."
         ),
     )
+    compare_to: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of the arms this variant/ablation is tested against. Empty keeps the "
+            "default: tested against every baseline. Baselines cannot set it."
+        ),
+    )
 
     @field_validator("config")
     @classmethod
@@ -97,6 +109,32 @@ class CampaignExperimentSchema(BaseModel):
         if not value.endswith((".yaml", ".yml")):
             raise ValueError(f"Config must be a YAML file, got: {value}")
         return value
+
+    @property
+    def replicate_group(self) -> str:
+        """Replicate group: ``tags.arm``, else the name with its ``_seedN`` suffix removed."""
+        return self.tags.get("arm") or _SEED_SUFFIX.sub("", self.name)
+
+    @model_validator(mode="after")
+    def _validate_pairing_tags(self) -> CampaignExperimentSchema:
+        """Reject pairing declarations the evaluator would otherwise ignore."""
+        if self.compare_to:
+            if self.role == "baseline":
+                raise ValueError(f"Baseline '{self.name}' cannot declare compare_to")
+            if self.name in self.compare_to:
+                raise ValueError(f"Experiment '{self.name}' cannot compare_to itself")
+            if len(set(self.compare_to)) != len(self.compare_to):
+                raise ValueError(f"Experiment '{self.name}' lists a compare_to target twice")
+            if "seed" in self.tags:
+                raise ValueError(
+                    f"Experiment '{self.name}' sets both compare_to and tags.seed; "
+                    "declare compare_to on the un-replicated arm"
+                )
+        if "seed" in self.tags and not self.tags["seed"].isdigit():
+            raise ValueError(
+                f"tags.seed of '{self.name}' must be an integer, got {self.tags['seed']!r}"
+            )
+        return self
 
 
 class AblationAxisSchema(BaseModel):
@@ -336,6 +374,32 @@ class CampaignConfigSchema(BaseModel):
         else:
             if not self.experiments and not self.stage_groups:
                 raise ValueError("Parallel campaigns require 'experiments' to be defined")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_compare_targets(self) -> CampaignConfigSchema:
+        """Validate compare_to targets and that every seeded arm has a replicate partner."""
+        names = [e.name for e in self.all_declared_experiments]
+        known = set(names)
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes and any(e.compare_to or "seed" in e.tags for e in self.all_declared_experiments):
+            raise ValueError(
+                f"Duplicate experiment names {dupes}: compare_to and tags.seed resolve arms by name"
+            )
+        replicates = Counter(e.replicate_group for e in self.enabled_experiments if "seed" in e.tags)
+        lonely = sorted(g for g, count in replicates.items() if count == 1)
+        if lonely:
+            raise ValueError(
+                f"Seeded arms {lonely} are alone in their replicate group: a single seed is "
+                "not a replicate. Add the other seeds, or drop tags.seed"
+            )
+        for exp in self.all_declared_experiments:
+            missing = [t for t in exp.compare_to if t not in known]
+            if missing:
+                raise ValueError(
+                    f"Experiment '{exp.name}' compare_to names unknown experiments {missing}. "
+                    f"Available: {sorted(known)}"
+                )
         return self
 
     @property

@@ -22,22 +22,21 @@ Convexity of ``psi`` is structural, not learned:
 - the activation is ``softplus`` (convex, non-decreasing, smooth — smoothness matters because
   training backprops through ``grad_x psi``, a double backward);
 - the ``x -> z`` (input-skip) convs are AFFINE in ``x`` (unconstrained — affine is convex);
-- mean-pool over space+channels (a non-negative combination) yields the scalar ``psi``.
+- a sum over space+channels (a non-negative combination) yields the scalar ``psi``. A sum keeps
+  the per-pixel gradient independent of the image size; a mean damped it to ``O(1/N)`` and pinned
+  ``T`` at the identity (#192).
 
 ``enforce_convexity=False`` drops the softplus reparam (raw, sign-free weights) so ``psi`` is a
 generic CNN whose gradient is NOT a guaranteed OT map — the one-knob ablation for B-1.5/3.9.
 It stays a trainable map (non-degenerate), isolating the convexity/Brenier guarantee.
 
-``intensity_adaptation`` (``none`` | ``undamped`` | ``transfer``) controls how the map remaps
+``intensity_adaptation`` (``none`` | ``transfer``) controls how the map remaps
 INTENSITY/CONTRAST — the residual that survives on co-registered, normalised source/target pairs:
 
-- ``none`` (default): the original mean-pooled potential. The ``1/N`` mean damps ``grad psi`` to
-  ``O(1/N)`` so ``T(x) ~ x`` is pinned at identity (the right diagnostic baseline, but it learns
-  no contrast change).
-- ``undamped`` (Route 1): SUM-pool the potential, so the per-pixel intensity gradient is ``O(1)``.
-  A sum is still a non-negative reduction, so ``psi`` stays convex and ``T`` stays monotone. NOTE:
-  a convex displacement map has ``T'(x) = 1 + map_scale*psi''(x) >= 1`` — it can only EXPAND
-  intensities, never COMPRESS them.
+- ``none`` (default): the displacement map alone. A convex displacement map has
+  ``T'(x) = 1 + map_scale*psi''(x) >= 1`` — it can only EXPAND intensities, never COMPRESS them.
+  (The former ``undamped`` value sum-pooled the potential; that is now the only pooling, so the
+  value is retired and raises.)
 - ``transfer`` (Route 2): compose a field-conditioned MONOTONE per-pixel intensity transfer
   ``g_b(x) = gain(b)*x + bias(b) + sum_k w_k(b)*softplus(s*(x - t_k))`` (``gain, w_k >= 0``) with
   the convex spatial map: ``T(x) = g_b(x) + map_scale*grad psi(x)``. ``diag(g_b') (PSD) +
@@ -81,13 +80,9 @@ class InputConvexNeuralNetwork(nn.Module):
             raise ValueError(f"n_layers must be >= 2; got {n_layers}.")
         if map_scale_init <= 0.0:
             raise ValueError(f"map_scale_init must be > 0; got {map_scale_init}.")
-        # intensity_adaptation: how the (curl-free, near-identity) base map is allowed to remap
-        # INTENSITY/CONTRAST. On co-registered+normalised source/7T pairs the residual is a
-        # contrast change, not a geometric one, so the default mean-pool ("none") leaves the map
-        # pinned at identity (grad psi ~ O(1/N)). "undamped" sum-pools the potential so the
-        # intensity-space gradient is O(1); "transfer" composes a field-conditioned monotone
-        # per-pixel intensity transfer. Both keep the map monotone (Brenier-valid) under convexity.
-        _valid_ia = {"none", "undamped", "transfer"}
+        # "transfer" composes a field-conditioned monotone per-pixel intensity transfer that keeps
+        # the map monotone (Brenier-valid) under convexity.
+        _valid_ia = {"none", "transfer"}
         if intensity_adaptation not in _valid_ia:  # pitfall #9/#15: raise, never silently degrade
             raise ValueError(
                 f"intensity_adaptation must be one of {sorted(_valid_ia)}; got "
@@ -106,12 +101,14 @@ class InputConvexNeuralNetwork(nn.Module):
         self.field_dim = int(field_dim)
         self.enforce_convexity = bool(enforce_convexity)
         self.pad = kernel_size // 2
-        # Fan-in normalisation of the convex-path convs: without it the gradient grad_x psi
-        # compounds MULTIPLICATIVELY through depth/width (softplus weights ~0.69 x fan-in per
-        # layer) and explodes at the production config (h=64,n=4 -> |grad|~470, ~79% clamp
-        # saturation — NOT the near-identity init the displacement form intends). Dividing each
-        # conv by sqrt(fan_in) keeps the gradient O(1) and config-invariant.
-        self._znorm = float((self.hidden * kernel_size * kernel_size) ** 0.5)
+        # Fan-in normalisation of the convex-path convs. Non-negative softplus weights average
+        # ~ln 2 at init, so each layer's gain is ~ln2*fan_in and only a ln2*fan_in divisor keeps
+        # grad_x psi O(1) through depth; sign-free weights need sqrt(fan_in). Both give a
+        # ~0.03-0.07 near-identity displacement at map_scale_init=0.1 for any width/depth/size.
+        fan_in = self.hidden * kernel_size * kernel_size
+        self._znorm = (
+            float(math.log(2.0) * fan_in) if self.enforce_convexity else float(fan_in**0.5)
+        )
 
         # Input-skip (x -> hidden/out) convs: AFFINE in x, unconstrained.
         self.x_skips = nn.ModuleList(
@@ -173,7 +170,7 @@ class InputConvexNeuralNetwork(nn.Module):
         return F.softplus(self.map_scale_raw)
 
     def potential(self, x: torch.Tensor, field: torch.Tensor | None = None) -> torch.Tensor:
-        """Convex scalar potential ``psi(x)`` -> ``[B]`` (mean over channels + space)."""
+        """Convex scalar potential ``psi(x)`` -> ``[B]`` (sum over channels + space)."""
         gammas = betas = None
         if self.field_dim > 0:
             if field is None:
@@ -185,7 +182,7 @@ class InputConvexNeuralNetwork(nn.Module):
 
         z = F.softplus(self.x_skips[0](x))  # z_1 = softplus(affine(x))
         for i in range(self.n_layers - 2):
-            # /_znorm (sqrt fan-in) keeps grad_x psi O(1) across width/depth (near-identity init)
+            # /_znorm (fan-in) keeps grad_x psi O(1) across width/depth (near-identity init)
             zc = F.conv2d(z, self._zw(self.z_raw[i]), padding=self.pad) / self._znorm  # non-neg
             if gammas is not None and betas is not None:
                 zc = gammas[:, i][:, :, None, None] * zc + betas[:, i][:, :, None, None]
@@ -193,13 +190,7 @@ class InputConvexNeuralNetwork(nn.Module):
         out = F.conv2d(
             z, self._zw(self.z_final_raw), padding=self.pad
         ) / self._znorm + self.x_final(x)
-        flat = out.flatten(1)
-        # "none"/"transfer": mean-pool (a non-negative combination; keeps convexity, bounds the
-        # gradient to a near-identity base). "undamped": sum-pool so the per-pixel intensity
-        # gradient is O(1) instead of O(1/N) -- still a non-negative combination, so still convex.
-        if self.intensity_adaptation == "undamped":
-            return flat.sum(dim=1)  # [B]
-        return flat.mean(dim=1)  # [B]
+        return out.flatten(1).sum(dim=1)  # [B]
 
     def _transfer(self, x: torch.Tensor, field: torch.Tensor | None) -> torch.Tensor:
         """Field-conditioned monotone per-pixel intensity transfer ``g_b(x)`` (Route 2 base)."""

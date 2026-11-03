@@ -9,12 +9,20 @@ own contrast map, and is refused when neither applies. It is never defaulted to 
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from spectramr.domain.exceptions import ConfigurationError
+from spectramr.infrastructure.training.strategies.mixins.contrast_forwarding import (
+    contrast_inputs,
+    declared_acquisition_lookup,
+)
+
+#: Generator kwargs a contrast-conditioned forward is fed at train and at predict (#2410).
+CONDITIONING_KEYS: tuple[str, ...] = ("contrast_idx", "acquisition_params")
 
 
 def _from_filename(name: str, contrast_map: Mapping[str, int] | None) -> int | None:
@@ -56,3 +64,45 @@ def resolve_predict_contrast(
             f"contrast id {idx} is outside [0, {num_contrasts}) for {input_file.name}."
         )
     return torch.tensor([int(idx)], dtype=torch.long)
+
+
+def resolve_predict_conditioning(
+    multi_contrast: Any,
+    forward: Callable[..., Any],
+    input_file: Path,
+    explicit: int | None,
+) -> dict[str, Any] | None:
+    """One-sample ``contrast_idx`` / ``acquisition_params`` for a forward training conditioned.
+
+    Mirrors the training seam (``contrast_inputs``): ``None`` when the arm trains the
+    network unconditioned, else the kwargs its forward names, resolved from the file or
+    refused. The table is ``data.multi_contrast.contrast_map``, the one training indexed.
+    """
+    takes_idx, takes_acq = contrast_inputs(forward, multi_contrast)
+    if not (takes_idx or takes_acq):
+        return None
+    contrast_map = dict(multi_contrast.contrast_map)
+    if not contrast_map:
+        raise ConfigurationError(
+            "data.multi_contrast.enabled is true and the generator takes contrast_idx, but "
+            "data.multi_contrast.contrast_map is empty: predict has no contrast id to resolve."
+        )
+    contrast = resolve_predict_contrast(len(contrast_map), input_file, explicit, contrast_map)
+    assert contrast is not None  # num_contrasts > 0: resolved or raised
+    out: dict[str, Any] = {"contrast_idx": contrast} if takes_idx else {}
+    lookup = declared_acquisition_lookup(multi_contrast) if takes_acq else None
+    if lookup is not None:
+        out["acquisition_params"] = lookup(contrast)
+    return out
+
+
+def expand_conditioning(conditioning: Mapping[str, Any], rows: int) -> dict[str, Any]:
+    """Broadcast one-sample conditioning tensors to ``rows`` samples (views, no copy)."""
+    return {
+        key: (
+            {k: v.expand(rows) for k, v in value.items()}
+            if isinstance(value, Mapping)
+            else value.expand(rows)
+        )
+        for key, value in conditioning.items()
+    }

@@ -152,7 +152,7 @@ class TestGenerateJobScript:
         for directive in [
             "#SBATCH --job-name=exp_alpha",
             "#SBATCH --account=test_alloc",
-            "#SBATCH --time=120:00:00",
+            "#SBATCH --time=96:00:00",
             "#SBATCH --mem=64GB",
             "#SBATCH --cpus-per-task=8",
             "#SBATCH --gpus=1",

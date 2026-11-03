@@ -203,6 +203,14 @@ def test_batch_fields_reads_non_dict_trainingbatch() -> None:
     assert cid.tolist() == [0, 1]
 
 
+def test_batch_fields_raises_without_a_source_field() -> None:
+    """The encoder reads the source field; substituting the target would be silent."""
+    s = _make_strategy()
+    s._current_batch = {"field_strength_target": torch.tensor([7.0])}
+    with pytest.raises(ValueError, match="'field_strength' \\(source\\)"):
+        s._batch_fields(torch.device("cpu"))
+
+
 def test_train_step_captures_non_dict_get_able_batch() -> None:
     fake = _FakeTrainingBatch({"field_strength_target": torch.tensor([7.0])})
     assert hasattr(fake, "get") and not isinstance(fake, dict)
@@ -245,10 +253,25 @@ def test_validation_forward_renders_at_the_target_field() -> None:
     strategy._contrast_conditioning = False
 
     x = torch.rand(2, 1, 16, 16)
-    ctx = {"input": x, "field_strength_target": torch.tensor([3.0, 7.0])}
+    ctx = {
+        "input": x,
+        "field_strength": torch.tensor([0.1, 1.5]),
+        "field_strength_target": torch.tensor([3.0, 7.0]),
+    }
     out = strategy._validation_forward(x, ctx)
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
+
+
+def test_validation_forward_raises_without_a_source_field() -> None:
+    """The encoder is conditioned on the source field, so it may not be guessed."""
+    strategy = FieldCocycleTranslationStrategy.__new__(FieldCocycleTranslationStrategy)
+    strategy.env = SimpleNamespace(generator=FieldCocycleGenerator(latent_channels=4, width=8))
+    strategy.config = SimpleNamespace(training=SimpleNamespace(enforce_output_range=False))
+    strategy._contrast_conditioning = False
+    ctx = {"field_strength_target": torch.tensor([3.0])}
+    with pytest.raises(ValueError, match="'field_strength' \\(source\\)"):
+        strategy._validation_forward(torch.rand(1, 1, 16, 16), ctx)
 
 
 def test_validation_forward_raises_without_a_target_field() -> None:

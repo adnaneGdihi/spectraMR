@@ -134,3 +134,23 @@ def test_g_factor_registered_as_no_reference():
     g_no_target = metric(img, sensitivity_maps=smaps, acceleration=2)
     g_with_target = metric(img, ref, sensitivity_maps=smaps, acceleration=2)
     assert g_no_target == g_with_target, "g_factor must ignore the reference target"
+
+
+def test_g_factor_reads_maps_and_rate_from_the_validation_context():
+    """The validation loop threads ``context=``; its maps and R must be used."""
+    from spectramr.core.metrics.context import MetricContext
+
+    metric = GFactor()  # default acceleration=2 must not override the context's R
+    img = torch.zeros(1, 1, 48, 48)
+    smaps = create_synthetic_csm((1, 1, 48, 48), num_coils=8)[0]
+    via_ctx = metric(img, context=MetricContext(coil_maps=smaps, acceleration=4.0))
+    assert via_ctx == metric(img, sensitivity_maps=smaps, acceleration=4)
+    assert via_ctx > metric(img, sensitivity_maps=smaps, acceleration=2) > 1.0
+    # A context that carries maps but no rate is not scored at the constructor default.
+    assert math.isnan(metric(img, context=MetricContext(coil_maps=smaps)))
+
+
+def test_g_factor_is_nan_when_r_exceeds_the_coil_count():
+    """R > coils leaves SENSE underdetermined: unmeasurable, never the best score 1.0."""
+    smaps = create_synthetic_csm((1, 1, 48, 48), num_coils=4)[0]
+    assert math.isnan(GFactor()(torch.zeros(1, 1, 48, 48), sensitivity_maps=smaps, acceleration=6))

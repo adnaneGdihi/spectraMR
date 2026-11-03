@@ -93,3 +93,13 @@ def test_pred_kspace_field_defaults_none_and_is_carried() -> None:
     k = torch.zeros(1, 4, 8, 8, dtype=torch.complex64)
     assert MetricContext(pred_kspace=k).has("pred_kspace")
     assert MetricContext.from_kwargs({"pred_kspace": k}).pred_kspace is k
+
+
+def test_model_input_is_a_context_field() -> None:
+    import torch
+
+    from spectramr.core.metrics.context import MetricContext
+
+    x = torch.zeros(1, 1, 2, 2)
+    assert MetricContext(model_input=x).has("model_input")
+    assert MetricContext.from_kwargs({"model_input": x}).model_input is x

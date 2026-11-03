@@ -581,6 +581,20 @@ class TestSSIMCodomainGuard:
         v = torch.tensor(0.87)
         assert _guard_ssim_codomain(v, metric_name="ssim") is v
 
+    @pytest.mark.parametrize("value, bound", [(1.0 + 1e-6, 1.0), (-1.0 - 1e-6, -1.0)])
+    def test_float_rounding_past_the_bound_is_clamped_not_refused(self, value, bound):
+        """A mean SSIM map of identical images can round past 1 in float32."""
+        from spectramr.core.metrics.evaluation_metrics import _guard_ssim_codomain
+
+        assert float(_guard_ssim_codomain(torch.tensor(value), metric_name="ssim")) == bound
+
+    @pytest.mark.parametrize("value", [1.0 + 1e-3, -1.0 - 1e-3])
+    def test_a_real_overshoot_still_raises(self, value):
+        from spectramr.core.metrics.evaluation_metrics import _guard_ssim_codomain
+
+        with pytest.raises(ValueError, match="codomain"):
+            _guard_ssim_codomain(torch.tensor(value), metric_name="ssim")
+
     def test_nonfinite_value_is_also_refused(self):
         """NaN is not a score either — it is 'the metric did not measure'."""
         from spectramr.core.metrics.evaluation_metrics import _guard_ssim_codomain
@@ -1122,3 +1136,17 @@ def test_ms_ssim_still_scores_a_large_enough_image() -> None:
     ms_ssim = MetricsRegistry.get("ms_ssim")
     x = torch.rand(1, 1, 176, 176)
     assert float(ms_ssim.compute_metric(x, x)) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_med_fid_computes_on_current_scipy(monkeypatch) -> None:
+    """``sqrtm(..., disp=False)`` raised TypeError on SciPy >= 1.18, so every MedFID read NaN."""
+    import torch
+
+    from spectramr.core.metrics.evaluation_metrics import MedFID
+
+    monkeypatch.setattr(MedFID, "_setup_extractor", lambda self: setattr(self, "_model_available", False))
+    metric = MedFID(feature_dim=49)
+    g = torch.Generator().manual_seed(0)
+    metric.update(torch.rand(40, 1, 14, 14, generator=g), torch.rand(40, 1, 14, 14, generator=g) + 0.5)
+    value = float(metric.compute())
+    assert math.isfinite(value) and value > 0

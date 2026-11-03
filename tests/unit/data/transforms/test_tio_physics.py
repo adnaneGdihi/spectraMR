@@ -461,3 +461,96 @@ def test_the_profile_survives_the_provenance_cap() -> None:
     record = DigitalTwinDegradation(sim, pe_axis="W").applied_record()
     assert _scalarize(record) == record
     assert record["scanner_profile_sha256"] == sim.scanner_profile.meta_sha256()
+
+
+def test_an_unset_sampling_pattern_keeps_the_uniform_random_mask_byte_identical() -> None:
+    """Arms that never set ``sampling_pattern`` keep the seeded ``randperm`` draw they trained on."""
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    mask = PhysicsInformedMasking(acceleration=8, center_fraction=0.08)._generate_mask(256, 4)[:, 0]
+    expected = torch.zeros(256)
+    expected[118:138] = 1
+    outer = torch.where(expected == 0)[0]
+    gen = torch.Generator(device="cpu").manual_seed(1234 + 256)
+    expected[outer[torch.randperm(len(outer), generator=gen)[: int(len(outer) / 8)]]] = 1
+    assert torch.equal(mask, expected)
+    explicit = PhysicsInformedMasking(acceleration=8, center_fraction=0.08, sampling_pattern="random")
+    assert torch.equal(explicit._generate_mask(256, 4)[:, 0], expected)
+
+
+def test_variable_density_outer_lines_are_seeded_and_stamped() -> None:
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    def build() -> PhysicsInformedMasking:
+        return PhysicsInformedMasking(
+            acceleration=8, center_fraction=0.08, sampling_pattern="variable_density_1d"
+        )
+
+    assert torch.equal(build()._generate_mask(256, 4), build()._generate_mask(256, 4))
+    record = build().applied_record()
+    assert record["pattern"] == "variable_density_1d_outer_lines"
+    assert record["density_power"] == "2.0"
+
+
+def test_a_sampling_pattern_the_loader_cannot_draw_is_refused() -> None:
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    with pytest.raises(ValueError, match="cannot draw"):
+        PhysicsInformedMasking(acceleration=8, sampling_pattern="poisson_disk")
+    with pytest.raises(ValueError, match="Unknown sampling pattern"):
+        PhysicsInformedMasking(acceleration=8, sampling_pattern="not_a_pattern")
+
+
+# --- PhysicsInformedMasking: undersampling.sampling_pattern: sle_kappa ---
+
+
+def test_default_sampling_pattern_keeps_the_random_line_mask() -> None:
+    """Planted: the default must stay the published 79-line R4 mask at 256 lines."""
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    mask = PhysicsInformedMasking(acceleration=4, center_fraction=0.08)._generate_mask(256, 8)
+    assert torch.all(mask == mask[:, :1])
+    assert int(mask[:, 0].sum()) == 79
+
+
+def test_sle_kappa_mask_keeps_the_acs_band_and_the_sample_budget() -> None:
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    lines = PhysicsInformedMasking(acceleration=4, center_fraction=0.08)
+    sle = PhysicsInformedMasking(acceleration=4, center_fraction=0.08, sampling_pattern="sle_kappa")
+    a, b = lines._generate_mask(64, 48), sle._generate_mask(64, 48)
+    assert int(b.sum()) == int(a.sum())
+    assert sle.realised_acceleration(64, 48) == pytest.approx(lines.realised_acceleration(64, 48))
+    centre, half = 32, int(64 * 0.08) // 2
+    assert torch.all(b[centre - half : centre + half] == 1)
+    assert not torch.all(b == b[:, :1]), "SLE outer samples are points, not lines"
+    record = sle.applied_record()
+    assert record["sle_kappa"] == "2.0" and record["sle_shots"].startswith("64x48: ")
+
+
+def test_sle_kappa_mask_is_deterministic_and_replayable() -> None:
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    masking = PhysicsInformedMasking(acceleration=4, sampling_pattern="sle_kappa")
+    replay = PhysicsInformedMasking(**masking._get_named_arguments())
+    assert torch.equal(replay._generate_mask(40, 40), masking._generate_mask(40, 40))
+
+
+def test_a_trajectory_pattern_is_refused_by_the_line_mask() -> None:
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    with pytest.raises(ValueError, match="cannot draw"):
+        PhysicsInformedMasking(sampling_pattern="spiral")
+
+
+def test_sle_kappa_outer_density_is_symmetric_about_dc() -> None:
+    """Planted: unmirrored shots rooted at y=0 put ~11x more samples at one k-space edge."""
+    from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+    masking = PhysicsInformedMasking(acceleration=4, center_fraction=0.08, sampling_pattern="sle_kappa")
+    mask = masking._generate_mask(320, 320)
+    half = int(320 * 0.08) // 2
+    low, high = int(mask[: 160 - half].sum()), int(mask[160 + half :].sum())
+    assert min(low, high) / max(low, high) > 0.7
+    edge_low, edge_high = int(mask[:32].sum()), int(mask[-32:].sum())
+    assert min(edge_low, edge_high) / max(edge_low, edge_high) > 0.5

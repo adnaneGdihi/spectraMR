@@ -117,3 +117,16 @@ def test_audit_check_rejects_mismatched_cardinality() -> None:
     result = checker.check_vendor_model_support(_Cfg())  # type: ignore[arg-type]
     assert not result.passed
     assert "n_vendors" in result.message
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync-debug mode needs a GPU")
+def test_forward_does_not_sync_the_gpu() -> None:
+    """The range check is host-only; on CUDA nn.Embedding's own assert covers it."""
+    block = VendorPromptEmbedding(n_vendors=2, embed_dim=4).cuda()
+    acq, ids = torch.randn(2, 4, device="cuda"), torch.tensor([0, 1], device="cuda")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        block(acq, ids)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

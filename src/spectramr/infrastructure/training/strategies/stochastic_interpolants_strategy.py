@@ -28,18 +28,23 @@ from typing import Any, ClassVar
 import torch
 import torch.nn.functional as F
 
+from spectramr.core.cascade_levels import resolve_cascade_levels
+from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import read_batch_field
+from spectramr.infrastructure.training.utils.held_out_severity import held_out_severity_points
 
 from .diffusion import DiffusionTrainingStrategy
+from .validation_chunking import forward_in_chunks
 
 
 class StochasticInterpolantsStrategy(DiffusionTrainingStrategy):
     """Albergo–Vanden-Eijnden stochastic-interpolant velocity matching."""
 
-    #: Loss ownership (issue #1918). mse_loss(pred, true_velocity) regresses the interpolant VELOCITY; no
-    #: declared image loss is computed and none is folded.
+    #: Loss ownership (issue #1918). mse_loss(pred, true_velocity) regresses the interpolant VELOCITY; declared
+    #: ``losses.image_losses`` are folded onto the endpoint estimate I_t + (1 - t) * pred against x1.
     inline_losses: ClassVar[frozenset[str]] = frozenset()
-    folds_image_losses: ClassVar[bool] = False
+    folds_image_losses: ClassVar[bool] = True
+    empty_loss_stack_is_design: ClassVar[bool] = True
 
     @staticmethod
     def _sigma(t: torch.Tensor) -> torch.Tensor:
@@ -50,6 +55,90 @@ class StochasticInterpolantsStrategy(DiffusionTrainingStrategy):
         # d/dt sqrt(t(1-t)) = (1 − 2t) / (2 sqrt(t(1-t)))
         eps = 1e-6
         return (1 - 2 * t) / (2 * StochasticInterpolantsStrategy._sigma(t).clamp_min(eps))
+
+    @staticmethod
+    def _interpolant_source(batch: Any, input_batch: Any, x1: torch.Tensor) -> torch.Tensor:
+        """The measurement-conditioned endpoint ``x0``: ``source`` if published, else the input.
+
+        The input is the prepared measurement the loop hands the step; a pure-noise
+        ``x0`` would train an unconditional interpolant, so its absence raises (rule 3).
+        """
+        x0 = read_batch_field(batch, "source")
+        if x0 is None:
+            x0 = input_batch if torch.is_tensor(input_batch) else read_batch_field(batch, "input")
+        if x0 is None:
+            raise ValueError(
+                "StochasticInterpolantsStrategy needs a measurement endpoint x0: the batch "
+                "carries neither 'source' nor 'input'."
+            )
+        if x0.shape != x1.shape:
+            raise ValueError(
+                f"Interpolant endpoints disagree: x0 (source/input) {tuple(x0.shape)} vs "
+                f"x1 (target) {tuple(x1.shape)}; combine coils so both are in one domain."
+            )
+        return x0
+
+    def _assert_single_measured_rung(self) -> None:
+        """Raise unless validation scores only the loader's own acceleration.
+
+        The ODE starts from the measurement the loader masked at
+        ``undersampling.base_acceleration``; it cannot re-mask at another rung, so a
+        wider ladder would publish copies of one reconstruction under different labels.
+        """
+        under = self.config.undersampling
+        if under is None:
+            return
+        base = float(under.base_acceleration)
+        levels = tuple(float(r) for r in resolve_cascade_levels(self.config.validation))
+        held_out = held_out_severity_points(self.config)
+        if levels != (base,) or held_out:
+            raise ValueError(
+                "StochasticInterpolantsStrategy integrates from the loader's measurement, "
+                f"masked at R={base:g}, so it can score only that rung. Declare "
+                f"validation.cascade.levels: [{base:g}] (resolved ladder {list(levels)}) and "
+                f"no held-out severity grid (got {list(held_out)})."
+            )
+
+    def _velocity_fn(self, gen: Any) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        if self._generator_accepts_time(gen):
+            return lambda x, t: gen(x, t)
+        return lambda x, _t: gen(x)
+
+    def _generate_validation_prediction(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        timestep: torch.Tensor,
+        batch_data: Any,
+        kwargs: dict,
+        *,
+        start_timestep: int | None = None,
+    ) -> torch.Tensor:
+        """Integrate the trained velocity field from the measurement, as training transports it.
+
+        The parent's reverse-diffusion samplers start from noise or a cold rung and would
+        grade a model this strategy never trained.
+        """
+        self._zf_measurement = None
+        self._rung_mask = None
+        self._rung_measured_maps = None
+        self._ensemble_members = None
+        self._assert_single_measured_rung()
+        gen = unwrap_model(self.generator_model)
+        x0 = self._interpolant_source(batch_data, input_batch, target_batch)
+        val = self.config.validation
+        declared = val is not None and val.sampling.steps is not None
+        diff = self.config.training.diffusion
+        declared = declared or (diff is not None and "sampling_steps" in diff.model_fields_set)
+        n_steps = self._resolve_validation_sampling_steps() if declared else None
+        extra = {"n_steps": n_steps} if n_steps is not None else {}
+        velocity = self._velocity_fn(gen)
+        chunk = self.config.validation.loader.chunk_size
+
+        def chunked(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            return forward_in_chunks(lambda xc, tc, _kw: velocity(xc, tc), x, t, {}, chunk)
+
+        return self.sample(chunked, x0, **extra)
 
     def _compute_losses_impl(
         self,
@@ -71,9 +160,7 @@ class StochasticInterpolantsStrategy(DiffusionTrainingStrategy):
             return {"loss_total": torch.tensor(0.0, device=self.device)}
 
         x1 = target
-        x0 = read_batch_field(batch, "source")
-        if x0 is None:
-            x0 = torch.randn_like(x1)
+        x0 = self._interpolant_source(batch, input_batch, x1)
 
         b = x1.shape[0]
         t = torch.rand(b, device=x1.device).view(b, *([1] * (x1.dim() - 1)))
@@ -119,7 +206,12 @@ class StochasticInterpolantsStrategy(DiffusionTrainingStrategy):
             pred = gen(I_t)
 
         loss = F.mse_loss(pred, true_velocity)
-        return {"loss_total": loss, "loss_si_velocity": loss.detach()}
+        components = {"loss_si_velocity": loss.detach()}
+        # Endpoint estimate on the interpolant path, as in flow matching: I_t + (1 - t) * v.
+        aux = self._apply_builder_image_losses(I_t + (1 - t) * pred, x1, components)
+        if aux is not None:
+            loss = loss + aux
+        return {"loss_total": loss, **components}
 
     @torch.no_grad()
     def sample(

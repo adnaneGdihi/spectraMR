@@ -55,7 +55,7 @@ def sample_reverse_path(
     Args:
         gen: The generator; its ``sample()`` is the reverse path.
         measurement: Measured k-space ``[B, C, H, W]`` in the model's domain.
-        mask: Observed support, or ``None`` for ``sample()`` to infer it.
+        mask: Observed support, or ``None`` for ``sample()`` to take the cascade mask.
         steps: Reverse step count, or ``None`` for the generator's own.
         chunk_size: Rows per ``sample()`` call (``validation.loader.chunk_size``).
         smaps: Image-domain coil maps, forwarded so every step conditions on them.

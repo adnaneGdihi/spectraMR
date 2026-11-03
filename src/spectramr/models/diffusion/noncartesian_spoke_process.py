@@ -24,6 +24,7 @@ import math
 import torch
 from torch import Tensor
 
+from spectramr.core.metrics.coil_manifold import as_interleaved
 from spectramr.data.transforms.normalization import compress_kspace_log, decompress_kspace_log
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.models.diffusion.kspace_process import KSpaceUndersamplingProcess
@@ -288,9 +289,9 @@ class NonCartesianSpokeProcess(KSpaceUndersamplingProcess):
         masks = self.sample_masks
         leaks = []
         for t in range(1, masks.shape[0]):
-            readded = int(((masks[t] > 0) & ~(masks[t - 1] > 0)).sum())
-            if readded:
-                leaks.append({"timestep": t, "reintroduced_samples": readded})
+            reintroduced = int(((masks[t] > 0) & ~(masks[t - 1] > 0)).sum())
+            if reintroduced:
+                leaks.append({"timestep": t, "reintroduced_samples": reintroduced})
         return leaks
 
     def coverage_at(self, t: int) -> Tensor:
@@ -357,7 +358,11 @@ class NonCartesianSpokeProcess(KSpaceUndersamplingProcess):
         coverage = self.grid_coverage.to(device)[
             t.clamp(0, self.grid_coverage.shape[0] - 1)
         ].unsqueeze(1)
-        x_t = fft2c(gridded.reshape(batch, channels, height, width))
+        # ifft2c read real-stacked input as C // 2 complex coils; hand back the
+        # representation the caller passed in.
+        x_t = fft2c(gridded)
+        if not torch.is_complex(x_start):
+            x_t = as_interleaved(x_t)
         if self.kspace_log_scaled:
             # The measurement above stays linear; the network keeps its input
             # in the compressed units the rest of the arm uses.

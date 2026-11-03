@@ -141,6 +141,14 @@ class PILOTStrategy(ReconstructionTrainingStrategy):
         radius = self._trajectory.detach().norm(dim=-1).clamp_min(1.0 / (2 * self._n_shots))
         return radius.reshape(1, 1, -1)
 
+    def _needs_kspace_adjoint(self, batch_context: dict[str, Any]) -> bool:
+        """Never: the arm's ``pre_model`` chain is the adjoint, and the trajectory samples its image.
+
+        The image-domain registration would otherwise ``ifft2c`` the context's
+        fully sampled ``measured_kspace`` and hand the backbone an unsampled image.
+        """
+        return False
+
     def _sampled_input(
         self, input_batch: torch.Tensor, traj: torch.Tensor | None = None
     ) -> torch.Tensor:

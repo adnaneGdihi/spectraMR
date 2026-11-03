@@ -120,3 +120,25 @@ class TestProgressiveGAN:
         out = model(z)
         out.mean().backward()
         assert model.project.weight.grad is not None
+
+    def test_image_conditioning_sees_spatial_layout(self) -> None:
+        # #2384: a pixel permutation keeps the mean but must change the output.
+        torch.manual_seed(0)
+        model = ProgressiveGAN(z_dim=16, max_resolution=16, base_channels=8).eval()
+        x = torch.rand(2, 1, 16, 16)
+        x2 = x[:, :, torch.randperm(16)][:, :, :, torch.randperm(16)]
+        with torch.no_grad():
+            assert (model(x) - model(x2)).abs().max() > 1e-4
+
+    def test_conditioning_params_exist_before_first_forward(self) -> None:
+        model = ProgressiveGAN(z_dim=16, max_resolution=16, base_channels=8)
+        opt_ids = {id(p) for p in model.parameters()}
+        assert all(id(p) in opt_ids for p in model.cond_proj.parameters())
+        n_before = sum(1 for _ in model.parameters())
+        model(torch.rand(1, 1, 16, 16))
+        assert sum(1 for _ in model.parameters()) == n_before
+
+    def test_conditioning_channel_mismatch_raises(self) -> None:
+        model = ProgressiveGAN(in_channels=1, z_dim=16, max_resolution=16, base_channels=8)
+        with pytest.raises(ValueError, match="in_channels"):
+            model(torch.rand(1, 2, 16, 16))

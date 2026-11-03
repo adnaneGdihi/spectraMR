@@ -8,9 +8,10 @@ called the computer without a ``MetricContext`` and got ``nan``. This module rea
 the extra fields off the batch and brings each to the shape the two tensors have.
 
 **Which metrics get a context.** Only those whose every declared ``need`` is a
-field this path supplies (:data:`SUPPLIED_FIELDS`). A metric needing more -- a
-sampling ``mask``, a ``reconstructor`` -- keeps its old context-free call rather
-than receiving a context that is silently missing half of what it declared.
+field this path supplies (:data:`SUPPLIED_FIELDS`); ``reconstructor`` is the
+validation forward on the model's own input. A metric needing more -- a
+``prior_model`` -- keeps its old context-free call rather than receiving a context
+that is silently missing half of what it declared.
 
 The flatten is repeated here, not imported: its owner sits in ``pipelines/``,
 which this layer may not import (non-negotiable 5). Where the two could
@@ -25,7 +26,7 @@ from typing import Any
 
 import torch
 
-from spectramr.core.coil_map_names import COIL_MAP_ALIASES, REFERENCE_MAPS_KEY
+from spectramr.core.coil_map_names import COIL_MAP_ALIASES
 from spectramr.core.metrics.coil_manifold import (
     as_complex_coils,
     as_interleaved,
@@ -45,12 +46,14 @@ __all__ = [
     "flatten_like",
     "measured_kspace",
     "project_prediction",
-    "scoring_maps",
+    "sampling_mask",
     "with_measurement",
 ]
 
 #: ``MetricContext`` fields the validation path can fill from a batch.
-SUPPLIED_FIELDS: frozenset[str] = frozenset({"coil_maps", "y_kspace", "pred_alt"})
+SUPPLIED_FIELDS: frozenset[str] = frozenset(
+    {"coil_maps", "y_kspace", "pred_alt", "mask", "reconstructor", "model_input"}
+)
 
 #: The complex spelling first: ``espirit_sensitivity`` writes the magnitude under
 #: ``sensitivity`` beside it, and ``BatchAdapter`` binds THAT to ``coil_maps``.
@@ -85,6 +88,8 @@ def batch_tensor(batch_data: Any, key: str) -> torch.Tensor | None:
         value = metadata.get(key)
         if value is None and key in COIL_MAP_ALIASES:
             value = getattr(batch_data, "coil_maps", None)
+        elif value is None and key == "mask":
+            value = getattr(batch_data, "mask", None)
     if isinstance(value, dict):
         value = value.get("data")
     return value if isinstance(value, torch.Tensor) else None
@@ -135,14 +140,10 @@ def coil_maps(batch_data: Any, like: torch.Tensor) -> tuple[torch.Tensor | None,
     return None, None
 
 
-def scoring_maps(batch_data: Any, like: torch.Tensor) -> tuple[torch.Tensor | None, str | None]:
-    """The maps the SENSE image metrics combine with: the validation-only scoring
-    store when the batch carries it (one map set across arms, #2664), else the
-    batch's own maps."""
-    reference = batch_tensor(batch_data, REFERENCE_MAPS_KEY)
-    if reference is not None:
-        return flatten_like(reference, like, name=REFERENCE_MAPS_KEY), REFERENCE_MAPS_KEY
-    return coil_maps(batch_data, like)
+def sampling_mask(batch_data: Any, like: torch.Tensor) -> torch.Tensor | None:
+    """The loader's ``mask`` (the Cartesian masking transform writes it) flattened to ``like``."""
+    mask = batch_tensor(batch_data, "mask")
+    return None if mask is None else flatten_like(mask, like, name="mask")
 
 
 def alternate_input(batch_data: Any, like: torch.Tensor) -> torch.Tensor | None:
@@ -251,14 +252,23 @@ def compute_context_metrics(
     when a projection is given, and ``pred_alt`` goes through the same projection,
     so the repetition-based decomposition describes the estimator the arm reports.
     ``forward`` runs the model on ``input_alt`` and is called only when a
-    configured metric needs ``pred_alt``: a second validation forward nothing
-    reads would double the cost for no column.
+    configured metric needs ``pred_alt``, or handed as ``reconstructor`` to a
+    metric that declares it: a second validation forward nothing reads would
+    double the cost for no column.
     """
-    # Every reference-graded metric reads the shared scoring store when the batch
-    # carries it, so the noise term, the NEX floor and the certificate rest on one
-    # map set across families (#2664); otherwise the batch's own maps.
-    maps, _ = scoring_maps(batch_data, prediction)
+    # The batch's own coil maps: the noise term, the NEX floor and the certificate
+    # all read the maps the arm trained on (the input-repetition store, #2510).
+    maps, _ = coil_maps(batch_data, prediction)
     y_kspace = measured_kspace(input_batch) if model_config.input_type == "kspace" else None
+    mask = None
+    if any("mask" in MetricsRegistry.needs(name) for name in names):
+        mask = sampling_mask(batch_data, input_batch)
+        if mask is None:
+            raise ValueError(
+                f"{[n for n in names if 'mask' in MetricsRegistry.needs(n)]} need the "
+                "sampling mask, and the validation batch carries no `mask`. Route the "
+                "arm through the loader's Cartesian masking (data.trajectory: cartesian)."
+            )
     pred_alt = None
     if any("pred_alt" in MetricsRegistry.needs(name) for name in names):
         alt = alternate_input(batch_data, input_batch)
@@ -293,6 +303,7 @@ def compute_context_metrics(
             coil_maps=maps,
             y_kspace=y_kspace,
             pred_alt=pred_alt,
+            mask=mask,
             signal_domain=signal_domain,
         )
         computed.update(computer.compute(prediction, target, only=certificate, context=context))
@@ -301,24 +312,33 @@ def compute_context_metrics(
             prediction = projected(prediction)
             if pred_alt is not None:
                 pred_alt = projected(pred_alt)
+        needed = {need for name in graded for need in MetricsRegistry.needs(name)}
+        reruns = "model_input" in needed
+        if reruns and model_config.input_type != "image":
+            raise ValueError(
+                f"{list(graded)} transform the model input's intensities, and this arm's "
+                f"input_type is {model_config.input_type!r}, not 'image'."
+            )
         context = MetricContext(
             coil_maps=maps,
             y_kspace=y_kspace,
             pred_alt=pred_alt,
+            mask=mask,
             signal_domain=signal_domain,
+            reconstructor=forward if "reconstructor" in needed else None,
+            model_input=input_batch if reruns else None,
         )
         computed.update(computer.compute(prediction, target, only=graded, context=context))
     if sense:
         # The projected output when the arm projects, as for every graded metric,
-        # combined with the scoring maps rather than the arm's training maps. An
-        # image network's output is already one combined image and is scored as it
-        # is: re-expanding it through its training maps and combining with the
-        # scoring maps would score |S_ref^H S_train x_hat|, not x_hat.
+        # combined with the batch's maps. An image network's output is already one
+        # combined image: re-expanding it through the maps and combining again
+        # would score |S^H S x_hat|, not x_hat.
         graded_prediction = projected(prediction) if projected is not None and not graded else prediction
         if image_prediction is not None:
             graded_prediction = image_prediction
         context = MetricContext(
-            coil_maps=scoring_maps(batch_data, graded_prediction)[0],
+            coil_maps=coil_maps(batch_data, graded_prediction)[0],
             signal_domain=signal_domain,
         )
         computed.update(computer.compute(graded_prediction, target, only=sense, context=context))

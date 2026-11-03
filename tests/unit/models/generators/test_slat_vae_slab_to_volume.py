@@ -124,3 +124,18 @@ class TestSLATVAESlabToVolume:
         m = _small()
         with pytest.raises(RuntimeError, match="active set"):
             _ = m.decode(torch.randn(1, 4, 8, 8, 1))
+
+    def test_structural_prior_is_the_declared_weighted_sum(self) -> None:
+        """#642: occupancy_lambda / sparsity_lambda were stored and never reached a loss."""
+        m = _small(d_in=3, d_out=3)
+        x = torch.rand(1, 1, 32, 32, 3)
+        _ = m(x)
+        mask = m.encoder._foreground_mask(x, m.occupancy_threshold)
+        expected = m.occupancy_lambda * m.occupancy_loss(mask) + m.sparsity_lambda * m.sparsity_loss()
+        torch.testing.assert_close(m.structural_prior_loss(x), expected)
+        m.occupancy_lambda, m.sparsity_lambda = 0.0, 0.0
+        assert m.structural_prior_loss(x) == 0
+
+    def test_beta_kl_is_refused_not_swallowed(self) -> None:
+        with pytest.raises(ValueError, match=r"training\.latent\.kl_beta_end"):
+            SLATVAESlabToVolumeGenerator(beta_kl=1.0e-4)

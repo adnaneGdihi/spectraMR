@@ -260,8 +260,9 @@ Cascaded Diffusion Generator
 
 **Registry:** ``cascaded_diffusion`` — **File:** ``cascaded_diffusion_generator.py``
 
-Multi-stage coarse-to-fine diffusion: each stage operates at increasing
-spatial resolution with the previous stage's output as conditioning.
+Two-stage spectral cascade: stage 1 denoises the low-pass circle of the image in
+k-space, stage 2 the high-pass residual conditioned on the stage-1 output
+(``CascadedDiffusionStrategy``, ``training_mode: cascaded_diffusion``).
 
 
 ---
@@ -1119,18 +1120,6 @@ Data Layer: Image Volume Utilities
 * ``find_common_png_stems`` — intersection of PNG stems across directories.
 
 These helpers centralise the logic shared across TRELLIS dataset variants.
-
-
-Infrastructure: Reporting Tables
-==================================
-
-CertificateTable (``infrastructure.reporting.tables.certificate_table``)
-------------------------------------------------------------------------
-
-Builds a per-certificate summary table from a ``ValidationBadge`` JSON
-payload (``upstream_certificates`` key).  ``render_markdown`` and
-``render_latex`` produce ``.md`` / ``.tex`` side-by-side outputs.
-``write_certificate_table(badge_payload, out_dir)`` writes both files.
 
 
 Diffusion-Transformer Backbones (k-space adapted)

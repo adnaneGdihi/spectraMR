@@ -422,6 +422,23 @@ class TestVisualCaptureInputs:
         assert context["input"] is self._X and context["target"] is self._Y
         assert context["field_strength_target"].item() == 7.0
 
+    def test_the_m4raw_contrast_spelling_reaches_the_context(self) -> None:
+        """A contrast-conditioned forward raises at capture without the M4Raw ``contrast_idx``."""
+        from spectramr.pipelines.train import visual_capture_inputs
+
+        batch = {**self._batch(), "contrast_idx": torch.tensor([2])}
+        _, _, context = visual_capture_inputs(SimpleNamespace(), self._X, self._Y, batch)
+        assert context["contrast_idx"].tolist() == [2]
+
+    def test_the_acquisition_prompt_reaches_the_context(self) -> None:
+        """universal_reconstruction's backbone raises at capture without the scan's metadata."""
+        from spectramr.pipelines.train import visual_capture_inputs
+
+        meta = {"TR": [2750.0], "TE": [27.0], "FA": [90.0], "B0": [2.89]}
+        batch = {**self._batch(), "acquisition_metadata": meta}
+        _, _, context = visual_capture_inputs(SimpleNamespace(), self._X, self._Y, batch)
+        assert context["acquisition_metadata"] is meta
+
     def test_a_hook_returning_none_keeps_the_bare_context(self) -> None:
         from spectramr.pipelines.train import visual_capture_inputs
 
@@ -3602,3 +3619,37 @@ def test_validation_batches_are_moved_without_blocking_the_host() -> None:
     source = inspect.getsource(train_mod)
     assert "val_batch.to(pipeline.device)" not in source
     assert "val_batch.to(pipeline.device, non_blocking=True)" in source
+
+
+def test_declared_validate_only_grades_instead_of_training(monkeypatch, tmp_path):
+    """``training.validate_only: true`` routes the pipeline to the one-pass grade
+    without the CLI flag, never reaches the training loop, and stamps provenance.
+    Without ``model.checkpoint_path`` the grade refuses (it would score the init)."""
+    cfg_dict = _config_dict(tmp_path)
+    cfg_dict["training"]["validate_only"] = True
+    cfg = TrainingSettings.settings_from_dict(cfg_dict)
+    seen: dict = {}
+
+    def _no_training(*a, **k):
+        raise AssertionError("a validate_only arm must not enter the training loop")
+
+    real = train_mod._validate_only_result
+
+    def _spy(loop, paths, start, weights, logging_service, **kw):
+        seen["weights"] = weights
+        return real(loop, paths, start, weights, logging_service, **kw)
+
+    def _record(config, result, **kw):
+        seen["provenance"] = kw.get("provenance")
+        return result
+
+    monkeypatch.setattr(training_loop_mod, "_execute_training_loop", _no_training)
+    monkeypatch.setattr(train_mod, "_validate_only_result", _spy)
+    monkeypatch.setattr(train_mod, "_record_failed_run", _record)
+    result = train_mod.run_training_pipeline(cfg, env=_env(cfg), device="cpu")
+    assert seen["weights"] is None
+    assert result["success"] is False and "--validate-only needs weights" in result["error"]
+    assert seen["provenance"]["validate_only"] == {
+        "applied": True,
+        "declared": "training.validate_only",
+    }

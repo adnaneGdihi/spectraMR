@@ -290,38 +290,25 @@ WORKFLOW_PROFILES: dict[Regime, WorkflowProfile] = {
     Regime.FLOW: WorkflowProfile(
         name=Regime.FLOW,
         modality=Modality.MR,
-        # LIVE: both clauses of the ledger's rule are satisfied honestly — the
-        # `phase_contrast` operator is registered (and pc_adjoint is a TRUE
-        # inverse within |v| < venc, not a stand-in), and PhaseContrastFlowStrategy
-        # is registered in STRATEGY_CLASS_PATHS and FLOW-tagged. Real physics
-        # (flow_encoding), FLOW-tagged losses and metrics back it.
+        # LIVE on a split forward model: each velocity encoding is a multicoil
+        # Fourier acquisition (linear, `multi_coil_fft`), and the encoding itself,
+        # v -> m exp(i pi v / venc), is the nonlinear `phase_contrast` signal model.
+        # PhaseContrastFlowStrategy is FLOW-tagged, as are the losses and metrics.
         #
-        # LIVE is a fact about the CODE, not about any one cluster's data: if
-        # maturity tracked local data, this profile would be PARTIAL here and LIVE
-        # at a 4D-flow site, which is incoherent for a frozen fact. Data
-        # availability is a separate gate, and both halves of what this comment
-        # used to say about that gate were wrong.
+        # LIVE is a fact about the code, not about a cluster's data. flow_synthetic
+        # (an analytic phantom) exposes VELOCITY_ENCODING; osu_4dflow_cine (Zenodo
+        # 12515230) is the cluster's 4D-flow source; whole_heart_5d is bSSFP with
+        # no velocity encoding.
         #
-        # 4D-flow data is NOT absent. The cluster holds osu_4dflow_cine and
-        # whole_heart_5d, extracted (TODO/cluster_data_inventory_2026_06_16.md,
-        # which retired the "M4Raw-0.3T-magnitude-only" premise the workflow
-        # backlog was written under). What is missing is wiring: no dataset_type
-        # exposes VELOCITY_ENCODING, so there is no flow arm to run.
-        #
-        # And that missing annotation does not gate anything, because the guard's
-        # polarity is the opposite of the intuitive reading.
-        # check_workflow_required_axes rejects an arm only when the dataset_type IS
-        # annotated in data/datasets/axis_exposure.py and its declared axes lack
-        # VELOCITY_ENCODING. An UNANNOTATED dataset_type returns None from
-        # exposed_axes_for, and the check SKIPS it — passed=True, severity=info.
-        # An absent annotation is never a rejection, so "no dataset_type exposes
-        # it" protects this regime from nothing; only a PRESENT annotation that
-        # omits the axis does.
+        # check_workflow_required_axes rejects an arm only when its dataset_type IS
+        # annotated in data/datasets/axis_exposure.py without VELOCITY_ENCODING; an
+        # unannotated dataset_type is skipped, so the missing annotation gates nothing.
         maturity=Maturity.LIVE,
         spatial_ranks=frozenset({2, 3}),
         required_axes=frozenset({Axis.VELOCITY_ENCODING}),
         signal_domains=_MR_IMAGE_KSPACE,
-        forward_operator="phase_contrast",
+        forward_operator="multi_coil_fft",
+        signal_model="phase_contrast",
         supported_tasks=frozenset({Task.PARAMETER_MAPPING, Task.RECONSTRUCTION}),
     ),
     # --- STUBs: typed seams the framework does not implement yet. ---

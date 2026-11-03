@@ -277,10 +277,6 @@
       "call": "nib.load"
     },
     {
-      "file": "spectramr/infrastructure/physics/m4raw_pseudo_gt.py",
-      "call": "h5py.File"
-    },
-    {
       "file": "spectramr/infrastructure/physics/sampling.py",
       "call": "torch.load"
     },

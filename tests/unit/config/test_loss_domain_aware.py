@@ -16,6 +16,18 @@ from spectramr.config.schemas.loss import (
     PhysicsLossesConfig,
     ReconstructionLossesConfig,
 )
+from spectramr.models.losses.build_set import declared_build_set
+from spectramr.models.losses.weights import build_loss_weight_table
+
+
+def _declared(losses):
+    """Weights the author declared (the table owns this, #1966); the build set is narrower."""
+    return {
+        k: s.weight
+        for k, s in build_loss_weight_table(losses).items()
+        if s.enabled and s.weight > 0
+    }
+
 
 
 class TestLossConfigSchemaListBased:
@@ -42,7 +54,7 @@ class TestLossConfigSchemaListBased:
             )
         )
         assert not schema.uses_list_based_losses
-        enabled = schema.get_enabled_losses()
+        enabled = _declared(schema)
         assert "l1" in enabled
         assert enabled["l1"] == 10.0
         assert "background_suppression" in enabled
@@ -79,7 +91,7 @@ class TestLossConfigSchemaListBased:
                 LossComponentConfig(name="l1", weight=5.0),
             ],
         )
-        enabled = schema.get_enabled_losses()
+        enabled = _declared(schema)
         assert "sobolev_kspace" in enabled
         assert enabled["sobolev_kspace"] == 1.0
         assert "l1" in enabled
@@ -98,7 +110,7 @@ class TestLossConfigSchemaListBased:
                 LossComponentConfig(name="l1", weight=5.0, enabled=False),
             ],
         )
-        enabled = schema.get_enabled_losses()
+        enabled = _declared(schema)
         assert "sobolev_kspace" in enabled
         assert "log_spectral" not in enabled  # weight=0
         assert "l1" not in enabled  # enabled=False
@@ -140,7 +152,7 @@ class TestLossConfigSchemaListBased:
                 lambda_physics_constraint=0.1,
             ),
         )
-        enabled = schema.get_enabled_losses()
+        enabled = _declared(schema)
         assert "sobolev_kspace" in enabled
         assert "physics_constraint" in enabled
 
@@ -156,7 +168,8 @@ class TestLossConfigSchemaListBased:
             ],
             policy={"exclude_defaults": ["l1"]},
         )
-        enabled = schema.get_enabled_losses()
+        enabled = declared_build_set(schema)
+
         assert "sobolev_kspace" in enabled
         assert "l1" not in enabled  # disabled via disable_default_losses
 

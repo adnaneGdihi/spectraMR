@@ -56,7 +56,6 @@ def arm(tmp_path):
         update={
             "source": source,
             "coil_maps_root": None,
-            "coil_maps_reference_root": None,
             "coil_maps_missing": "estimate",
         }
     )

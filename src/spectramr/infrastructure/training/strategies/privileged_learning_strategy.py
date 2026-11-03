@@ -10,12 +10,13 @@ gradient-reversal domain discriminator):
 
 1. ``privileged_learning_loss`` from
    :mod:`spectramr.infrastructure.physics.marker_estimators`
-2. A student network supplied via ``env.generator`` and a marker-
-   supervised **teacher** built by the strategy itself (a frozen copy of
-   the student architecture). ``TrainingEnvironment`` is frozen, so the
-   teacher and the domain discriminator are stored on the strategy
-   instance (``self._teacher`` / ``self._domain_discriminator``), not on
-   ``env``.
+2. A student network supplied via ``env.generator`` and a frozen
+   **teacher** of the same architecture, loaded from the stage-1 checkpoint
+   named by ``training.privileged.teacher_checkpoint``. Stage 1
+   (``training.privileged.stage: teacher``) trains that teacher on
+   ``input + marker``. ``TrainingEnvironment`` is frozen, so the teacher and
+   the domain discriminator are stored on the strategy instance
+   (``self._teacher`` / ``self._domain_discriminator``), not on ``env``.
 3. A gradient-reversal layer + small domain discriminator MLP for the
    synthetic↔real distribution-shift closing step. Its parameters are
    registered on ``env.opt_g`` so the generator optimizer trains them.
@@ -40,6 +41,7 @@ References
 from __future__ import annotations
 
 import copy
+import logging
 import math
 from typing import Any
 
@@ -47,12 +49,19 @@ import torch
 import torch.nn as nn
 
 from spectramr.core.module_utils import unwrap_model
+from spectramr.data.batch_types import read_batch_field
+from spectramr.infrastructure.checkpointing.restore import weights
 from spectramr.infrastructure.distributed.owned_modules import OWNED_MODULE
 from spectramr.infrastructure.physics.marker_estimators import (
     privileged_learning_loss,
 )
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.models.blocks.domain_adaptation import grad_reverse
+
+logger = logging.getLogger(__name__)
+
+PRIVILEGED_STAGES = ("teacher", "student")
+_CURRICULUM_KNOBS = ("curriculum_tau0", "min_keep_fraction", "initial_keep_fraction")
 
 # ──────────────────────────────────────────────────────────────────────
 # Domain discriminator, fed through the shared reversal (Ganin & Lempitsky 2015)
@@ -122,6 +131,10 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
     * ``training.privileged.min_keep_fraction`` (default 0) — final marker keep-fraction
     * ``training.privileged.initial_keep_fraction`` (default 1) — initial marker keep-fraction
     * ``training.privileged.disc_hidden_dim`` (default 128) — disc MLP width
+    * ``training.privileged.stage`` (default ``student``) — ``teacher`` trains
+      ``f(input + marker)`` against the target (stage 1); ``student`` distils
+    * ``training.privileged.teacher_checkpoint`` — stage-1 checkpoint the student's
+      teacher is loaded from; required when ``beta > 0``
     """
 
     # parallel_compat: The domain discriminator is an owned module, wrapped in __init__ and called
@@ -149,20 +162,69 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
         self._n_min = float(getattr(cfg, "min_keep_fraction", 0.0)) if cfg else 0.0
         self._n_max = float(getattr(cfg, "initial_keep_fraction", 1.0)) if cfg else 1.0
         self._disc_hidden_dim = int(getattr(cfg, "disc_hidden_dim", 128)) if cfg else 128
+        self._stage = str(getattr(cfg, "stage", "student")) if cfg else "student"
+        self._teacher_checkpoint = getattr(cfg, "teacher_checkpoint", None) if cfg else None
+        self._declared_knobs = frozenset(getattr(cfg, "model_fields_set", ()) or ())
         super().__init__(env=env, **kwargs)
 
+    def _validate_stage_knobs(self) -> None:
+        """Raise on a stage/knob combination that would make a declared knob inert."""
+        if self._stage not in PRIVILEGED_STAGES:
+            raise ValueError(
+                f"training.privileged.stage={self._stage!r} is not one of {PRIVILEGED_STAGES}."
+            )
+        ckpt = self._teacher_checkpoint
+        if self._stage == "teacher":
+            inert = [k for k in _CURRICULUM_KNOBS if k in self._declared_knobs]
+            if self._beta > 0 or self._delta > 0 or ckpt or inert:
+                raise ValueError(
+                    "training.privileged.stage=teacher trains the marker-fed teacher on the "
+                    "reconstruction term alone; set beta: 0.0 and delta: 0.0 and drop "
+                    f"teacher_checkpoint and the curriculum knobs (got beta={self._beta}, "
+                    f"delta={self._delta}, teacher_checkpoint={ckpt!r}, declared={inert})."
+                )
+        elif self._beta > 0 and not ckpt:
+            raise ValueError(
+                f"training.privileged.beta={self._beta} distils from a teacher, but "
+                "training.privileged.teacher_checkpoint is unset. Train the stage-1 arm "
+                "(stage: teacher) and point teacher_checkpoint at its checkpoint, or set "
+                "beta: 0.0 to drop the distillation term."
+            )
+        elif self._beta == 0 and ckpt:
+            raise ValueError(
+                f"training.privileged.teacher_checkpoint={ckpt!r} is set but beta=0.0, so "
+                "the teacher would never enter the loss. Drop the checkpoint or set beta > 0."
+            )
+
+    def _load_teacher(self, student: nn.Module) -> nn.Module:
+        """The frozen teacher: the student architecture with the stage-1 weights loaded exactly."""
+        teacher = copy.deepcopy(unwrap_model(student))
+        report = weights(self._teacher_checkpoint, "generator", teacher, policy="exact")
+        for p in teacher.parameters():
+            p.requires_grad_(False)
+        teacher.eval()
+        message = (
+            f"[privileged] teacher loaded from {report.source} "
+            f"({report.matched}/{report.total} tensors, policy=exact)"
+        )
+        logger.info(message)
+        if getattr(self, "logging_service", None):
+            self.logging_service.log_info(message)
+        return teacher.to(self.device) if self.device is not None else teacher
+
     def _setup_strategy_specific_components(self) -> None:
-        """Build the marker-supervised teacher and the domain discriminator.
+        """Load the stage-1 teacher and build the domain discriminator.
 
         ``TrainingEnvironment`` is a frozen dataclass and exposes neither a
         ``teacher`` nor a ``domain_discriminator`` field, so both live on the
-        strategy instance. The teacher is a frozen copy of the student
-        generator (identical architecture → identical input contract); it is
+        strategy instance. The teacher (student mode with ``beta > 0`` only) is
+        the student architecture with the ``teacher_checkpoint`` weights; it is
         only ever run under ``torch.no_grad`` in the loss path. The domain
         discriminator is a small MLP whose parameters are added to
         ``env.opt_g`` so the generator optimizer trains them jointly with the
         student (the gradient-reversal layer makes that step adversarial).
         """
+        self._validate_stage_knobs()
         student = getattr(self.env, "generator", None)
         if student is None:
             raise ValueError(
@@ -170,18 +232,9 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
                 "student network) to build its teacher copy."
             )
 
-        # Teacher: frozen deep-copy of the student architecture. Marker
-        # supervision flows through its privileged input at train time; it
-        # is never optimized by opt_g (the loss path runs it under no_grad).
-        # The inner module: a copy of a DDP/DP wrapper would carry the process group and
-        # prefix every checkpoint key with ``module.``.
-        teacher = copy.deepcopy(unwrap_model(student))
-        for p in teacher.parameters():
-            p.requires_grad_(False)
-        teacher.eval()
-        if self.device is not None:
-            teacher = teacher.to(self.device)
-        self._teacher = teacher
+        # No teacher in stage 1 or when beta is 0: it would never enter the loss.
+        distils = self._stage == "student" and self._beta > 0
+        self._teacher = self._load_teacher(student) if distils else None
 
         # Domain discriminator operates on the student's prediction;
         # feature_dim is the model's output channels.
@@ -199,6 +252,30 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
             new = [p for p in disc.parameters() if p not in existing]
             if new:
                 opt.add_param_group({"params": new, "name": "domain_discriminator"})
+
+    def validation_step(
+        self,
+        input_batch: torch.Tensor,
+        target_batch: torch.Tensor,
+        *,
+        batch_data: Any = None,
+        **kwargs: Any,
+    ) -> dict[str, float]:
+        """Score the stage-1 teacher on ``input + marker``, the input it trains on.
+
+        Best-checkpoint selection must rank the teacher the student will load, not a
+        markerless forward it never trained for. The student stage scores markerless.
+        """
+        if self._stage == "teacher":
+            marker = read_batch_field(batch_data, "marker")
+            if marker is None:
+                raise ValueError(
+                    "PrivilegedLearningStrategy stage=teacher validates on input + marker, "
+                    "but the validation batch carries no 'marker'; list the synthetic_marker "
+                    "transform for the validation loader too."
+                )
+            input_batch = input_batch + marker.to(input_batch.device)
+        return super().validation_step(input_batch, target_batch, **kwargs)
 
     def _curriculum_marker_fraction(self, epoch: int) -> float:
         r"""Fraction of marker entries kept at epoch ``τ``.
@@ -236,6 +313,24 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
             mask_flat[:, :keep_count] = 1.0
         return mask_flat.reshape(marker.shape)
 
+    @staticmethod
+    def _resolve_domain_label(raw_label: Any, input_batch: torch.Tensor) -> torch.Tensor | None:
+        """Per-sample ``(B,)`` float label, or ``None`` when the batch carries none."""
+        if raw_label is None:
+            return None
+        label = torch.as_tensor(raw_label, device=input_batch.device, dtype=torch.float32).reshape(-1)
+        if label.numel() == 1:
+            # A scalar is a legitimate single-domain declaration, broadcast explicitly.
+            return label.expand(input_batch.shape[0])
+        if label.numel() != input_batch.shape[0]:
+            raise ValueError(
+                "PrivilegedLearningStrategy: batch['domain_label'] carries "
+                f"{label.numel()} entries for a batch of {input_batch.shape[0]}. "
+                "The label is per-SAMPLE; a length mismatch would broadcast and "
+                "mislabel the batch."
+            )
+        return label
+
     def _compute_losses_impl(
         self,
         input_batch: torch.Tensor | None = None,
@@ -245,27 +340,22 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
     ) -> dict[str, torch.Tensor]:
         student = getattr(self.env, "generator", None)
         teacher = self._teacher
-        if teacher is None:
+        if teacher is None and self._stage == "student" and self._beta > 0:
             raise ValueError(
-                "PrivilegedLearningStrategy.teacher was not built; "
+                "PrivilegedLearningStrategy.teacher was not loaded; "
                 "_setup_strategy_specific_components must run before the "
-                "first training step (it constructs the teacher copy)."
+                "first training step."
             )
 
-        # The dataloader collate may travel as a dict in ``batch`` (legacy
-        # callers) or as the orchestrator's ``input_batch`` kwarg. Resolve
-        # it before reading the marker channel; fall back to the positional
-        # tensor for the actual student/teacher input.
+        # A dict or a TrainingBatch; read_batch_field reaches TrainingBatch metadata too.
         batch = self._resolve_legacy_batch(input_batch, kwargs)
-        if not isinstance(batch, dict):
-            batch = {}
 
         # Marker channel — the dataset MUST attach the synthetic privileged
         # markers under batch['marker'] (shape matching input). A run with no
         # markers is misconfigured: the teacher would then see exactly the
         # student's input, collapsing the teacher-student privileged gap to
         # zero (silent no-op). Raise rather than silently degrade (pitfall #9).
-        marker = batch.get("marker")
+        marker = read_batch_field(batch, "marker")
         if marker is None:
             raise ValueError(
                 "PrivilegedLearningStrategy requires batch['marker'] (the "
@@ -275,6 +365,16 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
             )
         marker = marker.to(input_batch.device)
 
+        if self._stage == "teacher":
+            # Stage 1: the teacher sees every marker, constant, and fits the target.
+            pred = student(input_batch + marker)
+            recon = (pred - target_batch).pow(2).mean()
+            return {
+                "g_total_loss": self._alpha * recon,
+                "g_priv_recon": recon.detach(),
+                "g_priv_marker_frac": torch.ones((), device=input_batch.device),
+            }
+
         # Curriculum: drop a fraction of the marker's discrete entries at the
         # teacher's input. ``keep_mask`` zeroes ``1 - keep_frac`` of the marker
         # components so the *count* of visible markers decays with epoch
@@ -283,12 +383,23 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
         keep_mask = self._marker_keep_mask(marker, keep_frac)
         teacher_input = input_batch + marker * keep_mask
 
-        # Teacher (no grad — privileged path is frozen at this step)
-        with torch.no_grad():
-            teacher_pred = teacher(teacher_input)
-
         # Student (markerless deployment)
         student_pred = student(input_batch)
+
+        # Teacher (no grad, frozen). With beta 0 there is none and the distill term is zero.
+        if teacher is None:
+            teacher_pred = student_pred.detach()
+        else:
+            with torch.no_grad():
+                teacher_pred = teacher(teacher_input)
+
+        # Per-sample domain label: 1.0 = synthetic (source, supervised), 0.0 = real
+        # (target, unlabelled). ``DomainLabelledBalancer`` (data.multi_domain with
+        # balancing: domain_labelled) emits it. A missing label is never fabricated:
+        # a constant one trains the discriminator to separate one class from itself.
+        domain_label = self._resolve_domain_label(
+            read_batch_field(batch, "domain_label"), input_batch
+        )
 
         # Privileged-learning loss. The FitNet-style hint term
         # (``gamma`` / ``student_features`` / ``teacher_features``) is NOT
@@ -296,59 +407,32 @@ class PrivilegedLearningStrategy(BaseTrainingStrategy):
         # features through its forward contract, so a hint weight would be an
         # identically-zero no-op (pitfall #15). It is therefore left at the
         # loss default and not advertised as a strategy knob — only the
-        # recon (alpha) and distillation (beta) terms are active.
+        # recon (alpha) and distillation (beta) terms are active. With domain
+        # labels, recon and distill are restricted to the synthetic samples
+        # (spec §4.3 defines L_S on the twin's x_a only).
         out = privileged_learning_loss(
             student_pred=student_pred,
             teacher_pred=teacher_pred,
             target=target_batch,
             alpha=self._alpha,
             beta=self._beta,
+            sample_weight=domain_label,
         )
 
         # Domain-adversarial loss (gradient-reversal vs. the strategy-owned
-        # discriminator). ``batch`` is already a dict (possibly empty).
+        # discriminator).
         disc = self._domain_discriminator
         if disc is not None and self._delta > 0:
-            # A6: no loader under ``data/`` emits ``domain_label``, and the
-            # default here was ``1`` -- so EVERY sample in EVERY batch carried
-            # the same label and the gradient-reversal discriminator was trained
-            # to separate one class from itself. The loss stayed finite and
-            # plotted a plausible curve while the domain term it exists to
-            # supply carried no domain information at all.
-            #
-            # That is worse than the 33 orphan keys whose absence merely skips a
-            # term: the mechanism is present, running, and wrong. See
-            # TODO/inprogress/a6_orphan_batch_key_triage_2026_08_06.md, which
-            # classes this as the census's single "substitutes" case. Same
-            # disposition as ``batch['marker']`` above -- raise rather than
-            # fabricate (pitfall #9; #16, an advertised mechanism that cannot
-            # work as advertised).
-            raw_label = batch.get("domain_label")
-            if raw_label is None:
+            if domain_label is None:
                 raise ValueError(
                     "PrivilegedLearningStrategy: training.privileged.delta="
                     f"{self._delta} enables the domain-adversarial term, but "
-                    "batch['domain_label'] is absent and no dataset under "
-                    "spectramr.data emits it. A constant label trains the "
-                    "gradient-reversal discriminator to separate one class "
-                    "from itself -- a confounded objective, not a weaker one. "
-                    "Supply per-sample domain labels, or set "
-                    "training.privileged.delta: 0.0 to drop the term "
-                    "explicitly."
-                )
-            domain_label = torch.as_tensor(
-                raw_label, device=input_batch.device, dtype=torch.float32
-            ).reshape(-1)
-            if domain_label.numel() == 1:
-                # A scalar is a legitimate single-domain declaration -- but an
-                # EXPLICIT one, which the fabricated default never was.
-                domain_label = domain_label.expand(input_batch.shape[0])
-            elif domain_label.numel() != input_batch.shape[0]:
-                raise ValueError(
-                    "PrivilegedLearningStrategy: batch['domain_label'] carries "
-                    f"{domain_label.numel()} entries for a batch of "
-                    f"{input_batch.shape[0]}. The label is per-SAMPLE; a "
-                    "length mismatch would broadcast and mislabel the batch."
+                    "batch['domain_label'] is absent. Declare a two-domain "
+                    "data.multi_domain block with balancing: domain_labelled "
+                    "(DomainLabelledBalancer stamps the label per sample), or set "
+                    "training.privileged.delta: 0.0 to drop the term explicitly. "
+                    "A constant label trains the gradient-reversal discriminator "
+                    "to separate one class from itself."
                 )
             # Discriminate on the student's prediction. (A hidden-feature seam
             # would need a ``forward(..., return_features=True)`` contract that

@@ -516,42 +516,13 @@ class TestReportGeneration:
     """Test HTML dashboard and LaTeX table generation."""
 
     def test_html_dashboard(self, synthetic_state, campaign_dir: Path):
-        """Dashboard HTML + plots should be generated."""
-        from spectramr.config.schemas.campaign import EvaluationConfigSchema
-        from spectramr.infrastructure.orchestration.campaign_evaluator import (
-            CampaignEvaluator,
-        )
-        from spectramr.infrastructure.orchestration.campaign_report_generator import (
-            CampaignReportGenerator,
-        )
+        """The campaign dashboard renders from the saved campaign state."""
+        from spectramr.infrastructure.reporting.dashboard.campaign import build_campaign_report
 
-        evaluator = CampaignEvaluator(
-            EvaluationConfigSchema(
-                metrics=["psnr", "ssim"],
-                n_bootstrap=50,
-                per_sample_inference=False,
-                compute_uncertainty=False,
-            )
-        )
-        report = evaluator.evaluate(synthetic_state)
-
-        gen = CampaignReportGenerator(output_dir=campaign_dir)
-        dashboard_path = gen.generate(report)
-
-        assert Path(dashboard_path).exists()
-        html = Path(dashboard_path).read_text()
-
-        # Check HTML structure
+        pages = build_campaign_report(campaign_dir)
+        html = pages["index"].read_text()
         assert "smoke_test" in html
-        assert "Leaderboard" in html
-        assert "plot-card" in html
-
-        # Check plots exist
-        plots_dir = campaign_dir / "plots"
-        assert plots_dir.is_dir()
-        assert (plots_dir / "leaderboard.png").exists()
-        assert (plots_dir / "effect_sizes.png").exists()
-        assert (plots_dir / "significance_psnr.png").exists()
+        assert "Runs" in html
 
     def test_latex_table(self, synthetic_state):
         """LaTeX export should produce valid table markup."""

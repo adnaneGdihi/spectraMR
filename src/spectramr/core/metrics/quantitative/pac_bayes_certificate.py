@@ -29,8 +29,8 @@ Exports:
 * :func:`kl_isotropic_gaussian` — :math:`\mathrm{KL}(\mathcal{N}(\mu,\sigma^2 I)\|\mathcal{N}(0,\sigma_0^2 I))`.
 * :func:`mcallester_bound` — closed-form McAllester PAC-Bayes upper bound.
 * :func:`pac_bayes_bernstein_bound` — Tolstikhin-Seldin Bernstein refinement.
-* :class:`PACBayesCertificate` — registered per-volume metric that returns
-  the upper bound on the test risk.
+* :class:`PACBayesCertificate` — registered per-batch metric that returns
+  the Bernstein bound on per-image MSE in ``[0, loss_bound]``.
 """
 
 from __future__ import annotations
@@ -156,26 +156,35 @@ def pac_bayes_bernstein_bound(
 
 @register_metric("pac_bayes_certificate", aliases=["pac_bayes", "pb_bound"])
 class PACBayesCertificate:
-    r"""Per-volume PAC-Bayes-Bernstein certificate metric.
+    r"""Per-batch PAC-Bayes-Bernstein risk-bound metric.
 
-    Treats the ``prediction`` and ``target`` as a calibration sample
-    :math:`\{(y_i, x_i)\}_{i=1}^{n_{\rm cal}}` of bounded losses; returns
-    the :func:`pac_bayes_bernstein_bound` upper bound on the *test* loss
-    of a future patient drawn from the same distribution.
+    Treats the batch of ``prediction``/``target`` pairs as a calibration
+    sample of per-image MSE losses and returns
+    :func:`pac_bayes_bernstein_bound` in the loss's own units. The bound is
+    valid only for losses in ``[0, loss_bound]``, so the losses are divided by
+    ``loss_bound`` before bounding and any loss above it raises. Because the
+    batch is also the validation sample used for model selection, the value
+    is a diagnostic, not a held-out certificate.
 
     Args:
         kl_divergence: Pre-computed :math:`\mathrm{KL}(Q\|P)` for the
             trained network. The metric does not re-estimate it.
         delta: Confidence level.
+        loss_bound: Upper end :math:`B` of the per-image loss range.
     """
 
-    def __init__(self, kl_divergence: float = 0.0, delta: float = 0.05) -> None:
+    def __init__(
+        self, kl_divergence: float = 0.0, delta: float = 0.05, loss_bound: float = 1.0
+    ) -> None:
         if kl_divergence < 0:
             raise ValueError("kl_divergence must be non-negative.")
         if not 0 < delta < 1:
             raise ValueError("delta must lie in (0, 1).")
+        if loss_bound <= 0:
+            raise ValueError("loss_bound must be positive.")
         self.kl_divergence = kl_divergence
         self.delta = delta
+        self.loss_bound = loss_bound
 
     def __call__(
         self,
@@ -186,15 +195,22 @@ class PACBayesCertificate:
         per_sample = (prediction - target).pow(2).flatten(start_dim=1).mean(dim=-1)
         if per_sample.numel() == 0:
             raise ValueError("prediction must contain at least one sample.")
-        risk = per_sample.mean().item()
-        var = per_sample.var(unbiased=False).item()
-        return pac_bayes_bernstein_bound(
-            empirical_risk=risk,
-            empirical_variance=var,
+        worst = per_sample.max().item()
+        if worst > self.loss_bound:
+            raise ValueError(
+                f"pac_bayes_certificate: per-image MSE {worst:.4g} exceeds loss_bound "
+                f"{self.loss_bound:.4g}; the Bernstein bound holds only for losses in "
+                "[0, loss_bound]. Rescale the intensities or raise loss_bound."
+            )
+        scaled = per_sample / self.loss_bound
+        bound = pac_bayes_bernstein_bound(
+            empirical_risk=scaled.mean().item(),
+            empirical_variance=scaled.var(unbiased=False).item(),
             kl_divergence=self.kl_divergence,
             n_calibration=int(per_sample.numel()),
             delta=self.delta,
         )
+        return bound * self.loss_bound
 
     @property
     def name(self) -> str:

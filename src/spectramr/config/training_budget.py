@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-__all__ = ["NO_TRAINING_MODES", "zero_budget_defect"]
+__all__ = ["NO_TRAINING_MODES", "declares_no_training", "zero_budget_defect"]
 
 #: Modes that optimise nothing (split-conformal, physics-residual conformal and
 #: equivariance-conformal calibration, and the validation badge, all over a frozen
@@ -33,6 +33,19 @@ def _number(value: object) -> float | None:
         return None
 
 
+def declares_no_training(training: Mapping[str, object] | None) -> bool:
+    """Whether the ``training`` block names a mode that optimises nothing.
+
+    ``training_mode: calibration`` and ``strategy_class: calibration`` resolve to the
+    same class through the factory (a bare token, not a dotted path), so both
+    spellings count (mrixfields b17, 2026-09-03).
+    """
+    training = training or {}
+    mode = str(training.get("training_mode") or "").lower()
+    alias = str(training.get("strategy_class") or "").lower()
+    return mode in NO_TRAINING_MODES or ("." not in alias and alias in NO_TRAINING_MODES)
+
+
 def zero_budget_defect(training: Mapping[str, object] | None) -> str | None:
     """The finding, or None: ``epochs`` at or below zero with no positive ``max_iterations``.
 
@@ -41,12 +54,7 @@ def zero_budget_defect(training: Mapping[str, object] | None) -> str | None:
     default's business, not a zero budget.
     """
     training = training or {}
-    # ``training_mode: calibration`` and ``strategy_class: calibration`` resolve to the
-    # same class through the factory (a bare token, not a dotted path), so both
-    # spellings name a no-training mode here (mrixfields b17, 2026-09-03).
-    mode = str(training.get("training_mode") or "").lower()
-    alias = str(training.get("strategy_class") or "").lower()
-    if mode in NO_TRAINING_MODES or ("." not in alias and alias in NO_TRAINING_MODES):
+    if declares_no_training(training):
         return None
     epochs = _number(training.get("epochs"))
     max_iter = _number(training.get("max_iterations"))

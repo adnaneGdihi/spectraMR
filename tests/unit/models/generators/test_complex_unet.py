@@ -219,6 +219,8 @@ def test_every_attention_type_is_identity_at_init(attention_type: str) -> None:
         kan_dual_domain_kwargs={"max_dense_attn_tokens": 256},
         num_contrasts=4,
         phase_safe_dim=64,
+        # CC-OLMPA attends to a source contrast; the other types never read this.
+        **({"reference_channels": 2} if attention_type == "cross_contrast_olmpa" else {}),
     ).eval()
 
     rhos: list[float] = []
@@ -287,24 +289,16 @@ def test_t_emb_reaches_time_conditioned_attention() -> None:
     assert all(m.takes_t_emb for m in sites)
 
 
-def test_cc_olmpa_bottleneck_is_one_to_one_regardless_of_num_contrasts():
-    """The bottleneck OLMPA has no contrast axis, and must not pretend to.
-
-    The construction previously read ``num_contrasts = kwargs.pop("num_contrasts", 4)``
-    and then passed the literal ``1``, so a declared value was consumed and
-    discarded in the same breath. Every kspace_filling arm declares
-    ``num_contrasts: 3``; the value is a data-level quantity and the block
-    attends at bottleneck resolution where the source|target split is 1:1 by
-    construction, so 1 is correct -- the defect was the misleading read, which
-    grep reports as a wired knob.
-    """
-    common = dict(
-        in_channels=4,
-        out_channels=4,
-        features=(8, 16),
-        img_size=(32, 32),
-        attention_type="cross_contrast_olmpa",
-    )
+def test_cc_olmpa_bottleneck_ignores_num_contrasts():
+    """``num_contrasts`` is a data-level quantity; the block attends to one encoded source."""
+    common = {
+        "in_channels": 4,
+        "out_channels": 4,
+        "features": (8, 16),
+        "img_size": (32, 32),
+        "attention_type": "cross_contrast_olmpa",
+        "reference_channels": 2,
+    }
     for declared in (1, 3, 4):
         model = ComplexUNet(num_contrasts=declared, **common)
         assert model.cc_olmpa is not None
@@ -321,9 +315,60 @@ def test_cc_olmpa_phase_safe_dim_is_honoured():
         features=(8, 16),
         img_size=(32, 32),
         attention_type="cross_contrast_olmpa",
+        reference_channels=2,
         phase_safe_dim=64,
     )
     assert model.cc_olmpa.phase_safe_dim == 64
+
+
+@pytest.mark.parametrize("reference_channels", [0, 3, 8])
+def test_cc_olmpa_without_a_usable_source_raises(reference_channels: int) -> None:
+    """No source, an odd (non-complex) width, or no target channels left: refuse (#3032)."""
+    with pytest.raises(ValueError, match="reference_channels"):
+        ComplexUNet(
+            in_channels=8,
+            out_channels=8,
+            features=(8, 16),
+            attention_type="cross_contrast_olmpa",
+            reference_channels=reference_channels,
+        )
+
+
+def test_cc_olmpa_keys_and_values_come_from_the_reference_only() -> None:
+    """The block's source argument follows the reference channels, never the target (#3032).
+
+    The previous split labelled half of the bottleneck channels "source"; after the
+    encoder every one of them mixes both contrasts, so perturbing the target moved it.
+    """
+    torch.manual_seed(0)
+    model = ComplexUNet(
+        in_channels=8,
+        out_channels=8,
+        features=(8, 16),
+        img_size=(32, 32),
+        attention_type="cross_contrast_olmpa",
+        reference_channels=4,
+    ).eval()
+    seen: list[tuple[torch.Tensor, torch.Tensor]] = []
+    handle = model.cc_olmpa.register_forward_hook(
+        lambda _m, inp, _out: seen.append((inp[0].clone(), inp[1].clone()))
+    )
+    x = torch.randn(1, 8, 32, 32)
+    x_target = x.clone()
+    x_target[:, 4:] += torch.randn(1, 4, 32, 32)
+    x_reference = x.clone()
+    x_reference[:, :4] += torch.randn(1, 4, 32, 32)
+    t = torch.tensor([3])
+    try:
+        with torch.no_grad():
+            for inp in (x, x_target, x_reference):
+                model(inp, timesteps=t)
+    finally:
+        handle.remove()
+    (q0, s0), (q1, s1), (_, s2) = seen
+    assert torch.equal(s0, s1), "the source moved when only the target changed"
+    assert not torch.allclose(s0, s2), "the source ignored the reference channels"
+    assert not torch.allclose(q0, q1), "the query ignored the target channels"
 
 
 class TestPhaseEquivariance:

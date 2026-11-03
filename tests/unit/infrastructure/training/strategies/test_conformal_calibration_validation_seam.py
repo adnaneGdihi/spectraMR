@@ -27,7 +27,7 @@ class TestCalibrationValidationSeam:
         params = inspect.signature(
             ConformalCalibrationStrategy.validation_step
         ).parameters
-        for key in ("field_strength_target", "contrast_id"):
+        for key in ("field_strength", "field_strength_target", "contrast_id"):
             assert key in params, (
                 f"{key!r} missing from validation_step: the seam only forwards a batch "
                 "key whose name appears in the signature, so AnatomyFieldRenderer.forward "
@@ -36,7 +36,7 @@ class TestCalibrationValidationSeam:
 
     def test_those_kwargs_are_actually_forwardable_by_the_seam(self) -> None:
         # Guard the other half of the contract: a name the seam does not know is inert.
-        for key in ("field_strength_target", "contrast_id"):
+        for key in ("field_strength", "field_strength_target", "contrast_id"):
             assert key in _VALIDATION_FORWARD_FIELDS
 
     def test_strategy_overrides_validation_step_rather_than_inheriting_it(self) -> None:

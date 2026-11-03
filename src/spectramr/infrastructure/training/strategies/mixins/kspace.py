@@ -287,7 +287,9 @@ class KspaceMixin:
                 rep_fusion = getattr(gen, "rep_fusion", None)
                 if rep_fusion is None:
                     backbone = getattr(gen, "backbone", None)
-                    if backbone is not None:
+                    # A bridge may hold the untrained pre-#3363 module only so an old
+                    # checkpoint resumes; fuse through it only when the arm declared it.
+                    if backbone is not None and getattr(backbone, "rep_fusion_declared", True):
                         rep_fusion = getattr(backbone, "rep_fusion", None)
 
             if rep_fusion is not None and d > 1:

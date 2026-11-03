@@ -28,45 +28,47 @@ import math
 import os
 import time
 from collections.abc import Iterable
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from itertools import cycle
 from pathlib import Path
 from typing import Any
 
 import torch
-from spectramr.infrastructure.logging.progress import make_progress
 
+from spectramr.infrastructure.training.snapshot import SnapshotSession
 from spectramr.config.overrides import applied_override_paths
 from spectramr.config.schemas.validation import validation_declared_off
+from spectramr.config.training_budget import declares_no_training
 from spectramr.core.cascading_validation import aggregate_cascade_rows
 from spectramr.core.metrics.flag_map import schema_flag_to_metric
 from spectramr.core.metrics.scalar_transfer import fuse_to_host
 from spectramr.core.module_utils import unwrap_model
 from spectramr.core.topology import resolve_run_topology
-from spectramr.data.batch_types import BatchAdapter, TrainingBatch, reject_targetless_samples
-from spectramr.domain.exceptions import ConfigurationError
 from spectramr.core.wall_clock import (
     VALIDATION_SAFETY_FACTOR,
     resolve_check_interval,
     resolve_wall_clock_budget,
 )
+from spectramr.data.batch_types import BatchAdapter, TrainingBatch, reject_targetless_samples
+from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.checkpointing.async_writer import (
     CheckpointWriteError,
     CheckpointWriter,
 )
 from spectramr.infrastructure.checkpointing.layout import CheckpointLayout
 from spectramr.infrastructure.distributed.distributed_training import RankUtility
+from spectramr.infrastructure.logging.progress import make_progress
 from spectramr.infrastructure.logging.provenance import config_fingerprint
 from spectramr.infrastructure.training.nonfinite_monitor import (
     NonFiniteMonitor,
     NonFiniteVerdict,
     process_group_spans_ranks,
 )
-from spectramr.infrastructure.training.strategies.tall_locality import TALL_LOCALITY_LOSS_KEY
 from spectramr.infrastructure.training.strategies.lifecycle import (
     StrategyLifecycleDriver,
 )
-from spectramr.pipelines.loader_wait import LoaderWaitMonitor
+from spectramr.infrastructure.training.strategies.tall_locality import TALL_LOCALITY_LOSS_KEY
+from spectramr.models.losses.build_set import declared_build_set
 
 # The loop body (moved here in WS-3 PR-2) calls these helpers, which STAY in
 # ``pipelines/train.py`` (same layer — pipelines → pipelines is legal, and
@@ -74,7 +76,9 @@ from spectramr.pipelines.loader_wait import LoaderWaitMonitor
 # untouched). ``train`` imports ``TrainingLoop`` lazily, so this top-level
 # import does not cycle.
 from spectramr.pipelines.divergence_report import log_divergence_state
+from spectramr.pipelines.loader_wait import LoaderWaitMonitor
 from spectramr.pipelines.train import (
+    _drain_validation_images,
     _evaluate_sanity_overfit,
     _extract_es_best,
     _extract_es_best_iter,
@@ -82,7 +86,6 @@ from spectramr.pipelines.train import (
     _maybe_run_calibration,
     _resync_scheduler_base_lrs,
     _run_validation,
-    _drain_validation_images,
     _should_step_schedulers,
     _summarise_best_metrics_from_csv,
     early_stop_monitor_candidates,
@@ -207,6 +210,11 @@ def resolve_producer_declared_columns(strategy: Any) -> frozenset[str]:
     if getattr(type(strategy), "forwards_loss_components", False):
         keys.update(strategy.loss_computer.stamped_component_keys)
     return frozenset(keys)
+
+
+def strategy_reports_train_metrics(strategy: Any) -> bool:
+    """Whether the strategy writes ``train_*`` metrics; ``False`` drops those columns (#183)."""
+    return bool(getattr(type(strategy), "reports_train_metrics", True))
 
 
 def classify_discarded_keys(discarded: Iterable[str]) -> tuple[list[str], list[str]]:
@@ -463,7 +471,13 @@ class TrainingLoop:
                 executor.nonfinite_monitor = None
 
     def evaluate(
-        self, *, iteration: int = 0, epoch: int = 0, csv_file: Any = None, split: str = "val"
+        self,
+        *,
+        iteration: int = 0,
+        epoch: int = 0,
+        csv_file: Any = None,
+        split: str = "val",
+        record: bool = True,
     ) -> dict[str, float]:
         """Run one validation pass and return the aggregated metrics.
 
@@ -495,9 +509,10 @@ class TrainingLoop:
                 epoch,
                 self.logging_service,
                 output_paths=self.output_paths,
-                # A test pass must not write into the validation curves or images.
-                metrics_service=self.metrics_service if split == "val" else None,
-                tb_writer=self.tb_writer if split == "val" else None,
+                # A test pass, or an unrecorded re-score (``record=False``), must not
+                # write into the validation curves or images.
+                metrics_service=self.metrics_service if split == "val" and record else None,
+                tb_writer=self.tb_writer if split == "val" and record else None,
                 csv_file=csv_file,
                 split=split,
             )
@@ -1261,20 +1276,19 @@ def _execute_training_loop(
                     expected_loss_keys.add(loss_name)
 
             if hasattr(config, "losses") and config.losses is not None:
-                if hasattr(config.losses, "get_enabled_losses"):
-                    enabled_losses = config.losses.get_enabled_losses()
-                    # enabled_losses is a flat dict: {loss_name: weight}, not nested
-                    for loss_name, weight in enabled_losses.items():
-                        if weight > 0:
-                            expected_loss_keys.add(loss_name)
-                            # GAN specific cases
-                            if loss_name == "adversarial":
-                                expected_loss_keys.add("g_adv_loss")
-                                expected_loss_keys.add("d_real_loss")
-                                expected_loss_keys.add("d_fake_loss")
-                                expected_loss_keys.add("d_total_loss")
-                            elif loss_name == "gradient_penalty":
-                                expected_loss_keys.add("gradient_penalty")
+                enabled_losses = declared_build_set(config.losses)
+                # enabled_losses is a flat dict: {loss_name: weight}, not nested
+                for loss_name, weight in enabled_losses.items():
+                    if weight > 0:
+                        expected_loss_keys.add(loss_name)
+                        # GAN specific cases
+                        if loss_name == "adversarial":
+                            expected_loss_keys.add("g_adv_loss")
+                            expected_loss_keys.add("d_real_loss")
+                            expected_loss_keys.add("d_fake_loss")
+                            expected_loss_keys.add("d_total_loss")
+                        elif loss_name == "gradient_penalty":
+                            expected_loss_keys.add("gradient_penalty")
 
             # The TALL locality term is folded into the loss dict only when its weight is > 0.
             tall_cfg = getattr(config.training, "tall_sr", None)
@@ -1340,7 +1354,8 @@ def _execute_training_loop(
 
             # Dynamically extract training metrics from config.metrics
             expected_metrics = set()
-            if hasattr(config, "metrics") and config.metrics is not None:
+            metrics_block = getattr(config, "metrics", None)
+            if strategy_reports_train_metrics(strategy) and metrics_block is not None:
                 metrics_dict = (
                     config.metrics.model_dump() if hasattr(config.metrics, "model_dump") else {}
                 )
@@ -1585,7 +1600,20 @@ def _execute_training_loop(
     # 2026-08-21) and the only way out would be editing the YAML. So sanity
     # mode gets the diagnosis without the veto: warn, attribute the budget to
     # the mode, and let the check run.
-    if _val_loader_present and not _can_fire and not is_sanity_check:
+    # A certify-only mode takes no step and validates nothing in the loop: its val
+    # loader is the calibration cohort the post-loop hook consumes, so a zero budget
+    # is its contract rather than an unreachable gate (#1374).
+    _gate_unreachable = (
+        _val_loader_present
+        and not _can_fire
+        and not declares_no_training(
+            {
+                "training_mode": config.training.training_mode,
+                "strategy_class": config.training.strategy_class,
+            }
+        )
+    )
+    if _gate_unreachable and not is_sanity_check:
         raise ConfigurationError(
             f"validation.schedule.interval_steps={eval_interval} exceeds this "
             f"run's whole budget of {max_iterations} iterations, so the "
@@ -1613,7 +1641,7 @@ def _execute_training_loop(
     # it runs outside sanity mode. Telling that operator "not a defect in the
     # arm" would be a false all-clear on the one occasion the mode surfaced a
     # real defect early -- so the attribution is conditioned, not asserted.
-    elif _val_loader_present and not _can_fire:
+    elif _gate_unreachable:
         _arm_survives_own_budget = validation_can_fire(
             eval_interval=eval_interval,
             max_iterations=declared_max_iterations,
@@ -1941,6 +1969,12 @@ def _execute_training_loop(
     nonfinite_monitor = NonFiniteMonitor(pipeline.device, distributed=process_group_spans_ranks())
     strategy.step_executor.nonfinite_monitor = nonfinite_monitor
 
+    # One snapshot session per run: it selects the steps, owns the model hooks and
+    # writes every stage recorded inside a selected step (loader to model output).
+    if getattr(strategy, "snapshot_session", None) is not None:
+        strategy.snapshot_session.close()
+    strategy.snapshot_session = SnapshotSession.build(strategy)
+
     # #1353: the strategy lifecycle contract (``on_epoch_start`` /
     # ``on_epoch_end`` / ``on_validation_start`` / ``on_validation_end``) was
     # declared on BaseTrainingStrategy and overridden by real strategies, but
@@ -2090,24 +2124,24 @@ def _execute_training_loop(
                     for k, v in batch.items()
                 }
 
-            # Strategy Step
-            # Strategy returns list of OptimizationStepConfigs
-            step_configs = strategy.train_step(
-                batch,
-                epoch,
-                iteration=iteration,
-                batch_data=batch,  # For legacy callbacks
-                scaler=scaler,
-            )
-
-            # Let the step executor orchestrate the standard PyTorch boilerplate
-            result = strategy.step_executor.execute_step(
-                step_configs,
-                epoch,
-                global_step=iteration,
-                model_type=model_type,
-                clip_and_log_fn=getattr(strategy, "_clip_and_log_gradients", None),
-            )
+            # The snapshot spans both calls: the forward runs inside the closures
+            # ``train_step`` returns, which ``execute_step`` invokes.
+            _snapshots = strategy.snapshot_session
+            with _snapshots.step("train", iteration, batch) if _snapshots else nullcontext():
+                step_configs = strategy.train_step(
+                    batch,
+                    epoch,
+                    iteration=iteration,
+                    batch_data=batch,  # For legacy callbacks
+                    scaler=scaler,
+                )
+                result = strategy.step_executor.execute_step(
+                    step_configs,
+                    epoch,
+                    global_step=iteration,
+                    model_type=model_type,
+                    clip_and_log_fn=getattr(strategy, "_clip_and_log_gradients", None),
+                )
 
             # [FIX] Step LR schedulers (created by OptimizationBuilder but previously never stepped)
             # This is the root cause of late-stage training oscillation: constant LR with no decay.

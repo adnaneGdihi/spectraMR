@@ -189,7 +189,7 @@ class _RecordingStudent(nn.Module):
         return self.conv(x)
 
 
-def test_declares_the_student_input_not_the_clean_target():
+def test_declares_the_student_input_not_the_clean_target(declared):
     strat, _ = _make_strategy(beta0=0.0)
     student = _RecordingStudent()
     strat.env = SimpleNamespace(generator=student)
@@ -197,8 +197,8 @@ def test_declares_the_student_input_not_the_clean_target():
 
     strat._compute_losses_impl(input_batch=batch)
 
-    assert strat._declared_model_input is not None
-    tensors, extra, in_kspace_keys = strat._declared_model_input
+    assert declared() is not None
+    tensors, extra, in_kspace_keys = declared()
 
     # The student is called first; that call is the one the contract binds to.
     assert torch.equal(tensors["model_input"], student.seen[0])
@@ -209,7 +209,7 @@ def test_declares_the_student_input_not_the_clean_target():
     assert in_kspace_keys == set(), "must be explicit, not None"
 
 
-def test_teacher_input_rides_alongside_and_differs_from_the_student_input():
+def test_teacher_input_rides_alongside_and_differs_from_the_student_input(declared):
     """A one-tensor snapshot cannot show the mechanism.
 
     Student and teacher get the SAME noise draw at two adjacent knots
@@ -225,7 +225,7 @@ def test_teacher_input_rides_alongside_and_differs_from_the_student_input():
     strat.env = SimpleNamespace(generator=student)
 
     strat._compute_losses_impl(input_batch=_batch())
-    tensors, _extra, _keys = strat._declared_model_input
+    tensors, _extra, _keys = declared()
 
     assert "teacher_input" in tensors
     assert not torch.equal(tensors["model_input"], tensors["teacher_input"]), (
@@ -330,7 +330,8 @@ def test_it_declares_its_own_loss_ownership() -> None:
     PASS every declared ``losses.image_losses`` entry on this strategy's arms
     while the training step discards them.
     """
-    assert VFConsistencyDistillationStrategy.__dict__["folds_image_losses"] is False
+    assert VFConsistencyDistillationStrategy.__dict__["folds_image_losses"] is True
+    assert VFConsistencyDistillationStrategy.__dict__["empty_loss_stack_is_design"] is True
     assert VFConsistencyDistillationStrategy.__dict__["inline_losses"] == frozenset()
 
 
@@ -363,3 +364,42 @@ def test_the_ema_teacher_copies_the_inner_module_of_a_wrapper() -> None:
     teacher = strat._ensure_ema_teacher(nn.DataParallel(gen))
     assert not any(k.startswith("module.") for k in teacher.state_dict())
     strat._update_ema(nn.DataParallel(gen))
+
+
+def _image_cfg(weight: float) -> SimpleNamespace:
+    entry = SimpleNamespace(name="l1", weight=weight, enabled=True, role="target")
+    return SimpleNamespace(losses=SimpleNamespace(image_losses=[entry]))
+
+
+class _RecordingLoss:
+    """Image loss that records what it was asked to compare."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        self.calls.append((pred, target))
+        return (pred - target).abs().mean()
+
+
+def test_declared_image_loss_is_folded_onto_the_student_clean_estimate():
+    weight = 0.5
+    batch = _batch()
+
+    torch.manual_seed(3)
+    off, _ = _make_strategy(beta0=0.5)
+    off.config = _image_cfg(weight)
+    off.env.losses = {}
+    loss_off = off._compute_losses_impl(input_batch=batch)["loss_total"]
+
+    torch.manual_seed(3)
+    on, _ = _make_strategy(beta0=0.5)
+    on.config = _image_cfg(weight)
+    l1 = _RecordingLoss()
+    on.env.losses = {"l1": l1}
+    out = on._compute_losses_impl(input_batch=batch)
+
+    assert "loss_l1" in out
+    ((pred, target),) = l1.calls
+    assert torch.equal(target, batch["target"]), "the clean estimate is compared with x0"
+    assert torch.allclose(out["loss_total"] - loss_off, weight * (pred - target).abs().mean())

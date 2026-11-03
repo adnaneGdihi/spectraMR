@@ -124,3 +124,19 @@ def test_target_key_digest_is_a_non_security_sha1(monkeypatch):
     monkeypatch.setattr(hashlib, "sha1", spy)
     _target_key({"acceleration": 4, "target": [[1.0, 2.0]]})
     assert seen == [False]
+
+
+def test_arms_pair_by_subject_and_slice_when_both_row_kinds_exist(tmp_path):
+    """Slice rows win over per-call batch means; per-call rows only fill accelerated gaps."""
+    from ._runs import add_slice_rows
+
+    for name, offset, seed in (("exp_a_run", 0.0, 1), ("exp_b_run", 1.0, 2)):
+        add_slice_rows(make_run(tmp_path, name, selected=200), offset=offset, seed=seed)
+    arms = load_arms(resolve_runs([tmp_path]), with_images=False)
+    plain = arms.per_case[arms.per_case["acceleration"].isna()]
+    assert plain["case_id"].str.count(r"\|").ge(3).all()  # subject|contrast|slice|repetition
+    keys = plain[plain["base_metric"] == "psnr"].groupby("method")["case_id"].apply(set)
+    assert keys["a"] == keys["b"]  # the same slices, whatever order each loader read them in
+    assert arms.case_unit == "slices"
+    # the accelerated metrics only per-call rows carry are still there for the sweep
+    assert arms.per_case["acceleration"].notna().any()

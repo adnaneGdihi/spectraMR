@@ -8,32 +8,8 @@ from spectramr.models.registry import register_model
 
 logger = logging.getLogger(__name__)
 
-# One `try` per optional package (non-negotiable 18), resolved ONCE at import.
-# It used to sit inside `forward`, which is wrong twice over: Python does not
-# negative-cache a failed import, so every step re-ran the whole `sys.meta_path`
-# finder search (29 us/call, and `sys.modules` never gains the name), and the
-# `except ImportError: pass` that followed chose a different integrator without
-# saying so.
-#
-# `torchdiffeq` is declared in no `pyproject.toml` extra and appears in no
-# lockfile, so no environment built from this repository's metadata has ever
-# had it: every run of the 8 arms selecting `neural_ode` -- two of them under
-# `experiments/validated/` -- took the built-in solver below.
-try:
-    from torchdiffeq import odeint
-
-    HAVE_TORCHDIFFEQ = True
-except ImportError:
-    odeint = None
-    HAVE_TORCHDIFFEQ = False
-    logger.warning(
-        "torchdiffeq is not installed, so NeuralODEGenerator integrates with its "
-        "built-in fixed-step RK4 instead of torchdiffeq.odeint. Both walk the same "
-        "grid (%d uniform steps over [0, integration_time]), so this is a change of "
-        "implementation and not of discretisation -- but torchdiffeq's adjoint and "
-        "adaptive solvers are unreachable. Install it with `pip install torchdiffeq`.",
-        10,
-    )
+# Classical RK4 is the only integrator; torchdiffeq is not used because its fixed-step
+# "rk4" is the 3/8 rule, a different tableau.
 
 
 #: Integration steps of the continuous mode, and blocks of the fixed-depth control.
@@ -178,25 +154,6 @@ class NeuralODEGenerator(nn.Module, IGenerator):
         # RK4 Solver (4th-order Runge-Kutta)
         steps = _STEPS
         dt = self.integration_time / steps
-
-        if HAVE_TORCHDIFFEQ:
-            # `steps + 1` POINTS, so torchdiffeq walks `steps` intervals of `dt`
-            # -- the same grid the built-in solver below uses. It was
-            # `linspace(..., steps)` before, i.e. 9 intervals of T/9, so the two
-            # branches silently disagreed on the discretisation. Nothing
-            # published is affected: torchdiffeq is in no extra and no lockfile,
-            # so this branch has never executed.
-            t_span = torch.linspace(0, self.integration_time, steps + 1, device=x.device)
-            h_trajectory = odeint(self.ode_func, h, t_span, method="rk4")
-            h = h_trajectory[-1]  # Final state
-            return self.reconstruct(h)
-
-        # A ten-iteration loop stood here that computed k1..k4 and never wrote
-        # back to `h`. Its four stages were rebound each pass and discarded, so
-        # it could not affect the result -- it only doubled the model's forward
-        # cost (measured: 80 ode_func evaluations per forward, 40 of them dead)
-        # and, on CUDA, added ten host->device transfers via torch.tensor(t).
-        # The live RK4 update is the one below at the end of this method.
         current_t = 0.0
 
         # If t_eval is provided, we need to store intermediate states

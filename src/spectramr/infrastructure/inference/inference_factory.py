@@ -9,6 +9,9 @@ import torch
 from torch import nn
 
 from spectramr.infrastructure.inference.base_inference_strategy import BaseInferenceStrategy
+from spectramr.infrastructure.inference.cascaded_diffusion_inference_strategy import (
+    CascadedDiffusionInferenceStrategy,
+)
 from spectramr.infrastructure.inference.cold_diffusion_inference_strategy import (
     ColdDiffusionInferenceStrategy,
 )
@@ -90,6 +93,7 @@ class InferenceStrategyFactory:
             "gan": GANInferenceStrategy,
             "diffusion": DiffusionInferenceStrategy,
             "cold_diffusion": ColdDiffusionInferenceStrategy,
+            "cascaded_diffusion": CascadedDiffusionInferenceStrategy,
             "reconstruction": ReconstructionInferenceStrategy,
             "vae": VAEInferenceStrategy,
             "vqvae": VQVAEInferenceStrategy,

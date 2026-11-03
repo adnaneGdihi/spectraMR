@@ -90,7 +90,7 @@ class TestTheZeroFilledBaselineOnTheCoilMapFooting:
             zero_filled_metrics,
         )
         from spectramr.infrastructure.training.strategies.mixins.validation_context import (
-            scoring_maps,
+            coil_maps,
         )
 
         computer = self._computer(["psnr", "clinical_ssim"])
@@ -99,7 +99,7 @@ class TestTheZeroFilledBaselineOnTheCoilMapFooting:
         out = zero_filled_metrics(computer, context, target, op, names, transform="sense_magnitude", batch_data=batch)
         assert set(out) == {"val_zf_psnr", "val_zf_clinical_ssim"}
         image = op.model_input(context["measured_kspace"])
-        zf, ref = (t.abs() for t in sense_scoring_pair(image, target, scoring_maps(batch, image)[0]))
+        zf, ref = (t.abs() for t in sense_scoring_pair(image, target, coil_maps(batch, image)[0]))
         assert out["val_zf_psnr"] == pytest.approx(computer.compute(zf, ref, only=("psnr",))["psnr"])
         # Fully sampled and noise-free, A^H y is the SENSE target itself.
         op1, context1, target1, batch1 = self._scene(1)

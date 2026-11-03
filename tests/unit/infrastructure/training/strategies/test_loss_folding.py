@@ -13,6 +13,7 @@ from spectramr.config.settings import TrainingSettings
 from spectramr.infrastructure.training.strategies.loss_folding import (
     declared_loss_roles,
     declared_loss_weights,
+    declares_inline_objective,
     fold_builder_image_losses,
     fold_source_role_losses,
     unpaired_source_terms,
@@ -273,3 +274,19 @@ def test_target_role_image_loss_refused_under_unpaired_owner() -> None:
     pred, src = torch.rand(1, 1, 16, 16), torch.rand(1, 1, 16, 16)
     with pytest.raises(ValueError, match="role 'target'"):
         unpaired_source_terms(owner, pred, src)
+
+
+def test_empty_stack_is_design_only_where_declared() -> None:
+    from spectramr.infrastructure.training.strategies.diffusion import (
+        DiffusionTrainingStrategy,
+    )
+    from spectramr.infrastructure.training.strategies.flow_matching_strategy import (
+        FlowMatchingStrategy,
+    )
+    from spectramr.infrastructure.training.strategies.reconstruction import (
+        ReconstructionTrainingStrategy,
+    )
+
+    assert declares_inline_objective(FlowMatchingStrategy)
+    assert not declares_inline_objective(ReconstructionTrainingStrategy)
+    assert not declares_inline_objective(DiffusionTrainingStrategy)

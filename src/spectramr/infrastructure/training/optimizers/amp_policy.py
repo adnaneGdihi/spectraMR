@@ -119,10 +119,11 @@ class AMPPolicy(IAMPPolicy):
     def clip_gradients(self, model: torch.nn.Module, max_norm: float) -> None:
         """Clip by global norm over the model's own parameters.
 
-        Global on every backend: unsharded models hold every parameter, and FSDP2's
-        DTensor gradients reduce the norm across shards inside the utility.
+        Global on every backend, tensor-parallel included (``grad_norm``).
         """
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        from spectramr.infrastructure.distributed.grad_norm import clip_grad_norm_global_
+
+        clip_grad_norm_global_(model, max_norm)
 
     def _apply_gradient_clipping(self, model: torch.nn.Module) -> None:
         """Apply gradient clipping if enabled.
@@ -158,6 +159,58 @@ class AMPPolicy(IAMPPolicy):
                 "detached or constant term scaled by a weight, or summed with Python sum()."
             )
         checked.add(model_name)
+
+    def _unscale_clip_and_step(
+        self,
+        optimizer: torch.optim.Optimizer,
+        model: torch.nn.Module,
+        model_name: str,
+        scaler: Any,
+        gradient_clipping_fn: Callable[[torch.nn.Module], float] | None,
+        skip_scaler_update: bool,
+    ) -> None:
+        """Everything after the scaled backward: unscale, clip the fp32 grads, step, update."""
+        self._ensure_gradients_arrived(optimizer, model_name)
+        # Unscale gradients to fp32 for clipping and inf/nan checking
+        scaler.unscale_(optimizer)
+
+        # Clip gradients (operating on fp32 unscaled grads)
+        if gradient_clipping_fn:
+            gradient_clipping_fn(model)
+        else:
+            self._apply_gradient_clipping(model)
+
+        # Guard: scaler.step() asserts found_inf_per_device > 0
+        # which fails if optimizer has zero parameters with gradients
+        # (e.g., zero-loss first step or a model whose parameters all
+        # received None grads). The record lives in private torch
+        # state; ``None`` means the private API is gone (torch
+        # upgrade) — treat as recorded and use the public pattern.
+        recorded = _scaler_recorded_inf_checks(scaler, optimizer)
+        has_inf_checks = True if recorded is None else recorded
+
+        if has_inf_checks:
+            scaler.step(optimizer)
+
+        # CRITICAL: if has_inf_checks is False, scaler.unscale_() left
+        # the optimizer state at OptState.UNSCALED with no inf record.
+        # Without resetting that state the next iteration's unscale_()
+        # raises "unscale_() has already been called". When stepping is
+        # also skipped we must still advance / reset the scaler state
+        # — either via scaler.update() (also resets all per-optimizer
+        # states) or by clearing this optimizer's entry directly.
+        if not skip_scaler_update:
+            if has_inf_checks:
+                scaler.update()
+            else:
+                # Clear stuck per-optimizer state without touching the
+                # global scale (no inf signal was actually observed).
+                _clear_scaler_optimizer_state(scaler, optimizer)
+        elif not has_inf_checks:
+            # Multi-optimizer iteration where update() is deferred to
+            # the last config — still need to clear our own stuck state.
+            _clear_scaler_optimizer_state(scaler, optimizer)
+        optimizer.zero_grad(set_to_none=True)
 
     def backward_and_step(
         self,
@@ -206,47 +259,9 @@ class AMPPolicy(IAMPPolicy):
             scaler.scale(loss).backward()
 
             if perform_step:
-                self._ensure_gradients_arrived(optimizer, model_name)
-                # Unscale gradients to fp32 for clipping and inf/nan checking
-                scaler.unscale_(optimizer)
-
-                # Clip gradients (operating on fp32 unscaled grads)
-                if gradient_clipping_fn:
-                    gradient_clipping_fn(model)
-                else:
-                    self._apply_gradient_clipping(model)
-
-                # Guard: scaler.step() asserts found_inf_per_device > 0
-                # which fails if optimizer has zero parameters with gradients
-                # (e.g., zero-loss first step or a model whose parameters all
-                # received None grads). The record lives in private torch
-                # state; ``None`` means the private API is gone (torch
-                # upgrade) — treat as recorded and use the public pattern.
-                recorded = _scaler_recorded_inf_checks(scaler, optimizer)
-                has_inf_checks = True if recorded is None else recorded
-
-                if has_inf_checks:
-                    scaler.step(optimizer)
-
-                # CRITICAL: if has_inf_checks is False, scaler.unscale_() left
-                # the optimizer state at OptState.UNSCALED with no inf record.
-                # Without resetting that state the next iteration's unscale_()
-                # raises "unscale_() has already been called". When stepping is
-                # also skipped we must still advance / reset the scaler state
-                # — either via scaler.update() (also resets all per-optimizer
-                # states) or by clearing this optimizer's entry directly.
-                if not skip_scaler_update:
-                    if has_inf_checks:
-                        scaler.update()
-                    else:
-                        # Clear stuck per-optimizer state without touching the
-                        # global scale (no inf signal was actually observed).
-                        _clear_scaler_optimizer_state(scaler, optimizer)
-                elif not has_inf_checks:
-                    # Multi-optimizer iteration where update() is deferred to
-                    # the last config — still need to clear our own stuck state.
-                    _clear_scaler_optimizer_state(scaler, optimizer)
-                optimizer.zero_grad(set_to_none=True)
+                self._unscale_clip_and_step(
+                    optimizer, model, model_name, scaler, gradient_clipping_fn, skip_scaler_update
+                )
         else:
             # Standard precision backward (fp32)
             loss.backward()

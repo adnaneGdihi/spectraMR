@@ -11,6 +11,7 @@ from spectramr.infrastructure.physics.degradations._common import (
     _ensure_complex,
     _generator,
     _isolated_rng,
+    reject_override_with_endpoint,
 )
 from spectramr.infrastructure.physics.digital_twin_simulator import (
     simulate_concomitant_phase,
@@ -139,8 +140,11 @@ def degrade_concomitant_phase(
     )
 
 
-def _delegate_eddy(x, theta, seed=0, **kw):
+def _delegate_eddy(x, theta, seed=0, linear_phase_scale=5.0, **kw):
     x = _ensure_complex(x)
+    reject_override_with_endpoint(
+        "eddy", "strength", kw.get("strength"), "linear_phase_scale", linear_phase_scale, 5.0
+    )
     with _isolated_rng(x.device, seed):
         torch.manual_seed(int(seed))
         if x.device.type == "cuda":
@@ -148,6 +152,6 @@ def _delegate_eddy(x, theta, seed=0, **kw):
         # Strength controls per-PE-line phase accumulation (radians).
         # Bumped 0.5 -> 5.0 so theta=1 produces a visible shearing
         # ghost rather than the prior near-imperceptible phase tilt.
-        strength = float(kw.get("strength", float(theta) * 5.0))
+        strength = float(kw.get("strength", float(theta) * float(linear_phase_scale)))
         out = ifft2c(simulate_eddy_current(fft2c(x), strength=strength))
     return out

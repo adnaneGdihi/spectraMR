@@ -51,7 +51,12 @@ def test_zero_scout_dim_rejected() -> None:
 
 
 def _make_subject(data: torch.Tensor) -> tio.Subject:
-    return tio.Subject(input=tio.ScalarImage(tensor=data, affine=np.eye(4)))
+    """A ``(1, H, W)`` plane as TorchIO's ``(C, W, H, D)`` with one slice."""
+    return tio.Subject(input=tio.ScalarImage(tensor=data.unsqueeze(-1), affine=np.eye(4)))
+
+
+def _plane(image: tio.Image) -> torch.Tensor:
+    return image.data[..., 0]
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +69,7 @@ def test_scout_zeroes_outside_window_kspace() -> None:
     H, W = 64, 64
     Sx, Sy = 16, 16
     # Synthetic k-space — non-zero everywhere.
-    data = torch.ones(1, 1, H, W)
+    data = torch.ones(1, H, W)
     subj = _make_subject(data)
     transform = ScoutAcquisitionTransform(
         scout_resolution=(Sx, Sy), domain="kspace", keys=("input",)
@@ -72,8 +77,8 @@ def test_scout_zeroes_outside_window_kspace() -> None:
     result = transform.apply_transform(subj)
     # 2026-06: the scout is now a SEPARATE 'scout' image; the input is preserved
     # (no longer overwritten in place).
-    assert torch.equal(result["input"].data, data)
-    out = result["scout"].data
+    assert torch.equal(_plane(result["input"]), data)
+    out = _plane(result["scout"])
     # Outside the centre is zero.
     x0 = (H - Sx) // 2
     y0 = (W - Sy) // 2
@@ -89,12 +94,12 @@ def test_scout_zeroes_outside_window_kspace() -> None:
 
 def test_kspace_output_shape_matches_input() -> None:
     """Output shape equals input shape (only values change)."""
-    data = torch.randn(1, 1, 32, 32)
+    data = torch.randn(1, 32, 32)
     subj = _make_subject(data)
     transform = ScoutAcquisitionTransform(
         scout_resolution=(8, 8), domain="kspace", keys=("input",)
     )
-    out = transform.apply_transform(subj)["input"].data
+    out = _plane(transform.apply_transform(subj)["scout"])
     assert out.shape == data.shape
 
 
@@ -107,12 +112,12 @@ def test_image_domain_low_pass() -> None:
     """Image-domain mode reduces high-frequency content."""
     torch.manual_seed(0)
     H, W = 32, 32
-    data = torch.randn(1, 1, H, W)
+    data = torch.randn(1, H, W)
     subj = _make_subject(data)
     transform = ScoutAcquisitionTransform(
         scout_resolution=(8, 8), domain="image", keys=("input",)
     )
-    out = transform.apply_transform(subj)["input"].data
+    out = _plane(transform.apply_transform(subj)["scout"])
     # Output is complex (after FFT/iFFT round trip); take magnitude.
     if torch.is_complex(out):
         out_mag = out.abs()
@@ -134,7 +139,7 @@ def test_image_domain_low_pass() -> None:
 
 def test_scout_larger_than_input_raises() -> None:
     """Scout window larger than the spatial dims raises."""
-    data = torch.randn(1, 1, 16, 16)
+    data = torch.randn(1, 16, 16)
     subj = _make_subject(data)
     transform = ScoutAcquisitionTransform(
         scout_resolution=(32, 32), domain="kspace", keys=("input",)
@@ -145,14 +150,14 @@ def test_scout_larger_than_input_raises() -> None:
 
 def test_missing_key_skipped() -> None:
     """Subjects lacking the configured key are silently skipped."""
-    data = torch.randn(1, 1, 16, 16)
+    data = torch.randn(1, 16, 16)
     subj = _make_subject(data)
     transform = ScoutAcquisitionTransform(
         scout_resolution=(8, 8), domain="kspace", keys=("ghost",)
     )
     out = transform.apply_transform(subj)
     # No-op: input unchanged.
-    assert torch.equal(out["input"].data, data)
+    assert torch.equal(_plane(out["input"]), data)
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +169,8 @@ def test_multiple_keys_processed_independently() -> None:
     """Each configured key is cropped independently."""
     affine = np.eye(4)
     subj = tio.Subject(
-        input=tio.ScalarImage(tensor=torch.ones(1, 1, 32, 32), affine=affine),
-        target=tio.ScalarImage(tensor=torch.ones(1, 1, 32, 32), affine=affine),
+        input=tio.ScalarImage(tensor=torch.ones(1, 32, 32, 1), affine=affine),
+        target=tio.ScalarImage(tensor=torch.ones(1, 32, 32, 1), affine=affine),
     )
     transform = ScoutAcquisitionTransform(
         scout_resolution=(8, 8), domain="kspace", keys=("input", "target")
@@ -174,8 +179,8 @@ def test_multiple_keys_processed_independently() -> None:
     # 2026-06: with multiple keys each scout is emitted as ``scout_<key>``; the
     # originals are preserved.
     for k in ("input", "target"):
-        assert torch.equal(out[k].data, torch.ones(1, 1, 32, 32))
-        d = out[f"scout_{k}"].data
+        assert torch.equal(out[k].data, torch.ones(1, 32, 32, 1))
+        d = _plane(out[f"scout_{k}"])
         assert d[..., 0, 0].item() == 0.0
         assert d[..., 16, 16].item() == 1.0  # inside the 8×8 window
 
@@ -194,3 +199,22 @@ def test_scout_acquisition_is_registered_under_its_config_name() -> None:
     entry = get_transform("scout_acquisition")
     assert entry.cls is ScoutAcquisitionTransform
     assert "scout" in entry.produces
+
+
+def test_a_single_slice_volume_is_cropped_in_plane() -> None:
+    """TorchIO's ``(C, W, H, 1)``: the crop used to read ``(H, D)`` and raise on ``D=1``."""
+    data = torch.ones(1, 64, 48, 1)
+    subj = tio.Subject(input=tio.ScalarImage(tensor=data, affine=np.eye(4)))
+    t = ScoutAcquisitionTransform(scout_resolution=(32, 16), domain="kspace", keys=("input",))
+    scout = t.apply_transform(subj)["scout"].data
+    assert scout.shape == data.shape
+    assert scout[0, 16:48, 16:32, 0].eq(1).all()
+    assert scout.sum().item() == 32 * 16
+
+
+def test_each_slice_of_a_volume_gets_the_same_in_plane_window() -> None:
+    data = torch.ones(1, 32, 32, 3)
+    subj = tio.Subject(input=tio.ScalarImage(tensor=data, affine=np.eye(4)))
+    t = ScoutAcquisitionTransform(scout_resolution=(8, 8), domain="kspace", keys=("input",))
+    scout = t.apply_transform(subj)["scout"].data
+    assert [scout[..., d].sum().item() for d in range(3)] == [64.0, 64.0, 64.0]

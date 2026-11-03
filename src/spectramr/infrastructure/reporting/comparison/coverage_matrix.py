@@ -52,7 +52,10 @@ def coverage_grid(
 def _draw(names, table, unavailable, arms, phases):
     use_default_style()
     width = column_width("double")
-    height = max(1.2, 0.22 * len(arms) + 0.7) * len(phases)
+    # Each panel also carries its 60-degree metric labels below it (~0.045 in per character
+    # at 5 pt); without that room tight_layout gives up once long band metrics are listed.
+    label_room = 0.045 * max((len(pretty_label(m)) for m in names), default=0)
+    height = max(1.2, 0.22 * len(arms) + 0.7 + label_room) * len(phases)
     fig, axes = plt.subplots(len(phases), 1, figsize=(width, height), squeeze=False)
     for ax, phase in zip(axes.ravel(), phases, strict=True):
         grid = coverage_grid(table, unavailable, arms, phase, names)

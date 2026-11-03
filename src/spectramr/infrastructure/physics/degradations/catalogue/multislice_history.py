@@ -161,6 +161,7 @@ def spin_history(
     fa_deg: float = DEFAULT_FA_DEG,
     tr_ms: float = DEFAULT_TR_MS,
     t1_ms: float = DEFAULT_T1_MS,
+    peak_dz_mm: float = PEAK_DZ_MM,
 ) -> Tensor:
     """Per-shot through-plane displacement with the magnetisation history it carries."""
     check_volume(x, geometry, "spin_history")
@@ -178,14 +179,14 @@ def spin_history(
     shots = shot_index(line_times(geometry, d, h, tr_s=MOTION_TR_S), min(N_SHOTS, d * h))
     n_shots = int(shots.max()) + 1
     u = per_sample_rand(b, n_shots, generator=_generator(x.device, seed), device=x.device)
-    dz = (2.0 * u - 1.0) * (PEAK_DZ_MM * float(theta) / pitch)
+    dz = (2.0 * u - 1.0) * (peak_dz_mm * float(theta) / pitch)
     multislice = geometry.mode is AcquisitionMode.MULTISLICE_2D
     times = line_times(geometry, d, h, tr_s=tr_s).double()
     n_line = lines_since_hop(times, shots, multislice)
     _, q = steady_state(tr_s, t1_s, math.radians(fa_deg))
     qn = (q ** n_line.double()).to(device=x.device, dtype=x.real.dtype).view(1, 1, d, h, 1)
     if multislice:
-        max_hop = math.ceil(PEAK_DZ_MM / pitch) + 1
+        max_hop = math.ceil(peak_dz_mm / pitch) + 1
         offsets = range(-max_hop, max_hop + 1)
         first, start = shot_times(times, shots)
         dt = intervals_at(geometry, d, h, tr_s, offsets, first, cut=start)

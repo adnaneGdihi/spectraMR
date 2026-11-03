@@ -504,6 +504,7 @@ class ConcretePINNSensitivityStrategy(BaseTrainingStrategy):
         self,
         input_batch: torch.Tensor,
         target_batch: torch.Tensor,
+        batch_data: Any = None,
         **kwargs: Any,
     ) -> dict[str, float]:
         """Validate a single batch evaluating the unsupervised physics losses."""
@@ -531,6 +532,7 @@ class ConcretePINNSensitivityStrategy(BaseTrainingStrategy):
                     input_batch=input_batch,
                     target_batch=target_batch,
                     step=batch_idx,
+                    batch=batch_data,
                 ),
             ):
                 loss_tensors = self._compute_losses_impl(

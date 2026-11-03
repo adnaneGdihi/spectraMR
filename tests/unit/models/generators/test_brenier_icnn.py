@@ -69,17 +69,14 @@ def test_rejects_multichannel() -> None:
 
 
 def test_synthetic_forward_probe_passes_for_both_arms() -> None:
-    # The Brenier map is near-identity at init (designed OT start), which trips the Tier-2
-    # identity-collapse heuristic; the model declares synthetic_forward_probe_skip =
-    # {"identity_collapse"} so a healthy arm passes --probe (the input-invariance #20 check
-    # stays active). Regression for both the convex arm and its enforce_convexity=false control.
+    # #192: with the identity_collapse skip removed, the probe's identity check is live; the
+    # near-identity start (~0.03-0.07 displacement) must still clear it on every b15 arm.
     from spectramr.config.settings import TrainingSettings
     from spectramr.infrastructure.validation.forward_probe import synthetic_forward_probe
 
     for arm in (
         "b15_brenier_map",
         "b15_ablate_convexity",
-        "b15_brenier_intensity_undamped",
         "b15_brenier_intensity_transfer",
     ):
         cfg = TrainingSettings.from_yaml(
@@ -90,8 +87,8 @@ def test_synthetic_forward_probe_passes_for_both_arms() -> None:
 
 
 def test_intensity_adaptation_passes_through_to_icnn() -> None:
-    m = BrenierICNN(hidden_channels=16, n_layers=3, intensity_adaptation="undamped")
-    assert m.icnn.intensity_adaptation == "undamped"
+    m = BrenierICNN(hidden_channels=16, n_layers=3, intensity_adaptation="transfer")
+    assert m.icnn.intensity_adaptation == "transfer"
 
 
 def test_unknown_intensity_adaptation_raises() -> None:

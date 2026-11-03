@@ -1,23 +1,21 @@
 """k-Space Implicit Neural Representation (ULF-PR-4 / II.1).
 
-Plan: TODO/backlog_ulf_radiologist_acceptance_roadmap.md §ULF-PR-4.
+A SIREN coordinate MLP ``f_theta(k_x, k_y) -> (Re, Im)`` per coil represents one
+slice's multi-coil k-space. Each slice gets its own fit: starting from the
+network's weights, ``training.kspace_inr.inner_steps`` gradient steps minimise the
+mask-weighted k-space MSE on the sampled points of ``measured_kspace``. The fitted
+field is then taken to the image domain (``ifft2c`` per coil, RSS) and scored
+against the reference by the declared ``losses.image_losses``, plus
+``lambda_dc`` times the fitted field's k-space residual. The outer optimiser
+therefore learns the initialisation the per-slice fit starts from (Tancik et al.
+2021, learned initialisations for coordinate networks; Sitzmann et al. 2020).
 
-This training strategy supervises a k-space-domain network on the sampled
-k-space points only (the unsampled locations are masked out of the loss).
-The configured model maps the under-sampled k-space to a completed k-space;
-the objective is a mask-weighted L1 in k-space and never enters the image
-domain (the wired arm sets ``losses.output_domain: kspace`` /
-``model.model_domain: kspace``).
+Validation runs the same per-slice fit, so the graded image is what the INR
+recovers from that slice's measurement alone.
 
-NOTE (2026-06 audit): the original docstring advertised a per-subject SIREN
-coordinate-MLP ``(k_x, k_y) -> (real, imag)`` with a per-subject fit and an
-iFFT-to-image step. That coordinate-grid / SIREN forward and the image-domain
-iFFT term are NOT implemented here, and no ``kspace_inr`` coordinate-MLP model
-is registered — the wired model is a plain k-space CNN. The docstring is
-aligned to the actual k-space-only behaviour to avoid the pitfall #15 /
-#9 "advertised-but-unimplemented" divergence. Implementing the genuine
-per-subject INR (a registered SIREN model + image-domain ``ifft2c`` term)
-remains future work tracked in the ULF-PR-4 plan.
+``coord_kspace_gen`` also evaluates a SIREN over k-space, but as one population
+field conditioned on contrast with a radial-moment prior; it shares only the
+coordinate convention (``kspace_coordinate_grid``) with this strategy.
 """
 
 from __future__ import annotations
@@ -26,9 +24,11 @@ import logging
 from typing import Any, ClassVar
 
 import torch
-import torch.nn.functional as F
+from torch.func import functional_call, vmap
 
-from spectramr.data.batch_types import read_batch_field
+from spectramr.infrastructure.physics.fft_ops import ifft2c
+from spectramr.infrastructure.physics.multicoil_ei_operator import interleaved_to_complex
+from spectramr.models.blocks.siren_inr import kspace_coordinate_grid
 
 from .reconstruction import ReconstructionTrainingStrategy
 
@@ -36,29 +36,140 @@ logger = logging.getLogger(__name__)
 
 
 class KSpaceINRStrategy(ReconstructionTrainingStrategy):
-    """k-Space INR — mask-weighted L1 supervision on the sampled k-space points.
+    """Per-slice SIREN k-space fit with a learned initialisation and an image-domain term."""
 
-    See the module docstring for the scope caveat: this is a k-space-domain
-    masked-L1 strategy, not (yet) the per-subject SIREN coordinate-MLP fit.
-    """
-
-    #: Loss ownership (issue #1918). l1_loss(pred_k, kspace) is a K-SPACE fidelity term. It is not the canonical
-    #: image-space l1, so it must NOT be declared inline: doing so would make the
-    #: witness exclude a declared image_losses: [l1] from the very check that
-    #: would otherwise report it as unreachable.
+    #: Loss ownership (issue #1918): the image-domain term is the builder's declared
+    #: image losses on RSS(ifft2c(k)); the k-space DC term is not a canonical image loss.
     inline_losses: ClassVar[frozenset[str]] = frozenset()
-    folds_image_losses: ClassVar[bool] = False
+    folds_image_losses: ClassVar[bool] = True
+    #: The fit reads the measurement and mask off the context, in validation too.
+    validates_on_batch_context: ClassVar[bool] = True
+    validation_reads_context_measurement = True
+    #: The network is handed coordinates, never the prepared input image; the audit's
+    #: coil-channel alignment reads this.
+    model_input_is_coordinates: ClassVar[bool] = True
+    # parallel_compat: the fit evaluates the bare generator through functional_call, outside
+    # any wrapper's forward, so DDP never all-reduces and a sharded backend reads shards.
+    parallel_compat = frozenset()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Provenance stamp (decision: document the alias): this arm runs as a
-        # mask-weighted k-space L1, NOT the advertised per-subject SIREN
-        # coordinate-MLP + iFFT (that remains roadmap — see the design-decision
-        # memo). Stamp it so a run is never mistaken for the INR paradigm.
+        training = getattr(self.config, "training", None)
+        cfg = getattr(training, "kspace_inr", None) if training is not None else None
+        if cfg is None:
+            raise ValueError(
+                "KSpaceINRStrategy requires a training.kspace_inr block: the per-slice fit's "
+                "inner_steps, inner_lr, lambda_dc and first_order have no implicit values."
+            )
+        self.inner_steps = int(cfg.inner_steps)
+        self.inner_lr = float(cfg.inner_lr)
+        self.lambda_dc = float(cfg.lambda_dc)
+        self.first_order = bool(cfg.first_order)
+        self._grids: dict[tuple[int, int, torch.device], torch.Tensor] = {}
         logger.info(
-            "KSpaceINRStrategy: running as mask-weighted k-space L1 "
-            "(per-subject SIREN coordinate-MLP fit is not implemented)."
+            "KSpaceINRStrategy: per-slice SIREN k-space fit, inner_steps=%d, inner_lr=%.3g, "
+            "lambda_dc=%.3g, first_order=%s; image term = declared image_losses on RSS(ifft2c(k)).",
+            self.inner_steps,
+            self.inner_lr,
+            self.lambda_dc,
+            self.first_order,
         )
+
+    def builds_own_model_input(self) -> bool:
+        """The network is evaluated on k-space coordinates, not the loader's input."""
+        return True
+
+    @classmethod
+    def standalone_infer_blocker(cls, config: object) -> str | None:
+        return (
+            "kspace_inr fits the SIREN to each slice's measured k-space inside the step; "
+            "infer would feed the image to a coordinate network"
+        )
+
+    def _measurement(self, context: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(y complex [B, C, H, W], mask [B, 1, H, W])`` off the batch context."""
+        measured = context.get("measured_kspace")
+        mask = context.get("mask")
+        if measured is None or mask is None:
+            raise ValueError(
+                "kspace_inr requires batch_context['measured_kspace'] and ['mask']: route the "
+                "arm through the loader's Cartesian masking (data.trajectory: cartesian)."
+            )
+        measured, mask = _squeeze_unit_depth(measured), _squeeze_unit_depth(mask)
+        y = interleaved_to_complex(measured)
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        if mask.shape[-2:] != y.shape[-2:] or mask.shape[1] != 1:
+            raise ValueError(
+                f"kspace_inr mask {tuple(mask.shape)} does not broadcast over the measurement "
+                f"{tuple(y.shape)} as one Cartesian mask per slice."
+            )
+        return y, mask.to(y.real.dtype)
+
+    def _grid(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        key = (height, width, device)
+        if key not in self._grids:
+            self._grids[key] = kspace_coordinate_grid(height, width, device)
+        return self._grids[key]
+
+    def _generator(self, coils: int) -> torch.nn.Module:
+        gen = getattr(self.env, "generator", None)
+        if gen is None:
+            raise RuntimeError("kspace_inr requires self.env.generator (the SIREN field).")
+        out_channels = getattr(gen, "out_channels", None)
+        if out_channels != 2 * coils:
+            raise ValueError(
+                f"kspace_inr: the generator emits {out_channels} channels but the measurement "
+                f"carries {coils} coils; set model.out_channels: {2 * coils} (Re, Im per coil)."
+            )
+        return gen
+
+    def _field(
+        self, gen: torch.nn.Module, params: dict[str, torch.Tensor], coords: torch.Tensor, shape
+    ) -> torch.Tensor:
+        """Per-slice parameters ``[B, ...]`` -> complex k-space ``[B, C, H, W]``."""
+        batch, coils, height, width = shape
+        out = vmap(lambda p: functional_call(gen, p, (coords,)))(params)
+        out = out.view(batch, height, width, coils, 2)
+        return torch.complex(out[..., 0], out[..., 1]).permute(0, 3, 1, 2)
+
+    @staticmethod
+    def _dc(pred_k: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Per-slice mean squared k-space residual over the sampled points, ``[B]``."""
+        residual = (pred_k - y).abs().pow(2) * mask
+        sampled = (mask.sum(dim=(1, 2, 3)) * y.shape[1]).clamp(min=1.0)
+        return residual.sum(dim=(1, 2, 3)) / sampled
+
+    def _fit(
+        self, y: torch.Tensor, mask: torch.Tensor, *, second_order: bool | None = None
+    ) -> torch.Tensor:
+        """Fit the field to each slice's sampled k-space from the network's weights.
+
+        The field represents ``y / s`` with ``s`` the RMS of the slice's sampled points,
+        so ``inner_lr`` and ``lambda_dc`` do not depend on the scanner's k-space scale.
+        """
+        gen = self._generator(y.shape[1])
+        coords = self._grid(y.shape[-2], y.shape[-1], y.device)
+        scale = self._dc(torch.zeros_like(y), y, mask).sqrt().clamp(min=1e-12).detach()
+        scale = scale.view(-1, 1, 1, 1)
+        y_unit = y / scale
+        create_graph = (not self.first_order) if second_order is None else second_order
+        batch = y.shape[0]
+        theta = {n: p.unsqueeze(0).expand(batch, *p.shape) for n, p in gen.named_parameters()}
+        for _ in range(self.inner_steps):
+            # Summed over slices: each slice's parameters see only their own residual.
+            inner = self._dc(self._field(gen, theta, coords, y.shape), y_unit, mask).sum()
+            grads = torch.autograd.grad(inner, list(theta.values()), create_graph=create_graph)
+            theta = {
+                n: t - self.inner_lr * g for (n, t), g in zip(theta.items(), grads, strict=True)
+            }
+        return scale * self._field(gen, theta, coords, y.shape)
+
+    @staticmethod
+    def _image(pred_k: torch.Tensor) -> torch.Tensor:
+        """RSS magnitude of the per-coil ``ifft2c`` images, ``[B, 1, H, W]``."""
+        power = ifft2c(pred_k).abs().pow(2).sum(dim=1, keepdim=True)
+        return power.clamp(min=1e-12).sqrt()
 
     def _compute_losses_impl(
         self,
@@ -67,33 +178,46 @@ class KSpaceINRStrategy(ReconstructionTrainingStrategy):
         epoch: int = 0,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
-        """Loss is just MSE on the sampled k-space points (the rest is masked out)."""
-        batch = self._resolve_legacy_batch(input_batch, kwargs)
-        gen = getattr(self.env, "generator", None)
-        if gen is None:
-            # No silent zero-loss fallback (CLAUDE.md pitfall #9/#10): a missing
-            # generator must fail loudly, not present a zero-gradient step that
-            # looks like training.
-            raise RuntimeError(
-                "k-space INR requires self.env.generator and batch['kspace']; generator is None"
-            )
+        context = self._prepare_batch_context(input_batch, target_batch, **kwargs)
+        y, mask = self._measurement(context)
+        pred_k = self._fit(y, mask)
+        scale2 = self._dc(torch.zeros_like(y), y, mask).clamp(min=1e-24)
+        dc = (self._dc(pred_k, y, mask) / scale2).mean()
+        env_losses: dict[str, Any] = (getattr(self.env, "losses", None) or {}) if self.env else {}
+        image_out = self.loss_computer.compute(
+            pred=self._image(pred_k),
+            target=context["hr"],
+            epoch=epoch,
+            iteration=int(kwargs.get("iteration", 0) or 0),
+            losses_dict=env_losses,
+        )
+        total = image_out.total + self.lambda_dc * dc
+        return {
+            **image_out.components,
+            "loss_total": total,
+            "loss_image": image_out.total.detach(),
+            "loss_kspace_dc": dc.detach(),
+        }
 
-        # ``read_batch_field``, not ``isinstance(batch, dict)``: the loop delivers a
-        # ``TrainingBatch`` dataclass, so the isinstance leg is False and the
-        # ``else`` handed the WHOLE BATCH OBJECT on as if it were a tensor.
-        kspace = read_batch_field(batch, "kspace")
-        mask = read_batch_field(batch, "mask")
-        if kspace is None:
-            raise RuntimeError(
-                "k-space INR requires self.env.generator and batch['kspace']; "
-                "batch['kspace'] is missing"
-            )
+    def _validation_forward(
+        self,
+        input_batch: torch.Tensor,
+        batch_context: dict[str, Any],
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """The image the per-slice fit recovers from this slice's measurement."""
+        y, mask = self._measurement(batch_context)
+        # Validation runs under no_grad; the fit itself is gradient descent, and no outer
+        # gradient is taken, so the inner loop never builds a second-order graph.
+        with torch.enable_grad():
+            pred_k = self._fit(y, mask, second_order=False)
+        return self._image(pred_k).detach()
 
-        pred_k = gen(kspace, mask=mask) if mask is not None else gen(kspace)
-        if mask is not None:
-            # Mask-weighted L1 — sum/mask-sum rather than the SSOT F.l1_loss
-            # because the standard reduction would average over masked-out pixels.
-            loss = ((pred_k - kspace).abs() * mask).sum() / mask.sum().clamp(min=1.0)
-        else:
-            loss = F.l1_loss(pred_k, kspace)
-        return {"loss_total": loss, "loss_kspace_mae": loss.detach()}
+
+def _squeeze_unit_depth(x: torch.Tensor) -> torch.Tensor:
+    """Drop a trailing singleton slice axis (``[B, C, H, W, 1]`` -> ``[B, C, H, W]``)."""
+    if x.dim() == 5:
+        if x.shape[-1] != 1:
+            raise ValueError(f"kspace_inr is a 2-D fit; got a {x.shape[-1]}-slice tensor.")
+        return x.squeeze(-1)
+    return x

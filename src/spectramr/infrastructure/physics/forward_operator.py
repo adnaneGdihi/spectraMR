@@ -28,10 +28,11 @@ Author: Physics-AI MRI Framework
 from __future__ import annotations
 
 import math
-from typing import Literal
+from typing import ClassVar, Literal
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from spectramr.infrastructure.physics.fft_ops import (
     fft1_uncentered,
@@ -442,6 +443,9 @@ class NullSpaceProjection(nn.Module):
     Used in PA-PCFM to ensure network only generates null-space content.
     """
 
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
+
     def __init__(self, forward_operator: MultiCoilForwardOperator) -> None:
         """__init__.
 
@@ -503,23 +507,43 @@ class MultiCoilDataConsistency(nn.Module):
         lambda_dc: Weight for soft data consistency (default 1.0)
     """
 
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
+
     def __init__(
         self,
         forward_operator: MultiCoilForwardOperator,
         mode: Literal["soft", "hard"] = "soft",
         lambda_dc: float = 1.0,
+        learnable: bool = False,
     ) -> None:
         """__init__.
 
         Args:
             forward_operator (MultiCoilForwardOperator): Description.
             mode (Literal['soft', 'hard']): Description.
-            lambda_dc (float): Description.
+            lambda_dc (float): Soft-DC step size; the initial value when ``learnable``.
+            learnable: Train the soft-DC step as ``softplus(raw)``, initialised at
+                ``lambda_dc``. Hard replacement has no step, so it refuses the flag.
         """
         super().__init__()
         self.A = forward_operator
         self.mode = mode
         self.lambda_dc = lambda_dc
+        self.learnable = bool(learnable)
+        if self.learnable:
+            if mode != "soft" or lambda_dc <= 0.0:
+                raise ValueError(
+                    f"a learnable DC step needs mode='soft' and lambda_dc > 0, got "
+                    f"mode={mode!r}, lambda_dc={lambda_dc}."
+                )
+            # Inverse softplus, so the first forward uses exactly lambda_dc.
+            raw = lambda_dc + math.log(-math.expm1(-lambda_dc))
+            self.lambda_raw = nn.Parameter(torch.tensor(raw, dtype=torch.float32))
+
+    def step_size(self) -> torch.Tensor | float:
+        """The soft-DC step: the trained ``softplus(raw)`` or the fixed ``lambda_dc``."""
+        return F.softplus(self.lambda_raw) if self.learnable else self.lambda_dc
 
     def forward(
         self,
@@ -564,7 +588,7 @@ class MultiCoilDataConsistency(nn.Module):
             # Gradient step: x - λ·A†(Ax - y)
             residual = self.A.forward(x) - y
             correction = self.A.adjoint(residual)
-            x_dc = x - self.lambda_dc * correction
+            x_dc = x - self.step_size() * correction
         else:
             # Hard replacement in k-space
             # Get current k-space

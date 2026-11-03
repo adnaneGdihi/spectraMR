@@ -49,7 +49,6 @@ logger = logging.getLogger(__name__)
 __all__ = ["SSDUReconstructionStrategy", "inject_noisier_kspace", "split_acquired_mask"]
 
 
-
 def _committed_coil_factor() -> torch.Tensor:
     """Cholesky factor of the committed M4Raw coil covariance, scaled to trace C.
 
@@ -82,9 +81,6 @@ class SSDUReconstructionStrategy(ReconstructionTrainingStrategy):
     #: ``_measurement`` raises without the batch's mask and measurement.
     validates_on_batch_context: ClassVar[bool] = True
     checkpointed_streams: ClassVar[tuple[str, ...]] = ("_rng",)
-    #: The network is fed ``A^H y~`` built inside the step, not the prepared k-space (#2508).
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "ssdu_model_input"
     #: Schema default, on the class so an instance built without ``__init__`` reads it.
     score_structural_zeros: bool = False
     _split_seed: int = 0

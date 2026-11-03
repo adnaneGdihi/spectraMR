@@ -180,7 +180,7 @@ The GAN block's ``enable_`` flags gate their weights
 ``losses.gan`` pairs each weight with an enable flag —
 ``enable_gradient_penalty``/``lambda_gp``,
 ``enable_feature_matching``/``feature_matching``,
-``enable_adversarial``/``lambda_adv``. ``get_enabled_losses`` has always honoured
+``enable_adversarial``/``lambda_adv``. The weight table has always honoured
 the pairing; ``LossBuilder``, the surface that actually **constructs**
 ``gan_composite``, read the weights raw and ignored the flags, so
 ``enable_gradient_penalty: false`` still bought a penalty at the schema default
@@ -2273,14 +2273,20 @@ theorem does **not** transfer to a *learned*, task-specific conv frame trained
 end-to-end with soft-thresholding (not :math:`\ell_1` minimisation); here incoherence is
 an **empirical** regulariser and the claim is the testable ablation below, not a recovery
 guarantee. This loss is that lever. For the atom matrix :math:`W\in\mathbb{R}^{m\times n}`
-(``m`` unit-normalised atoms), it is the Gram off-diagonal Frobenius energy
+(``m`` unit-normalised atoms, Gram :math:`G=\hat W\hat W^\top`), the penalty is chosen by
+``training.sparse_frame.coherence_penalty``. The default ``smooth_max`` is the log-sum-exp
+smooth maximum
 
 .. math::
 
-   \mathcal{L}_{\mathrm{coh}} = \sum_{i\neq j}\langle\hat d_i,\hat d_j\rangle^2
-       = \lVert\hat W\hat W^\top - I_m\rVert_F^2 ,
+   L_\beta = \beta^{-1}\log\sum_{i<j}\exp\!\big(\beta\,G_{ij}^2\big),
 
-which is 0 iff the atoms are mutually orthogonal and rises with coherence. It is a
+with sharpness ``coherence_beta`` (default 1000), which lies within :math:`\log N/\beta`
+above :math:`\mu^2` (:math:`N=m(m-1)/2`) and so minimises the mutual coherence itself.
+``frobenius`` is the off-diagonal energy
+:math:`\sum_{i\neq j}G_{ij}^2=\lVert G-I_m\rVert_F^2`; for an over-complete frame its floor
+is attained by every unit-norm tight frame, including frames far above the Welch bound,
+so it lowers only the average squared coherence (#2368). It is a
 **parameter** penalty (not a ``(pred, target)`` loss): invoked without a frame /
 atom tensor it **raises** so it cannot silently no-op in a YAML ``losses``
 block. It is wired through

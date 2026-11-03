@@ -9,11 +9,14 @@ __all__ = ["KSpaceGPT"]
 
 @register_model(name="kspace_gpt", training_mode="reconstruction", spatial_dims=(2,))
 class KSpaceGPT(nn.Module, IGenerator):
-    """
-    KSpaceGPT: Generative Pre-trained Transformer for k-space (Experiment 102).
+    """Transformer over k-space tokens: bidirectional patches, or causal lines.
 
-    Models k-space as a sequence of tokens (e.g., patches or lines).
-    Uses a Transformer to predict missing k-space data or refine it.
+    ``causal_mask=False`` tokenises ``patch_size`` patches and attends over all of them.
+    ``causal_mask=True`` makes each row of the ``[..., H, W]`` plane (dim -2, the axis the
+    Cartesian loader mask removes lines along) one token, in raster order, and masks
+    attention so the output row ``j`` reads input rows ``0..j`` only. An unacquired row
+    arrives as zeros, so its prediction comes from the rows before it. One causal pass,
+    teacher-forced on the measured context; no sequential rollout.
     """
 
     def __init__(
@@ -27,7 +30,9 @@ class KSpaceGPT(nn.Module, IGenerator):
         img_size: int = 256,
         patch_size: int = 16,
         features: list[int] = None,  # Compatibility with UNet-style configs
-        **kwargs,  # Absorb extra config args (causal_mask, max_seq_length, etc.)
+        causal_mask: bool = False,
+        max_seq_length: int | None = None,
+        **kwargs,  # legacy corpora (experiments/training, validated) declare unread keys
     ):
         """__init__.
 
@@ -41,6 +46,9 @@ class KSpaceGPT(nn.Module, IGenerator):
             img_size (int): Description.
             patch_size (int): Description.
             features (list[int]): Description.
+            causal_mask (bool): Causal line tokens instead of bidirectional patches.
+            max_seq_length (int | None): Longest line sequence the causal path accepts
+                (its positional table); defaults to ``img_size``. Causal path only.
         """
         super().__init__()
 
@@ -55,11 +63,45 @@ class KSpaceGPT(nn.Module, IGenerator):
         if "embed_dim" in kwargs:
             d_model = kwargs["embed_dim"]
 
+        if not isinstance(causal_mask, bool):
+            raise ValueError(f"causal_mask must be a bool, got {causal_mask!r}.")
+        if not causal_mask and max_seq_length is not None:
+            raise ValueError(
+                "max_seq_length sizes the causal line sequence and is unread with "
+                "causal_mask=False; remove it or set causal_mask: true."
+            )
+
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.patch_size = patch_size
         self.d_model = d_model
+        self.causal_mask = causal_mask
+        self.img_size = img_size
 
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        if causal_mask:
+            seq_len = img_size if max_seq_length is None else max_seq_length
+            if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
+                raise ValueError(f"max_seq_length must be a positive int, got {seq_len!r}.")
+            self.max_seq_length = seq_len
+            # One token per row: a per-row Linear in and out, so nothing mixes rows
+            # except the masked attention.
+            self.line_embed = nn.Linear(in_channels * img_size, d_model)
+            self.line_pos = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
+            self.line_out = nn.Linear(d_model, out_channels * img_size)
+            # True = may not attend; built once and sliced per forward.
+            self.register_buffer(
+                "attn_mask",
+                torch.ones(seq_len, seq_len, dtype=torch.bool).triu(1),
+                persistent=False,
+            )
+            return
+
+        self.max_seq_length = None
         # Patch embedding
         self.patch_embed = nn.Conv2d(
             in_channels, d_model, kernel_size=patch_size, stride=patch_size
@@ -68,12 +110,6 @@ class KSpaceGPT(nn.Module, IGenerator):
         # Positional encoding
         num_patches = (img_size // patch_size) ** 2
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, d_model))
-
-        # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
         # Output projection
         self.output_proj = nn.ConvTranspose2d(
@@ -131,6 +167,8 @@ class KSpaceGPT(nn.Module, IGenerator):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
+        if self.causal_mask:
+            return self._forward_causal_lines(x)
         B, C, H, W = x.shape
 
         # Embed patches
@@ -152,6 +190,25 @@ class KSpaceGPT(nn.Module, IGenerator):
         x = self.output_proj(x)
 
         return x
+
+    def _forward_causal_lines(self, x: torch.Tensor) -> torch.Tensor:
+        """``[B, C, H, W]`` -> same, row ``j`` of the output a function of input rows ``<= j``."""
+        b, c, n_lines, width = x.shape
+        if n_lines > self.max_seq_length:
+            raise ValueError(
+                f"{n_lines} k-space lines exceed max_seq_length={self.max_seq_length}; raise "
+                "model_kwargs.max_seq_length or crop the plane."
+            )
+        if (c, width) != (self.in_channels, self.img_size):
+            raise ValueError(
+                f"causal line tokens are {self.in_channels} channels x {self.img_size} "
+                f"samples (in_channels x img_size); got {c} x {width}."
+            )
+        tokens = x.permute(0, 2, 1, 3).reshape(b, n_lines, c * width)
+        h = self.line_embed(tokens) + self.line_pos[:, :n_lines]
+        h = self.transformer(h, mask=self.attn_mask[:n_lines, :n_lines], is_causal=True)
+        out = self.line_out(h).reshape(b, n_lines, self.out_channels, width)
+        return out.permute(0, 2, 1, 3).contiguous()
 
     def get_parameter_count(self) -> int:
         """get_parameter_count.

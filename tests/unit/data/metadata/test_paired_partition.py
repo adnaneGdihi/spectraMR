@@ -131,8 +131,16 @@ def test_unpaired_sessions_of_held_out_subjects_stay_out_of_train():
 
 def test_holdout_site_is_refused_on_paired_route():
     data = _data(split={"type": "random", "validation_fraction": 0.2, "holdout_site": "siteA"})
-    with pytest.raises(ValueError, match="loso_subject"):
+    with pytest.raises(ValueError, match="val_subjects"):
         partition_paired_records(_pool(), data)
+
+
+def test_two_subject_holdout_is_exclusive_validation_on_paired_route():
+    data = _data(split={"type": "subjects", "val_subjects": ["01", "02"]})
+    part = partition_paired_records(_pool(), data)
+    assert _subjects_of(part.val) == {"01", "02"}
+    assert not _subjects_of(part.train) & {"01", "02"}
+    assert part.test == []
 
 
 def test_unknown_subject_id_raises():

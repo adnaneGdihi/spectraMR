@@ -9,6 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+from matplotlib.colors import LinearSegmentedColormap
+
+from spectramr.core.design_tokens import SEQUENTIAL_BLUE
 
 from spectramr.core.metrics.metric_directions import resolve_direction
 from spectramr.infrastructure.reporting.metadata import RunMetadata
@@ -51,7 +54,9 @@ def make(
 
     width = column_width("single")
     fig, ax = plt.subplots(figsize=(width, width * max(0.5, 0.07 * len(methods) + 0.3)))
-    im = ax.imshow(ranks.to_numpy(), cmap="viridis_r", vmin=1, vmax=len(methods), aspect="auto")
+    # One hue, darkest = rank 1 (best), as on the dashboard heatmap; viridis is a multi-hue ramp.
+    ramp = LinearSegmentedColormap.from_list("rank", list(reversed(SEQUENTIAL_BLUE)))
+    im = ax.imshow(ranks.to_numpy(), cmap=ramp, vmin=1, vmax=len(methods), aspect="auto")
     ax.set_xticks(range(ranks.shape[1]))
     ax.set_xticklabels([pretty_label(c) for c in ranks.columns], rotation=30, ha="right")
     ax.set_yticks(range(len(methods)))

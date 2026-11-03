@@ -22,12 +22,15 @@ def slice_batch_aligned(
     """Slice every tensor whose leading dimension is the batch to ``[start:stop]``.
 
     A tensor with a different leading size (a broadcast ``(1, ...)`` mask, a
-    scalar) is shared by every chunk and passed through unchanged.
+    scalar) is shared by every chunk and passed through unchanged. A mapping of
+    per-sample tensors (``acquisition_params``) is sliced entry by entry.
     """
     return {
         key: (
             value[start:stop]
             if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == batch
+            else slice_batch_aligned(value, start, stop, batch)
+            if isinstance(value, dict)
             else value
         )
         for key, value in kwargs.items()

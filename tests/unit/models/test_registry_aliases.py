@@ -153,7 +153,7 @@ KNOWN_CROSS_REGISTRY_DISAGREEMENTS = frozenset(
         "fusion_unet", "gaussian_splatting", "laplace_diffusion", "medical_dino",
         "motion_inr", "pggs_pipeline", "physics_aware_gaussian_splatter", "pin_nerf",
         "refined_kan_unet", "rl_scanner", "sparse_vae", "stable_vit", "structured_vae",
-        "symbolic_regression", "uncertainty_wrapper", "vae", "vit_kan", "vq_vae",
+        "uncertainty_wrapper", "vae", "vit_kan", "vq_vae",
         "vqgan", "vqvae",
     )  # fmt: skip
 )

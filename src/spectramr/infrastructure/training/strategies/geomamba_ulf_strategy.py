@@ -397,9 +397,9 @@ class GeoMambaULFStrategy(BaseTrainingStrategy):
                 "set the cubical_ph_w2 weight to 0 to disable the PH term."
             ) from exc
 
-    def _first_steps_extra(self, epoch: int, batch: Any = None) -> dict[str, Any]:
-        """Stamp the resolved PH knobs (pitfall 15) into the first-steps snapshot."""
-        extra = super()._first_steps_extra(epoch, batch=batch)
+    def _snapshot_context(self) -> dict[str, Any]:
+        """Stamp the resolved PH knobs (pitfall 15) into the snapshot manifest."""
+        extra = super()._snapshot_context()
         extra.update(self._topology_provenance)
         if self._ulf_unwarp is not None:
             extra["unwarp"] = self._ulf_unwarp.provenance()

@@ -85,6 +85,13 @@ and launches such an arm with ``--validate-only`` and no ``--resume``, so it sta
 array beside the learned arms and writes to the same run tree. A model type the registry
 does not know raises; it is never read as "learned".
 
+An evaluation-only arm declares ``training.validate_only: true``, the YAML spelling of
+``--validate-only``: ``train`` grades the weights ``model.checkpoint_path`` loads in one
+validation pass, takes no optimizer step, and raises when there are no weights to grade.
+A distillation arm that grades real corruption also sets
+``training.distillation.validation_input: loaded``: the student reads the loaded scan
+without the digital twin, and the step raises if the loaded reference equals that scan.
+
 **Runs follow** ``dev``. A manifest lists config *paths*, and each task reads its
 YAML and imports ``src/`` from the live checkout when it starts. Both submitters
 (``submit_experiment_array.sh`` and the campaign array path) refuse a checkout

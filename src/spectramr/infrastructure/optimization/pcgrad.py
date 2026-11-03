@@ -137,14 +137,14 @@ class PCGrad:
                 if gi_flat is None or gj_flat is None:
                     continue
                 dot = torch.dot(gi_flat, gj_flat)
-                if dot < 0:
-                    gj_norm_sq = torch.dot(gj_flat, gj_flat).clamp(min=1e-12)
-                    coeff = dot / gj_norm_sq
-                    for k in range(num_params):
-                        gi_k = projected[i][k]
-                        gj_k = task_grads[j][k]
-                        if gi_k is not None and gj_k is not None:
-                            projected[i][k] = gi_k - coeff * gj_k
+                gj_norm_sq = torch.dot(gj_flat, gj_flat).clamp(min=1e-12)
+                # A zero coefficient when they agree: no host sync on the conflict test.
+                coeff = torch.where(dot < 0, dot / gj_norm_sq, torch.zeros_like(dot))
+                for k in range(num_params):
+                    gi_k = projected[i][k]
+                    gj_k = task_grads[j][k]
+                    if gi_k is not None and gj_k is not None:
+                        projected[i][k] = gi_k - coeff * gj_k
         return projected
 
     def _flatten(self, grads: list[Tensor | None]) -> Tensor | None:
@@ -166,44 +166,49 @@ class PCGrad:
 
 
 def project_conflicting_gradients(
-    grad_primary: list[torch.Tensor],
-    grad_secondary: list[torch.Tensor],
-) -> list[torch.Tensor]:
-    """Project the secondary gradients to remove conflict with primary gradients.
+    grad_primary: list[torch.Tensor | None],
+    grad_secondary: list[torch.Tensor | None],
+) -> list[torch.Tensor | None]:
+    """Project the secondary task gradient off the primary one where the two conflict.
 
-    For each parameter, if the primary and secondary gradients conflict
-    (dot product < 0), the conflicting component of the secondary gradient
-    is surgically removed by projecting it onto the normal plane of the
-    primary gradient.
+    The conflict test and the projection act on the whole task gradient, concatenated
+    over every parameter (Yu et al. 2020), not tensor by tensor: a layer whose two
+    gradients disagree is left alone while the task gradients agree overall. A ``None``
+    entry is a zero gradient.
 
     Args:
-        grad_primary: Primary task gradients (e.g., physics/reconstruction).
-            These are treated as the ground truth direction and are NOT modified.
-        grad_secondary: Secondary task gradients (e.g., adversarial).
-            Conflicting components are projected away.
+        grad_primary: Primary task gradients (e.g., physics/reconstruction), one per
+            parameter. They are the protected direction and are NOT modified.
+        grad_secondary: Secondary task gradients (e.g., adversarial), aligned with
+            ``grad_primary``.
 
     Returns:
-        Modified secondary gradients with conflicting components removed.
-        Non-conflicting gradients are returned unchanged.
+        ``g_s - min(g_s . g_p, 0) / ||g_p||^2 * g_p`` split back per parameter. A
+        parameter with no primary gradient keeps its secondary entry (``None`` stays
+        ``None``); one with a primary but no secondary gradient gets ``-coeff * g_p``.
     """
-    projected = []
-    for g_p, g_s in zip(grad_primary, grad_secondary, strict=False):
-        if g_p is None or g_s is None:
+    pairs = [
+        (g_p.reshape(-1), g_s.reshape(-1))
+        for g_p, g_s in zip(grad_primary, grad_secondary, strict=True)
+        if g_p is not None and g_s is not None
+    ]
+    primaries = [g_p.reshape(-1) for g_p in grad_primary if g_p is not None]
+    if not primaries:
+        return list(grad_secondary)
+    # Two scalars for the whole task; torch.where keeps the test on device (no host sync).
+    dot = sum((torch.dot(a, b) for a, b in pairs), torch.zeros((), device=primaries[0].device))
+    norm_sq = sum(torch.dot(a, a) for a in primaries)
+    coeff = torch.where(
+        (dot < 0) & (norm_sq > 1e-12), dot / norm_sq.clamp_min(1e-12), torch.zeros_like(dot)
+    )
+    projected: list[torch.Tensor | None] = []
+    for g_p, g_s in zip(grad_primary, grad_secondary, strict=True):
+        if g_p is None:
             projected.append(g_s)
-            continue
-
-        # reshape, not view: autograd may return a non-contiguous gradient. The conflict
-        # test stays on device (torch.where) so no parameter forces a host sync.
-        g_p_flat = g_p.reshape(-1)
-        g_s_flat = g_s.reshape(-1)
-        dot = torch.dot(g_p_flat, g_s_flat)
-        norm_sq = torch.dot(g_p_flat, g_p_flat)
-        # Conflicting (dot < 0) with a non-zero primary: g_s - (g_s·g_p / ||g_p||²) g_p.
-        coeff = torch.where(
-            (dot < 0) & (norm_sq > 1e-12), dot / norm_sq.clamp_min(1e-12), torch.zeros_like(dot)
-        )
-        projected.append(g_s - coeff * g_p)
-
+        elif g_s is None:
+            projected.append(-coeff * g_p)
+        else:
+            projected.append(g_s - coeff * g_p)
     return projected
 
 

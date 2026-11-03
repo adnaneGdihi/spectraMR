@@ -9,6 +9,8 @@ These models alternate between data consistency (DC) steps and learned
 regularization (CNN updates) in an unrolled optimization framework.
 """
 
+from typing import Any
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -16,6 +18,12 @@ from torch.nn import functional as F
 from spectramr.infrastructure.physics.forward_operator import (
     MultiCoilDataConsistency,
     MultiCoilForwardOperator,
+)
+from spectramr.models.blocks.pipeline_stages import (
+    CascadeStage,
+    Payload,
+    build_cascade_stages,
+    cascade_at,
 )
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
@@ -144,6 +152,8 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
         num_coils: int = 1,
         activation: str = "relu",
         output_activation: str = "tanh",
+        residual: bool = False,
+        learnable_dc: bool = False,
     ):
         """__init__.
 
@@ -159,6 +169,9 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
             activation (str): Description.
             output_activation: ``"tanh"`` (default) or ``"none"``; a tanh after the
                 last DC step clips the image above 1 and undoes the DC (#2327).
+            residual: each regulariser refines the estimate (``x + r(x)``, last conv
+                zero-initialised) instead of replacing it.
+            learnable_dc: train one soft-DC step per unroll, initialised at ``lambda_dc``.
         """
         super().__init__()
 
@@ -167,6 +180,7 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
         self.img_size = img_size
         self.num_unrolls = num_unrolls
         self.num_coils = int(num_coils)
+        self.residual = bool(residual)
         if output_activation not in _OUTPUT_ACTIVATIONS:
             raise ValueError(f"Unknown output_activation {output_activation!r}")
 
@@ -183,7 +197,9 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
         # Uses shared forward operator for all steps
         self.dc_layers = nn.ModuleList(
             [
-                MultiCoilDataConsistency(self.forward_operator, mode="soft", lambda_dc=lambda_dc)
+                MultiCoilDataConsistency(
+                    self.forward_operator, mode="soft", lambda_dc=lambda_dc, learnable=learnable_dc
+                )
                 for _ in range(num_unrolls)
             ],
         )
@@ -200,6 +216,11 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
                 for _ in range(num_unrolls)
             ],
         )
+        if self.residual:
+            # Each stage starts as the identity, so the cascade begins at plain DC iterations.
+            for block in self.regularization_blocks:
+                nn.init.zeros_(block.model[-1].weight)
+                nn.init.zeros_(block.model[-1].bias)
 
         self.output_activation = _OUTPUT_ACTIVATIONS[output_activation]()
 
@@ -236,29 +257,26 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # A half-supplied pair would silently skip every DC step.
-        if (kspace_measured is None) != (mask is None):
-            raise ValueError(
-                "data consistency needs both kspace_measured and mask; got only "
-                f"{'kspace_measured' if mask is None else 'mask'}."
-            )
-        # Initial reconstruction
-        x = self.initial_recon(x)
+        payload = _enter(self, x, kspace_measured, mask, sensitivity_maps)
+        payload = _cascade(self, range(self.num_unrolls), payload)
+        return self.output_activation(payload[0])
 
-        # Unrolled optimization
-        for dc_layer, reg_block in zip(self.dc_layers, self.regularization_blocks, strict=False):
-            # Learned regularization step
-            x = reg_block(x)
+    def pipeline_stages(self, n: int) -> list[CascadeStage]:
+        """``n`` contiguous, balanced runs of regulariser/DC pairs (pipeline parallelism).
 
-            # Data consistency step (if k-space data available)
-            if kspace_measured is not None and mask is not None:
-                self._check_coils(kspace_measured, sensitivity_maps)
-                self.forward_operator.set_coil_sensitivities(sensitivity_maps)
-                self.forward_operator.set_mask(mask)
-                x = dc_layer(x, kspace_measured)
+        ``initial_recon`` belongs to the first stage and ``output_activation`` to the
+        last. The forward operator holds no state-dict entries; every stage that owns a
+        DC layer reaches it as ``dc_layer.A`` and sets its mask and maps per call.
+        """
 
-        # Final activation
-        return self.output_activation(x)
+        def paths(cascades: range, first: bool, last: bool) -> list[str]:
+            owned = [f"{g}.{i}" for i in cascades for g in ("regularization_blocks", "dc_layers")]
+            return owned + ["initial_recon"] * first + ["output_activation"] * last
+
+        return build_cascade_stages(
+            self, n, self.num_unrolls, _UnrolledStage, paths,
+            num_coils=self.num_coils, residual=self.residual,
+        )
 
     def generate(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         """Generate method for IGenerator interface."""
@@ -274,19 +292,7 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
         )
 
     def _check_coils(self, kspace: torch.Tensor, maps: torch.Tensor | None) -> None:
-        """Refuse k-space whose coil count ``num_coils`` does not name (shape-only, no sync).
-
-        Without maps the operator is ``A = M F`` on one coil and has no combine.
-        """
-        coils = kspace.shape[1] if torch.is_complex(kspace) else kspace.shape[1] // 2
-        if coils != self.num_coils or (maps is not None and maps.shape[-3] != coils):
-            raise ValueError(
-                f"unrolled_reconstruction declares num_coils={self.num_coils}, but data "
-                f"consistency received {coils}-coil k-space and maps "
-                f"{None if maps is None else tuple(maps.shape)}."
-            )
-        if coils > 1 and maps is None:
-            raise ValueError(f"{coils}-coil data consistency needs sensitivity_maps to combine.")
+        _check_coils(self.num_coils, kspace, maps)
 
     @property
     def name(self) -> str:
@@ -304,6 +310,78 @@ class UnrolledReconstructionGenerator(nn.Module, IGenerator):
     def get_parameter_count(self) -> int:
         """Get total number of parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def _check_coils(num_coils: int, kspace: torch.Tensor, maps: torch.Tensor | None) -> None:
+    """Refuse k-space whose coil count ``num_coils`` does not name (shape-only, no sync).
+
+    Without maps the operator is ``A = M F`` on one coil and has no combine.
+    """
+    coils = kspace.shape[1] if torch.is_complex(kspace) else kspace.shape[1] // 2
+    if coils != num_coils or (maps is not None and maps.shape[-3] != coils):
+        raise ValueError(
+            f"unrolled_reconstruction declares num_coils={num_coils}, but data "
+            f"consistency received {coils}-coil k-space and maps "
+            f"{None if maps is None else tuple(maps.shape)}."
+        )
+    if coils > 1 and maps is None:
+        raise ValueError(f"{coils}-coil data consistency needs sensitivity_maps to combine.")
+
+
+def _enter(
+    owner: nn.Module,
+    x: torch.Tensor,
+    kspace_measured: torch.Tensor | None,
+    mask: torch.Tensor | None,
+    sensitivity_maps: torch.Tensor | None,
+) -> Payload:
+    """The initial reconstruction. Payload: ``(estimate, kspace, mask, maps)``."""
+    # A half-supplied pair would silently skip every DC step.
+    if (kspace_measured is None) != (mask is None):
+        raise ValueError(
+            "data consistency needs both kspace_measured and mask; got only "
+            f"{'kspace_measured' if mask is None else 'mask'}."
+        )
+    return (owner.initial_recon(x), kspace_measured, mask, sensitivity_maps)
+
+
+def _cascade(owner: nn.Module, cascades: range, payload: Payload) -> Payload:
+    """Learned regularisation, then soft data consistency when k-space is present."""
+    x, kspace_measured, mask, sensitivity_maps = payload
+    for i in cascades:
+        update = cascade_at(owner.regularization_blocks, i)(x)
+        x = x + update if owner.residual else update
+        if kspace_measured is not None and mask is not None:
+            dc_layer = cascade_at(owner.dc_layers, i)
+            _check_coils(owner.num_coils, kspace_measured, sensitivity_maps)
+            dc_layer.A.set_coil_sensitivities(sensitivity_maps)
+            dc_layer.A.set_mask(mask)
+            x = dc_layer(x, kspace_measured)
+    return (x, *payload[1:])
+
+
+class _UnrolledStage(CascadeStage):
+    """Payload: ``(estimate, kspace_measured, mask, sensitivity_maps)``."""
+
+    def __init__(self, cascades: range, *, num_coils: int, residual: bool, **kwargs: Any):
+        super().__init__(cascades, **kwargs)
+        self.num_coils = num_coils
+        self.residual = residual
+
+    def _enter(
+        self,
+        x: torch.Tensor,
+        kspace_measured: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        sensitivity_maps: torch.Tensor | None = None,
+    ) -> Payload:
+        return _enter(self, x, kspace_measured, mask, sensitivity_maps)
+
+    def _cascade(self, payload: Payload) -> Payload:
+        return _cascade(self, self.cascades, payload)
+
+    def _exit(self, payload: Payload) -> torch.Tensor:
+        return self.output_activation(payload[0])
 
 
 @register_model(name="varnet", training_mode="reconstruction", spatial_dims=(2,))

@@ -23,7 +23,6 @@ training:
     sampling_steps: 20
     prediction_type: sample
     type: cold
-    degradation: kspace_mask
 
 data:
   coil_processing_mode: rss

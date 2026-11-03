@@ -19,6 +19,7 @@ from spectramr.config.schemas.base import (
 )
 from spectramr.config.schemas.certification import CertificationConfigSchema
 from spectramr.config.schemas.checkpoint import CheckpointConfigSchema
+from spectramr.config.schemas.compression import CompressionExportConfigSchema
 from spectramr.config.schemas.data import DataConfigSchema
 from spectramr.config.schemas.early_stopping import EarlyStoppingConfigSchema
 from spectramr.config.schemas.ema import EMAConfigSchema
@@ -46,7 +47,6 @@ from spectramr.config.schemas.run import (
     CONFIG_VERSION_NOT_AUTHORED_HERE,
     RunConfigSchema,
 )
-from spectramr.config.schemas.spectra import BackendAccelerationConfigSchema
 from spectramr.config.schemas.training.base import TrainingStrategyConfigSchema
 from spectramr.config.schemas.training.privacy import PrivacyConfig
 from spectramr.config.schemas.validation import ValidationConfigSchema
@@ -239,21 +239,6 @@ class TrainingSettings(BaseSettings):  # type: ignore[misc]
     # user-visible deliverable, and the class name touches 121 call sites for no
     # reader benefit.
     undersampling: AccelerationConfigSchema | None = Field(default=None)
-    # SPECTRA hardware inference backend (distinct from ``acceleration``, which
-    # is k-space undersampling). Declaring the typed field here is what makes a
-    # YAML ``backend_acceleration:`` block readable under ``extra="forbid"``;
-    # selecting the spectra backend without it is a hard audit failure, never a
-    # silent default. See spectramr.config.schemas.spectra and the
-    # ``check_spectra_*`` Tier-1 guards.
-    backend_acceleration: BackendAccelerationConfigSchema | None = Field(
-        default=None,
-        description=(
-            "SPECTRA hardware inference-backend configuration (WCSR systolic "
-            "array + NMAE physics-remap over the RoCC contract). Optional; when "
-            "omitted the run uses the default torch/device backend. See "
-            "spectramr.config.schemas.spectra.BackendAccelerationConfigSchema."
-        ),
-    )
     physics: PhysicsConfigSchema | None = Field(default=None)
     # `artifacts` was removed (#698) and is refused at load; see removals.py.
     # Declarative adapter chains. Per CLAUDE.md #9 adapters NEVER fire
@@ -284,6 +269,13 @@ class TrainingSettings(BaseSettings):  # type: ignore[misc]
         description=(
             "Regulatory certification block (R1 CDFC, R2 CHD, R4 PRC, R5 PAC-Bayes, "
             "V.3 validation badge). See spectramr.config.schemas.certification."
+        ),
+    )
+    compression: CompressionExportConfigSchema | None = Field(
+        default=None,
+        description=(
+            "Post-training network compression export (pruning / weight quantization), "
+            "re-scored on the validation pass. See spectramr.config.schemas.compression."
         ),
     )
     parallel: ParallelismConfigSchema | None = Field(

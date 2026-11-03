@@ -271,7 +271,7 @@ def test_axis_materially_degrades_at_full_severity(axis: str) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_severity_yardstick_spread_is_pinned() -> None:
+def test_severity_spread_at_theta_one_is_pinned() -> None:
     """The axes are NOT severity-equalised, and this pins how unequal they are.
 
     ``compute_minimax_borda`` already warns that its worst-axis term "is only
@@ -298,15 +298,26 @@ def test_severity_yardstick_spread_is_pinned() -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _sweep(axis: str, *, grid: list[float] | None = None):
-    """One axis swept by the real ``MetaDegradationSweep``, optionally on a
-    hand-compressed severity grid (what a yardstick does to a strong axis)."""
+def _narrow_r(*axes: str) -> dict:
+    # R in [1, 1.0035]: the band theta <= 5e-4 covered before the range was physical.
+    from spectramr.config.schemas.severity_axes import SeverityAxis
+
+    return {a: SeverityAxis(start=1.0, end=1.0035, n_steps=20) for a in axes}
+
+
+def _sweep(axis: str, *, severity_axes: dict | None = None):
+    """One axis swept by the real ``MetaDegradationSweep``, optionally on a narrowed
+    per-degradation range."""
     pytest.importorskip("scripts.sim2rank.degradation")  # not in the public export
     from scripts.sim2rank.degradation import MetaDegradationSweep
 
-    sweep = MetaDegradationSweep(n_timesteps=20, device=torch.device("cpu"), seed=7)
-    if grid is not None:
-        sweep.severity_grid = grid
+    sweep = MetaDegradationSweep(
+        n_timesteps=20,
+        device=torch.device("cpu"),
+        seed=7,
+        axes=[axis] if severity_axes else None,
+        severity_axes=severity_axes,
+    )
     return sweep, sweep.sweep_axis(_phantom(), axis)
 
 
@@ -345,9 +356,8 @@ def test_collapsed_grid_raises_at_the_sweep_not_in_a_ranker() -> None:
     pytest.importorskip("scripts.sim2rank.degradation")  # not in the public export
     from scripts.sim2rank.degradation import DegenerateSweepError
 
-    grid = np.linspace(5e-4 / 20, 5e-4, 20).tolist()
     with pytest.raises(DegenerateSweepError) as excinfo:
-        _sweep("cartesian_undersamp", grid=grid)
+        _sweep("cartesian_undersamp", severity_axes=_narrow_r("cartesian_undersamp"))
     msg = str(excinfo.value)
     assert "cartesian_undersamp" in msg
     assert "distinct degradation levels" in msg
@@ -373,8 +383,8 @@ def test_sweep_all_axes_reports_every_degenerate_axis_at_once() -> None:
         device=torch.device("cpu"),
         seed=7,
         axes=["cartesian_undersamp", "vd_cartesian", "complex_gaussian"],
+        severity_axes=_narrow_r("cartesian_undersamp", "vd_cartesian"),
     )
-    sweep.severity_grid = np.linspace(5e-4 / 20, 5e-4, 20).tolist()
     with pytest.raises(DegenerateSweepError) as excinfo:
         sweep.sweep_all_axes(_phantom())
     msg = str(excinfo.value)

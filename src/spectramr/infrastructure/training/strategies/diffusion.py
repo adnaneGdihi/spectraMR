@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 from collections.abc import Iterable, Mapping
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 import torch
@@ -35,6 +36,7 @@ from spectramr.core.metrics.ring_power import RING_METRICS
 from spectramr.core.metrics.scalar_transfer import fuse_to_host
 from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import align_scale_to_batch, read_batch_field
+from spectramr.data.transforms.normalization import LoaderNormalization, loader_normalization
 from spectramr.domain.exceptions import ConfigurationError
 from spectramr.infrastructure.checkpointing.restore import ZeroOverlapError, weights
 from spectramr.infrastructure.physics.coil_sensitivity import (
@@ -44,7 +46,8 @@ from spectramr.infrastructure.physics.coil_sensitivity import (
     resolve_estimation_settings,
 )
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
-from spectramr.infrastructure.training.debug_snapshot import ChannelSegment
+from spectramr.core import snapshot_trace
+from spectramr.core.snapshot_trace import ChannelSegment
 from spectramr.infrastructure.training.loop_state import resolve_loop_iteration
 from spectramr.infrastructure.training.strategies.measured_map_scoring import (
     MeasuredMapStash,
@@ -56,6 +59,10 @@ from spectramr.infrastructure.training.strategies.measured_map_scoring import (
 )
 from spectramr.infrastructure.distributed.owned_modules import OWNED_PARAM_GROUP
 from spectramr.infrastructure.training.strategies.owned_param_groups import add_owned_param_group
+from spectramr.infrastructure.training.strategies.score_sde_engine import (
+    ScoreSDEEngine,
+    build_score_sde_engine,
+)
 from spectramr.infrastructure.training.strategies.selection_rules import apply_selection_rule
 from spectramr.infrastructure.training.strategies.mixins.adversarial import (
     AdversarialMixin,
@@ -93,10 +100,20 @@ from spectramr.models.losses.critic_domain import (
     to_critic_input,
 )
 from spectramr.models.losses.registry import create_loss
+from spectramr.models.losses.weights import canonical_loss_name
 
 from ..utils.data_adapters import TorchIOAdapter
-from ..utils.diffusion_mixin import DiffusionStrategyMixin
+from ..utils.diffusion_mixin import DiffusionStrategyMixin, bind_latent_reverse_schedule
 from .base import BaseTrainingStrategy
+from .loss_folding import (
+    TARGET_ROLE,
+    declared_inline_losses,
+    declared_loss_roles,
+    declared_loss_weights,
+    fold_builder_image_losses,
+    inline_managed_with,
+    scheduled_overrides,
+)
 from .mixins.reference_batch import reference_from_batch, refuse_stacked_cross_contrast
 from .mixins.utils import masked_measurement, pick_present
 
@@ -141,6 +158,29 @@ _SAMPLER_STEP_PARAM_NAMES: tuple[str, ...] = (
     "n_steps",
     "steps",
 )
+
+# What each non-APPLIED verdict observed on the batch, and why it implicates the
+# transform; the three point at different wiring faults, so they stay distinct.
+_UNNORMALIZED_EVIDENCE: dict[LoaderNormalization, tuple[str, str]] = {
+    LoaderNormalization.MARKED_RAW: (
+        "published kspace_normalized=False",
+        "the dataset's own marker says the tensors left it raw, and "
+        "KSpaceNormalizationTransform overwrites that marker with "
+        "True whenever it runs — so it did not run on the tensor "
+        "that reached train_step",
+    ),
+    LoaderNormalization.NO_EVIDENCE: (
+        "published NEITHER a kspace_scale NOR a 'kspace_normalized' marker",
+        "the transform publishes both, so a batch carrying neither "
+        "was not produced by a chain containing it",
+    ),
+    LoaderNormalization.IDENTITY_SCALE: (
+        "published an IDENTITY kspace_scale (1.0) and no 'kspace_normalized' marker",
+        "an identity scale is the placeholder a dataset publishes to say "
+        "it served raw k-space; KSpaceNormalizationTransform overwrites "
+        "it with the scale it divided by, so it did not run",
+    ),
+}
 
 
 def describe_nonfinite_prediction(hr_fakes: torch.Tensor) -> str | None:
@@ -375,16 +415,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         | declared_measured_keys(_MEASUREMENT_AWARE_METRIC_NAMES)
     )
 
-    #: Diffusion degrades the prepared input INSIDE the step -- ``q_sample``
-    #: adds noise, or (cold) zero-fills with ``x_0 * mask``. The base class
-    #: captures ``first_steps/input_prepared`` before the forward pass, so for
-    #: this family it is the CLEAN tensor, not the one the model receives. The
-    #: real model input is emitted separately under ``diffusion_step`` (key
-    #: ``noisy_kspace``, #1177). Declaring False here is what stops a reader
-    #: concluding a cold-diffusion arm was fed fully-sampled data --
-    #: ``docs/debug_snapshot_contract.rst``.
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
     #: Cold / Gaussian schedules build their own masks (``generate_batch_masks``).
     applies_undersampling = True
     #: The cold branch grades the zero-filled baseline from the MASKED measurement
@@ -411,6 +441,41 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
     inline_losses: ClassVar[frozenset[str]] = frozenset()
     folds_image_losses: ClassVar[bool] = True
     forwards_loss_components: ClassVar[bool] = True
+
+    def _apply_builder_image_losses(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        components: dict[str, torch.Tensor],
+    ) -> torch.Tensor | None:
+        """Fold the declared target-role image losses onto this strategy's own objective.
+
+        Subclasses that override ``_compute_losses_impl`` bypass the loss computer, so the
+        builder's ``losses.image_losses`` reach their objective only through this fold.
+        Only enabled ``role: target`` image entries are folded, so k-space or complex terms
+        never meet image tensors. Returns ``None`` when no such entry is declared.
+        """
+        env_losses = getattr(getattr(self, "env", None), "losses", None)
+        if not isinstance(env_losses, dict) or not env_losses:
+            return None
+        roles = declared_loss_roles(self.config)
+        image_only = {
+            name: module
+            for name, module in env_losses.items()
+            if roles.get(canonical_loss_name(name)) == TARGET_ROLE
+        }
+        if not image_only:
+            return None
+        declared = declared_inline_losses(type(self))
+        return fold_builder_image_losses(
+            image_only,
+            declared_loss_weights(self.config),
+            scheduled_overrides(self),
+            pred,
+            target,
+            components,
+            inline_managed=declared if declared is not None else inline_managed_with(),
+        )
 
     @staticmethod
     def _generator_accepts_time(gen: Any) -> bool:
@@ -558,8 +623,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
 
         # OPTIMIZATION (Phase 3C): Cache frequently-accessed config values
         self._cached_log_interval = self.config.logging.intervals.log
-        _val = self.config.validation
-        self._cached_val_interval = int(_val.schedule.interval_steps) if _val.enabled else 0
         self._cached_normalize_kspace = self.config.data.processing.enable_kspace_normalization
         # One warning per run, not one per step: 30,000 copies would bury it.
         # Guards all three "the batch arrived unnormalized" states, not just the
@@ -588,6 +651,9 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
 
         self._bind_generator_reverse_schedule()
         self._bind_acquisition_table()
+        self._score_sde = build_score_sde_engine(self)
+        if self._score_sde is not None:
+            self.logging_service.log_info(f"Score-SDE engine: {self._score_sde.describe()}")
 
         self._log_config_features(self.logging_service)
 
@@ -727,50 +793,133 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             self.logging_service.log_error(f"❌ Failed to load prior model: {e}")
             raise
 
-    def _effective_prediction_type(self) -> str:
-        """Return the objective this strategy actually optimises.
+    #: True when the pixel path trains epsilon (declared training.diffusion.prediction_type).
+    _pixel_epsilon: bool = False
+    #: VE-SDE engine, set when the generator declares ``sde_type``; it then owns the step.
+    #: The hooks test ``isinstance`` so a MagicMock strategy in unit tests keeps the old path.
+    _score_sde: ScoreSDEEngine | None = None
 
-        Mirrors the target selection in ``compute_losses``: the loss target is
-        the injected latent noise when the arm is a latent-diffusion model
-        (ε-prediction) and the clean ``target_batch`` otherwise (x0-prediction,
-        spelled ``sample`` by :class:`PredictionType`). Keep the two in sync —
-        this method is the declaration-side mirror of that branch.
+    def _declared_prediction_type(self) -> str | None:
+        """The explicit ``training.diffusion.prediction_type``, or ``None`` when undeclared.
+
+        The schema default is ``epsilon``, which the pixel path never trained, so
+        reading the default would retarget every undeclared pixel arm. Only an
+        explicit declaration counts; a schema without field tracking counts as declared.
         """
-        return "epsilon" if self._is_latent_diffusion() else "sample"
+        diffusion = self.config.training.diffusion
+        fields_set = getattr(diffusion, "model_fields_set", None)
+        if fields_set is not None and "prediction_type" not in fields_set:
+            return None
+        declared = diffusion.prediction_type
+        return str(getattr(declared, "value", declared)).lower()
+
+    def _effective_prediction_type(self) -> str:
+        """Return the objective this strategy optimises for the resolved path.
+
+        Latent diffusion trains the injected latent noise (epsilon). On the pixel
+        path an arm that declares ``epsilon`` trains the injected noise too
+        (``_pixel_epsilon``); every other pixel arm trains the clean target (``sample``).
+        """
+        if self._is_latent_diffusion():
+            return "epsilon"
+        return "epsilon" if getattr(self, "_pixel_epsilon", False) is True else "sample"
 
     def _validate_prediction_type(self) -> None:
         """Raise when ``training.diffusion.prediction_type`` is not what runs.
 
-        ``v_prediction`` is never implemented on this strategy, and an
-        epsilon/sample declaration that contradicts the resolved path means the
-        arm reports an objective it does not train.
+        ``v_prediction`` is never implemented here. Latent diffusion trains epsilon.
+        On the pixel path an explicit ``epsilon`` selects ε-prediction (see
+        ``_pixel_epsilon``); an explicit ``epsilon`` on a masking (cold) forward
+        process has no noise target and raises.
         """
-        if not self._is_latent_diffusion():
-            # Scoped to the latent path deliberately. The pixel-space path
-            # targets target_batch (x0/"sample"), yet 9 arms on this strategy
-            # declare `epsilon` there — including DDPM baselines whose INTENT is
-            # plainly epsilon-prediction. That disagreement is a real defect,
-            # but resolving it means deciding whether the YAML or the path is
-            # wrong, which is those cohorts' call, not a side effect of an LDM
-            # review. Tracked in issue #641 (which lists all 9); until it is
-            # settled this check defers rather than crashing them. Once it is,
-            # drop this guard so the check covers both paths.
+        declared = self._declared_prediction_type()
+        self._pixel_epsilon = False
+        if declared == "v_prediction":
+            raise ConfigurationError(
+                "training.diffusion.prediction_type='v_prediction' is not implemented on "
+                "DiffusionTrainingStrategy. Declare 'epsilon' or 'sample'."
+            )
+        if self._is_latent_diffusion():
+            if declared not in (None, "epsilon"):
+                raise ConfigurationError(
+                    f"training.diffusion.prediction_type={declared!r} is not the objective this "
+                    f"run would optimise. model_type={self.config.model.model_type!r} resolves to "
+                    "the latent-space path, whose loss target is the injected latent noise, "
+                    "i.e. 'epsilon'-prediction. Declare prediction_type: epsilon or move the arm "
+                    "to a strategy that implements the objective you want."
+                )
             return
+        if declared != "epsilon":
+            return
+        if self._is_cold_diffusion():
+            raise ConfigurationError(
+                f"training.diffusion.prediction_type='epsilon' is declared for "
+                f"model_type={self.config.model.model_type!r}, whose forward process is a "
+                "masking/degradation (cold diffusion). It injects no Gaussian noise, so there is "
+                "no epsilon target. Remove the declaration, or move the arm to a Gaussian "
+                "pixel-space model."
+            )
+        if takes_coil_maps(self.config.model.model_type):
+            raise ConfigurationError(
+                f"training.diffusion.prediction_type='epsilon' is not implemented for "
+                f"coil-map model_type={self.config.model.model_type!r}."
+            )
+        self._pixel_epsilon = True
 
-        declared = self.config.training.diffusion.prediction_type
-        declared = str(getattr(declared, "value", declared)).lower()
-        effective = self._effective_prediction_type()
-        if declared == effective:
-            return
-        raise ConfigurationError(
-            f"training.diffusion.prediction_type={declared!r} is not the objective this "
-            f"run would optimise. model_type={self.config.model.model_type!r} resolves to the "
-            f"{'latent' if self._is_latent_diffusion() else 'pixel'}-space path, whose loss "
-            f"target is {'the injected latent noise' if self._is_latent_diffusion() else 'the clean target image'}"
-            f" — i.e. {effective!r}-prediction. Declare prediction_type: {effective} or move the "
-            "arm to a strategy that implements the objective you want. "
-            "(v_prediction is not implemented here.)"
-        )
+    def _sample_pixel_epsilon(
+        self,
+        cond_input: torch.Tensor,
+        gen_kwargs: dict[str, Any],
+        shape: torch.Size,
+        forward_chunked: Callable[..., Any],
+        project: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Reverse-sample a pixel ε-prediction arm; the network's ε drives the posterior.
+
+        A full-length chain (``validation.sampling.steps`` absent or >= T) takes the
+        ancestral DDPM step ``DiffusionScheduler.denoise_step``. A shorter chain takes
+        deterministic DDIM hops over a strided schedule. Both are the scheduler that
+        training uses. ``project(x, t_prev)``, when given, runs after every step
+        (``t_prev = -1`` after the last), e.g. data consistency. Returns the sample at t = 0.
+        """
+        horizon = int(self.num_timesteps)
+        steps = self._resolve_validation_sampling_steps()
+        steps = horizon if steps is None else min(int(steps), horizon)
+        if steps >= horizon:
+            seq = list(range(horizon - 1, -1, -1))
+        else:
+            seq = sorted(
+                set(torch.linspace(horizon - 1, 0, steps).round().long().tolist()),
+                reverse=True,
+            )
+        device = self.scheduler.device
+        x = torch.randn(tuple(shape), device=device)
+        batch = x.shape[0]
+        for i, t in enumerate(seq):
+            t_prev = seq[i + 1] if i + 1 < len(seq) else -1
+            x_in = self._maybe_condition_on_input(
+                x,
+                input_batch=cond_input,
+                noisy_images=x,
+                is_cold_diffusion=False,
+                is_latent_diffusion=False,
+            )
+            t_vec = torch.full((batch,), t, dtype=torch.long, device=device)
+            eps = forward_chunked(x_in, t_vec, False, gen_kwargs)
+            if isinstance(eps, tuple):
+                eps = eps[0]
+            if eps.shape != x.shape:
+                raise ValueError(
+                    f"pixel ε-prediction sampler: model returned {tuple(eps.shape)}, "
+                    f"expected {tuple(x.shape)}."
+                )
+            if steps >= horizon:
+                x = self.scheduler.denoise_step(x, eps, t_vec)
+            else:
+                x = self.scheduler.ddim_step(x, t, t_prev, eps)
+            if project is not None:
+                x = project(x, t_prev)
+        return x
 
     def _bind_generator_reverse_schedule(self) -> None:
         """Bind a latent-diffusion generator's reverse schedule to the training SSOT.
@@ -793,29 +942,8 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             if hasattr(self.generator_model, "module")
             else self.generator_model
         )
-        if not hasattr(gen, "diffusion"):
+        if not bind_latent_reverse_schedule(gen, self.scheduler):
             return
-
-        if not hasattr(gen, "set_diffusion_schedule"):
-            # #9 — never sample on a schedule that silently disagrees with training.
-            raise RuntimeError(
-                f"{type(gen).__name__} owns an internal reverse-diffusion schedule but "
-                "exposes no set_diffusion_schedule(); its sampler would invert the "
-                "forward process with a different schedule than training.diffusion "
-                "declares. Add the method or drop the private schedule."
-            )
-
-        # Hand over the forward process's ACTUAL betas, not just its name. The
-        # two sides implement different `cosine` formulas (s=0 in
-        # DiffusionScheduler vs Nichol-Dhariwal s=0.008 in base_diffusion), so a
-        # name-only binding still left sampling inverting a trajectory training
-        # never ran -- the very desync this method exists to kill.
-        gen.set_diffusion_schedule(
-            timesteps=self.num_timesteps,
-            beta_schedule=self.beta_schedule,
-            device=str(self.device),
-            betas=self.scheduler.betas,
-        )
         self.logging_service.log_info(
             f"🔗 Reverse schedule bound to training SSOT: "
             f"timesteps={self.num_timesteps}, noise_schedule={self.beta_schedule} "
@@ -922,14 +1050,11 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         ``~44`` through this module's ``sqrt(R^2 + I^2)``), so that batch was
         provably never compressed.
 
-        Positive evidence, in order of authority:
-
-        1. ``kspace_normalized`` — set True by the transform, False by a dataset
-           that serves raw. An explicit answer; believe it.
-        2. Otherwise a *non-identity* ``kspace_scale``. Something divided by it,
-           so the tensors are not raw. An identity scale means nothing was
-           divided, and re-running the divide is a no-op rather than a
-           double-application, so falling through is safe.
+        The evidence is read by
+        :func:`~spectramr.data.transforms.normalization.loader_normalization`,
+        which the base strategy's snapshot emitters share. An identity scale
+        means nothing was divided, and re-running the divide is a no-op rather
+        than a double-application, so falling through is safe.
 
         **Every** route to ``False`` announces itself, because each one means the
         declared transform's output is not reaching ``train_step`` and the
@@ -947,63 +1072,12 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         reached 30,000 iterations with a mosaic of DC blobs and nothing in the
         log (CLAUDE.md #3, #4; issues #1211, #1213).
         """
-        # Read through the mapping protocol, NOT isinstance-dict + hasattr. A
-        # TrainingBatch fails both of those legs -- it is not a mapping, and its
-        # metadata is invisible to attribute lookup -- so the pair read a
-        # published marker as absent and fell through to the "cannot say" branch
-        # below. See ``read_batch_field`` for the measured access table.
-        marker = read_batch_field(batch_data, "kspace_normalized")
-        if marker is not None:
-            # Collated per-subject markers arrive as a tensor/list of one value
-            # per sample; reducing with ``all`` keeps a partially-normalized
-            # batch (a pipeline bug of its own) out of the fast path, and avoids
-            # ``bool(tensor([False, False]))`` raising.
-            if torch.is_tensor(marker):
-                normalized = bool(marker.all())
-            elif isinstance(marker, (list, tuple)):
-                normalized = all(bool(m) for m in marker)
-            else:
-                normalized = bool(marker)
-            if normalized:
-                return True
-            self._warn_batch_reached_step_unnormalized(
-                current_step,
-                observed="published kspace_normalized=False",
-                diagnosis=(
-                    "the dataset's own marker says the tensors left it raw, and "
-                    "KSpaceNormalizationTransform overwrites that marker with "
-                    "True whenever it runs — so it did not run on the tensor "
-                    "that reached train_step"
-                ),
-            )
-            return False
-
-        if kspace_scale is None:
-            self._warn_batch_reached_step_unnormalized(
-                current_step,
-                observed="published NEITHER a kspace_scale NOR a 'kspace_normalized' marker",
-                diagnosis=(
-                    "the transform publishes both, so a batch carrying neither "
-                    "was not produced by a chain containing it"
-                ),
-            )
-            return False
-
-        scale_tensor = (
-            kspace_scale if torch.is_tensor(kspace_scale) else torch.as_tensor(kspace_scale)
-        )
-        scale_float = scale_tensor.float()
-        if not torch.allclose(scale_float, torch.ones_like(scale_float)):
+        verdict = loader_normalization(batch_data, kspace_scale)
+        if verdict is LoaderNormalization.APPLIED:
             return True
-
+        observed, diagnosis = _UNNORMALIZED_EVIDENCE[verdict]
         self._warn_batch_reached_step_unnormalized(
-            current_step,
-            observed="published an IDENTITY kspace_scale (1.0) and no 'kspace_normalized' marker",
-            diagnosis=(
-                "an identity scale is the placeholder a dataset publishes to say "
-                "it served raw k-space; KSpaceNormalizationTransform overwrites "
-                "it with the scale it divided by, so it did not run"
-            ),
+            current_step, observed=observed, diagnosis=diagnosis
         )
         return False
 
@@ -1320,72 +1394,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             return result
 
         return super().q_sample(x_start, t, noise)
-
-    def _save_debug_snapshots(
-        self,
-        tensors: dict[str, torch.Tensor],
-        step: int,
-        extra: dict[str, Any] | None = None,
-    ) -> None:
-        """Save visual snapshots of tensors for debugging.
-
-        Delegates to the paradigm-agnostic
-        :meth:`BaseTrainingStrategy.save_debug_snapshot` so the same
-        textual / JSON / image-preview format is used across all
-        strategies. Tagged ``diffusion_step`` to distinguish from the
-        base class's ``first_steps`` auto-snapshot.
-
-        **Not the primary path any more.** ``_prepare_diffusion_inputs`` now
-        DECLARES its model input (``_declare_model_input``) and the wrapper
-        emits it, so a subclass overriding ``_compute_losses_impl`` cannot drop
-        the ``diffusion_step`` snapshot its ``first_steps`` artifact promises.
-        This method remains a valid way to satisfy that contract directly:
-        its tag equals ``snapshot_model_input_tag``, so
-        :meth:`BaseTrainingStrategy.save_debug_snapshot` marks the step's
-        model-input requirement met on the way through. Prefer declaring —
-        one emitter, and the wrapper owns the "did anything arrive" check.
-
-        Args:
-            tensors: Key -> tensor to capture.
-            step: Current training step.
-            extra: JSON-serialisable provenance recorded alongside the tensors
-                -- for the cold path, which tensor the forward process degraded.
-                The tag's snapshot is the only artifact showing the *degraded*
-                model input, so what it was derived from belongs in it.
-        """
-        try:
-            # Mark only the keys that genuinely contain k-space data. ``smaps``
-            # is image-domain even though its channels are real-stacked
-            # complex — see findings booklet 2026-05-05 VIS-1.
-            #
-            # That exclusion is necessary but not sufficient: ``model_input`` is
-            # ``cat([noisy_images, smaps])``, so keeping the standalone ``smaps``
-            # key out of the k-space set still leaves the SAME maps inside
-            # ``model_input`` being IFFT'd as if they were a spectrum.
-            # ``channel_segments`` splits that tensor back into its two domains
-            # for rendering; it returns ``{}`` when no maps were concatenated,
-            # so arms without smaps conditioning render exactly as before.
-            self.save_debug_snapshot(
-                tensors,
-                step=step,
-                tag="diffusion_step",
-                in_kspace_keys={
-                    "input",
-                    "target",
-                    "noisy_images",
-                    "noisy_kspace",
-                    "model_input",
-                },
-                channel_segments=self._model_input_channel_segments(tensors),
-                extra=extra,
-                # This tag equals ``snapshot_model_input_tag``, so this method
-                # satisfies the model-input contract on the way through and owes
-                # it the same naming the declaring path gives -- through the
-                # same rule, not a second copy of it (#697).
-                model_input_key=cold_model_input_key(tensors),
-            )
-        except Exception as e:
-            logging.getLogger(__name__).warning(f"Failed to save debug snapshot: {e}")
 
     def _adversarial_loss_computer(self):
         """The GAN loss computer used for the DISCRIMINATOR step only.
@@ -1956,6 +1964,8 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             A dictionary of loss tensors, including `g_total_loss` and individual components.
         """
         # DEBUG: Log input shapes at function entry
+        if isinstance(self._score_sde, ScoreSDEEngine):
+            return self._score_sde.losses(self, target_batch)
         current_step = kwargs.get("iteration", 0)
 
         # CRITICAL: Log shapes IMMEDIATELY to debug mismatch
@@ -2013,41 +2023,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             mask=mask,
             acquired=acquired_plane,
         )
-
-        # The class declares ``snapshot_prepared_is_model_input = False`` and
-        # ``snapshot_model_input_tag = "diffusion_step"``, which obliges EVERY
-        # path through here to declare the tensor the network is actually fed
-        # (non-negotiable 14). Only one path did: the declaration in
-        # ``_prepare_diffusion_inputs`` sits inside
-        # ``if takes_coil_maps(self.config.model.model_type)``,
-        # so the promise was kept for one model family and broken for every
-        # other diffusion arm -- which then died on the contract check with
-        # "its _compute_losses_impl neither called _declare_model_input() nor
-        # emitted a snapshot tagged 'diffusion_step'".
-        #
-        # ``model_input`` is that tensor on the general path, and this is the
-        # last point before it reaches the network. Guarded on "nothing declared
-        # yet" rather than called unconditionally: the k-space branch has
-        # already declared a RICHER record (channel_segments for the
-        # [noisy_kspace || smaps] concat), and ``_declare_model_input`` is a
-        # plain overwrite, so an unconditional call here would silently discard
-        # it. The stash is reset per step by ``_compute_losses``, so this reads
-        # None on entry for every arm that did not take that branch.
-        if getattr(self, "_declared_model_input", None) is None:
-            # ``model_input_key`` is required, not decorative: the tag promises a
-            # reader "the real model input is in here", and the contract refuses to
-            # let them guess which tensor -- a guess is what let #1298's mislabel
-            # stand.
-            declared = {"model_input": model_input}
-            # The source contrast is concatenated inside the generator, so the
-            # snapshot names it beside the input it joins (non-negotiable 14).
-            if gen_kwargs.get("reference") is not None:
-                declared["kspace_source"] = gen_kwargs["reference"]
-            self._declare_model_input(
-                declared,
-                extra={"model_input_key": "model_input"},
-                in_kspace_keys={"kspace_source"} & declared.keys(),
-            )
 
         # STEP 3: Forward pass through generator
         predicted_output = self._forward_through_model(
@@ -2156,6 +2131,38 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         if scale is not None:
             pass
 
+        # STEP 5b: pixel-space ε-prediction (training.diffusion.prediction_type: epsilon).
+        # The network output is ε̂. The image terms and data consistency score the
+        # x0 it implies, and the diffusion term regresses ε̂ onto the injected noise.
+        diffusion_pair: tuple[torch.Tensor, torch.Tensor] | None = None
+        # A latent model with an image-space head (#1066): the latent ε̂ trains the
+        # diffusion term; the decoded, refined x0 is what the image terms score.
+        refine = getattr(unwrap_model(self.generator_model), "decode_and_refine", None)
+        if is_latent_diffusion and noise is not None and refine is not None:
+            diffusion_pair = (hr_fakes_for_loss, noise)
+            latent_x0 = self.scheduler.predict_x0_from_eps(
+                noisy_images, timesteps, hr_fakes_for_loss
+            )
+            hr_fakes_for_loss = refine(latent_x0, contrast_idx)
+            target_for_loss = target_batch
+        if self._pixel_epsilon is True:
+            if noise is None or torch.is_complex(hr_fakes_for_loss) or torch.is_complex(noise):
+                raise ConfigurationError(
+                    "prediction_type='epsilon' on the pixel path needs an additive real-valued "
+                    "Gaussian forward process; this step produced none (a masking/degradation "
+                    f"forward, or complex data: noise={None if noise is None else noise.dtype}). "
+                    "Remove the epsilon declaration or change the arm."
+                )
+            if noise.shape != hr_fakes_for_loss.shape:
+                raise ValueError(
+                    f"ε-prediction shape mismatch: ε̂ {tuple(hr_fakes_for_loss.shape)} vs "
+                    f"injected noise {tuple(noise.shape)}."
+                )
+            diffusion_pair = (hr_fakes_for_loss, noise)
+            hr_fakes_for_loss = self.scheduler.predict_x0_from_eps(
+                noisy_images, timesteps, hr_fakes_for_loss
+            )
+
         # STEP 6: Debug logging and anomaly detection (reads the live iteration
         # from self.loop_state, WS-3 PR-3 — no longer threaded as current_step).
         self._compute_and_log_debug_info(
@@ -2230,6 +2237,7 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         loss_output = self.loss_computer.compute(
             pred=hr_fakes_for_loss,
             target=target_for_loss,
+            **({} if diffusion_pair is None else {"diffusion_pair": diffusion_pair}),
             epoch=epoch,
             iteration=current_step,
             timesteps=timesteps,
@@ -2282,6 +2290,13 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         # ``_compute_training_metrics`` fired EVERY step (pitfall #16).
         current_step = resolve_loop_iteration(self)
         self._train_metric_scale = scale if is_cold_diffusion else None
+        # A latent arm's loss pair is (eps_hat, eps); its train_* image metrics score
+        # the decoded x0 estimate against the image target instead (#186).
+        self._train_metric_latent = (
+            (noisy_images, timesteps, target_batch)
+            if is_latent_diffusion and noise is not None
+            else None
+        )
         train_metrics = self._compute_training_metrics(
             pred=hr_fakes_for_loss,
             target=target_for_loss,
@@ -2302,7 +2317,7 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             # Cadence check is INSIDE the guard: this snapshot is purely
             # diagnostic and must never perturb loss computation, even if
             # ``_cached_log_interval`` or the tensors are unexpected (tests/mocks).
-            _due_tags = self._output_snapshot_tags_due(current_step)
+            _due_tags = ("model_output_dc",) if snapshot_trace.is_active() else ()
             if _due_tags:
                 _dc_snap = self._build_output_snapshot(
                     hr_fakes_for_loss,
@@ -2315,7 +2330,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                 for _tag in _due_tags:
                     self.save_debug_snapshot(
                         _dc_snap,
-                        step=current_step,
                         # Its OWN tag, not "model_output" (#706, one level down).
                         # The budget is per-(run_dir, tag), and the base class's
                         # generic `model_output` emitter fires on EVERY early step
@@ -2357,13 +2371,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                             "timesteps": lambda: timesteps.detach().flatten().tolist(),
                             "realised_acceleration": lambda: self._snapshot_realised_acceleration(
                                 mask, acquired_plane
-                            ),
-                            # Only the validation-cadence tag is captured at a
-                            # validation step; the early tag is log-cadence.
-                            "snapshot_kind": (
-                                "train_step_at_val_cadence"
-                                if _tag == "model_output_dc_validation"
-                                else "train_step_at_log_cadence"
                             ),
                         },
                     )
@@ -2683,7 +2690,7 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                 condition_image=gen_kwargs.get("condition_image"),
             )
         else:
-            from .mixins.utils import _callable_accepts_kwarg
+            from .mixins.utils import timestep_kwarg_for
 
             # For wrapped models (DataParallel, DistributedDataParallel),
             # introspect the underlying module's forward signature.
@@ -2697,12 +2704,11 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             # we pass it explicitly below (avoids "multiple values" TypeError).
             gen_kwargs.pop("timesteps", None)
 
-            if _callable_accepts_kwarg(gen_forward, "timesteps"):
-                return self.generator_model(model_input, timesteps=timesteps, **gen_kwargs)
-            elif _callable_accepts_kwarg(gen_forward, "time"):
-                return self.generator_model(model_input, time=timesteps, **gen_kwargs)
-            else:
-                return self.generator_model(model_input, **gen_kwargs)
+            time_kwarg = timestep_kwarg_for(gen_forward)
+            call_kwargs = dict(gen_kwargs)
+            if time_kwarg is not None:
+                call_kwargs[time_kwarg] = timesteps
+            return self.generator_model(model_input, **call_kwargs)
 
     def _extract_and_fix_output(
         self,
@@ -2948,8 +2954,12 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         """Decompress and de-normalise the cold-diffusion training pair, as validation does.
 
         Without this the train_* metrics graded the SENSE image of log-compressed,
-        percentile-normalised k-space, a quantity no val_* column measures.
+        percentile-normalised k-space, a quantity no val_* column measures. A latent
+        arm's pair is decoded to image space (``_decode_latent_metric_pair``).
         """
+        latent = getattr(self, "_train_metric_latent", None)
+        if latent is not None:
+            return self._decode_latent_metric_pair(pred, latent)
         if not self._is_cold_diffusion():
             return pred, target
         from spectramr.infrastructure.training.utils.kspace_view import (
@@ -2968,6 +2978,32 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
             ).to(pred.dtype)
             pred, target = pred * denom, target * denom
         return pred, target
+
+    def _decode_latent_metric_pair(
+        self,
+        eps_hat: torch.Tensor,
+        latent: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Image-space ``(x0_hat, target)`` for a latent arm's ``(eps_hat, eps)`` pair.
+
+        PSNR/SSIM of latent noise against latent noise reported a healthy 31.9 dB
+        while the decoded image was near-black (#186). The latent x0 estimate is
+        recovered with the training schedule and decoded by the generator's VAE.
+        """
+        noisy, timesteps, image_target = latent
+        gen = unwrap_model(self.generator_model)
+        with torch.no_grad():
+            z0 = self.scheduler.predict_x0_from_eps(noisy.detach(), timesteps, eps_hat.detach())
+            image = gen.decode_from_latent(z0)
+        image_target = image_target.detach().to(image.device)
+        if image.shape != image_target.shape:
+            if image.numel() != image_target.numel():
+                raise ValueError(
+                    f"Decoded latent x0 {tuple(image.shape)} cannot be scored against the "
+                    f"image target {tuple(image_target.shape)}."
+                )
+            image_target = image_target.reshape(image.shape)
+        return image, image_target
 
     def declared_metric_keys(self) -> frozenset[str]:
         """Declare each pre-DC term's column whenever that term is enabled (#1682).
@@ -3170,22 +3206,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
 
         return total_loss
 
-    def _output_snapshot_tags_due(self, step: int) -> tuple[str, ...]:
-        """Snapshot tags due at ``step``: the early cadence, then once per validation.
-
-        ``model_output_dc`` fires every ``log_interval // 10`` steps and spends its
-        8-call budget by step 4000 on the cohort, mid-curriculum, before the top
-        rungs train. ``model_output_dc_validation`` has its own budget and fires on
-        the validation steps, so the trained model's output is captured too.
-        """
-        tags: list[str] = []
-        if step % max(1, int(self._cached_log_interval) // 10) == 0:
-            tags.append("model_output_dc")
-        val_interval = int(getattr(self, "_cached_val_interval", 0) or 0)
-        if val_interval > 0 and step > 0 and step % val_interval == 0:
-            tags.append("model_output_dc_validation")
-        return tuple(tags)
-
     def _build_output_snapshot(
         self,
         hr_fakes_for_loss: torch.Tensor,
@@ -3291,7 +3311,6 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         multistep = bool(validation_cfg.sampling.enable_multistep_cold) if validation_cfg else False
         self.save_debug_snapshot(
             tensors,
-            step=resolve_loop_iteration(self),
             tag="cascade_val_8x",
             extra={
                 "acceleration": accel,
@@ -4272,35 +4291,10 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                     except Exception as e:
                         logger.warning(f"Failed to compute model_input stats: {e}")
 
-            # Declare the degraded tensor as THE model input. The wrapper
-            # (``BaseTrainingStrategy._compute_losses``) emits it under
-            # ``snapshot_model_input_tag`` -- the tag ``first_steps`` already
-            # points readers to. Declaring rather than emitting here is what
-            # closes the dangling pointer: this method is reachable only through
-            # ``_compute_losses_impl``, the hook seven subclasses override, so
-            # every one of them inherited the ``diffusion_step`` promise and
-            # emitted nothing at its target.
-            #
-            # When ``model_input`` is the concat ``[noisy_kspace || smaps]``,
-            # rendering it as a single k-space tensor produces a
-            # superposition of brain (iFFT of k-space half) + bright DC
-            # spike (iFFT of image-domain smaps half). Pass the parts as
-            # separate keys so the visualizer can apply the right
-            # transform to each. See findings booklet 2026-05-05 VIS-1.
-            #
-            # UNCONDITIONAL, and that is load-bearing. Two owners have gated this
-            # on a cadence: first ``self._cached_log_interval * 5`` -- i.e.
-            # ``logging.intervals.log``, a *logging* knob arms routinely set to
-            # 5000, which put this snapshot at step 25 000 and made it
-            # unreachable in every shorter run (#706's shape); then
-            # ``snapshot_step_is_due``, the RIGHT cadence but still a second
-            # gate. The wrapper's contract check is deliberately not
-            # step-dependent, so any cadence here makes the two disagree: under
-            # ``snapshots.interval_steps: 100`` this would declare on step 0 and
-            # the wrapper would raise on step 1 -- a violation manufactured by
-            # the gate. Cadence belongs to ``save_debug_snapshot`` alone, and a
-            # declaration is a dict of references plus a tensor view, so there is
-            # no per-step cost to avoid (non-negotiable 9).
+            # Name the degraded tensor and its parts for the snapshot; the
+            # ``[noisy_kspace || smaps]`` concat is split so each half renders in
+            # its own domain (findings booklet 2026-05-05 VIS-1). A no-op unless
+            # the snapshot schedule selected this step.
             snap: dict[str, torch.Tensor] = {
                 "noisy_kspace": noisy_images,
                 "target": target_batch,
@@ -4483,6 +4477,10 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         Returns:
             A dictionary of validation metrics (e.g., ``val_psnr``, ``val_ssim``).
         """
+        if isinstance(self._score_sde, ScoreSDEEngine):
+            return self._score_sde.validation_step(
+                self, input_batch, target_batch, batch_data, kwargs
+            )
         batch = (input_batch, target_batch)
         batch_idx = kwargs.get("batch_idx", 0)  # Extract batch_idx for logging control
 
@@ -6133,6 +6131,8 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
         self._rung_measured_maps = None
         # Same discipline for the ensemble stack (see the class attribute).
         self._ensemble_members = None
+        if isinstance(self._score_sde, ScoreSDEEngine):
+            return self._score_sde.predict(self, input_batch)
 
         try:
             gen_kwargs = {}
@@ -6503,6 +6503,10 @@ class DiffusionTrainingStrategy(BaseTrainingStrategy, DiffusionStrategyMixin, Ad
                         model_input, timestep, torch.randn_like(model_input)
                     )
                     hr_fakes = _forward_chunked(noisy_input, timestep, True, gen_kwargs)
+            elif self._pixel_epsilon is True:
+                hr_fakes = self._sample_pixel_epsilon(
+                    model_input, gen_kwargs, target_batch.shape, _forward_chunked
+                )
             else:
                 # F13 (2026-05-17 round 5): score-based and consistency
                 # generators return *predicted noise* (score-based) or a
@@ -8421,23 +8425,6 @@ class XDiffusionTrainingStrategy(BaseTrainingStrategy):
     # wrapped forward.
     parallel_compat = frozenset({"replicated"})
 
-    #: X-Diffusion noises the clean target inside the step
-    #: (``x_t = sqrt(a_bar) * x_0 + sqrt(1 - a_bar) * eps``), so
-    #: ``first_steps/input_prepared`` -- captured before the forward pass -- is
-    #: the source modality, not what the UNet receives.
-    #:
-    #: Stated explicitly because this class extends ``BaseTrainingStrategy``
-    #: rather than ``DiffusionTrainingStrategy``, so it inherited the ``True``
-    #: default despite running a textbook forward diffusion. Its own docstrings
-    #: describe the noising; the machine-readable flag contradicted them, which
-    #: is the half a reader of the artifact sees (non-negotiable 14).
-    snapshot_prepared_is_model_input: bool = False
-
-    #: Its own tag, not the parent's ``diffusion_step``: this class does not
-    #: share ``DiffusionTrainingStrategy``'s emission path, and the per-tag call
-    #: budget in ``save_debug_snapshot`` is keyed on ``(run_dir, tag)`` -- so a
-    #: borrowed name would also mean a borrowed allowance.
-    snapshot_model_input_tag: str | None = "xdiffusion_step"
 
     #: Loss ownership (issue #1918). Unlike its sibling this class does not use a
     #: loss computer: ``_compute_losses_impl`` iterates ``self.env.losses`` directly
@@ -8767,7 +8754,7 @@ class XDiffusionTrainingStrategy(BaseTrainingStrategy):
         )
 
         # --- Model prediction (x_0-prediction); pass t if forward accepts it -
-        from .mixins.utils import _callable_accepts_kwarg
+        from .mixins.utils import timestep_kwarg_for
 
         gen_forward = getattr(unwrap_model(generator), "forward", generator)
 
@@ -8784,12 +8771,11 @@ class XDiffusionTrainingStrategy(BaseTrainingStrategy):
                 z_cond = z_cond.to(x_t.device)
             gen_kwargs[cond_kwarg] = z_cond
 
-        if _callable_accepts_kwarg(gen_forward, "timesteps"):
-            prediction = generator(x_t, timesteps=t, **gen_kwargs)
-        elif _callable_accepts_kwarg(gen_forward, "time"):
-            prediction = generator(x_t, time=t, **gen_kwargs)
-        else:
-            prediction = generator(x_t, **gen_kwargs)
+        time_kwarg = timestep_kwarg_for(gen_forward)
+        call_kwargs = dict(gen_kwargs)
+        if time_kwarg is not None:
+            call_kwargs[time_kwarg] = t
+        prediction = generator(x_t, **call_kwargs)
 
         # Models may return tuples/dicts; take the primary tensor.
         if isinstance(prediction, (tuple, list)):

@@ -20,6 +20,12 @@ the hazards differ by backend, not by name:
     FSDP and DeepSpeed ZeRO-3. Parameters are partitioned, so a call outside the
     wrapped ``forward`` reads a shard.
 
+``"pipelined"``
+    ``parallel.mesh.pipeline > 1``: the generator is split into stages and the
+    pipeline schedule owns the backward. Only a strategy that runs one optimizer
+    over the generator, no discriminator, and calls nothing but its forward can
+    declare it. Unlike the backend tokens it must be declared on the class itself.
+
 ``None`` means undeclared. A **restriction** (a declared set lacking the token)
 is inherited by subclasses; a **permission** is not, because a subclass can add
 the very module that made its parent safe. Single-process runs are never gated.
@@ -40,7 +46,8 @@ from spectramr.infrastructure.distributed.owned_modules import (
 
 REPLICATED = "replicated"
 SHARDED = "sharded"
-VALID_TOKENS: frozenset[str] = frozenset({REPLICATED, SHARDED})
+PIPELINED = "pipelined"
+VALID_TOKENS: frozenset[str] = frozenset({REPLICATED, SHARDED, PIPELINED})
 
 
 @dataclass(frozen=True)
@@ -87,9 +94,31 @@ def _declared(cls: type) -> frozenset[str] | None:
 
 
 def evaluate_parallel_compat(
-    strategy_cls: type, parallel_strategy: str | None, zero_stage: int | None = None
+    strategy_cls: type,
+    parallel_strategy: str | None,
+    zero_stage: int | None = None,
+    pipeline: int = 1,
 ) -> CompatVerdict:
-    """Decide whether ``strategy_cls`` may run under ``parallel_strategy``."""
+    """Decide whether ``strategy_cls`` may run under ``parallel_strategy`` (and a pipeline)."""
+    verdict = _evaluate_backend(strategy_cls, parallel_strategy, zero_stage)
+    if verdict.refused or pipeline <= 1:
+        return verdict
+    if PIPELINED not in (_declared(strategy_cls) or frozenset()):
+        return CompatVerdict(
+            True,
+            False,
+            verdict.kind,
+            f"{strategy_cls.__name__} cannot run under parallel.mesh.pipeline={pipeline}: it "
+            f"does not declare {PIPELINED!r} in its own parallel_compat. The pipeline schedule "
+            "owns the backward of one optimizer over the generator's forward; a strategy "
+            "with a discriminator, a second optimizer or a non-forward call would bypass it.",
+        )
+    return verdict
+
+
+def _evaluate_backend(
+    strategy_cls: type, parallel_strategy: str | None, zero_stage: int | None
+) -> CompatVerdict:
     kind = backend_kind(parallel_strategy, zero_stage)
     name = strategy_cls.__name__
     if kind is None:
@@ -146,7 +175,10 @@ def check_strategy_for_parallel(config: Any, strategy_cls: type) -> CompatVerdic
     deepspeed = getattr(parallel, "deepspeed", None)
     backend = getattr(parallel, "strategy", "none")
     verdict = evaluate_parallel_compat(
-        strategy_cls, backend, getattr(deepspeed, "zero_stage", None)
+        strategy_cls,
+        backend,
+        getattr(deepspeed, "zero_stage", None),
+        pipeline=int(getattr(getattr(parallel, "mesh", None), "pipeline", 1)),
     )
     if verdict.refused:
         return verdict

@@ -12,6 +12,9 @@ from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 
+_DEGRADATION_TYPES = frozenset({"noise", "physical"})
+
+
 @register_model(
     name="image_cold_diffusion",
     training_mode="diffusion",
@@ -51,6 +54,11 @@ class ImageColdDiffusionGenerator(nn.Module, DiffusionMixin, IGenerator):
     ):
         super().__init__()
 
+        if degradation_type not in _DEGRADATION_TYPES:
+            raise ValueError(
+                f"Unknown degradation_type {degradation_type!r}; "
+                f"valid: {sorted(_DEGRADATION_TYPES)}."
+            )
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.degradation_type = degradation_type
@@ -186,8 +194,17 @@ class ImageColdDiffusionGenerator(nn.Module, DiffusionMixin, IGenerator):
         # Predict x_0 from x_t (x)
         return self.denoising_model(x, t, cond=cond)
 
+    @torch.no_grad()
     def generate(self, z: Tensor, **kwargs: Any) -> Tensor:
-        return self.p_sample_loop(z.shape, **kwargs)
+        """Restore ``z``, the degraded input, by the reverse loop from t = T-1 to 0.
+
+        Cold diffusion starts from the measurement, not from noise (#2383).
+        """
+        x = z
+        for i in reversed(range(self.timesteps)):
+            t = torch.full((z.shape[0],), i, device=z.device, dtype=torch.long)
+            x = self.p_sample(x, t, i, **kwargs)
+        return x
 
     def get_output_shape(self, input_shape: tuple[int, ...]) -> tuple[int, ...]:
         return input_shape

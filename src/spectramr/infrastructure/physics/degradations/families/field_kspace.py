@@ -50,7 +50,16 @@ ENTRIES = (
         fn=degrade_nyquist_ghost,
         description="EPI N/2 ghost",
         severity=SeveritySpec(
-            (_P("phase_offset", "rad", 0.0, math.pi),),
+            (
+                _P(
+                    "phase_offset",
+                    "rad",
+                    0.0,
+                    math.pi,
+                    endpoint_kwargs=(None, "max_phase_rad"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="EPI even/odd phase offset; theta=1 is a pi offset (max N/2 ghost).",
         ),
         affects=BOTH,
@@ -66,7 +75,12 @@ ENTRIES = (
         fn=_delegate_gibbs,
         description="Gibbs ringing (delegated)",
         severity=SeveritySpec(
-            (_P("truncation_radius", "fraction of the max k-space radius", 1.0, 0.085),),
+            (_P(
+                "truncation_radius", "fraction of the max k-space radius", 1.0, 0.085,
+                endpoint_kwargs=(None, "min_truncation_radius"),
+                valid_min=0.0,
+                valid_max=1.0,
+            ),),
             notes="symmetric circular k-space truncation; less retained = stronger "
             "ringing. The radius is normalised by its own maximum (the grid CORNER), "
             "so 1.0 is a genuine identity — before #246 the window compared an "
@@ -84,7 +98,16 @@ ENTRIES = (
         fn=degrade_t2star_blur,
         description="T2*-induced Gaussian blur",
         severity=SeveritySpec(
-            (_P("readout_over_t2prime", "T_read / T2'", 0.0, 4.0),),
+            (
+                _P(
+                    "readout_over_t2prime",
+                    "T_read / T2'",
+                    0.0,
+                    4.0,
+                    endpoint_kwargs=(None, "max_readout_over_t2"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="spin-echo relaxation during the readout: k-space weight exp(-r|f|) along "
             "readout only, a Lorentzian PSF of FWHM r/pi px (1.27 px at theta=1).",
         ),
@@ -99,7 +122,17 @@ ENTRIES = (
         fn=degrade_slice_thickness_pve,
         description="Slice-thickness PVE proxy (2-D only; volumes use through_plane_pve)",
         severity=SeveritySpec(
-            (_P("sigma", "px", 0.0, 5.0),),
+            (
+                _P(
+                    "sigma",
+                    "px",
+                    0.0,
+                    5.0,
+                    endpoint_kwargs=(None, "max_kernel_px"),
+                    endpoint_scale=4.0,
+                    valid_min=0.0,
+                ),
+            ),
             notes="NOT a through-plane model (that needs the third dimension): a readout-axis "
             "Gaussian blur proxy (max_kernel_px 20 / 4), applied as a k-space window.",
         ),
@@ -114,7 +147,11 @@ ENTRIES = (
         description="Eddy current (delegated)",
         severity=SeveritySpec(
             (
-                _P("linear_phase_scale", "randn std, x pi rad", 0.0, 5.0),
+                _P(
+                    "linear_phase_scale", "randn std, x pi rad", 0.0, 5.0,
+                    endpoint_kwargs=(None, "linear_phase_scale"),
+                    valid_min=0.0,
+                ),
                 _P("quadratic_phase_scale", "randn std, x pi rad", 0.0, 2.5),
             ),
             notes="per-PE-line phase = pi*(alpha*u + beta*u^2), u in [-1, 1], "
@@ -135,7 +172,12 @@ ENTRIES = (
         fn=_delegate_spike,
         description="Spike noise (delegated)",
         severity=SeveritySpec(
-            (_P("probability", "per k-space sample", 0.0, 0.05),),
+            (_P(
+                "probability", "per k-space sample", 0.0, 0.05,
+                endpoint_kwargs=(None, "max_probability"),
+                valid_min=0.0,
+                valid_max=1.0,
+            ),),
             notes="RF spike / herringbone. Each spike is complex Gaussian with RMS 5x the "
             "sample's k-space RMS, at the same k-space position in every coil. The added "
             "energy is linear in the probability, so the residual grows as its square root.",
@@ -152,7 +194,14 @@ ENTRIES = (
         description="Quadrature-receiver DC + I/Q ghost",
         severity=SeveritySpec(
             (
-                _P("dc_offset", "fraction", 0.0, 0.20),
+                _P(
+                    "dc_offset",
+                    "fraction",
+                    0.0,
+                    0.20,
+                    endpoint_kwargs=(None, "max_dc_offset"),
+                    valid_min=0.0,
+                ),
                 _P("iq_imbalance", "fraction", 0.0, 0.35),
             ),
             notes="receiver DC offset and I/Q gain imbalance ramp together.",
@@ -160,7 +209,8 @@ ENTRIES = (
         affects=BOTH,
         origin=ArtifactOrigin.SCANNER,
         modes={
-            MS: independent(degrade_iq_ghost),
+            # One receiver chain per stack: the kernel draws one DC/IQ pair, so it is shared.
+            MS: exact(degrade_iq_ghost),
             VOL: (iq_ghost_volume, Realisation.NATIVE),
         },
     ),
@@ -172,7 +222,14 @@ ENTRIES = (
         description="Stimulated-echo TSE ghost",
         severity=SeveritySpec(
             (
-                _P("amplitude", "fraction", 0.0, 0.40),
+                _P(
+                    "amplitude",
+                    "fraction",
+                    0.0,
+                    0.40,
+                    endpoint_kwargs=(None, "max_amp"),
+                    valid_min=0.0,
+                ),
                 _P("shift", "px", 0.0, 6.0),
             ),
             notes="spurious stimulated-echo pathway; amplitude and shift ramp together. The "
@@ -190,7 +247,9 @@ ENTRIES = (
         description="Coupled effective-resolution loss + noise (no resampling)",
         severity=SeveritySpec(
             (
-                _P("eff_fwhm", "px", 0.0, 2.5),
+                _P(
+                    "eff_fwhm", "px", 0.0, 2.5, endpoint_kwargs=(None, "fwhm_max_px"), valid_min=0.0
+                ),
                 _P("noise_sigma", "fraction of clean k-space RMS", 0.0, 0.0707),
             ),
             notes="coupled effective-resolution loss (k-space Gaussian apodization, no resampling) + noise on ONE theta. noise_sigma is referenced to the CLEAN, un-apodized k-space RMS: 20 dB at theta=1 against that reference. The output SNR is lower, because the apodization removes signal and not the noise added after it, and how much lower depends on the image's spectrum.",

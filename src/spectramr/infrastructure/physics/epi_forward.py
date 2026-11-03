@@ -69,12 +69,15 @@ def apply_epi_distortion(
     t_esp: float = 0.5e-3,
     phase_encode_axis: int = -2,
 ) -> torch.Tensor:
-    """Warp an image by the EPI distortion induced by ``delta_b0``.
+    """Simulate the EPI image of ``image`` under the field ``delta_b0``.
 
-    Implements ``y(x) = x(φ⁻¹(x))`` via ``grid_sample`` in the
-    normalised-coordinate convention. The phase-encode direction
-    receives the displacement; the read-out direction is unaffected
-    (consistent with single-shot EPI physics).
+    With the phase-encode displacement ``d`` (pixels) sampled on the output
+    grid, the observed intensity is ``image(y + d(y)) * (1 + d'(y))``: the
+    resampled image times the Jacobian of the phase-encode map, so signal is
+    conserved along each phase-encode line (Jezzard & Balaban 1995; FSL FUGUE
+    ``--icorr``). Compressed bands brighten and stretched bands darken; the
+    factor is clamped at zero where the field violates the no-fold condition.
+    The read-out direction is unaffected (single-shot EPI).
     """
     if image.dim() != 4:
         raise ValueError("expected image of shape [B, C, H, W]")
@@ -88,17 +91,17 @@ def apply_epi_distortion(
     # Pixel shift along PE, normalised to grid_sample's [-1, 1] (FOV spans 2.0)
     # by the PE-axis pixel count.
     n_pe = H if phase_encode_axis == -2 else W
-    disp = (
-        b0_to_displacement(delta_b0, t_esp=t_esp, phase_encode_axis=phase_encode_axis).squeeze(1)
-        / float(n_pe)
-        * 2.0
-    )
+    # align_corners=True: the n_pe pixel centres span the 2.0-wide grid in n_pe - 1 steps.
+    disp_px = b0_to_displacement(delta_b0, t_esp=t_esp, phase_encode_axis=phase_encode_axis)
+    disp = disp_px.squeeze(1) / float(n_pe - 1) * 2.0
     if phase_encode_axis == -2:
         grid_y = grid_y + disp
     else:
         grid_x = grid_x + disp
     grid = torch.stack([grid_x.clamp(-1, 1), grid_y.clamp(-1, 1)], dim=-1)
-    return F.grid_sample(image, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    warped = F.grid_sample(image, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    jacobian = (1.0 + torch.gradient(disp_px, dim=phase_encode_axis)[0]).clamp_min(0.0)
+    return warped * jacobian
 
 
 def beltrami_from_b0(

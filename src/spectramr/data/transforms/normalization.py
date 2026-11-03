@@ -30,6 +30,7 @@ import torch
 import torchio as tio
 
 from spectramr.core.quantile import robust_quantile
+from spectramr.data.batch_types import read_batch_field
 
 logger = logging.getLogger(__name__)
 
@@ -1223,6 +1224,60 @@ class KSpaceNormalizationTransform(tio.Transform):
         subject.update_attributes()
 
         return subject
+
+
+class LoaderNormalization(enum.Enum):
+    """What a collated batch says about whether ``KSpaceNormalizationTransform`` ran.
+
+    Only ``APPLIED`` puts the batch on the transform's output side. The other
+    three are kept apart because each points at a different wiring fault.
+    """
+
+    APPLIED = "applied"
+    MARKED_RAW = "marked_raw"
+    NO_EVIDENCE = "no_evidence"
+    IDENTITY_SCALE = "identity_scale"
+
+
+def loader_normalization(batch: Any, kspace_scale: Any) -> LoaderNormalization:
+    """Classify ``batch`` by the evidence ``KSpaceNormalizationTransform`` leaves on it.
+
+    Evidence, in order of authority:
+
+    1. ``kspace_normalized`` -- True from the transform, False from a dataset
+       that serves raw (``M4RawRepetitionDataset``). An explicit answer wins.
+    2. Otherwise a non-identity ``kspace_scale``: something divided by it. An
+       identity scale is the placeholder a raw-serving dataset publishes, so it
+       proves nothing.
+
+    Args:
+        batch: A dict, :class:`~spectramr.data.batch_types.TrainingBatch` or
+            ``None``; read through ``read_batch_field`` so ``.metadata`` is seen.
+        kspace_scale: The batch's ``kspace_scale``, already read by the caller.
+
+    Returns:
+        The :class:`LoaderNormalization` verdict.
+    """
+    marker = read_batch_field(batch, "kspace_normalized")
+    if marker is not None:
+        # Collated markers arrive one per sample; `all` keeps a partially
+        # normalized batch out of APPLIED and avoids `bool` on a multi-element tensor.
+        if torch.is_tensor(marker):
+            normalized = bool(marker.all())
+        elif isinstance(marker, (list, tuple)):
+            normalized = all(bool(m) for m in marker)
+        else:
+            normalized = bool(marker)
+        return LoaderNormalization.APPLIED if normalized else LoaderNormalization.MARKED_RAW
+
+    if kspace_scale is None:
+        return LoaderNormalization.NO_EVIDENCE
+    scale = (
+        kspace_scale if torch.is_tensor(kspace_scale) else torch.as_tensor(kspace_scale)
+    ).float()
+    if not torch.allclose(scale, torch.ones_like(scale)):
+        return LoaderNormalization.APPLIED
+    return LoaderNormalization.IDENTITY_SCALE
 
 
 def consumes_measured_input(transform: Any) -> bool:

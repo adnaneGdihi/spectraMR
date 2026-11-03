@@ -53,10 +53,15 @@ def test_spec_card_uses_this_and_does_not_keep_its_own_copy() -> None:
     source = inspect.getsource(spec_card)
     assert "is_kspace_dataset_type" in source
     assert "KSPACE_DATASET_TYPES = {" not in source, (
-        "spec_card re-declared the set instead of importing it"
+        "spec_card redeclared the set instead of importing it"
     )
 
 
 def test_the_set_is_immutable() -> None:
     """A mutable module-level set invites a caller to 'just add one'."""
     assert isinstance(KSPACE_DATASET_TYPES, frozenset)
+
+
+def test_phase_contrast_slices_are_kspace() -> None:
+    """flow_synthetic's input is multicoil k-space; calling it an image fails the audit's domain check."""
+    assert is_kspace_dataset_type("flow_synthetic")

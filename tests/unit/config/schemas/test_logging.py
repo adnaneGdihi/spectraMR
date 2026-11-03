@@ -187,26 +187,19 @@ def test_log_steps_does_not_drive_the_snapshot_cadence() -> None:
     fact drives the diffusion anomaly LOG (``_log_diffusion_anomalies``), not
     the snapshot writer.
 
-    Pinned behaviourally: the resolver is what the writer actually consults,
-    so assert ``log_steps`` cannot reach it whatever the arm declares.
+    Pinned behaviourally: the schedule is the one cadence owner, so assert
+    ``log_steps`` cannot reach it whatever the arm declares.
     """
-    from spectramr.infrastructure.training.debug_snapshot import (
-        _resolve_config,
-        snapshot_step_is_due,
-    )
+    from spectramr.infrastructure.training.snapshot.policy import SnapshotSchedule
 
     cfg = LoggingConfigSchema()
     assert cfg.snapshots.interval_steps == 0
     assert cfg.snapshots.log_steps == [0, 1, 2, 10]
 
-    resolved = _resolve_config(cfg)
-    assert resolved.image_interval_steps == 0
-    assert not hasattr(resolved, "log_steps")
-
     # Step 3 is absent from the default `log_steps`; it is still due, because
-    # the budget -- not that list -- is what bounds the writes.
+    # the budget -- not that list -- is what bounds the snapshot steps.
     assert 3 not in cfg.snapshots.log_steps
-    assert snapshot_step_is_due(cfg, 3) is True
+    assert SnapshotSchedule.from_logging(cfg).due("train", 3) is True
 
     # And the description may not re-advertise the retired fallback.
     described = LoggingSnapshotsConfigSchema.model_fields["interval_steps"].description

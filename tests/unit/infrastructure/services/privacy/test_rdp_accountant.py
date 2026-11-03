@@ -180,6 +180,18 @@ def test_reset_clears_history() -> None:
     assert acc.get_epsilon(delta=1e-5) == 0.0
 
 
+def test_num_steps_composes_like_repeated_calls() -> None:
+    """``step(num_steps=n)`` equals ``n`` single calls; ``num_steps < 1`` raises."""
+    one, many = RDPAccountant(), RDPAccountant()
+    for _ in range(7):
+        one.step(noise_multiplier=1.1, sample_rate=0.02)
+    many.step(noise_multiplier=1.1, sample_rate=0.02, num_steps=7)
+    assert many.steps == 7
+    assert math.isclose(many.get_epsilon(1e-5), one.get_epsilon(1e-5), rel_tol=1e-12)
+    with pytest.raises(ValueError, match="num_steps"):
+        many.step(noise_multiplier=1.1, sample_rate=0.02, num_steps=0)
+
+
 # ---------------------------------------------------------------------------
 # Protocol
 # ---------------------------------------------------------------------------

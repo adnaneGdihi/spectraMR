@@ -148,3 +148,8 @@ def test_underpopulated_band_raises_rather_than_reporting_noise() -> None:
     snf = SuperNyquistFidelity(sr_scale=1, rho_max=2.0)
     with pytest.raises(ValueError, match="frequency bins"):
         snf(*_pair(32))
+
+
+def test_unknown_geometry_raises_at_construction() -> None:
+    with pytest.raises(ValueError, match="geometry"):
+        SuperNyquistFidelity(sr_scale=2, geometry="spiral")  # type: ignore[arg-type]

@@ -55,12 +55,17 @@ def _write(runs, tmp_path, contrast_set=None, **kw):
 
 def _undrawn(manifest):
     """Artifacts that are not ok, bar the figures that need per-slice rows, image cases or checkpoints."""
+    from spectramr.infrastructure.reporting.plotters.differences import IDENTITY_FIGURES
     from spectramr.infrastructure.reporting.plotters.distributions import (
         CASE_FIGURES,
         SLICE_FIGURES,
     )
+    from spectramr.infrastructure.reporting.plotters.dynamics import FIGURES as DYNAMICS_FIGURES
 
     needs_more_data = {
+        # band errors, input scores or subject|contrast|slice rows the fixture does not log
+        *DYNAMICS_FIGURES,
+        *IDENTITY_FIGURES,
         *SLICE_FIGURES,
         *CASE_FIGURES,
         "fig_4_1_weight_trajectory",

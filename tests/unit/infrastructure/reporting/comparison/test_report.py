@@ -36,12 +36,17 @@ def cohort(tmp_path):
 
 def _undrawn(manifest):
     """Artifacts that are not ok, bar the figures that need per-slice rows, image cases or checkpoints."""
+    from spectramr.infrastructure.reporting.plotters.differences import IDENTITY_FIGURES
     from spectramr.infrastructure.reporting.plotters.distributions import (
         CASE_FIGURES,
         SLICE_FIGURES,
     )
+    from spectramr.infrastructure.reporting.plotters.dynamics import FIGURES as DYNAMICS_FIGURES
 
     needs_more_data = {
+        # band errors, input scores or subject|contrast|slice rows the fixture does not log
+        *DYNAMICS_FIGURES,
+        *IDENTITY_FIGURES,
         *SLICE_FIGURES,
         *CASE_FIGURES,
         "fig_4_1_weight_trajectory",
@@ -246,3 +251,19 @@ def test_learning_curves_for_many_metrics_continue_in_numbered_figures(cohort, t
     ]
     assert all(res["figures"][k].exists() for k in curves)  # 12 + 12 + 6 panels
     assert not [w for w in recwarn if "Glyph" in str(w.message)]  # no panel letter past z
+
+
+def test_a_figure_list_is_drawn_and_all_attempts_every_figure(cohort, tmp_path):
+    """``figures`` reaches the dispatch loop (it once shadowed the results dict and drew nothing)."""
+    from spectramr.infrastructure.reporting import plotters
+    from spectramr.infrastructure.reporting.comparison.figure_set import DRAWN_ELSEWHERE
+
+    one = generate_comparison([cohort], tmp_path / "one", baseline="base", formats=("png",), dpi=40,
+                              html_report=False, figures=["cmp_metric_bars"])
+    assert one["figures"]["cmp_metric_bars"] is not None and "cmp_mosaic" not in one["figures"]
+    out = tmp_path / "all"
+    generate_comparison([cohort], out, baseline="base", formats=("png",), dpi=40, html_report=False,
+                        figures="all")
+    ids = {a["id"] for a in json.loads((out / "report_manifest.json").read_text())["artifacts"]
+           if a["kind"] == "figure"}
+    assert set(plotters.list_available()) - DRAWN_ELSEWHERE <= ids

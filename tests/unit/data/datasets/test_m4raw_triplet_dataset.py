@@ -9,7 +9,11 @@ import numpy as np
 import pytest
 import torch
 
-from spectramr.data.datasets.m4raw_triplet_dataset import M4RawTripletDataset, family_of
+from spectramr.data.datasets.m4raw_triplet_dataset import (
+    ContrastiveViews,
+    M4RawTripletDataset,
+    family_of,
+)
 
 # Header values as the carya census found them (2026-10-05).
 _PROTO = {
@@ -56,6 +60,8 @@ def _write(
         f["ismrmrd_header"] = np.bytes_(_header(proto).encode())
         if nex is not None:
             f.attrs["nex_average_count"] = nex
+        if nex is not None:
+            f.attrs["nex_average_mode"] = "phase_aligned_mean"
         if registered:
             f.attrs["registration_valid_slices"] = np.array([True, True, False])
         if source is not None:
@@ -170,3 +176,51 @@ def test_a_series_without_its_averaging_count_excludes_the_subject(tmp_path: Pat
     (tmp_path / "y" / "A" / "split").mkdir(parents=True)
     with pytest.raises(FileNotFoundError, match="no registered triplet"):
         M4RawTripletDataset(*trees, split="split")
+
+
+def test_an_average_not_phase_aligned_excludes_the_subject(tmp_path: Path) -> None:
+    trees = _tree(tmp_path, s2_flair_registered=True)
+    with h5py.File(trees[0] / "split" / "s1_T100.h5", "a") as f:
+        f.attrs["nex_average_mode"] = "complex_mean"
+    ds = M4RawTripletDataset(*trees, split="split")
+    assert "averages not phase_aligned_mean" in ds.excluded["s1"]
+    assert {s for s, _ in ds.records} == {"s2"}
+
+
+_MAP = {"t1": 4, "T2": 5, "Flair": 6}
+
+
+def test_contrastive_views_are_two_distinct_series_of_the_same_slice(tmp_path: Path) -> None:
+    views = ContrastiveViews(_MAP, positive="co_registered_subject", deterministic=False)
+    ds = M4RawTripletDataset(*_tree(tmp_path), split="split", views=views)
+    torch.manual_seed(0)
+    for i in range(len(ds)):
+        for _ in range(8):
+            item = ds[i]
+            x = item["input"].data[..., 0]
+            a, b = int(item["contrast_idx_a"]) - 4, int(item["contrast_idx_b"]) - 4
+            assert a != b
+            assert item["view_a"].shape == (1, 32, 32)
+            torch.testing.assert_close(item["view_a"][0], x[a])
+            torch.testing.assert_close(item["view_b"][0], x[b])
+            assert int(item["subject_index"]) == 0
+
+
+def test_validation_views_are_fixed(tmp_path: Path) -> None:
+    views = ContrastiveViews(_MAP, positive="co_registered_subject", deterministic=True)
+    ds = M4RawTripletDataset(*_tree(tmp_path), split="split", views=views)
+    first = [(int(ds[i]["contrast_idx_a"]), int(ds[i]["contrast_idx_b"])) for i in range(len(ds))]
+    again = [(int(ds[i]["contrast_idx_a"]), int(ds[i]["contrast_idx_b"])) for i in range(len(ds))]
+    assert first == again == [(4, 5), (5, 6)]
+
+
+def test_without_views_no_view_keys(tmp_path: Path) -> None:
+    item = M4RawTripletDataset(*_tree(tmp_path), split="split")[0]
+    assert "view_a" not in item
+
+
+def test_views_refuse_an_unsupported_positive_and_a_missing_contrast_id() -> None:
+    with pytest.raises(ValueError, match="same_volume_slice"):
+        ContrastiveViews(_MAP, positive="same_volume_slice", deterministic=True)
+    with pytest.raises(ValueError, match="FLAIR"):
+        ContrastiveViews({"T1": 0, "T2": 1}, positive="co_registered_subject", deterministic=True)

@@ -36,7 +36,7 @@ class _RecordingComputer:
 def _kspace_mae_config():
     return types.SimpleNamespace(
         training=types.SimpleNamespace(
-            mae=types.SimpleNamespace(mask_domain="kspace", mask_ratio=0.75)
+            mae=types.SimpleNamespace(mask_domain="kspace", mask_ratio=0.75, patch_size=16)
         )
     )
 
@@ -51,6 +51,7 @@ def test_kspace_mae_loss_targets_clean_image_not_corruption():
     s._loss_dict_reuse = {}
     s.env = types.SimpleNamespace(generator=lambda x, **k: x, losses={})
     s.config = _kspace_mae_config()
+    s._mask_rng = torch.Generator().manual_seed(0)
     # _resolve_legacy_batch returns a non-dict → strategy uses target_batch.
     s._resolve_legacy_batch = lambda ib, kw: ib
 

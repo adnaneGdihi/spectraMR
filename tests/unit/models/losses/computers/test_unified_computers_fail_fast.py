@@ -59,13 +59,21 @@ def test_builder_error_propagates_with_real_config(
     """A LossBuilder failure with a (non-None) config must raise, NOT collapse
     to a bare L1 stack."""
     config = MagicMock()  # truthy, `is not None` → the real-config branch
+    if computer_cls is UnifiedVAELossComputer:
+        # The VAE computer first checks for a declared reconstruction loss (decision 16).
+        from spectramr.config.schemas.loss import LossComponentConfig, LossConfigSchema
+
+        config.losses = LossConfigSchema(
+            output_domain="image", image_losses=[LossComponentConfig(name="mse", weight=1.0)]
+        )
     with pytest.raises(RuntimeError, match="boom"):
         computer_cls(config=config, device=torch.device("cpu"))
 
 
+# The VAE computer has no config-less fallback: it raises (decision 16; test_unified_vae.py).
 @pytest.mark.parametrize(
     "computer_cls",
-    [UnifiedGANLossComputer, UnifiedVAELossComputer, UnifiedDisentangledLossComputer],
+    [UnifiedGANLossComputer, UnifiedDisentangledLossComputer],
 )
 def test_no_config_uses_minimal_fallback(computer_cls: type) -> None:
     """``config is None`` is the ONLY sanctioned minimal-fallback path — it must

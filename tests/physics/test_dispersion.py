@@ -223,3 +223,18 @@ def test_the_two_t2_laws_agree_in_sign_and_disagree_in_magnitude() -> None:
         f"BPP shortens by {bpp_factor:.3f}x, power law by {pow_factor:.3f}x -- "
         "if these have converged, one of the two laws is now redundant"
     )
+
+
+@pytest.mark.parametrize(("n_pools", "expected"), [(1, 5), (2, 7), (3, 9)])
+def test_magnitude_stack_counts_rho_a0_c0_and_two_per_pool(n_pools: int, expected: int) -> None:
+    """One magnitude per field must determine 2P+3 constants, not the 2P+1 of R1 (#2417)."""
+    from spectramr.infrastructure.physics.dispersion import magnitude_stack_unknowns
+
+    assert magnitude_stack_unknowns(n_pools) == expected
+
+
+def test_magnitude_stack_unknowns_rejects_zero_pools() -> None:
+    from spectramr.infrastructure.physics.dispersion import magnitude_stack_unknowns
+
+    with pytest.raises(ValueError, match="n_pools"):
+        magnitude_stack_unknowns(0)

@@ -239,7 +239,77 @@ def test_second_foreground_reuses_stored_curve() -> None:
     other = (torch.rand_like(mask) > 0.5).to(mask.dtype)
     second = model._resolve_linearizer(volume, other, None)
     assert second is first
-    assert torch.equal(model._linearizer_mask, mask[0] if mask.ndim == 4 else mask)
+    # The stored curve spans the whole grid, not the first batch's foreground (#2375).
+    assert bool(model._linearizer_mask.all())
+    assert first.n_foreground == mask.numel()
+
+
+def _half_volume(left: bool, D: int = 4, H: int = 12, W: int = 12):
+    v = torch.zeros(1, 1, D, H, W)
+    m = torch.zeros_like(v)
+    sl = slice(0, W // 2) if left else slice(W // 2, W)
+    v[..., sl] = 0.5 + 0.1 * torch.rand(1, 1, D, H, W)[..., sl]
+    m[..., sl] = 1
+    return v, m
+
+
+def test_scan_order_is_exactly_the_batch_foreground() -> None:
+    """Every foreground voxel of every batch is scanned, and no air (#2375)."""
+    model = _lazy_curve_model()
+    va, ma = _half_volume(True)
+    vb, mb = _half_volume(False)
+    lin = model._resolve_linearizer(va, ma, None)
+    for v, m in ((va, ma), (vb, mb)):
+        order = model._scan_order(lin, v, m)
+        expected = torch.nonzero(m.flatten()).flatten()
+        assert torch.equal(torch.sort(order).values, expected)
+        # The batch's sub-sequence keeps the curve's own order.
+        assert torch.all(torch.diff(lin.inverse_idx[order]) > 0)
+
+
+def test_scan_order_without_mask_thresholds_the_volume() -> None:
+    model = _lazy_curve_model()
+    vb, mb = _half_volume(False)
+    lin = model._resolve_linearizer(vb, None, None)
+    order = model._scan_order(lin, vb, None)
+    assert torch.equal(torch.sort(order).values, torch.nonzero(mb.flatten()).flatten())
+
+
+def test_subgrid_curve_raises_on_foreground_outside_it() -> None:
+    va, ma = _half_volume(True)
+    vb, mb = _half_volume(False)
+    lin = MetricSFCLinearizer(intensity_volume=va[0, 0], mask=ma[0, 0], cache_dir=None)
+    model = _lazy_curve_model(linearizer=lin)
+    assert model._scan_order(lin, va, ma).numel() == int(ma.sum())
+    with pytest.raises(ValueError, match="outside the stored scan curve"):
+        model._scan_order(lin, vb, mb)
+
+
+def test_beta_changes_the_full_grid_curve() -> None:
+    """abl_no_metric_sfc's knob still reaches the order on the full-grid curve."""
+    vol, _ = _half_volume(True)
+    curves = [
+        _lazy_curve_model(sfc_beta=beta)._resolve_linearizer(vol, None, None).forward_idx
+        for beta in (0.0, 1000.0)
+    ]
+    assert not torch.equal(curves[0], curves[1])
+
+
+def test_later_batch_foreground_gets_spatial_mixing() -> None:
+    """The #2375 repro: after the first batch builds the curve, perturbing one voxel
+    of a disjoint foreground changes its neighbours' outputs."""
+    torch.manual_seed(0)
+    model = GeoMambaUNet(d_model=8, n_blocks=2, d_state=4, sfc_cache_dir=None).eval()
+    va, ma = _half_volume(True)
+    vb, mb = _half_volume(False)
+    with torch.no_grad():
+        model(va, mask=ma)
+        out = model(vb, mask=mb)
+        vb2 = vb.clone()
+        vb2[0, 0, 2, 6, 11] += 1.0
+        diff = (model(vb2, mask=mb) - out).abs()[0, 0]
+    diff[2, 6, 11] = 0.0
+    assert float(diff.max()) > 0.0
 
 
 def test_linearizer_rejects_mismatched_spatial_shape() -> None:
@@ -248,6 +318,14 @@ def test_linearizer_rejects_mismatched_spatial_shape() -> None:
     lin = model._resolve_linearizer(volume, mask, None)
     with pytest.raises(ValueError, match="spatial shape mismatch"):
         lin(torch.zeros(1, 1, 4, 8, 4))
+
+
+def test_forward_rejects_a_grid_other_than_the_curves() -> None:
+    model = _lazy_curve_model()
+    volume, mask, _ = _toy_inputs()
+    model(volume, mask=mask)
+    with pytest.raises(ValueError, match="spatial shape mismatch"):
+        model(torch.rand(1, 1, 4, 16, 4))
 
 
 def test_checkpoint_without_stored_curve_raises() -> None:

@@ -11,6 +11,28 @@ from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 
+def _conv_stem(in_channels: int, embed_dim: int, patch_size: int) -> nn.Sequential:
+    """Xiao et al. (2021) ViT_C stem: log2(patch_size) stride-2 3x3 convs, then a 1x1 projection."""
+    num_down = patch_size.bit_length() - 1
+    if patch_size < 2 or (1 << num_down) != patch_size:
+        raise ValueError(
+            f"VisionTransformer: use_conv_stem needs a power-of-two patch_size >= 2, "
+            f"got {patch_size}."
+        )
+    layers: list[nn.Module] = []
+    channels = in_channels
+    for i in range(num_down):
+        out = max(embed_dim >> (num_down - i), 8)
+        layers += [
+            nn.Conv2d(channels, out, 3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out),
+            nn.ReLU(inplace=True),
+        ]
+        channels = out
+    layers.append(nn.Conv2d(channels, embed_dim, 1))
+    return nn.Sequential(*layers)
+
+
 @register_model(
     name="vision_transformer",
     training_mode="reconstruction",
@@ -38,6 +60,7 @@ class VisionTransformer(nn.Module, IGenerator):
         num_heads: int = 12,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        use_conv_stem: bool = False,
         **kwargs,
     ):
         """Initialize Vision Transformer.
@@ -52,6 +75,8 @@ class VisionTransformer(nn.Module, IGenerator):
             num_heads: Number of attention heads
             mlp_ratio: MLP expansion ratio
             dropout: Dropout rate
+            use_conv_stem: Replace the patchify conv with a stride-2 3x3 conv stem
+                (Xiao et al., 2021) whose total stride equals ``patch_size``.
         """
         super().__init__()
         self.img_size = img_size
@@ -59,46 +84,20 @@ class VisionTransformer(nn.Module, IGenerator):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.embed_dim = embed_dim
+        self.use_conv_stem = bool(use_conv_stem)
 
         self.num_patches = (img_size // patch_size) ** 2
 
-        # Patch Embedding
-        # [ARCHITECTURE FIX] Convolutional Stem / Overlapping Patch Embedding
-        # Replaces simple strided conv with overlapping convolutions to reduce boundary artifacts.
-        # Reference: Xiao et al. "Early Convolutions Help Transformers See Better"
-
-        use_conv_stem = kwargs.get("use_conv_stem", False)
-        if use_conv_stem:
-            # 4-layer conv stem
-            self.patch_embed = nn.Sequential(
-                nn.Conv2d(in_channels, embed_dim // 4, 3, stride=2, padding=1),
-                nn.BatchNorm2d(embed_dim // 4),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(embed_dim // 4, embed_dim // 2, 3, stride=2, padding=1),
-                nn.BatchNorm2d(embed_dim // 2),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(
-                    embed_dim // 2, embed_dim, 3, stride=patch_size // 4, padding=1
-                ),  # Adjust stride?
-                # If patch_size=16 (typical), stems stride 2*2=4. We need total stride 16.
-                # So we need 2 more stride-2 layers or 1 stride-4.
-                # Let's trust standard CoAtNet style or similar:
-                # 3x3 convs.
-                # Layer 3: stride 2 -> total 8
-                # Layer 4: stride 2 -> total 16
-                nn.Conv2d(embed_dim, embed_dim, 3, stride=2, padding=1),  # -> 8
-                nn.ReLU(inplace=True),
-                nn.Conv2d(embed_dim, embed_dim, 3, stride=2, padding=1),  # -> 16
+        if img_size % patch_size != 0:
+            raise ValueError(
+                f"VisionTransformer: img_size={img_size} is not divisible by "
+                f"patch_size={patch_size}."
             )
-            # The output dim needs to match embed_dim?
-            # The last conv out_channels is embed_dim.
-        else:
-            # Standard non-overlapping or simple overlapping
-            # Overlapping: k = 2*p - 1? No, k=7, s=4, p=2 (Swin style)
-            # Here we just allow standard via kwargs or default
-            self.patch_embed = nn.Conv2d(
-                in_channels, embed_dim, kernel_size=patch_size, stride=patch_size
-            )
+        self.patch_embed = (
+            _conv_stem(in_channels, embed_dim, patch_size)
+            if use_conv_stem
+            else nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        )
 
         # Positional Embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
@@ -159,6 +158,11 @@ class VisionTransformer(nn.Module, IGenerator):
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
         B, C, H, W = x.shape
+        if tuple(x.shape[-2:]) != (self.img_size, self.img_size):
+            raise ValueError(
+                f"VisionTransformer: input {H}x{W} does not match img_size="
+                f"{self.img_size}; the positional embedding is fixed to that grid."
+            )
 
         # Patch Embedding
         x = self.patch_embed(x)  # [B, E, H/P, W/P]

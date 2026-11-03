@@ -884,3 +884,43 @@ def test_numeric_scale_has_no_calibration_buffer():
     """Old checkpoints of numeric-scale arms must still load strictly."""
     gen = LatentDiffusionGenerator(_config(), num_layers=3, latent_scaling_factor=2.45)
     assert "latent_scale_calibrated" not in gen.state_dict()
+
+
+def test_5d_latent_refuses_a_condition_it_would_drop() -> None:
+    """#642: the 5-D branch fed the U-Net z alone, silently discarding the SR3 condition."""
+    import types
+
+    stub = types.SimpleNamespace(config=types.SimpleNamespace(use_contrast_guidance=False))
+    z = torch.zeros(1, 4, 2, 8, 8)
+    with pytest.raises(ValueError, match="5-D latent"):
+        LatentDiffusionGenerator._process_slices(
+            stub, z, torch.zeros(1, dtype=torch.long), cond_latent=torch.zeros_like(z)
+        )
+
+
+def test_load_autoencoder_state_into_is_the_shared_restore():
+    """The free function is the one owner both LDM and latent_flow call."""
+    from spectramr.models.generators.latent_diffusion_generator import (
+        AutoencoderKL,
+        load_autoencoder_state_into,
+    )
+
+    state, _ = _stage1_state()
+    ae = AutoencoderKL(latent_channels=4, base_channels=16)
+    load_autoencoder_state_into(ae, state, freeze=True, source="stage1")
+    assert all(not p.requires_grad for p in ae.parameters())
+    with pytest.raises(RuntimeError, match="no keys"):
+        load_autoencoder_state_into(ae, {"unrelated.w": torch.zeros(1)}, freeze=True, source="x")
+
+
+def test_cfg_schedule_is_read_and_reaches_the_provenance_record():
+    gen = LatentDiffusionGenerator(
+        **_conditional_kwargs(
+            cfg_drop_probs={"condition": 0.1},
+            cfg_weights={"condition": 2.0},
+            cfg_schedule={"condition": {"type": "step", "high": 3.0, "low": 1.0}},
+        )
+    )
+    record = gen.cfg_guidance_record
+    assert record["cfg_schedule"] == {"condition": {"type": "step", "high": 3.0, "low": 1.0}}
+    assert gen._cfg.schedule.weight_at("condition", 0.0) == 3.0

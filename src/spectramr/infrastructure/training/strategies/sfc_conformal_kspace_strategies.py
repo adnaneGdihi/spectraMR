@@ -60,6 +60,9 @@ class AdaptiveSFCHSSCStrategy(BaseTrainingStrategy):
 
     @classmethod
     def owned_module_declarations(cls, config: object) -> tuple[tuple[str, str], ...]:
+        cfg = getattr(getattr(config, "training", None), "adaptive_sfc_hssc", None)
+        if cfg is not None and not cfg.learn_scan_order:
+            return super().owned_module_declarations(config)
         return (*super().owned_module_declarations(config), ("sfc", OWNED_MODULE),)
 
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
@@ -69,6 +72,12 @@ class AdaptiveSFCHSSCStrategy(BaseTrainingStrategy):
         in_channels = int(getattr(cfg, "in_channels", 1)) if cfg else 1
         self.lambda_mu = float(getattr(cfg, "lambda_mu", 0.01)) if cfg else 0.01
         self.lambda_traj = float(getattr(cfg, "lambda_traj", 0.01)) if cfg else 0.01
+        self.learn_scan_order = bool(getattr(cfg, "learn_scan_order", True)) if cfg else True
+        logger.info("adaptive_sfc_hssc: learn_scan_order=%s", self.learn_scan_order)
+        if not self.learn_scan_order:
+            # Fixed-Hilbert control: the generator falls back to its Hilbert scan.
+            self.sfc = None
+            return
         self.sfc = BeltramiSFCBlock(grid_size=grid_size, in_channels=in_channels)
         if self.device is not None:
             self.sfc = self.sfc.to(self.device)
@@ -82,6 +91,37 @@ class AdaptiveSFCHSSCStrategy(BaseTrainingStrategy):
             if new_params:
                 opt.add_param_group({"params": new_params})
 
+    def _scan_order(self, input_batch: torch.Tensor, *, soft: bool = True) -> dict[str, torch.Tensor]:
+        # The Beltrami head sees the input resized to its grid; the reconstructor
+        # sees the unrestricted input.
+        gs = self.sfc.grid_size
+        x_sfc = F.interpolate(input_batch, size=(gs, gs), mode="bilinear", align_corners=False)
+        return self.call_owned("sfc", x_sfc, soft=soft)
+
+    def _order_kwargs(self, sfc_out: dict[str, torch.Tensor], *, soft: bool) -> dict[str, Any]:
+        # Only generators whose ``forward`` names the kwarg (or takes ``**kwargs``)
+        # get the order; a strict ``forward(self, x)`` would raise. The soft
+        # permutation carries the straight-through gradient to the μ-head.
+        fwd = getattr(self.generator_model, "forward", self.generator_model)
+        kwargs: dict[str, Any] = {}
+        if _callable_accepts_kwarg(fwd, "sfc_indices"):
+            kwargs["sfc_indices"] = sfc_out["indices"]
+            if soft and _callable_accepts_kwarg(fwd, "sfc_soft_perm"):
+                kwargs["sfc_soft_perm"] = sfc_out["soft_perm"]
+        return kwargs
+
+    def _validation_generator_forward(self, input_batch: torch.Tensor) -> Any:
+        """Validate along the same learned order the training step scans."""
+        if self.sfc is None:
+            return self.env.generator(input_batch)
+        was_training = self.sfc.training
+        self.sfc.eval()
+        try:
+            sfc_out = self._scan_order(input_batch, soft=False)
+        finally:
+            self.sfc.train(was_training)
+        return self.env.generator(input_batch, **self._order_kwargs(sfc_out, soft=False))
+
     def _compute_losses_impl(
         self,
         input_batch: torch.Tensor,
@@ -90,22 +130,12 @@ class AdaptiveSFCHSSCStrategy(BaseTrainingStrategy):
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:
         del epoch
-        # Resize input to the SFC grid for the Beltrami head; the
-        # reconstructor itself sees the unrestricted input.
-        gs = self.sfc.grid_size
-        x_sfc = F.interpolate(input_batch, size=(gs, gs), mode="bilinear", align_corners=False)
-        sfc_out = self.call_owned("sfc", x_sfc)
-        # Only pass ``sfc_indices`` to generators whose ``forward`` advertises it
-        # (or accepts ``**kwargs``). A strict ``forward(self, x)`` generator would
-        # otherwise raise ``TypeError`` — the docstring promise is that models
-        # which ignore the kwarg are still trained on the L1 objective. No silent
-        # fallback: a generator that *names* the kwarg gets it; one that does not
-        # is simply called positionally.
-        fwd = getattr(self.generator_model, "forward", self.generator_model)
-        if _callable_accepts_kwarg(fwd, "sfc_indices"):
-            recon = self.generator_model(input_batch, sfc_indices=sfc_out["indices"])
-        else:
+        if self.sfc is None:
             recon = self.generator_model(input_batch)
+            recon_loss = F.l1_loss(recon, target_batch)
+            return {"g_total_loss": recon_loss, "adaptive_sfc_recon": recon_loss.detach()}
+        sfc_out = self._scan_order(input_batch)
+        recon = self.generator_model(input_batch, **self._order_kwargs(sfc_out, soft=True))
         recon_loss = F.l1_loss(recon, target_batch)
         beltrami_reg = sfc_out["mu"].abs().pow(2).mean()
         traj_smooth = (
@@ -142,11 +172,6 @@ class ConformalDiffusionReconStrategy(BaseTrainingStrategy):
     # parallel_compat: Builds no parameters (ConformalDataConsistency holds a float alpha); the
     # generator runs only through its wrapped forward.
     parallel_compat = frozenset({"replicated"})
-
-    # Debug-snapshot contract (non-negotiable 14): the model is fed a noised
-    # tensor, not the prepared input; declared here and emitted under the tag.
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
 
     def __init__(self, env: TrainingEnvironment, **kwargs: Any) -> None:
         super().__init__(env=env, **kwargs)

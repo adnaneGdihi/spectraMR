@@ -26,6 +26,9 @@ TASK_PRESETS: dict[str, dict[str, list[str]]] = {
     "default": {
         "figures": [
             "fig_1_2_learning_curves",
+            "fig_5_1_spectral_recovery",
+            "fig_5_2_gain_over_input",
+            "fig_5_3_training_health",
             "fig_1_3_loss_decomposition",
             "fig_1_15_computational_profile",
             "fig_1_16_run_summary_card",
@@ -45,6 +48,9 @@ TASK_PRESETS: dict[str, dict[str, list[str]]] = {
     "reconstruction": {
         "figures": [
             "fig_1_2_learning_curves",
+            "fig_5_1_spectral_recovery",
+            "fig_5_2_gain_over_input",
+            "fig_5_3_training_health",
             "fig_1_3_loss_decomposition",
             "mri_recon_panel",
             "kspace_error_spectrum",
@@ -58,18 +64,19 @@ TASK_PRESETS: dict[str, dict[str, list[str]]] = {
             "fig_1_16_run_summary_card",
             "fig_1_17_metric_correlation",
             "fig_1_18_train_val_gap",
-            "fig_3_1_metric_violin",
             "fig_3_2_subject_bars",
             "fig_3_3_metric_scatter",
             "fig_3_6_error_decomposition",
             "fig_3_7_metric_embedding",
+            "fig_6_3_band_fidelity",
+            "fig_6_4_slice_profile",
+            "fig_6_5_gain_distribution",
             "fig_3_8_intensity_joint",
             "fig_3_9_background_zoom",
             "fig_4_1_weight_trajectory",
             "fig_4_2_layer_drift",
             "fig_4_3_progress_strip",
             "fig_4_4_image_embedding",
-            "mri_a7_kspace_recon",
             "mri_a11_cohort_table",
             "qc_group_strip",
             "qc_subject_mosaic",
@@ -93,7 +100,6 @@ TASK_PRESETS: dict[str, dict[str, list[str]]] = {
             "fig_1_16_run_summary_card",
             "fig_1_17_metric_correlation",
             "fig_1_18_train_val_gap",
-            "fig_3_1_metric_violin",
             "fig_3_2_subject_bars",
             "fig_3_3_metric_scatter",
             "fig_3_6_error_decomposition",
@@ -130,7 +136,6 @@ TASK_PRESETS: dict[str, dict[str, list[str]]] = {
             "fig_1_16_run_summary_card",
             "fig_1_17_metric_correlation",
             "fig_1_18_train_val_gap",
-            "fig_3_1_metric_violin",
             "fig_3_2_subject_bars",
             "fig_3_3_metric_scatter",
             "fig_3_6_error_decomposition",
@@ -350,9 +355,9 @@ def generate_report(
     fig_dir = out_dir / "figures"
     tab_dir = out_dir / "tables"
 
-    from .style import set_panel_labels, use_default_style
+    from .style import select_style, set_panel_labels
 
-    use_default_style(style)
+    select_style(style)
     set_panel_labels(panel_labels)
 
     method = method_name or experiment_dir.name
@@ -369,7 +374,10 @@ def generate_report(
     # it was ~33 extra render attempts and a report whose contents did not
     # depend on the declared task.
     explicit = figures is not None
+    if explicit and list(figures) == ["all"]:  # `figures: [all]`: every registered plotter
+        figures = _all_figure_ids()
     fig_ids = list(figures) if explicit else list(preset["figures"])
+    plotters.reject_retired(fig_ids)
     tab_ids = tables_ if tables_ is not None else preset["tables"]
     if qc_figures:
         # ADDITIVE, not a filter. `qc_figures` promises to "include the QC
@@ -420,7 +428,7 @@ def generate_report(
     if cases_synth is not None:
         plot_kwargs["mri_a2_synthesis_c2c"] = {"cases": cases_synth}
     if cases_kspace is not None:
-        plot_kwargs["mri_a7_kspace_recon"] = {"cases": cases_kspace}
+        plot_kwargs["mri_recon_panel"] = {"cases": cases_kspace}
     if cases_failure is not None:
         plot_kwargs["fig_1_12_failure_gallery"] = {"cases": cases_failure}
     if predictions_df is not None:
@@ -444,7 +452,7 @@ def generate_report(
         step=checkpoint_step,
     )
     case_routing = {
-        "cases_kspace": ("mri_a7_kspace_recon", "cases"),
+        "cases_kspace": ("mri_recon_panel", "cases"),
         "cases_sr": ("mri_a1_sr_triptych", "cases"),
         "cases_synth": ("mri_a2_synthesis_c2c", "cases"),
         "cases_failure": ("fig_1_12_failure_gallery", "cases"),
@@ -465,7 +473,9 @@ def generate_report(
         experiment_dir, step=checkpoint_step, run_id=str(method), method=str(method)
     )
     if not slice_df.empty:
-        for fid in SLICE_FIGURES:
+        from .plotters.differences import IDENTITY_FIGURES
+
+        for fid in (*SLICE_FIGURES, *IDENTITY_FIGURES):
             plot_kwargs.setdefault(fid, {}).setdefault("slice_df", slice_df)
     plot_kwargs.setdefault("fig_4_1_weight_trajectory", {}).setdefault(
         "weight_runs", {str(method): experiment_dir}
@@ -502,7 +512,8 @@ def generate_report(
     if _pc_csv.exists():
         try:
             per_call_df = pd.read_csv(_pc_csv)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Unreadable %s; per-case QC figures skipped: %s", _pc_csv, exc)
             per_call_df = None
     if per_call_df is not None and not per_call_df.empty:
         plot_kwargs.setdefault("qc_group_strip", {}).setdefault("per_call_df", per_call_df)
@@ -619,7 +630,7 @@ def generate_report(
     html_path: Path | None = None
     if html_report:
         try:
-            from .html_report import build_html_report
+            from .dashboard.run_page import build_html_report
 
             html_path = build_html_report(
                 out_dir,

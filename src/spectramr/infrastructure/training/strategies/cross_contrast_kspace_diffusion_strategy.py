@@ -36,9 +36,19 @@ import torch.nn.functional as F
 
 from spectramr.core.module_utils import unwrap_model
 from spectramr.data.batch_types import read_batch_field
+from spectramr.infrastructure.physics.fft_ops import ifft2c
 
 from .diffusion import DiffusionTrainingStrategy
+from .mixins.reference_batch import reference_from_batch
 from .mixins.utils import _callable_accepts_kwarg
+
+
+def _flat_rows(x: torch.Tensor) -> torch.Tensor:
+    """``(B, C, H, W, D)`` -> ``(B*D, C, H, W)`` volume-major, as ``reference_from_batch`` flattens."""
+    if x.dim() != 5:
+        return x
+    b, c, h, w, d = x.shape
+    return x.permute(0, 4, 1, 2, 3).reshape(b * d, c, h, w)
 
 
 class CrossContrastKspaceDiffusionStrategy(DiffusionTrainingStrategy):
@@ -48,10 +58,11 @@ class CrossContrastKspaceDiffusionStrategy(DiffusionTrainingStrategy):
     # a permission is not inherited from the diffusion parent, so it is stated here.
     parallel_compat = frozenset({"replicated"})
 
-    #: Loss ownership (issue #1918). mse_loss(dst_hat, k_dst) is a K-SPACE term against the destination contrast,
-    #: not an image loss against the target, and the hook routes nowhere.
+    #: Loss ownership (issue #1918). mse_loss(dst_hat, k_dst) is a K-SPACE term and stays inline; declared
+    #: ``losses.image_losses`` fold onto the image-domain destination, ifft2c(dst_hat) against ifft2c(k_dst).
     inline_losses: ClassVar[frozenset[str]] = frozenset()
-    folds_image_losses: ClassVar[bool] = False
+    folds_image_losses: ClassVar[bool] = True
+    empty_loss_stack_is_design: ClassVar[bool] = True
 
     sigma_max: float = 0.05
     lambda_destination: float = 1.0
@@ -108,6 +119,21 @@ class CrossContrastKspaceDiffusionStrategy(DiffusionTrainingStrategy):
                 "None — the DI container did not produce a generator. Check "
                 "the ModelBuilder wiring."
             )
+        model_cfg = getattr(getattr(self, "config", None), "model", None)
+        image_domain = getattr(model_cfg, "model_domain", None) == "image"
+        if image_domain:
+            # model_domain: image bridges RSS magnitudes: the loader's rss_image combine
+            # turns both the target and the separate-layout source into images.
+            k_dst = read_batch_field(batch, "target")
+            if k_dst is None or read_batch_field(batch, "kspace_source") is None:
+                raise ValueError(
+                    "cross_contrast_kspace_diffusion with model_domain: image requires "
+                    "batch['target'] and batch['kspace_source'] (data.pairing.source_layout: "
+                    "separate)."
+                )
+            k_dst = _flat_rows(k_dst)
+            k_src = reference_from_batch(batch, k_dst.device, k_dst.shape[0])
+            return self._bridge_losses(gen, batch, k_src, k_dst, kwargs, image_domain=True)
 
         # The cross-contrast bridge is DEFINED on a source/destination k-space
         # pair: `forward_corrupt` interpolates between them. Falling back to the
@@ -138,29 +164,38 @@ class CrossContrastKspaceDiffusionStrategy(DiffusionTrainingStrategy):
                 "back to the plain reconstruction loss would train a vanilla denoiser "
                 "under this arm's name."
             )
+        return self._bridge_losses(gen, batch, k_src, k_dst, kwargs, image_domain=False)
 
+    def _bridge_losses(
+        self,
+        gen: Any,
+        batch: Any,
+        k_src: torch.Tensor,
+        k_dst: torch.Tensor,
+        kwargs: dict[str, Any],
+        *,
+        image_domain: bool,
+    ) -> dict[str, torch.Tensor]:
+        """Corrupt along the source->destination bridge and score the destination prediction."""
         B = k_src.shape[0]
         t = torch.rand(B, device=k_src.device)
-        contrast_idx = batch.get("contrast_idx")
+        contrast_idx = read_batch_field(batch, "contrast_idx")
         k_t = self.forward_corrupt(k_src, k_dst, t)
 
         # The bridge interpolant is what the model sees, and it is formed here --
         # ``first_steps/input_prepared`` is captured before the forward pass and
         # holds neither endpoint. Declare the real one; the wrapper emits it
         # under ``diffusion_step`` (non-negotiable 14).
+        dom = "image" if image_domain else "kspace"
+        declared = {f"{dom}_interpolant": k_t, f"{dom}_source": k_src, f"{dom}_target": k_dst}
         self._declare_model_input(
-            {
-                "kspace_interpolant": k_t,
-                "kspace_source": k_src,
-                "kspace_target": k_dst,
-            },
-            # Named explicitly rather than left to the config union: this
-            # strategy RAISES unless the batch supplies paired k-space (above),
-            # so all three are k-space by its own contract, whatever
-            # ``data.dataset_type`` happens to say.
-            in_kspace_keys={"kspace_interpolant", "kspace_source", "kspace_target"},
+            declared,
+            # Named explicitly rather than left to the config union: the k-space path
+            # raises unless the batch supplies paired k-space, and the image path holds
+            # RSS magnitudes, whatever ``data.dataset_type`` happens to say.
+            in_kspace_keys=set() if image_domain else set(declared),
             extra={
-                "model_input_key": "kspace_interpolant",
+                "model_input_key": f"{dom}_interpolant",
                 "note": (
                     "Cross-contrast feeds forward_corrupt(k_src, k_dst, t) -- the "
                     "bridge interpolant between the source and destination "
@@ -211,6 +246,14 @@ class CrossContrastKspaceDiffusionStrategy(DiffusionTrainingStrategy):
             "loss_residual": residual,
             "loss_total": destination + residual,
         }
+        # Image-domain endpoint: the destination image is ifft2c of the destination k-space, and the
+        # prediction is ifft2c of the predicted k-space. Magnitudes match the arm's rss_image output.
+        if image_domain:
+            aux = self._apply_builder_image_losses(dst_hat, k_dst, out)
+        else:
+            aux = self._apply_builder_image_losses(ifft2c(dst_hat).abs(), ifft2c(k_dst).abs(), out)
+        if aux is not None:
+            out["loss_total"] = out["loss_total"] + aux
         # Per-contrast diagnostic breakdown is GPU-sync heavy (.tolist(), .any(),
         # .sum()) so we only emit it at log-interval steps to keep the hot path
         # sync-free. CLAUDE.md "Training-loop performance rules" forbid these

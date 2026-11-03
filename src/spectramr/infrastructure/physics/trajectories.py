@@ -29,6 +29,10 @@ TRAJECTORY_TYPES: Final[tuple[str, ...]] = ("cartesian", *NON_CARTESIAN_TRAJECTO
 #: is wrong for the other family.
 SPIRAL_GOLDEN_ANGLE: Final[float] = math.pi * (3.0 - math.sqrt(5.0))
 
+#: Spiral ADC dwell time (s). The generator's slew-limited transition uses it, and so does the
+#: per-sample readout time that off-resonance simulation needs.
+SPIRAL_DWELL_S: Final[float] = 4e-6
+
 
 class TrajectoryFactory:
     """Factory for generating Non-Cartesian k-space trajectories.
@@ -109,7 +113,7 @@ class TrajectoryFactory:
         variable_density: bool = True,
         max_grad: float = 40.0,  # mT/m
         max_slew: float = 150.0,  # T/m/s
-        dt: float = 4e-6,  # Dwell time (4µs)
+        dt: float = SPIRAL_DWELL_S,
         device: torch.device = torch.device("cpu"),
         golden_angle: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -139,9 +143,8 @@ class TrajectoryFactory:
 
         Reference: Glover, G. H. (1999). "Simple analytic spiral K-space algorithm." MRM.
         """
-        N = max(im_size)
         if samples_per_arm is None:
-            samples_per_arm = 2 * N
+            samples_per_arm = default_spiral_samples_per_arm(im_size)
 
         # Slew-limited to gradient-limited transition time, T_s = G_max / S_max (seconds).
         T_s = (max_grad * 1e-3) / max_slew  # Convert mT/m to T/m
@@ -238,6 +241,35 @@ class TrajectoryFactory:
         dcf = torch.ones(trajectory.shape[1], device=device)
 
         return trajectory, dcf
+
+
+def default_spiral_samples_per_arm(im_size: tuple[int, int]) -> int:
+    """Readout samples per spiral interleave when the caller does not set it."""
+    return 2 * max(im_size)
+
+
+def spiral_readout_times(
+    im_size: tuple[int, int],
+    num_samples: int,
+    samples_per_arm: int | None = None,
+    dt: float = SPIRAL_DWELL_S,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Time since each interleave's excitation for every sample of a spiral, in seconds.
+
+    ``get_spiral_trajectory`` concatenates interleaves arm by arm, so sample ``j`` sits at
+    ``(j mod samples_per_arm) * dt``.
+
+    Raises:
+        ValueError: ``num_samples`` is not a whole number of interleaves.
+    """
+    per_arm = samples_per_arm or default_spiral_samples_per_arm(im_size)
+    if num_samples % per_arm:
+        raise ValueError(
+            f"{num_samples} spiral samples is not a whole number of {per_arm}-sample "
+            "interleaves; the readout timing of this trajectory is undefined."
+        )
+    return (torch.arange(num_samples, device=device) % per_arm).float() * dt
 
 
 def get_trajectory(

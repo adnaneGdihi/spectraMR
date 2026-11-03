@@ -46,9 +46,9 @@ _QMAP_KEYS = frozenset({"t1", "t2", "pd"})
 SEQUENCE_FLIP: dict[str, bool] = {"spin_echo": False, "spoiled_gre": True}
 
 
-def target_field(b0_src: float, theta: float) -> float:
-    """B0_target = B0_src * (0.05 / B0_src) ** theta (log-linear)."""
-    return b0_src * (FLOOR_FIELD_T / b0_src) ** theta
+def target_field(b0_src: float, theta: float, floor_field_T: float = FLOOR_FIELD_T) -> float:  # noqa: N803
+    """B0_target = B0_src * (floor / B0_src) ** theta (log-linear)."""
+    return b0_src * (floor_field_T / b0_src) ** theta
 
 
 def _positive(name: str, value: Any) -> float:
@@ -171,11 +171,13 @@ def field_contrast_volume(
     sequence: str = "spoiled_gre",
     beta: float = 0.35,
     gamma_t2: float = 0.05,
+    floor_field_T: float = FLOOR_FIELD_T,  # noqa: N803 -- tesla
 ) -> Tensor:
     """``x`` (B, C, [D,] H, W) re-weighted to the target field; any mode (voxel-wise, folded)."""
     b0_src = _positive("b0_T", b0_T)
-    if b0_src <= FLOOR_FIELD_T:
-        raise ValueError(f"field_contrast: b0_T must exceed {FLOOR_FIELD_T} T, got {b0_T!r}")
+    floor = _positive("floor_field_T", floor_field_T)
+    if b0_src <= floor:
+        raise ValueError(f"field_contrast: b0_T must exceed {floor} T, got {b0_T!r}")
     if ti_ms is not None:
         raise ValueError("field_contrast: ti_ms is not read; the operator has no inversion signal")
     tr = DEFAULT_TR_MS if tr_ms is None else _positive("tr_ms", tr_ms)
@@ -190,7 +192,7 @@ def field_contrast_volume(
     dev, work = x.device, torch.promote_types(x.real.dtype, torch.float32)
     t1, t2 = (_fold(m.to(dev, work), x.shape[0]) for m in (t1, t2))
     ratio = _contrast_ratio(
-        t1, t2, b0_src, target_field(b0_src, theta), tr, te, alpha, beta, gamma_t2
+        t1, t2, b0_src, target_field(b0_src, theta, floor), tr, te, alpha, beta, gamma_t2
     )
     if x.dim() == 5:
         ratio = ratio.reshape(x.shape[0], x.shape[2], -1, *x.shape[-2:]).permute(0, 2, 1, 3, 4)

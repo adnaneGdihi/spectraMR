@@ -1115,22 +1115,12 @@ class TestEmitAlternateInput:
 _MAPS = {"dataset_type": "m4raw", **_NULLSPACE, "pairing": {"single_contrast": True}}
 
 
-class TestCoilMapsReferenceRoot:
-    """``coil_maps_reference_root`` (#2664): scoring maps, same route as the training store."""
+class TestCoilMapsReferenceRootIsRetired:
+    """The all-repetitions scoring store was removed (its maps contain the reference, #2510)."""
 
-    def test_accepted_on_the_route_that_reads_it(self):
-        cfg = DataConfigSchema(**_MAPS, coil_maps_reference_root="databases/m4raw/coil_maps")
-        assert cfg.coil_maps_reference_root == "databases/m4raw/coil_maps"
-        assert DataConfigSchema().coil_maps_reference_root is None
-
-    @pytest.mark.parametrize(
-        "override",
-        [{"dataset_type": "kspace"}, {"pairing": {"single_contrast": False}}],
-        ids=["another-dataset", "cross-contrast"],
-    )
-    def test_refused_off_the_m4raw_single_contrast_route(self, override):
-        with pytest.raises(ValidationError, match="coil_maps_reference_root holds maps"):
-            DataConfigSchema(**{**_MAPS, **override}, coil_maps_reference_root="x")
+    def test_the_retired_key_raises_at_load(self):
+        with pytest.raises(ValidationError, match="coil_maps_reference_root"):
+            DataConfigSchema(**_MAPS, coil_maps_reference_root="databases/m4raw/coil_maps")
 
 
 class TestCoilMapsRoot:
@@ -1533,3 +1523,75 @@ class TestPairingUnpairedTrainingSchema:
         with pytest.raises(ValidationError, match="disjoint_subjects"):
             DataPairingConfigSchema(disjoint_subjects=True)
         assert DataPairingConfigSchema(unpaired_training=True, disjoint_subjects=True)
+
+
+class TestM4RawRouteRefusesSvd:
+    """``dataset_type: m4raw`` applies no SVD compression, so ``svd`` is refused at load (#392)."""
+
+    def test_the_authored_coil_mode_raises(self) -> None:
+        with pytest.raises(ValidationError, match="applies no SVD coil compression"):
+            DataConfigSchema(dataset_type="m4raw", coils={"processing_mode": "svd"})
+
+    def test_the_mode_derived_from_the_unified_block_raises(self) -> None:
+        from spectramr.config.schemas.loader import _sync_coil_processing_to_legacy
+
+        raw = {
+            "data": {"dataset_type": "m4raw"},
+            "physics": {"coil_processing": {"compression": {"method": "svd"}}},
+        }
+        data = _sync_coil_processing_to_legacy(raw)["data"]
+        with pytest.raises(ValidationError, match="applies no SVD coil compression"):
+            DataConfigSchema(**data)
+
+    def test_the_legacy_flat_spelling_raises(self) -> None:
+        with pytest.raises(ValidationError, match="applies no SVD coil compression"):
+            DataConfigSchema(dataset_type="m4raw", coil_processing_mode="svd")
+
+    def test_every_m4raw_alias_raises(self) -> None:
+        from spectramr.config.schemas.data import DATASET_TYPE_ALIASES
+
+        aliases = [k for k, v in DATASET_TYPE_ALIASES.items() if v == "m4raw"]
+        assert aliases
+        for alias in aliases:
+            with pytest.raises(ValidationError, match="applies no SVD coil compression"):
+                DataConfigSchema(dataset_type=alias, coils={"processing_mode": "svd"})
+
+    def test_the_m4raw_preset_no_longer_injects_svd(self) -> None:
+        assert DataConfigSchema(dataset_type="m4raw").coils.processing_mode == "none"
+
+    def test_svd_on_the_kspace_route_still_loads(self) -> None:
+        cfg = DataConfigSchema(dataset_type="kspace", coils={"processing_mode": "svd"})
+        assert cfg.coils.processing_mode == "svd"
+
+
+class TestStackedCombine:
+    """``pairing.stacked_combine`` is read only on the stacked M4Raw rss_image route."""
+
+    _ROUTE: ClassVar[dict] = {"dataset_type": "m4raw", "coils": {"processing_mode": "rss_image"}}
+
+    def test_default_is_joint(self) -> None:
+        assert DataConfigSchema().pairing.stacked_combine == "joint"
+
+    def test_accepted_on_the_stacked_rss_image_route(self) -> None:
+        cfg = DataConfigSchema(**self._ROUTE, pairing={"stacked_combine": "per_contrast"})
+        assert cfg.pairing.stacked_combine == "per_contrast"
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"pairing": {"single_contrast": True}},
+            {"pairing": {"source_layout": "separate"}},
+            {"coils": {"processing_mode": "none"}},
+            {"dataset_type": "kspace"},
+        ],
+        ids=["single-contrast", "separate-layout", "no-combine", "other-dataset"],
+    )
+    def test_off_route_is_an_unread_knob(self, override) -> None:
+        pairing = {"stacked_combine": "per_contrast", **override.get("pairing", {})}
+        data = {**self._ROUTE, **override, "pairing": pairing}
+        with pytest.raises(ValueError, match="stacked_combine"):
+            DataConfigSchema(**data)
+
+    def test_unknown_value_raises(self) -> None:
+        with pytest.raises(ValueError):
+            DataConfigSchema(**self._ROUTE, pairing={"stacked_combine": "mean"})

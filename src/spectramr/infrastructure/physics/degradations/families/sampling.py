@@ -43,7 +43,7 @@ ENTRIES = (
         fn=degrade_cartesian_undersampling,
         description="Cartesian PE-line undersampling",
         severity=SeveritySpec(
-            (_P("acceleration", "x", 1.0, 8.0),),
+            (_P("acceleration", "x", 1.0, 8.0, endpoint_kwargs=(None, "R_max"), valid_min=1.0),),
             notes="PE-line undersampling with an 8% fully-sampled centre.",
         ),
         affects=BOTH,
@@ -58,7 +58,7 @@ ENTRIES = (
         fn=degrade_variable_density_2d,
         description="Variable-density 2-D Bernoulli",
         severity=SeveritySpec(
-            (_P("acceleration", "x", 1.0, 8.0),),
+            (_P("acceleration", "x", 1.0, 8.0, endpoint_kwargs=(None, "R_max"), valid_min=1.0),),
             notes="2-D Bernoulli variable density; the Bernoulli scale is calibrated so "
             "the REALISED rate equals this declared one (#246).",
         ),
@@ -73,7 +73,9 @@ ENTRIES = (
         family="sampling",
         fn=degrade_variable_density_cartesian,
         description="Variable-density Cartesian PE-line",
-        severity=SeveritySpec((_P("acceleration", "x", 1.0, 8.0),)),
+        severity=SeveritySpec(
+            (_P("acceleration", "x", 1.0, 8.0, endpoint_kwargs=(None, "R_max"), valid_min=1.0),)
+        ),
         affects=BOTH,
         origin=ArtifactOrigin.ACQUISITION,
         modes={MS: exact(degrade_variable_density_cartesian), VOL: (vd_cartesian_volume, _NAT)},
@@ -86,7 +88,7 @@ ENTRIES = (
         fn=degrade_radial_undersampling,
         description="Radial spoke undersampling (Cartesian-grid)",
         severity=SeveritySpec(
-            (_P("acceleration", "x", 1.0, 8.0),),
+            (_P("acceleration", "x", 1.0, 8.0, endpoint_kwargs=(None, "R_max"), valid_min=1.0),),
             notes="golden-angle spokes on a Cartesian grid; the spoke count is chosen so "
             "the realised kept fraction is 1/R. R=1 is a fully-sampled radial "
             "acquisition, i.e. the identity (#246 — the axis previously ramped a raw "
@@ -105,7 +107,18 @@ ENTRIES = (
         fn=degrade_partial_fourier,
         description="Partial-Fourier acquisition",
         severity=SeveritySpec(
-            (_P("retained_fraction", "fraction of the truncated axis", 1.0, 0.625),),
+            (
+                _P(
+                    "retained_fraction",
+                    "fraction of the truncated axis",
+                    1.0,
+                    0.625,
+                    endpoint_kwargs=(None, "min_fraction"),
+                    # The kernels reject 0.5 itself (they need > 0.5); 0.5 is the closed limit.
+                    valid_min=0.5,
+                    valid_max=1.0,
+                ),
+            ),
             notes="asymmetric k-space truncation along ky (kwarg axis='kx' for kx); theta=1 "
             "keeps the 5/8 minimum.",
         ),

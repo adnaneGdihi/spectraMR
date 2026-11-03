@@ -22,7 +22,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from spectramr.infrastructure.physics.degradations._common import _ensure_complex, _generator
+from spectramr.infrastructure.physics.degradations._common import (
+    _ensure_complex,
+    _generator,
+    reject_override_with_endpoint,
+)
 from spectramr.infrastructure.physics.degradations.blocks.acquisition_timing import (
     line_times,
     shot_index,
@@ -178,8 +182,17 @@ def _to_voxels(shifts_px: Tensor, vox: _Voxel, axes: tuple[int, ...]) -> Tensor:
     return torch.stack([shifts_px[:, i] * (vox[1] / vox[a]) for i, a in enumerate(axes)], dim=1)
 
 
-def _limits(theta: float, max_translation: float | None, max_rotation: float | None):
-    t = float(theta) * 10.0 if max_translation is None else float(max_translation)
+def _limits(
+    theta: float,
+    max_translation: float | None,
+    max_rotation: float | None,
+    max_translation_px: float = 10.0,
+):
+    reject_override_with_endpoint(
+        "rigid_motion", "max_translation", max_translation,
+        "max_translation_px", max_translation_px, 10.0,
+    )
+    t = float(theta) * float(max_translation_px) if max_translation is None else float(max_translation)
     r = float(theta) * 0.1 if max_rotation is None else float(max_rotation)
     if t < 0 or r < 0:
         raise ValueError(f"rigid_motion: limits must be >= 0; got translation {t}, rotation {r}")
@@ -193,6 +206,7 @@ def rigid_motion_volume(
     geometry: AcquisitionGeometry,
     max_translation: float | None = None,
     max_rotation: float | None = None,
+    max_translation_px: float = 10.0,
 ) -> Tensor:
     """D6 in 3-D: per-shot 3-D rotation, per-(kz, ky)-line 3-D translation."""
     if geometry.mode is not AcquisitionMode.VOLUME_3D:
@@ -201,7 +215,7 @@ def rigid_motion_volume(
     x = _ensure_complex(x)
     if float(theta) <= 0.0:
         return x
-    t, r = _limits(theta, max_translation, max_rotation)
+    t, r = _limits(theta, max_translation, max_rotation, max_translation_px)
     shots, n_shots = _shots(x, geometry)
     vox = voxel_mm_or_unit(geometry.voxel_mm)
     b, _, d, h, _ = x.shape
@@ -224,6 +238,7 @@ def rigid_motion_multislice(
     geometry: AcquisitionGeometry,
     max_translation: float | None = None,
     max_rotation: float | None = None,
+    max_translation_px: float = 10.0,
 ) -> Tensor:
     """D6 in multislice: per-shot in-plane rotation and ``dz``, per-(slice, ky) in-plane shift."""
     if geometry.mode is not AcquisitionMode.MULTISLICE_2D:
@@ -232,7 +247,7 @@ def rigid_motion_multislice(
     x = _ensure_complex(x)
     if float(theta) <= 0.0:
         return x
-    t, r = _limits(theta, max_translation, max_rotation)
+    t, r = _limits(theta, max_translation, max_rotation, max_translation_px)
     shots, n_shots = _shots(x, geometry)
     vox = voxel_mm_or_unit(geometry.voxel_mm)
     b, _, d, h, _ = x.shape

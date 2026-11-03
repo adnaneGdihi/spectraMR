@@ -8,9 +8,11 @@ import pytest
 import torch
 
 from spectramr.data.transforms.sle_trajectory import (
+    build_sle_budget_mask,
     build_sle_kspace_mask,
     kappa_to_dimension,
     sample_sle_trace,
+    sample_sle_traces,
 )
 
 
@@ -89,11 +91,35 @@ def test_mask_type_sle_kappa_dispatch() -> None:
     )
     assert mask.shape == (1, 32, 32)
     assert mask.dtype == torch.bool
-    # DC must always be sampled (build_sle_kspace_mask guarantees this).
-    assert mask[..., 16, 16].any().item()
-    # Sparsity should be ≤ ~5% at acceleration 4 (n_steps ≈ HW/4 with overlaps).
-    sparsity = mask.float().mean().item()
-    assert 0.005 < sparsity < 0.20
+    # Multi-shot: exactly round(H*W / R) bins, so R is honoured.
+    assert int(mask.sum()) == 256
+
+
+def test_kappa_zero_tip_height_is_two_sqrt_t() -> None:
+    """With hcap 2t (dg/dt = 2/(g-U)) the SLE_0 slit at time T has height 2*sqrt(T)."""
+    trace = sample_sle_trace(kappa=0.0, n_steps=64, T=1.0)
+    assert trace[-1, 1].item() == pytest.approx(2.0, rel=1e-4)
+
+
+def test_batched_traces_are_independent_and_in_the_upper_half_plane() -> None:
+    a = sample_sle_traces(2.0, 50, 3, generator=torch.Generator().manual_seed(3))
+    assert a.shape == (3, 51, 2)
+    assert torch.all(a[..., 1] >= 0)
+    assert not torch.allclose(a[0], a[1])
+
+
+def test_budget_mask_hits_the_budget_inside_the_allowed_bins() -> None:
+    allowed = torch.ones(32, 32, dtype=torch.bool)
+    allowed[14:18] = False
+    gen = torch.Generator().manual_seed(5)
+    mask, shots = build_sle_budget_mask(2.0, (32, 32), 300, allowed=allowed, generator=gen)
+    assert int(mask.sum()) == 300 and shots >= 1
+    assert not mask[14:18].any()
+
+
+def test_budget_beyond_the_allowed_bins_raises() -> None:
+    with pytest.raises(ValueError, match="exceeds"):
+        build_sle_budget_mask(2.0, (8, 8), 65)
 
 
 def test_transforms_package_exposes_sle_api() -> None:

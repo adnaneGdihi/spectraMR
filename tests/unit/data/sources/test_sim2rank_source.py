@@ -39,6 +39,24 @@ class TestSliceWiseInvariant:
             _slice(clean=torch.rand(32, 32))
 
 
+class TestSubjectIdentity:
+    def test_the_subject_defaults_to_the_volume(self) -> None:
+        assert _slice().subject == "f"
+
+    def test_an_explicit_subject_wins(self) -> None:
+        assert _slice(subject_id="2022091411").subject == "2022091411"
+
+    def test_the_subject_is_keyword_only(self) -> None:
+        import dataclasses
+
+        field = {f.name: f for f in dataclasses.fields(Sim2RankSlice)}["subject_id"]
+        assert field.kw_only is True
+
+    def test_an_empty_subject_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="subject_id"):
+            _slice(subject_id="")
+
+
 class TestRegionGeometryIsChecked:
     def test_a_mask_from_another_geometry_is_rejected(self) -> None:
         """Regions are computed on the clean reference. A geometry mismatch means

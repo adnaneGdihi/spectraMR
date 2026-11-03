@@ -3,10 +3,9 @@
 Two real defects motivated this gate, and both are invisible to every
 unit test in the suite because neither side is individually wrong:
 
-* ``--severity-yardstick`` landed on ``sim2rank.py`` *and*
-  ``run_all_generations.py`` (PR #462) and was passed by no launcher, so the
-  iso-distortion calibration could not be reached from the cluster at all --
-  pitfall #15 relocated from the config layer to the launcher layer;
+* a severity flag landed on ``sim2rank.py`` *and* ``run_all_generations.py``
+  (PR #462) and was passed by no launcher, so it could not be reached from the
+  cluster at all -- pitfall #15 relocated from the config layer to the launcher layer;
 * the brain launcher passed ``--max-contrasts 3`` to ``sim2rank.py`` and nothing
   to ``run_all_generations.py``, whose parser defaults it to 1, so the two
   ranking surfaces were built on different cohorts and the report then rendered
@@ -186,7 +185,7 @@ def _brain_invocation(target: str) -> str:
     return "\n".join(blocks)
 
 
-@pytest.mark.parametrize("flag", ["--severity-yardstick", "--max-contrasts"])
+@pytest.mark.parametrize("flag", ["--damage-yardsticks", "--max-contrasts"])
 def test_both_ranker_sweeps_receive_the_cohort_defining_flags(flag: str) -> None:
     """The two ranking surfaces must be built on one cohort and one severity grid.
 
@@ -212,8 +211,8 @@ def test_leaderboard_sweep_declares_its_axis_bank() -> None:
 @pytest.mark.parametrize(
     "name,knobs",
     [
-        ("run_fastmri_brain_pipeline.sbatch", ("AXIS_BANK", "SEVERITY_YARDSTICK")),
-        ("run_full_pipeline.sbatch", ("AXIS_BANK", "SEVERITY_YARDSTICK")),
+        ("run_fastmri_brain_pipeline.sbatch", ("AXIS_BANK", "DAMAGE_YARDSTICKS")),
+        ("run_full_pipeline.sbatch", ("AXIS_BANK", "DAMAGE_YARDSTICKS")),
     ],
 )
 def test_sweep_knobs_are_validated_against_their_advertised_set(

@@ -60,6 +60,7 @@ measurements overwritten by the reconstruction operator on the way through.
 from __future__ import annotations
 
 import logging
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
@@ -127,6 +128,9 @@ class NonCartesianDataConsistency(nn.Module):
         learn_step: Expose ``step_size`` as a parameter.
         grid_size_factor: NUFFT oversampling.
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(
         self,

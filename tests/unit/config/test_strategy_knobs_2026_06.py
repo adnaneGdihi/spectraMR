@@ -81,6 +81,8 @@ _TRANCHE2 = [
      {"sigma_min": 0.2}, {"sigma_min": 0.0}),  # gt=0
     ("score_field_tomography", ScoreFieldTomographyTrainingConfigSchema,
      {"cond_dim": 7}, {"cond_dim": 0}),  # ge=1
+    ("score_field_tomography", ScoreFieldTomographyTrainingConfigSchema,
+     {"val_num_levels": 4, "val_step_size": 0.5}, {"val_step_size": 2.0}),  # lt=2
     ("synthetic_pathology_aug", SyntheticPathologyAugTrainingConfigSchema,
      {"p_augment": 0.3}, {"p_augment": 1.5}),  # le=1
     ("inverse_bloch_phase", InverseBlochPhaseTrainingConfigSchema,

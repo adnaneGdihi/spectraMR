@@ -738,3 +738,92 @@ def test_pimn_kwargs_are_not_silently_filtered() -> None:
 
     mapped = ParameterMapper().map_generator_params("pimn", hidden_channels=64, num_iterations=3)
     assert mapped["hidden_channels"] == 64
+
+
+def test_symbolic_regression_builds_the_symbolic_head():
+    """``symbolic_regression`` built the U-Net wrapper, dropping exp118's head kwargs (#977)."""
+    import torch
+
+    from spectramr.models.factories.model_factory import ModelFactory
+    from spectramr.models.generators.symbolic_regression import SymbolicRegressionGenerator
+    from spectramr.models.generators.symbolic_regression_wrapper import (
+        SymbolicRegressionWrapper,
+    )
+
+    factory = ModelFactory()
+    registry = factory._registry
+    assert registry.get_generator_class("symbolic_regression") is SymbolicRegressionGenerator
+    assert (
+        registry.get_generator_class("symbolic_regression_wrapper") is SymbolicRegressionWrapper
+    )
+    with torch.device("meta"):
+        model = factory.create_generator(
+            "symbolic_regression",
+            in_channels=1,
+            out_channels=1,
+            feature_dim=8,
+            num_symbolic_terms=3,
+            constraints={
+                "dimensional_consistency": True,
+                "units": {"T2": "time", "TE": "time", "M0": "magnetization"},
+            },
+            allowed_operators=["exp", "add", "mul", "div", "neg"],
+        )
+    assert model.symbolic_head.num_terms == 3
+    assert model.intro.out_channels == 8
+
+
+@pytest.mark.parametrize("model_type", ["score_based_diffusion", "score_based_diffusion_generator"])
+def test_score_sde_knobs_reach_the_score_generator(model_type: str) -> None:
+    from spectramr.models.factories.model_factory import ParameterMapper
+
+    mapped = ParameterMapper().map_generator_params(
+        model_type, sde_type="vesde", sigma_min=0.01, sigma_max=50.0, features=[8]
+    )
+    assert mapped["sde_type"] == "vesde"
+    assert (mapped["sigma_min"], mapped["sigma_max"]) == (0.01, 50.0)
+    assert "features" not in mapped
+
+
+class TestDeclaredKeysReachAWrapperThatNamesThem:
+    """A wrapper forwarding to an inner backbone needs the arm's pre-sweep key set."""
+
+    @pytest.fixture
+    def registered(self):
+        import torch.nn as nn
+
+        from spectramr.models.registry import MODEL_REGISTRY
+
+        class _Wrapper(nn.Module):
+            def __init__(self, in_channels=1, out_channels=1, _declared_keys=None, **kwargs):
+                super().__init__()
+                self.declared = _declared_keys
+
+        class _Plain(nn.Module):
+            def __init__(self, in_channels=1, out_channels=1, **kwargs):
+                super().__init__()
+                self.seen = kwargs
+
+        MODEL_REGISTRY["stub_wrapper"] = {"class": _Wrapper, "training_mode": "reconstruction"}
+        MODEL_REGISTRY["stub_plain"] = {"class": _Plain, "training_mode": "reconstruction"}
+        try:
+            yield
+        finally:
+            MODEL_REGISTRY.pop("stub_wrapper", None)
+            MODEL_REGISTRY.pop("stub_plain", None)
+
+    def test_named_parameter_receives_the_set(self, registered) -> None:
+        from spectramr.models.factories.model_factory import ModelFactory
+
+        model = ModelFactory().create_generator(
+            "stub_wrapper", in_channels=1, out_channels=1, _declared_keys=frozenset({"k"}), k=1
+        )
+        assert model.declared == frozenset({"k"})
+
+    def test_var_keyword_constructor_does_not_receive_it(self, registered) -> None:
+        from spectramr.models.factories.model_factory import ModelFactory
+
+        model = ModelFactory().create_generator(
+            "stub_plain", in_channels=1, out_channels=1, _declared_keys=frozenset({"k"}), k=1
+        )
+        assert "_declared_keys" not in model.seen

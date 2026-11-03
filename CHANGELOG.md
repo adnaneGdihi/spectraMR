@@ -7,6 +7,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-02
+
+### Changed
+- `phase_contrast` is now a signal model, not a physics operator: the velocity encoding is
+  nonlinear and has no adjoint. `create_physics_operator("phase_contrast")` raises, and the
+  `mri_flow` profile declares `multi_coil_fft` plus the `phase_contrast` signal model.
+- The flow metrics read masks, voxel spacing and measurement planes from the metric context
+  instead of the target slot. `mass_conservation` now reports percent imbalance (lower is
+  better), and `divergence` pairs velocity component *i* with spatial axis *i*, in 1/s.
+- **Loss build set has one owner.** An arm trains only the loss terms it declares: the build
+  set is a projection of the weight table (`models/losses/build_set.py`), and
+  `LossConfigSchema.get_enabled_losses()` is deleted. An objective with no total raises. The
+  VAE and VQ-VAE computers bind the declared `l1`/`l2` with no fallback, the VQ computer adds
+  `vq_loss` at `lambda_vq`, and `latent_loss_type: vq_kl` / `beta_tc_vae` are refused.
+- The diffusion-family strategies (EDM, flow matching, Schrödinger bridge, VF distillation,
+  stochastic interpolants, field-guided, cross-contrast k-space) add the declared image
+  losses to their objective, scored on each strategy's clean-endpoint estimate.
+- `training.diffusion.degradation` is refused on any strategy other than GraphCold, the only
+  reader. An arm that declares `prediction_type: epsilon` on the Gaussian pixel path trains
+  ε, and its validation reverse-samples through the training `DiffusionScheduler`.
+  Latent-diffusion predict binds the training schedule.
+- `data.coil_maps_reference_root` is a `RENAMES` record with posture `raise`. Validation and
+  test scoring use the batch's own coil maps, so the Rep-BV, certificate and SENSE metrics of
+  the n2n and self_supervised arms change on re-scoring.
+- `meta-evaluate` derives each content seed from `blake2b(seed:content_id)` (stamped
+  `seed_scheme: blake2b_v1`), which moves its draws. Betting certification honours each
+  metric's direction, and a metric with no direction raises.
+- The default SLURM wall-clock limit for campaigns drops from 120 h to 96 h.
+
+### Added
+- **Model parallelism on FSDP2.** Tensor, spatial (depth-split) and context parallelism now
+  compose with `parallel.strategy: fsdp`. Tensor-parallel checkpoints, optimizer moments and
+  EMA gather to the unsplit keys, and gradient clipping uses one global norm over the tensor
+  group (`clip_grad_norm_global_`). This also fixes clipping under `ddp` with a tensor mesh.
+- **Context (sequence) parallelism** (`parallel.mesh.context`) for the DiT and U-ViT trunks
+  under `ddp` and `fsdp`. K and V are all-gathered, and an equivalence gate runs before
+  training. Tensor × context composes; any other pair of model-parallel axes is refused,
+  each with its own reason.
+- **Pipeline parallelism** (`parallel.mesh.pipeline`) for the unrolled cascades
+  (`unrolled_reconstruction`, `unrolled_list`, `nc_pdnet`, `diff_varnet`) under `ddp` and
+  `fsdp`, using a GPipe schedule. Before this, the knob built a mesh that nothing read.
+- fp16 runs under tensor, context, spatial and pipeline parallelism. The gradient scaler's
+  non-finite flag is all-reduced over the world whenever a model-parallel axis is above 1.
+- **Sim2Rank.** Per-degradation local severity axes (`--severity-axes`, with a `log`
+  schedule), damage bands with a banded leaderboard, `--preview-coverage`, and fixed
+  per-metric figure scales. Every subject × contrast is swept and sharded, and metrics are
+  ranked by a composite score per contrast with a subject bootstrap. 3-D sweeps run on real
+  volumes (`data/datasets/kspace_volume_stack.py`) with a volume board. Severity ranges are
+  committed for all 59 2-D axes and all 69 3-D axes (`scripts/sim2rank/ranges/`).
+- Campaign arms take `compare_to: [...]` pairings, seed replicates (`tags.seed`) are pooled
+  into one arm, and a lone seeded arm is refused when the campaign loads.
+- `unrolled_reconstruction` takes `model_kwargs.residual` (a residual regulariser per stage)
+  and `model_kwargs.learnable_dc` (a learnable soft-DC step per unroll). Both are off by
+  default.
+- Rep-BV by k-space band (`band_corrected_mse`, `band_bias_squared`, `band_cross_power`,
+  `band_signal_deficit`, `band_input_cross_power`) for the n2n and self_supervised arms.
+- `abs_bland_altman_bias` and `limits_of_agreement_halfwidth` agreement metrics.
+- New components added by the in-progress cohort fix waves, among them: VE-SDE training
+  with predictor-corrector sampling, a vMF diffusion model and sampler, an epsilon DDPM on
+  complex k-space with hard DC, a two-stage spectral cascade diffusion strategy, a
+  pretrained Stable Diffusion UNet with a ControlNet measurement adapter, multi-axis CFG for
+  latent diffusion, a true-3D Swin UNETR baseline, an inter-frame temporal consistency loss
+  and metric, post-training pruning / INT8 export with size metrics, an expected-CRLB MRF
+  pulse design, a rotated-spiral MRF simulator, an I-JEPA objective with a frozen-encoder
+  probe, a sequential cross-slice loader cache, a PAC-Bayes KL estimator, an attack-time
+  adversarial validation pass, and a 64 mT synthetic k-space corpus with a cross-field
+  manifest mode.
+- `spectramr meta-evaluate --blackwell`: an opt-in gen-5 ranker that checks each metric
+  against the certified Blackwell relations of a Fourier-diagonal degradation catalogue.
+  It reports raw and display-canonicalised violation rates, mixture-probe violations,
+  revealed-design coherence and a concordance score in `summary.json["blackwell"]`, and
+  never enters the aggregate. Rankers registered with `opt_in=True` are skipped by
+  `available_rankers`.
+- `--blackwell-catalogue registry` evaluates the Blackwell ranker on the registry masks and
+  k-space filters, probed and re-checked at the content shape, with an audited before- or
+  after-noise placement. Also added: an equivalence display rate,
+  `--blackwell-max-groups` for the exact coherence LP, and an incoherence certificate (a
+  preference cycle or a convex dominance) whenever coherence is infeasible.
+- `--blackwell-catalogue multicoil`: the opt-in `blackwell_relations` ranker on Cartesian
+  masks with shared synthetic coils. Dominance is certified structurally, incomparability
+  by real Lanczos witnesses, and the remaining pairs are reported as uncertified. Random
+  line masks are ordered by coupling and refuted through the expected Fisher operator.
+- `--blackwell-catalogue nuisance`: the phase-only registry codes (motion, drifts, eddy
+  currents, ghosts), related to noise alone by unitary absorption. A fixed phase is
+  equivalent to noise alone, and a seeded one is dominated by it. The multi-coil ranker is
+  generalised to `blackwell_relations`, which takes any catalogue that certifies its own
+  relations.
+- `--blackwell-catalogue garbling` (clipping, quantisation and CS reconstruction applied
+  to noisy data, each dominated by its base) and `--blackwell-envelope oracle_wiener`. The
+  Blackwell ranker also takes mixed image sizes (centre-cropped to one shape) and 3-D
+  volumes (central slices).
+- `divergence_normalised` and `velocity_rmse_roi` flow metrics, and a polynomial
+  background-phase fit for phase-contrast velocity maps.
+- `dataset_type: flow_synthetic` with a `data.flow_synthetic` block: an analytic 4D-flow
+  phantom (pulsatile flow in tilted tubes, coil maps, background phase, noise) served as
+  readout slices of multicoil k-space, with exact velocity ground truth. Its venc and
+  encoding scheme come from `data.phase_contrast`.
+- `training_mode: phase_contrast_recon` (`PhaseContrastReconStrategy`): supervised k-t reconstruction
+  of phase-contrast cine slices, trained on a scale-free image NMSE and a wrap- and background-free
+  phasor loss (`losses.physics.lambda_phase_contrast_image_nmse` / `lambda_phase_contrast_phasor`).
+  Validation assembles each subject's volume and reports vessel-ROI velocity RMSE, normalised
+  divergence and mass conservation; it refuses a validation cap and multi-process backends. First
+  arm: `pc4d_synth_supervised_r6` in the `phase_contrast` cohort.
+- `flow_kt_unrolled`: an unrolled k-t reconstruction of velocity-encoded multicoil k-space
+  (per-encoding SENSE gradient steps plus a shared (2+1)D regulariser over all encodings),
+  returning per-encoding complex images from which velocity is decoded by the physics.
+- A k-t variable-density sampler (`kt_vd_gaussian`) with an exact per-frame budget and a
+  different pattern per velocity encoding and cardiac frame, and a strict `flow` collate.
+- **Debug snapshots trace the whole data path.** Each snapshot step is written as
+  `snapshots/<run_id>/<train|val>/step_N/` with a `manifest.json` listing every stage in order:
+  one dataset sample re-fetched through each loader stage (including the FastMRI/universal
+  builder's load, crop and coil steps), the prepared batch, the exact model input and output,
+  and data-consistency and projection modules as `post` stages. A strategy whose snapshot step
+  records no model call fails the coverage test.
+- One reporting dashboard module for runs and campaigns. A campaign report draws every
+  registered figure for each finished run and for the comparison, and records why a figure was
+  skipped in `report_manifest.json`. Demo dashboard render scripts.
+- Placeholder models made real: `contrast_agnostic_encoder` with a contrastive strategy that
+  consumes co-registered views (`data.m4raw_triplet.contrastive_views`), `frozen_backbone_with_head`
+  loading the stage-1 encoder, field-FiLM `cross_field_fm`, `multi_param_mapping` fitted through
+  the TSE render, and vendor-conditioned translation with vendor ids from the manifest.
+- Federated training: FedAvg/FedBN rounds with per-site DP and per-site validation, read from
+  `training.federated_config`.
+- Sim2Rank `--metrics` (`SIM2RANK_METRICS`) resolves metric names against the live registry,
+  plugin metrics included; an unregistered name raises.
+
+### Fixed
+- Four-point velocity decoding re-wraps the encoded phase difference, so phases near ±π no
+  longer decode to up to twice the venc. `phase_contrast_velocity` compares wrapped phase
+  differences, and a per-direction venc is applied along the direction axis.
+- `med_fid` and the radiomic `frd` no longer raise on SciPy 1.18, which removed
+  `sqrtm(..., disp=False)`. They had been silently all-NaN in Sim2Rank runs. MONAI's
+  `always_return_as_numpy` warning flood from the surface metrics is filtered at one owner.
+- `offres_blur_noncartesian` builds its NUFFT operators on the image's device, so it no
+  longer fails on a GPU input.
+- Meta-evaluation: signed metrics, aggregator ties, powered certification and subject-level
+  N are corrected.
+- `volume_consistency` measures or raises without a segmentation backend. It no longer
+  reports an intensity-quantile proxy. `FNOGenerator` runs its spectral blocks in the image
+  domain.
+- The k-space cold-diffusion generator reads `use_complex_conv` and one-channel widths as
+  declared and rejects `num_repetitions`. A `FourierBridgeNetwork` checkpoint saved before
+  this change still resumes.
+- kspace_filling loss-v2 cohort: ZeRO-2 resume of old bridge checkpoints, the gridded
+  non-Cartesian `q_sample` on real input, and the V100 OOM arms.
+- About 120 in-progress cohort fixes (waves W0–W1, 3a and 3b-A) that wire declared knobs,
+  add matched controls and repair stale baselines across the experiment corpus.
+- The v6.1 wrapper models build the backbone their arm declares. They previously ignored the
+  flattened `model_kwargs` and built a default backbone. Eight stub aliases that never bound
+  are deleted.
+- BALD acquisition scores real MC-dropout disagreement over k-space lines and applies it to the
+  input; the eight passes were previously identical.
+- Sim2Rank per-axis Spearman correlations mid-rank ties (`rankdata(method="average")`), which
+  lowers previously inflated correlations on tied inputs.
+- Report comparisons pair arms by subject and slice instead of by batch position. A campaign
+  report covers the runs on disk rather than a stale campaign state.
+- Report and Sim2Rank figure styling is scoped to each figure; arm, Sim2Rank category and
+  corruption-axis palettes are colour-blind safe. Duplicate figure pairs are merged and the
+  YAMLs naming them migrated.
+- Debug-snapshot inputs are log-decompressed per batch from the loader's evidence.
+
+### Removed
+- The SPECTRA RISC-V chip backend and its `cosim` arms. It had no production
+  caller, and its executor raised unless a test injected the runtime.
+
+### Security
+- Vulnerable locked dependencies bumped.
+
 ## [1.3.3] - 2026-10-28
 
 ### Added
@@ -504,7 +672,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      return 404, so the 200s here mean something. The `[0.1.0]` heading date above
      and `date-released` in CITATION.cff are two further declarations of the same
      day, and nothing reconciles the three; change them together. -->
-[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v1.3.3...HEAD
+[Unreleased]: https://github.com/adnaneGdihi/spectramr/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.4.0
 [1.3.3]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.3
 [1.3.2]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.2
 [1.3.1]: https://github.com/adnaneGdihi/spectramr/releases/tag/v1.3.1

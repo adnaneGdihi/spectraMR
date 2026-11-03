@@ -9,6 +9,7 @@ the declaration matches what the degrader actually does.
 from __future__ import annotations
 
 import itertools
+import math
 
 import pytest
 import torch
@@ -22,7 +23,46 @@ from spectramr.infrastructure.physics.severity import (
     PhysicalParam,
     SeverityDirection,
     SeveritySpec,
+    shape_severity_ratio,
 )
+
+
+class TestPhysicalParamCurves:
+    def test_geometric_value_at_matches_field_contrast_kernel(self) -> None:
+        p = DEGRADATION_REGISTRY["field_contrast"].severity.primary
+        assert p.curve == "geometric"
+        assert p.value_at(0.5) == pytest.approx(3.0 * (0.05 / 3.0) ** 0.5)
+
+    @pytest.mark.parametrize("curve", ["affine", "geometric"])
+    @pytest.mark.parametrize("theta", [0.0, 0.3, 1.0])
+    def test_theta_at_inverts_value_at(self, curve: str, theta: float) -> None:
+        p = PhysicalParam("x", "u", 3.0, 0.05, curve=curve)
+        assert p.theta_at(p.value_at(theta)) == pytest.approx(theta, abs=1e-9)
+
+    def test_theta_at_raises_for_one_minus_exp(self) -> None:
+        p = PhysicalParam("x", "u", 0.0, 1.0, curve="one_minus_exp")
+        with pytest.raises(ValueError, match="one_minus_exp"):
+            p.theta_at(0.5)
+
+    def test_susceptibility_dropout_declared_one_minus_exp(self) -> None:
+        # Kernel: keep = exp(-8 * theta * 0.5 * db0**2), peak db0**2 = 1 -> 1 - exp(-4 theta).
+        p = DEGRADATION_REGISTRY["susceptibility"].severity.co_varying[0]
+        assert p.name == "max_dropout"
+        assert p.curve == "one_minus_exp"
+        assert p.value_at(0.5) == pytest.approx(1.0 - math.exp(-2.0))
+        assert p.value_at(0.5) == pytest.approx(0.9817 * (1 - math.exp(-2)) / (1 - math.exp(-4)), rel=1e-4)
+
+    def test_unknown_curve_raises(self) -> None:
+        with pytest.raises(ValueError, match="curve"):
+            PhysicalParam("x", "u", 0.0, 1.0, curve="cubic")
+
+    def test_valid_range_must_be_ordered(self) -> None:
+        with pytest.raises(ValueError, match="valid_min"):
+            PhysicalParam("x", "u", 0.0, 1.0, valid_min=2.0, valid_max=1.0)
+
+    def test_shape_severity_ratio_rejects_log(self) -> None:
+        with pytest.raises(ValueError, match="log is applied to physical endpoints"):
+            shape_severity_ratio(0.5, "log")
 
 
 class TestPhysicalParam:
@@ -434,4 +474,6 @@ class TestAgreesWithTheUndersamplingRamp:
         from spectramr.config.schemas.enums import AccelerationSchedule
         from spectramr.infrastructure.physics.sampling import _SUPPORTED_SCHEDULES
 
-        assert {s.value for s in AccelerationSchedule} == _SUPPORTED_SCHEDULES
+        # ``log`` is the one severity-axis-only member; KSpaceAccelerator must keep rejecting it.
+        assert {s.value for s in AccelerationSchedule} - {"log"} == _SUPPORTED_SCHEDULES
+        assert "log" not in _SUPPORTED_SCHEDULES

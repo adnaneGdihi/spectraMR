@@ -63,9 +63,6 @@ class DisentangledDiffusionStrategy(BaseTrainingStrategy):
         own = (("generator.bloch", OWNED_CALL),) if bloch else ()
         return (*super().owned_module_declarations(config), *own)
 
-    snapshot_prepared_is_model_input: bool = False
-    snapshot_model_input_tag: str | None = "diffusion_step"
-
     def _setup_strategy_specific_components(self) -> None:
         """Initialize Bloch layer and loss tracking."""
         super()._setup_strategy_specific_components()

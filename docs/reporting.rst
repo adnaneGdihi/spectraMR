@@ -122,7 +122,7 @@ misspelled key is an error, never a silently ignored one.
         - fig_1_2_learning_curves
         - fig_1_3_loss_decomposition
         - fig_1_5_predicted_vs_true
-        - mri_a7_kspace_recon
+        - mri_recon_panel
         - mri_a11_cohort_table
       tables:
         - tab_2_1_main_results
@@ -245,7 +245,7 @@ Schema field reference
    * - ``html_report``
      - bool
      - ``true``
-     - Assemble the self-contained ``qc_report.html``.
+     - Assemble ``qc_report.html`` (figures linked from ``figures/``).
    * - ``interactive``
      - bool
      - ``true``
@@ -328,7 +328,7 @@ against an existing output directory:
        ``--recursive``.
    * - ``--recursive`` / ``-r``
      - Treat ``--exp-dir`` as a cohort root: report every run beneath it and
-       write a linking ``report_index.html``.
+       write the linking dashboard ``index.html``.
    * - ``--config`` / ``-c``
      - Reuse a config's ``reporting:`` block (style, formats, dpi, tables,
        ``qc_figures``, ``html_report``) for parity with the training hook.
@@ -348,7 +348,7 @@ against an existing output directory:
    * - ``--cohort-json``
      - A JSON file of cohort fields (``train_n``, ``val_n``, ``age_mean``, ...).
    * - ``--html`` / ``--no-html``
-     - Emit or skip the self-contained QC HTML report.
+     - Emit or skip the QC HTML report.
    * - ``--interactive`` / ``--no-interactive``
      - Emit or skip the interactive plotly layer.
    * - ``--qc`` / ``--no-qc``
@@ -417,11 +417,21 @@ quotes and every per-case spread a figure draws is read at one pass, chosen by
 metric's own optimum, and for different metrics those lie at different
 checkpoints, so together they describe no model that was ever saved.
 
-Error bars are drawn only from per-case rows of one pass
-(``per_call_metrics.csv`` cut to that pass by
-:mod:`~spectramr.infrastructure.reporting.per_case`). A spread taken across
-passes measures training progress, not variation across cases; when a run
-recorded no per-case rows the figures show one value per run and say so.
+Error bars are drawn only from per-case rows of one pass. Arms are paired by subject,
+contrast and slice: a comparison reads each run's per-slice rows
+(``logs/validation_batches.csv``, cut to that pass by
+:mod:`~spectramr.infrastructure.reporting.comparison.slice_cases`), so the same slice is
+compared across arms whatever order each loader read it in. ``per_call_metrics.csv``
+(batch means, :mod:`~spectramr.infrastructure.reporting.per_case`) is read only for what
+the slice rows lack: a run with no per-slice rows, and the acceleration-qualified metrics
+of cascading validation. A spread taken across passes measures training progress, not
+variation across cases; when a run recorded no per-case rows the figures show one value
+per run and say so.
+
+The grouped bar figures (``cmp_group_bars``, ``cmp_effect_bars``,
+``cmp_metric_group_bars``, ``cmp_phase_bars``) size themselves to their content: each bar
+keeps about 0.2 in, so many arms mean fewer panels per row or a wider figure (up to two
+page widths), and rows grow to fit the rotated arm names.
 Logged names are parsed once by
 :mod:`~spectramr.infrastructure.reporting.metric_names`: ``val_psnr_8x`` is the
 base metric ``psnr`` at ``R = 8``, and ``val_psnr_mean`` is the cascade mean.
@@ -848,7 +858,6 @@ ID                                   Shows
 ``fig_1_3_loss_decomposition``       Per-component loss stack over steps
 ``fig_1_4_residual_diagnostics``     Residual QQ / histogram / vs-target
 ``fig_1_5_predicted_vs_true``        Predicted-vs-target calibration scatter
-``fig_1_9_ablation_strip``           Per-ablation delta vs the full model, 95% CI
 ``fig_1_11_stratified_performance``  Metric by subgroup (age / site / pathology), with n
 ``fig_1_12_failure_gallery``         Worst-case montage
 ``fig_1_15_computational_profile``   Params / throughput / wall-time / memory panels
@@ -874,11 +883,11 @@ one indicates non-exchangeable splits (leakage or site shift).
 *MRI-specific (need recorded cases):*
 
 ==========================  ==========================================================
-``mri_recon_panel``         Cases x [input, prediction, target, error] with ROI insets
+``mri_recon_panel``         Cases x [input, (baseline), prediction, target, error, radial
+                            k-space error] with ROI insets
 ``kspace_error_spectrum``   Radial k-space error vs spatial frequency
 ``mri_a1_sr_triptych``      LR / SR / HR triptych, optional radial spectrum
 ``mri_a2_synthesis_c2c``    Contrast-to-contrast panel, 2-D joint histogram and MI
-``mri_a7_kspace_recon``     Zero-filled / recon / reference plus k-space error
 ``mri_a11_cohort_table``    Cohort descriptor rendered as a figure
 ``mri_a12_fiducial_check``  Virtual-fiducial localization check
 ==========================  ==========================================================
@@ -896,11 +905,11 @@ pass overrides through the plotter's ``**kwargs``.
 *Publication statistics:*
 
 ========================  ===================================================
-``metric_distribution``   Raincloud + paired-bootstrap significance brackets
+``metric_distribution``   Per-slice violins per arm (else test-split cases); bracket
+                          = Wilcoxon over subjects, best two arms
 ``bland_altman``          Agreement (bias +/- 1.96 sigma limits)
 ``significance_matrix``   Pairwise Holm-Bonferroni-corrected p-values
 ``calibration_coverage``  Reliability diagram (empirical vs nominal coverage)
-``forest_plot``           Effect size delta vs baseline, bootstrap CI
 ``ablation_heatmap``      Knob x knob -> metric heatmap
 ``acceleration_sweep``    Metric vs acceleration R, +/-1 sigma seed bands
 ``contact_sheet``         Thumbnail montage / index of every other PNG
@@ -942,8 +951,6 @@ into ``qc_report.html`` when ``reporting.html_report`` is on, and gated per run 
 rows of ``validation_batches.csv`` via :mod:`spectramr.infrastructure.reporting.plotters.distributions`):
 
 ==================================  ====================================================
-``fig_3_1_metric_violin``           Per-slice violins per metric (per arm, or per contrast
-                                    for one run), median and quartiles inside
 ``fig_3_2_subject_bars``            Per-subject means, sorted, one line per arm
 ``fig_3_3_metric_scatter``          Hexbin of one metric against another, per slice
 ``cmp_paired_slice_scatter``        Arm against baseline on the same slice, identity line
@@ -978,6 +985,27 @@ validation PNG pairs in ``logs/metrics``):
                                     and gradient histogram), t-SNE
 ==================================  ====================================================
 
+Training dynamics and where arms differ. The ``fig_5`` figures read the step-wise rows of
+one run or every arm; the ``fig_6`` figures read per-slice rows keyed by subject, contrast and
+slice (``Arms.slices`` in a comparison), at each arm's selected validation pass. All
+soft-skip when their columns are missing.
+
+==================================  ====================================================
+``fig_5_1_spectral_recovery``       Validation error per k-space band (low/mid/high)
+                                    against step, one line per arm
+``fig_5_2_gain_over_input``         Validation metric minus the input's against step;
+                                    zero is an identity map
+``fig_5_3_training_health``         Learning rate, rolling-median loss with spikes ringed,
+                                    non-finite substitutions
+``fig_6_1_critical_difference``     Friedman test and Nemenyi CD over subjects, >= 3 arms
+``fig_6_2_win_rate``                Share of subjects on which each arm beats each other,
+                                    Holm-corrected sign tests marked
+``fig_6_3_band_fidelity``           Per-slice error per k-space band, median and IQR
+``fig_6_4_slice_profile``           Primary metric against slice index, median across
+                                    subjects
+``fig_6_5_gain_distribution``       Per-slice gain over the input, share of slices worse
+==================================  ====================================================
+
 ``fig_4_1`` and ``fig_4_2`` read the checkpoints through
 :mod:`spectramr.infrastructure.reporting.weights` without building a model or reading data:
 a name-seeded subset of the float ``models.*`` tensors, the same positions in every
@@ -989,7 +1017,54 @@ To report a whole cohort at once,
 :func:`spectramr.infrastructure.reporting.generate_reports` (CLI:
 ``spectramr report --exp-dir <root> --recursive``) discovers every run beneath a
 root via :func:`spectramr.infrastructure.reporting.discover_run_dirs`, reports
-each, and writes a top-level ``report_index.html`` linking them.
+each, and writes the dashboard ``index.html`` linking them (see `Dashboard`_).
+
+Dashboard
+---------
+
+Every HTML page the reports write (the run ``qc_report.html``, ``comparison.html``, each
+contrast folder's page and the campaign ``index.html``) renders through one shell,
+:mod:`spectramr.infrastructure.reporting.dashboard`. It has one stylesheet built from
+:mod:`spectramr.core.design_tokens`, a light/dark switch that follows the system setting
+until the reader picks one, breadcrumbs back to the campaign, and a section nav.
+
+``spectramr campaign evaluate <campaign>`` reports every finished run and compares them with
+**every registered figure** (``figures="all"``, every metric): a figure without the data it
+needs is skipped with its reason in ``report_manifest.json``. The same is available by hand
+with ``--figures all`` (per run, or with ``--compare``), and in a run's YAML as
+``reporting.figures: [all]``.
+
+``spectramr report -e <campaign> --dashboard`` rebuilds the site from outputs already on
+disk, without drawing a figure, so a downloaded campaign tree can be re-skinned:
+
+.. code-block:: bash
+
+   spectramr report -e <campaign> --compare                 # comparison/ (figures, data)
+   spectramr report -e <campaign> --contrast-pairs vs_baseline
+   spectramr report -e <campaign> --dashboard               # index.html over all of it
+
+The campaign page reads ``campaign_state.json`` (runs, roles, status), the first
+``comparison*/data/metrics_long.csv`` and every ``contrasts/*/data/paired_stats.csv``.
+It shows:
+
+- **Leaderboard.** One dot per arm and headline metric (mean with a 95% interval), with
+  arms ordered by mean rank over those metrics. The best arm per metric is marked in the
+  accent colour and the baseline in grey.
+- **Ranks across every metric.** Metrics with a declared direction only.
+- **Contrasts.** Each contrast's Cohen's *d*, signed so that right of zero means better
+  than the baseline. When a paired test runs on a transformed scale (``1/N_eq (lower is
+  better)``), the scale's direction is used, not the metric's. Filled dots survive Holm
+  correction.
+- **Runs.** A table linking each run's QC report.
+
+Gallery tiles load a 1200 px WebP preview cached in ``figures/_preview/``; the full PNG
+and the PDF are one click away. Missing inputs drop their section rather than failing
+the page.
+
+Merged figures. ``mri_a7_kspace_recon`` is now drawn by ``mri_recon_panel`` (baseline
+column and radial k-space error included) and ``fig_3_1_metric_violin`` by
+``metric_distribution``. A config or ``--figures`` naming an old id raises with its
+replacement (``RETIRED_FIGURE_IDS`` in :mod:`spectramr.config.schemas.reporting`).
 
 Table catalog
 -------------
@@ -1143,10 +1218,10 @@ returns an inline ``<div>`` or ``None`` (plotly absent, or no data), so the
 section degrades cleanly to the embedded PNG. Every interactive panel carries a
 short **"How to read this"** caption.
 
-*Self-contained and offline.* plotly.js is inlined **once** at the top of the
-report (:func:`interactive.plotly_util.plotlyjs_script`); every div is emitted
-with ``include_plotlyjs=False``. The report renders fully offline, with no CDN
-fetch, matching the base64-PNG self-containment.
+*Offline.* plotly.js is written once to ``_assets/plotly.min.js`` beside the page
+(:func:`dashboard.shell.write_plotly_asset`) and every div is emitted with
+``include_plotlyjs=False``, so the report renders with no CDN fetch as long as the run
+folder travels whole. Figures are linked from ``figures/``, not base64-embedded.
 
 Interactive figures (:mod:`interactive.figures`):
 
@@ -1374,8 +1449,8 @@ or one lacking the requested metric/cost rows, it returns ``None`` (a "no data"
 signal) rather than raising. The guard must precede any ``df["metric"]`` access —
 a guard placed *after* the subscript raises ``KeyError: 'metric'`` on the empty
 frame before it can return ``None``. That ordering is covered by
-``tests/unit/reporting/test_reporting_plotters.py`` for ``headline_pareto``,
-``ablation_strip`` and ``ablation_table``.
+``tests/unit/reporting/test_reporting_plotters.py`` for ``headline_pareto``
+and ``ablation_table``.
 
 On top of that, the driver
 (:func:`~spectramr.infrastructure.reporting.pipeline.generate_report`, through
@@ -1429,10 +1504,6 @@ acquisition paths:
   plus validation-badge 2x3 grid, from the conformal-calibration JSON artefacts.
 - :func:`plotters.ksd_certificate.render_ksd_certificate` — KSD goodness-of-fit
   one-page PDF, from a ``KSDDefensibilityResult``.
-- :func:`plotters.learnable_acquisition_pareto.render_learnable_acquisition_pareto`
-  — a thin wrapper over ``headline_pareto`` taking an ``ArmResult`` list.
-- :func:`tables.certificate_table.write_certificate_table` — per-certificate
-  LaTeX and Markdown table from a ValidationBadge payload.
 
 Domain-artifact convention
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1445,9 +1516,8 @@ Physics and geometry figures whose data the aggregator frame cannot carry
 DataFrame; ``active_acquisition/*.csv`` becomes ``csv_paths``; ``qmap_slices.npz``
 becomes ``slices``. Absent artifacts leave the figure to soft-skip.
 ``mri_a12_fiducial_check`` is fed the recorded image cases like the other case
-plotters. The certificate figures (``certificate_summary``, ``ksd_certificate``,
-``learnable_acquisition_pareto``) are registered through soft-skipping adapters
-and render when their certificate, result or arms payload is routed.
+plotters. The certificate figures (``certificate_summary``, ``ksd_certificate``) are registered through soft-skipping adapters
+and render when their certificate or result payload is routed.
 
 Validation loss in the learning curves
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -524,8 +524,6 @@ def test_the_step_declares_the_tensor_the_network_is_fed_once() -> None:
     from spectramr.core.metrics.coil_manifold import as_interleaved
     from spectramr.infrastructure.physics.multicoil_ei_operator import interleaved_to_complex
 
-    assert EquivariantImagingStrategy.snapshot_prepared_is_model_input is False
-    assert EquivariantImagingStrategy.snapshot_model_input_tag == "ei_model_input"
     n = 16
     mask = _partial_mask(n, n)
     y = as_interleaved(mask * fft2c(_complex(1, 1, n, n, seed=2)))
@@ -554,21 +552,6 @@ def test_the_step_declares_the_tensor_the_network_is_fed_once() -> None:
     assert tensors["model_input"] is fed[0] and kw["in_kspace_keys"] == set()
     # An image network's A^H y is not k-space; without this the canonical union IFFTs it (#3043).
     assert kw["domain_exact"] is True
-    # The wrapper's contract, not a stub: the declaration must name its model input.
-    from spectramr.infrastructure.training.model_input_contract import require_model_input_key
-
-    tag = EquivariantImagingStrategy.snapshot_model_input_tag
-    key = require_model_input_key(
-        strategy_name="EquivariantImagingStrategy",
-        tag=tag,
-        tensors=tensors,
-        model_input_key=kw["extra"]["model_input_key"],
-    )
-    assert key == "model_input"
-    with pytest.raises(ValueError, match="without naming"):  # the sabine crash, planted
-        require_model_input_key(
-            strategy_name="EquivariantImagingStrategy", tag=tag, tensors=tensors, model_input_key=None
-        )
 
 
 class TestTheAnchorCarriesItsDeclaredWeight:

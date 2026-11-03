@@ -169,3 +169,31 @@ def test_bottomley_t1_tensor_matches_scalar_and_is_batched_differentiable() -> N
     bg = torch.tensor([3.0], requires_grad=True)
     bottomley_t1_tensor(bg, "gray_matter").sum().backward()
     assert bg.grad is not None and float(bg.grad.abs().sum()) > 0.0
+
+
+def test_tensor_prior_still_refuses_a_non_positive_field_on_cpu() -> None:
+    import pytest
+    import torch
+
+    from spectramr.infrastructure.physics.relaxation_priors import bottomley_t1_tensor
+
+    with pytest.raises(ValueError, match="b0_T must be > 0"):
+        bottomley_t1_tensor(torch.tensor([0.3, 0.0]), "white_matter")
+
+
+def test_tensor_prior_does_not_sync_the_gpu() -> None:
+    import pytest
+    import torch
+
+    from spectramr.infrastructure.physics.relaxation_priors import bottomley_t1_tensor
+
+    if not torch.cuda.is_available():
+        pytest.skip("sync-debug mode needs a GPU")
+    b0 = torch.tensor([0.064, 3.0], device="cuda")
+    bottomley_t1_tensor(b0, "csf")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        bottomley_t1_tensor(b0, "white_matter")
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

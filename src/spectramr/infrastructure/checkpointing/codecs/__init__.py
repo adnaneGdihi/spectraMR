@@ -78,4 +78,20 @@ def read(path: str | Path) -> RunState:
     return validate(codec_for(fmt).read(path), source=str(path))
 
 
-__all__ = ["read", "write"]
+def model_state_keys(path: str | Path, model: str) -> list[str]:
+    """The state-dict keys of ``model`` in the checkpoint at ``path``.
+
+    safetensors answers from its tensor names without reading a tensor; ``pt`` has no
+    index, so the file is read in full.
+    """
+    path = Path(path)
+    fmt = _format_of(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint {path} does not exist")
+    codec = codec_for(fmt)
+    if hasattr(codec, "model_state_keys"):
+        return codec.model_state_keys(path, model)
+    return list(read(path)["models"].get(model, {}))
+
+
+__all__ = ["model_state_keys", "read", "write"]

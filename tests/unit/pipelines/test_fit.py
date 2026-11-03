@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 import spectramr.pipelines.fit as fit_mod
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
+from spectramr.models.losses.build_set import declared_build_set
 from spectramr.pipelines.fit import Trainer, fit
 
 
@@ -170,7 +171,7 @@ def test_fit_gan_wires_discriminator_and_opt_d(monkeypatch):
     # returns only {"l1"} and the GAN trains a vanilla L1 denoiser while the
     # discriminator is built but never updated (pitfall #16).
     assert settings.losses.gan.enable_adversarial is True
-    assert "adversarial" in settings.losses.get_enabled_losses()
+    assert "adversarial" in declared_build_set(settings.losses)
 
 
 def test_fit_gan_without_discriminator_raises():

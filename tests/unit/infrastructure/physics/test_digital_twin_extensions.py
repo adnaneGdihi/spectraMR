@@ -192,6 +192,7 @@ from spectramr.infrastructure.physics.degradations.declarations import (  # noqa
     DECLARED_PHYSICAL_FOV_MM,
 )
 from spectramr.infrastructure.physics.fft_ops import fft2c  # noqa: E402
+from spectramr.infrastructure.physics.severity import severity_grid  # noqa: E402
 
 _ALL_AXES = _SINGLE_COIL_SLICE_AXES
 
@@ -466,6 +467,26 @@ class TestRealisedAcceleration:
         declared = DEGRADATION_REGISTRY["partial_fourier"].severity.physical_value(theta)
         realised = self._kept_fraction("partial_fourier", theta)
         assert realised == pytest.approx(declared, rel=0.05)
+
+    @pytest.mark.parametrize("r_max", [12.0, 16.0])
+    def test_cartesian_realises_r_past_the_acs_cap(self, r_max: float) -> None:
+        # An 8 % ACS alone caps R at 12.5; past it the ACS must take the whole budget.
+        g = torch.Generator().manual_seed(1234)
+        probe = torch.complex(
+            torch.randn(1, 1, 64, 64, generator=g), torch.randn(1, 1, 64, 64, generator=g)
+        )
+        out = apply_degradation("cartesian_undersamp", probe, theta=1.0, seed=0, R_max=r_max)
+        kept = float((fft2c(out).abs() > 1e-6).float().mean())
+        assert 1.0 / kept == pytest.approx(r_max, rel=0.12)
+
+    def test_acs_cap_is_inactive_on_the_default_grid(self) -> None:
+        # round(H/R) >= floor(H/R) >= floor(0.08 H) whenever R <= 12.5, so the capped ACS
+        # equals the old one for every H at the declared R_max = 8.
+        thetas = [*severity_grid(20), 1.0]
+        for h in range(4, 1025):
+            for theta in thetas:
+                r = 1.0 + 7.0 * float(theta)
+                assert max(1, round(h / r)) >= max(1, int(h * 0.08)), (h, r)
 
     def test_vd_undersamp_is_not_saturated_at_the_first_step(self) -> None:
         """The regression that made D4 useless: 72% of the damage at theta=0.05."""

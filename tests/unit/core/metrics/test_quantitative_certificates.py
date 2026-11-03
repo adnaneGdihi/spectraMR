@@ -174,3 +174,35 @@ class TestGaloisH1Certificate:
         phi = _vortex_phase()
         shifted = wrap_to_principal(phi + 2.0 * math.pi)
         assert m(shifted) == pytest.approx(m(phi), abs=1e-5)
+
+
+class TestGeodesicQMapManifoldInjection:
+    def test_registry_passes_an_injected_manifold_through(self):
+        from spectramr.core.metrics.registry import MetricsRegistry
+        from spectramr.infrastructure.physics.manifolds import BlochRelaxationManifold
+
+        manifold = BlochRelaxationManifold(cache_resolution=4)
+        metric = MetricsRegistry.get("geodesic_qmap_error", manifold=manifold)
+        assert metric.manifold is manifold
+        assert metric(_qmap(h=8, w=8), _qmap(h=8, w=8)) == pytest.approx(0.0, abs=1e-6)
+
+    def test_uncached_metric_refuses_a_map_it_would_loop_over(self):
+        big = torch.ones(1, 3, 65, 65)
+        big[:, 1] = 900.0
+        big[:, 2] = 70.0
+        with pytest.raises(ValueError, match="cache_resolution"):
+            GeodesicQMapErrorMetric()(big, big)
+
+    def test_foreground_mask_restricts_the_mean(self):
+        from spectramr.infrastructure.physics.manifolds import BlochRelaxationManifold
+
+        metric = GeodesicQMapErrorMetric(BlochRelaxationManifold(cache_resolution=4))
+        target = _qmap(h=4, w=4)
+        pred = target.clone()
+        pred[:, 1, 0, 0] += 200.0  # one wrong voxel
+        fg = torch.ones(1, 4, 4, dtype=torch.bool)
+        fg[:, 0, 0] = False
+        assert metric(pred, target, foreground=fg) == pytest.approx(0.0, abs=1e-6)
+        assert metric(pred, target) > 0.0
+        with pytest.raises(ValueError, match="does not match"):
+            metric(pred, target, foreground=fg[:, :2])

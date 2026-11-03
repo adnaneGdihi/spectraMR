@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 import spectramr.core.metrics as core_metrics
 from spectramr.cli import app
@@ -228,3 +229,170 @@ def test_core_degradations_flag_uses_dependency_free_library(
     with pytest.raises(_StopAtRunError):
         meta_evaluate(args)
     assert pipe.simulator_config.operator_library is None  # core fallback
+
+
+def _axes_file(tmp_path: Path, body: str) -> Path:
+    p = tmp_path / "axes.yaml"
+    p.write_text(body)
+    return p
+
+
+def test_cli_severity_axes_unknown_axis_raises(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_safe_metric_set(monkeypatch)
+    axes = _axes_file(tmp_path, "axes:\n  not_a_degradation: {start: 1.0, end: 2.0}\n")
+    with pytest.raises(ValueError, match="not_a_degradation"):
+        meta_evaluate(_meta_args(tmp_path, severity_axes=axes))
+
+
+def test_cli_severity_axes_missing_file_raises(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_safe_metric_set(monkeypatch)
+    with pytest.raises(FileNotFoundError, match="no such file"):
+        meta_evaluate(_meta_args(tmp_path, severity_axes=tmp_path / "nope.yaml"))
+
+
+def test_cli_severity_axes_and_yardsticks_reach_simulator_config(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _StopError(RuntimeError):
+        pass
+
+    _patch_safe_metric_set(monkeypatch)
+    pipe = isolated_meta_evaluate.from_defaults.return_value
+    pipe.run.side_effect = _StopError
+    axes = _axes_file(tmp_path, "axes:\n  cartesian_undersamp: {start: 2.0, end: 16.0}\n")
+    args = _meta_args(tmp_path, severity_axes=axes, damage_yardsticks=("rel_l2",))
+    with pytest.raises(_StopError):
+        meta_evaluate(args)
+    cfg = pipe.simulator_config
+    assert cfg.damage_yardsticks == ("rel_l2",)
+    assert cfg.severity_provenance["cartesian_undersamp"]["end"] == 16.0
+    assert set(cfg.severity_annotators) == set(cfg.families)
+
+
+def test_cli_n_steps_axis_rejected(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_safe_metric_set(monkeypatch)
+    axes = _axes_file(
+        tmp_path, "axes:\n  cartesian_undersamp: {start: 2.0, end: 16.0, n_steps: 4}\n"
+    )
+    with pytest.raises(ValueError, match="--severities"):
+        meta_evaluate(_meta_args(tmp_path, severity_axes=axes))
+
+
+def test_damage_yardsticks_parser_rejects_unknown() -> None:
+    import argparse
+
+    assert app._damage_yardsticks_arg("rel_l2, grad_l2") == ("rel_l2", "grad_l2")
+    with pytest.raises(argparse.ArgumentTypeError, match="bogus"):
+        app._damage_yardsticks_arg("rel_l2,bogus")
+
+
+def test_blackwell_config_fails_before_the_sweep(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_safe_metric_set(monkeypatch)
+    args = _meta_args(
+        tmp_path, blackwell=True, blackwell_draws=4, blackwell_q_fdr=1.5, core_degradations=True
+    )
+    with pytest.raises(ValueError, match="q_fdr"):
+        meta_evaluate(args)
+    isolated_meta_evaluate.from_defaults.return_value.run.assert_not_called()
+
+
+def test_blackwell_flag_reaches_the_config(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from spectramr.core.metrics.meta_evaluation import rankers
+
+    built: list[object] = []
+    real = rankers.BlackwellConfig
+
+    def _spy(**kw: object) -> object:
+        built.append(real(**kw))
+        return built[-1]
+
+    class _StopError(RuntimeError):
+        pass
+
+    _patch_safe_metric_set(monkeypatch)
+    monkeypatch.setattr(rankers, "BlackwellConfig", _spy)
+    monkeypatch.setattr(
+        app, "_synthesize_phantom_volumes", lambda n, seed: [("p", torch.zeros(2, 8, 8))]
+    )
+    isolated_meta_evaluate.from_defaults.return_value.run.side_effect = _StopError
+    args = _meta_args(
+        tmp_path,
+        blackwell=True,
+        blackwell_draws=3,
+        blackwell_q_fdr=0.2,
+        blackwell_max_contents=48,
+        blackwell_envelope="oracle_wiener",
+        core_degradations=True,
+    )
+    with pytest.raises(_StopError):
+        meta_evaluate(args)
+    assert built[0].n_draws == 3 and built[0].q_fdr == 0.2 and built[0].seed == 0
+    assert built[0].max_contents == 48 and built[0].envelope == "oracle_wiener"
+
+
+def test_blackwell_rejects_a_single_slice_before_the_sweep(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_safe_metric_set(monkeypatch)
+    monkeypatch.setattr(
+        app, "_synthesize_phantom_volumes", lambda n, seed: [("a", torch.zeros(8, 8))]
+    )
+    args = _meta_args(
+        tmp_path, blackwell=True, blackwell_draws=4, blackwell_q_fdr=0.1, core_degradations=True
+    )
+    with pytest.raises(ValueError, match="two 2-D slices"):
+        meta_evaluate(args)
+    isolated_meta_evaluate.from_defaults.return_value.run.assert_not_called()
+
+
+def test_blackwell_accepts_mixed_slice_shapes(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed sizes are cropped inside the ranker, so the preflight lets them through."""
+
+    class _StopError(RuntimeError):
+        pass
+
+    _patch_safe_metric_set(monkeypatch)
+    monkeypatch.setattr(
+        app,
+        "_synthesize_phantom_volumes",
+        lambda n, seed: [("a", torch.zeros(8, 8)), ("b", torch.zeros(16, 16))],
+    )
+    isolated_meta_evaluate.from_defaults.return_value.run.side_effect = _StopError
+    args = _meta_args(
+        tmp_path, blackwell=True, blackwell_draws=4, blackwell_q_fdr=0.1, core_degradations=True
+    )
+    with pytest.raises(_StopError):
+        meta_evaluate(args)
+
+
+def test_blackwell_rejects_an_unknown_catalogue_before_the_sweep(
+    tmp_path: Path, isolated_meta_evaluate: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_safe_metric_set(monkeypatch)
+    args = _meta_args(
+        tmp_path,
+        blackwell=True,
+        blackwell_draws=4,
+        blackwell_q_fdr=0.1,
+        blackwell_catalogue="bogus",
+        core_degradations=True,
+    )
+    with pytest.raises(ValueError, match="--blackwell-catalogue"):
+        meta_evaluate(args)
+    isolated_meta_evaluate.from_defaults.return_value.run.assert_not_called()
+
+
+def test_blackwell_catalogue_names_resolve_to_factories() -> None:
+    assert set(app._blackwell_catalogues()) == {"radial", "registry", "multicoil", "nuisance", "garbling"}

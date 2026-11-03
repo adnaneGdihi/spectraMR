@@ -65,6 +65,10 @@ class Sim2RankSlice:
     file_id: str
     slice_index: int
 
+    subject_id: str | None = field(default=None, kw_only=True)
+    """The person scanned. Slices (and contrasts) of one subject are one resampling
+    unit for any bootstrap; ``None`` falls back to ``file_id`` (one volume)."""
+
     kspace: torch.Tensor | None = None
     """Complex k-space, when the source has it. Physics metrics need the
     *measurement* -- an image ROI cannot restrict it, which is why they are
@@ -79,7 +83,14 @@ class Sim2RankSlice:
     provenance: Mapping[str, object] = field(default_factory=dict)
     """Where every region came from. A region you cannot reproduce is not a result."""
 
+    @property
+    def subject(self) -> str:
+        """The resampling unit: ``subject_id`` when the source knows it, else the volume."""
+        return self.subject_id if self.subject_id is not None else self.file_id
+
     def __post_init__(self) -> None:
+        if self.subject_id is not None and not self.subject_id:
+            raise ValueError("subject_id must be a non-empty string or None.")
         if self.clean.ndim != 3 or self.clean.shape[0] != 1:
             raise ValueError(
                 f"clean must be [1, H, W]; got {tuple(self.clean.shape)}. The "

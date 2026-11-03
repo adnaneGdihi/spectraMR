@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -244,10 +246,10 @@ class TestGFactor:
     """Tests for G-Factor metric."""
 
     def test_smoke_no_smaps(self) -> None:
-        """Without sensitivity maps, returns 1.0 (ideal)."""
+        """Without sensitivity maps the g-factor is unmeasured: NaN, not the ideal 1.0."""
         metric = GFactor()
         result = metric(torch.randn(1, 1, 64, 64))
-        assert result == 1.0
+        assert math.isnan(result)
 
     def test_registered(self) -> None:
         assert MetricsRegistry.is_registered("g_factor")

@@ -1,12 +1,12 @@
 """Cocycle-consistent unified cross-field operator (MICCAI MRIxFields2026, idea 4.2).
 
 A thin subclass of :class:`AnatomyFieldRenderer` that IS the shared-latent
-factorisation of Theorem 6: ``G(x; s, t) = R(E(x), b_t)`` with a field-invariant
+factorisation of Theorem 6: ``G(x; s, t) = R(E(x, b_s), b_t)`` with a source-field-aware
 encoder ``E = Phi`` (the universal field-canonicaliser) and a continuous-field
 renderer ``R(., b_t) = Psi_t``. The single-model / anti-ensemble property required
 by Task 3 is therefore *structural*, not argued — recorded here as the registry
 attribute ``is_unified_single_model = True`` that the ``field_cocycle_single_model``
-Tier-1 guard reads. Beyond the parent it exposes ``last_canonical_repr`` = ``Phi(x)``
+Tier-1 guard reads. Beyond the parent it exposes ``last_canonical_repr`` = ``Phi(x, b_s)``
 so the Tier-2 mechanism-fires probe can assert the canonicaliser was populated.
 
 No new architecture: reuse keeps the parent's ``FieldFiLMBlock`` conditioning and
@@ -61,9 +61,9 @@ class FieldCocycleGenerator(AnatomyFieldRenderer):
         # Exposure contract: the most recent canonicaliser output Phi(x) = E(x).
         self.last_canonical_repr: torch.Tensor | None = None
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Field-invariant canonicaliser ``Phi(x)``; stamps ``last_canonical_repr``."""
-        q = super().encode(x)
+    def encode(self, x: torch.Tensor, field_strength: torch.Tensor) -> torch.Tensor:
+        """Canonicaliser ``Phi(x; b)`` of ``x`` at field ``b``; stamps ``last_canonical_repr``."""
+        q = super().encode(x, field_strength)
         # Detached snapshot for exposure/audit (avoids retaining the graph across
         # the many encode calls a cocycle step makes).
         self.last_canonical_repr = q.detach()
@@ -74,7 +74,14 @@ class FieldCocycleGenerator(AnatomyFieldRenderer):
         x: torch.Tensor,
         *,
         field_strength: torch.Tensor,
+        field_strength_target: torch.Tensor,
         contrast_id: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        return super().forward(x, field_strength=field_strength, contrast_id=contrast_id, **kwargs)
+        return super().forward(
+            x,
+            field_strength=field_strength,
+            field_strength_target=field_strength_target,
+            contrast_id=contrast_id,
+            **kwargs,
+        )

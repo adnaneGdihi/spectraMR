@@ -41,13 +41,15 @@ class IPrivacyAccountant(Protocol):
         self,
         noise_multiplier: float,
         sample_rate: float,
+        num_steps: int = 1,
     ) -> None:
-        """Record one application of the sub-sampled Gaussian mechanism.
+        """Record ``num_steps`` applications of the sub-sampled Gaussian mechanism.
 
         Args:
-            noise_multiplier: ``σ`` in ``N(0, σ² Δ²)``. Must be > 0.
+            noise_multiplier: ``sigma`` in ``N(0, sigma^2 Delta^2)``. Must be > 0.
             sample_rate: Probability that a given sample is included
                 in the mini-batch. Must lie in ``(0, 1]``.
+            num_steps: Identical rounds to compose at once (e.g. on resume). Must be >= 1.
         """
         ...
 

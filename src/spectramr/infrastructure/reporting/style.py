@@ -20,6 +20,10 @@ from pathlib import Path
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
+from spectramr.core.design_tokens import CATEGORICAL as _TOKEN_CATEGORICAL
+from spectramr.core.design_tokens import OKABE_ITO as _TOKEN_OKABE_ITO
+from spectramr.core.design_tokens import OVERFLOW as _TOKEN_OVERFLOW
+
 _LOG = logging.getLogger(__name__)
 
 _STYLE_DIR = Path(__file__).resolve().parent / "styles"
@@ -57,16 +61,7 @@ def column_width(profile: str = "single") -> float:
 # dictionary. Plotters look up colours by *method name* (or fall back to
 # the cycler order) — this keeps a single method visually consistent
 # across every figure in the paper.
-OKABE_ITO = [
-    "#000000",  # black
-    "#E69F00",  # orange
-    "#56B4E9",  # sky blue
-    "#009E73",  # bluish green
-    "#F0E442",  # yellow
-    "#0072B2",  # blue
-    "#D55E00",  # vermilion
-    "#CC79A7",  # reddish purple
-]
+OKABE_ITO = list(_TOKEN_OKABE_ITO)
 
 METHOD_COLOURS: dict[str, str] = {
     # Reserved baselines
@@ -135,8 +130,10 @@ METHOD_COLOURS: dict[str, str] = {
     "qspace_diffusion": "#56B4E9",
     "noise_adaptive_score": "#0072B2",
     "cross_contrast_kspace_diffusion": "#009E73",
+    "complex_kspace_diffusion": "#0072B2",
     # ----- Disentangled / multi-task -----
     "disentangled": "#CC79A7",
+    "calibrated_qmap": "#CC79A7",
     "disentangled_vae": "#0072B2",
     "multi_task": "#999999",
     "dual_task": "#999999",
@@ -233,6 +230,7 @@ METHOD_COLOURS: dict[str, str] = {
     "ambient_diffusion": "#0072B2",
     "cross_modal_diffusion": "#56B4E9",
     "levy_diffusion": "#009E73",
+    "cascaded_diffusion": "#E69F00",
     "resetting_diffusion": "#0072B2",
     "x_diffusion": "#56B4E9",
     "tissue_diffusion_pretrain": "#009E73",
@@ -335,12 +333,29 @@ METHOD_COLOURS: dict[str, str] = {
     "mrs_quantification": "#0072B2",
     "perfusion_kinetic": "#D55E00",
     "phase_contrast_flow": "#CC79A7",
+    "phase_contrast_recon": "#AA4499",
     # ----- Acquisition-side -----
     "quality_matching": "#999999",
 }
 
 
 _ACTIVE_STYLE = "nature"
+
+
+def select_style(style: str) -> None:
+    """Record the house style later plotters apply, without touching ``rcParams``.
+
+    Report entry points call this; each plotter applies it with :func:`use_default_style`
+    inside :func:`..plotters.dispatch_detailed`, which restores ``rcParams`` afterwards,
+    so a report never restyles figures drawn later in the same process.
+
+    Raises:
+        ValueError: on an unknown style name (no silent fallback).
+    """
+    global _ACTIVE_STYLE
+    if style not in _STYLE_FILES:
+        raise ValueError(f"unknown report style {style!r}; choose from {sorted(_STYLE_FILES)}")
+    _ACTIVE_STYLE = style
 
 
 def use_default_style(style: str | None = None, extra_rc: dict[str, object] | None = None) -> None:
@@ -355,13 +370,10 @@ def use_default_style(style: str | None = None, extra_rc: dict[str, object] | No
     Raises:
         ValueError: on an unknown explicit style name (no silent fallback).
     """
-    global _ACTIVE_STYLE
     if style is None:
         style = _ACTIVE_STYLE
-    elif style not in _STYLE_FILES:
-        raise ValueError(f"unknown report style {style!r}; choose from {sorted(_STYLE_FILES)}")
     else:
-        _ACTIVE_STYLE = style
+        select_style(style)
     style_file = _STYLE_FILES[style]
     if style_file.exists():
         plt.style.use(str(style_file))
@@ -394,6 +406,16 @@ def set_panel_labels(enabled: bool) -> None:
     _PANEL_LABELS_ENABLED = bool(enabled)
 
 
+def panel_letter(index: int) -> str:
+    """Panel letter for the ``index``-th panel: a..z, then aa, ab, ... (never past ``z``)."""
+    letters = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(ord("a") + rem) + letters
+    return letters
+
+
 def panel_label(
     ax,
     letter: str,
@@ -421,11 +443,9 @@ def panel_label(
     )
 
 
-#: Colours an UNREGISTERED method may never be given. Black is the reserved
-#: identity of ``baseline`` / ``zero_filled``: handing it to an unknown method
-#: both loses the distinction between two unknowns and disguises one as the
-#: baseline, which is the single most misreadable thing a comparison figure can do.
-_FALLBACK_PALETTE = [c for c in OKABE_ITO if c != "#000000"]
+# Unregistered methods take the eight validated categorical hues in order; a ninth arm
+# folds to the neutral overflow grey (legend.arm_palette reads this same pool).
+_FALLBACK_PALETTE = list(_TOKEN_CATEGORICAL)
 
 
 def colour_for(method: str, fallback_index: int | None = None) -> str:
@@ -444,7 +464,8 @@ def colour_for(method: str, fallback_index: int | None = None) -> str:
 
     Args:
         method: Method identifier (case-insensitive, underscores allowed).
-        fallback_index: Explicit index into the non-black palette. ``None``
+        fallback_index: Position in the eight categorical hues; eight or more folds to
+            the overflow grey (a ninth hue would fail the colour-blind check). ``None``
             derives a stable index from the method name -- ``crc32``, not
             ``hash()``, because ``hash()`` is salted per process and would give
             one method different colours in two figures of the same report.
@@ -454,8 +475,10 @@ def colour_for(method: str, fallback_index: int | None = None) -> str:
     if registered is not None:
         return registered
     if fallback_index is None:
-        fallback_index = zlib.crc32(key.encode("utf-8"))
-    return _FALLBACK_PALETTE[fallback_index % len(_FALLBACK_PALETTE)]
+        return _FALLBACK_PALETTE[zlib.crc32(key.encode("utf-8")) % len(_FALLBACK_PALETTE)]
+    if fallback_index >= len(_FALLBACK_PALETTE):
+        return _TOKEN_OVERFLOW
+    return _FALLBACK_PALETTE[fallback_index]
 
 
 # Human-readable axis / title labels for the metric keys that appear in the
@@ -622,10 +645,6 @@ def caption_for(plot_id: str, **kwargs) -> str:
             "**Regulatory certificates.** R1 conformal coverage, R2 CHD slack, "
             "R4 pathology-recall lower bound, R5 PAC-Bayes upper bound, V.3 "
             "validation badge. {n_calibration} calibration samples."
-        ),
-        "ablation_strip": (
-            "**Ablation.** {metric} as a function of {axis}; baseline shown "
-            "as a dashed reference line."
         ),
         "run_summary_card": (
             "**Run summary.** Provenance, compute profile, and best validation "

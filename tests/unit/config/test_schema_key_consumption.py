@@ -215,7 +215,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "data.use_async_dataloader",
         "data.known_dataset",
         "data.multi_contrast.negative_sampling",
-        "data.multi_contrast.positive_sampling",
         "data.test_split",
         # Nothing in src/ names `adaptation_rate` at all. It looked consumed
         # until #1294 only because `TrainingState.initialize_ema` listed it in
@@ -311,7 +310,6 @@ KNOWN_UNCONSUMED: frozenset[str] = frozenset(
         "model.trellis_vae.trainer.i_sample",
         "model.trellis_vae.trainer.i_save",
         "mrf.phantom_calibration_path",
-        "mrf.spiral_rotation_schedule",
         # Unmasked by the mixed-case scanner fix, not newly broken: the old
         # identifier pattern was lowercase-only and the old YAML counter matched
         # `^\s*([a-z_][a-z0-9_]*)\s*:`, so a key holding a capital was invisible
@@ -639,7 +637,6 @@ class TestReachabilityAwareConsumption:
     #: once it is triaged it moves to the rg-debt ledger with a citation.
     NO_READ_AT_ALL: frozenset[str] = frozenset(
         {
-            "backend_acceleration.cosim_bridge_addr",
             "data.caching",
             "losses.gan.enable_gradient_penalty",
             "metrics.compute_precision_recall",

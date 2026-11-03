@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from spectramr.infrastructure.physics.fft_ops import fft2c
+from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
 from spectramr.models.diffusion.samplers import get_sampler, list_available
 from spectramr.models.diffusion.samplers.posterior_samplers import (
     DDSReconSampler,
@@ -265,3 +265,28 @@ def test_sampler_factory_resolves_aliases() -> None:
     s1 = get_sampler("dps_posterior", n_steps=2)
     s2 = get_sampler("DPSPosterior", n_steps=2)
     assert type(s1) is type(s2)
+
+
+@pytest.mark.parametrize("mode", ["adaptive_step", "ncchi"])
+def test_dynamic_dps_guidance_step_independent_of_batch(mode: str) -> None:
+    """#2367: a batch of identical copies takes the same step as one image."""
+    torch.manual_seed(0)
+    x = torch.rand(1, 1, 16, 16)
+    m = torch.zeros(1, 1, 16, 16)
+    m[..., ::4] = 1.0
+
+    def fwd(v):
+        return m * fft2c(v)
+
+    def adj(k):
+        return ifft2c(m * k).real
+
+    y = fwd(x)
+    x0 = x + 0.05 * torch.randn_like(x)
+    s = DynamicDPSSampler(model=_ScoreModelStub(), guidance_mode=mode, sigma=1e-3, n_coils=1)
+    ab = torch.tensor(0.5)
+    d1 = s._guide(x0, fwd, adj, y, ab) - x0
+    xb, yb = x0.repeat(8, 1, 1, 1), y.repeat(8, 1, 1, 1)
+    d8 = s._guide(xb, fwd, adj, yb, ab) - xb
+    for b in range(8):
+        torch.testing.assert_close(d8[b], d1[0], rtol=1e-5, atol=1e-6)

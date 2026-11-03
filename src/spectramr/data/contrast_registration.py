@@ -27,7 +27,6 @@ The target is never modified: its k-space is the measurement data consistency us
 from __future__ import annotations
 
 import math
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -37,9 +36,11 @@ import h5py
 import numpy as np
 import torch
 
+from spectramr.data.datasets.kspace_volume_stack import header_voxel_mm
 from spectramr.data.datasets.m4raw_identity import NEX_AVERAGE_REPETITION, parse_m4raw_file_id
 from spectramr.data.h5_kspace_layout import slice_chunked_kwargs
 from spectramr.infrastructure.physics.fft_ops import fft2c, ifft2c
+from spectramr.infrastructure.physics.m4raw_pseudo_gt import parse_acquisition_header
 from spectramr.infrastructure.physics.repeat_session_registration import (
     require_sitk,
     rigid_transform,
@@ -85,33 +86,6 @@ def lowpass_rss(kspace: torch.Tensor, disc: torch.Tensor) -> np.ndarray:
     """Coil-combined magnitude ``[S, H, W]`` of the k-space inside ``disc``."""
     image = ifft2c(kspace * disc)
     return image.abs().pow(2).sum(1).sqrt().numpy().astype(np.float32)
-
-
-def voxel_spacing(header: Any, height: int, width: int) -> tuple[float, float, float]:
-    """``(slice, row, col)`` spacing in mm from an ISMRMRD header, any namespace form."""
-    text = header.decode() if isinstance(header, bytes) else str(header)
-    root = ET.fromstring(text)
-    space = root.find("{*}encoding/{*}encodedSpace")
-    if space is None:
-        raise ValueError("ismrmrd_header has no encoding/encodedSpace")
-
-    def axis(tag: str, a: str) -> float:
-        return float(space.findtext(f"{{*}}{tag}/{{*}}{a}", "nan"))
-
-    if (axis("matrixSize", "y"), axis("matrixSize", "x")) != (height, width):
-        raise ValueError(
-            f"header matrix {axis('matrixSize', 'y'):.0f}x{axis('matrixSize', 'x'):.0f} "
-            f"does not match kspace {height}x{width}; the pixel spacing would be a guess"
-        )
-    gap = next((el.text for el in root.iter() if el.tag.endswith("spacingBetweenSlices")), None)
-    spacing = (
-        float(gap) if gap else axis("fieldOfView_mm", "z"),
-        axis("fieldOfView_mm", "y") / height,
-        axis("fieldOfView_mm", "x") / width,
-    )
-    if not all(math.isfinite(s) and s > 0 for s in spacing):
-        raise ValueError(f"ismrmrd_header gives no usable voxel spacing: {spacing}")
-    return spacing
 
 
 def _volume(array: np.ndarray, spacing: tuple[float, float, float]) -> Any:
@@ -233,7 +207,12 @@ def register_split(
             with h5py.File(targets[0], "r") as f:
                 target_k = read_kspace(f["kspace"])
                 disc = acs_disc(*target_k.shape[-2:], acs_fraction)
-                spacing = voxel_spacing(f["ismrmrd_header"][()], *target_k.shape[-2:])
+                header = f["ismrmrd_header"][()]
+            xml = header.decode() if isinstance(header, bytes) else str(header)
+            voxel = header_voxel_mm(
+                parse_acquisition_header(xml), *target_k.shape[-2:], targets[0].name
+            )
+            spacing = voxel.voxel_mm
             fixed = lowpass_rss(target_k, disc)
         for ref in refs:
             record: dict[str, Any] = {"subject": subject, "file": ref.name}
@@ -250,7 +229,7 @@ def register_split(
                 records.append(record)
                 continue
             fit = fit_rigid(fixed, lowpass_rss(ref_k, disc), spacing)
-            record.update(asdict(fit), target_file=targets[0].name)
+            record.update(asdict(fit), target_file=targets[0].name, **voxel.provenance())
             if fit.rotation_deg > max_rotation_deg:
                 record["status"] = f"refused: rotation {fit.rotation_deg:.2f} deg"
                 records.append(record)

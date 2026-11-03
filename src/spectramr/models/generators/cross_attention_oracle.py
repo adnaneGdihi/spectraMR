@@ -148,6 +148,8 @@ class CrossAttentionOracleUNet(nn.Module):
         embed_dim: Cross-attention embedding dimension.
         num_heads: Number of attention heads.
         oracle_channels: Channels for the marker residual (2 = real/imag).
+        use_marker: ``False`` builds no cross-attention branch, so the network is the
+            same encoder-decoder run blind: the marker-off control (pitfall #17).
     """
 
     def __init__(
@@ -158,9 +160,13 @@ class CrossAttentionOracleUNet(nn.Module):
         embed_dim: int = 256,
         num_heads: int = 8,
         oracle_channels: int = 2,
+        use_marker: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        if not isinstance(use_marker, bool):
+            raise TypeError(f"use_marker must be a bool, got {use_marker!r}.")
+        self.use_marker = use_marker
 
         if features is None:
             features = [32, 64, 128, 256]
@@ -181,19 +187,17 @@ class CrossAttentionOracleUNet(nn.Module):
         bottleneck_ch = features[-1] * 2
         self.bottleneck = self._conv_block(features[-1], bottleneck_ch)
 
-        # Spatial → token projection for cross-attention
-        self.to_tokens = nn.AdaptiveAvgPool2d((4, 4))
-        self.token_proj = nn.Linear(bottleneck_ch * 16, embed_dim)
-
-        # Cross-attention oracle
-        self.cross_attention = MarkerCrossAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            oracle_channels=oracle_channels,
-        )
-
-        # Token → spatial projection
-        self.from_tokens = nn.Linear(embed_dim, bottleneck_ch * 16)
+        # Marker branch. Off, it is not built: the VF strategy then sees no
+        # ``cross_attention`` attribute and passes no marker, and no parameter idles.
+        if use_marker:
+            self.to_tokens = nn.AdaptiveAvgPool2d((4, 4))
+            self.token_proj = nn.Linear(bottleneck_ch * 16, embed_dim)
+            self.cross_attention = MarkerCrossAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                oracle_channels=oracle_channels,
+            )
+            self.from_tokens = nn.Linear(embed_dim, bottleneck_ch * 16)
 
         # ── Decoder ──
         self.upconvs = nn.ModuleList()
@@ -279,7 +283,7 @@ class CrossAttentionOracleUNet(nn.Module):
         B, C_b, H_b, W_b = h.shape
 
         # ── Cross-Attention (if marker available) ──
-        if marker_residual is not None:
+        if marker_residual is not None and self.use_marker:
             # Spatial → tokens
             tokens = self.to_tokens(h)  # [B, C_b, 4, 4]
             tokens = tokens.flatten(1)  # [B, C_b * 16]

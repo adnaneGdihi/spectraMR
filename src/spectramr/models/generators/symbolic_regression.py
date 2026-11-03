@@ -1,13 +1,13 @@
 """Symbolic Regression Generator for physics-guided MRI signal discovery.
 
-Wraps a neural network backbone around a symbolic regression head that
-discovers interpretable closed-form signal equations. The network provides
-learned features; the symbolic head maps them to a linear combination of
-basis functions (exp, sin, mul, etc.) with dimensional consistency.
+A CNN backbone predicts per-pixel latent physical variables (one per declared unit key); the
+symbolic head combines them through the ``num_symbolic_terms`` selected terms of a dimensionally
+typed library (``symbolic_term_library``), so the closed-form terms are the reconstruction and
+enter the training objective directly.
 
 Reference:
-    Cranmer et al., "Discovering Symbolic Models from Deep Learning
-    with Inductive Biases", NeurIPS 2020.
+    Cranmer, "Interpretable Machine Learning for Science with PySR and SymbolicRegression.jl",
+    arXiv:2305.01582, 2023.
 """
 
 from __future__ import annotations
@@ -17,56 +17,15 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from spectramr.models.generators.symbolic_term_library import (
+    PhysicsSymbolicHead,
+    build_symbolic_spec,
+)
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.registry import register_model
 
 
-class _SymbolicHead(nn.Module):
-    """Learned linear combination of fixed basis functions."""
-
-    def __init__(self, in_dim: int, num_terms: int = 5) -> None:
-        super().__init__()
-        self.num_terms = num_terms
-        # Each term has a learnable coefficient
-        self.coefficients = nn.Parameter(torch.randn(num_terms) * 0.01)
-        # Project input to scalar per term
-        self.projections = nn.ModuleList([nn.Linear(in_dim, 1) for _ in range(num_terms)])
-
-    @staticmethod
-    def _basis(x: torch.Tensor, idx: int) -> torch.Tensor:
-        """Apply basis function by index: 0=identity, 1=exp, 2=sin, 3=square, 4=recip."""
-        if idx == 0:
-            return x
-        elif idx == 1:
-            return torch.exp(-x.abs().clamp(max=10))
-        elif idx == 2:
-            return torch.sin(x)
-        elif idx == 3:
-            return x**2
-        else:
-            return 1.0 / (x.abs() + 1e-6)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """forward method for _SymbolicHead.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        result = torch.zeros_like(x[:, :1])
-        for i in range(self.num_terms):
-            proj = self.projections[i](x)  # [B*HW, 1]
-            result = result + self.coefficients[i] * self._basis(proj, i % 5)
-        return result
-
-
-@register_model(name="symbolic_regression", training_mode="reconstruction")
+@register_model(name="symbolic_regression", training_mode="reconstruction", strict_kwargs=True)
 class SymbolicRegressionGenerator(IGenerator, nn.Module):
     """Neural backbone + symbolic regression head for MRI signal discovery."""
 
@@ -74,15 +33,17 @@ class SymbolicRegressionGenerator(IGenerator, nn.Module):
         self,
         in_channels: int = 2,
         out_channels: int = 2,
-        **kwargs: Any,
+        feature_dim: int = 64,
+        num_layers: int = 8,
+        num_symbolic_terms: int = 5,
+        type: str = "PhysicsPySR",
+        constraints: dict[str, Any] | None = None,
+        allowed_operators: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-
-        feature_dim: int = kwargs.get("feature_dim", 64)
-        num_layers: int = kwargs.get("num_layers", 8)
-        num_terms: int = kwargs.get("num_symbolic_terms", 5)
+        spec = build_symbolic_spec(type, constraints, allowed_operators, num_symbolic_terms)
 
         # CNN backbone for feature extraction
         self.intro = nn.Conv2d(in_channels, feature_dim, 3, padding=1)
@@ -96,10 +57,13 @@ class SymbolicRegressionGenerator(IGenerator, nn.Module):
                 ]
             )
         self.backbone = nn.Sequential(*layers)
-
-        # Symbolic head operates per-pixel
-        self.symbolic_head = _SymbolicHead(feature_dim, num_terms)
+        self.symbolic_head = PhysicsSymbolicHead(feature_dim, spec)
         self.out_proj = nn.Conv2d(1, out_channels, 1)
+
+    @property
+    def solver_record(self) -> dict[str, Any]:
+        """The symbolic head's declaration and term library, stamped into provenance."""
+        return self.symbolic_head.spec.record()
 
     @property
     def name(self) -> str:
@@ -118,14 +82,8 @@ class SymbolicRegressionGenerator(IGenerator, nn.Module):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        B, C, H, W = x.shape
-        h = self.intro(x)
-        h = self.backbone(h)  # [B, D, H, W]
-        # Flatten spatial for symbolic head
-        h_flat = h.permute(0, 2, 3, 1).reshape(B * H * W, -1)
-        sym_out = self.symbolic_head(h_flat)  # [B*HW, 1]
-        sym_out = sym_out.reshape(B, H, W, 1).permute(0, 3, 1, 2)
-        return self.out_proj(sym_out)
+        h = self.backbone(self.intro(x))  # [B, D, H, W]
+        return self.out_proj(self.symbolic_head(h))
 
     def generate(self, z: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         return self.forward(z, **kwargs)

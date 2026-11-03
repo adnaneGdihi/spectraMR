@@ -178,3 +178,20 @@ def test_dp_metrics_includes_canonical_keys() -> None:
     metrics = host.dp_metrics()
     for key in ("dp/epsilon", "dp/delta", "dp/steps", "dp/noise_multiplier", "dp/max_grad_norm"):
         assert key in metrics
+
+
+def test_restore_dp_steps_matches_live_ledger_and_refuses_overwrite() -> None:
+    """A restored step count reproduces the live epsilon; restoring onto a used ledger raises."""
+    live, resumed = _Host(), _Host()
+    for host in (live, resumed):
+        host.configure_dp(noise_multiplier=1.1, max_grad_norm=1.0, sample_rate=0.05)
+    for _ in range(5):
+        live.record_dp_step()
+    resumed.restore_dp_steps(5)
+    assert resumed.accountant.steps == 5
+    assert resumed.get_epsilon() == pytest.approx(live.get_epsilon(), rel=1e-12)
+    resumed.restore_dp_steps(5)  # idempotent at the same count
+    with pytest.raises(RuntimeError, match="already at 5"):
+        resumed.restore_dp_steps(9)
+    with pytest.raises(RuntimeError, match="disabled"):
+        _Host().restore_dp_steps(1)

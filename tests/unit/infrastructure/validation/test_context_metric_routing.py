@@ -33,8 +33,12 @@ def test_the_shared_validation_path_routes_the_sense_metrics() -> None:
 
 
 def test_the_shared_path_still_refuses_a_metric_whose_needs_it_cannot_fill() -> None:
-    """``ndcr`` needs the sampling mask, which ``SUPPLIED_FIELDS`` does not carry."""
-    assert unrouted_context_metrics(ReconstructionTrainingStrategy, ["ndcr"]) == ["ndcr"]
+    """``fmrs`` needs a reconstructor, which ``SUPPLIED_FIELDS`` does not carry."""
+    assert unrouted_context_metrics(ReconstructionTrainingStrategy, ["fmrs"]) == ["fmrs"]
+
+
+def test_the_shared_path_routes_the_held_out_line_metric() -> None:
+    assert unrouted_context_metrics(ReconstructionTrainingStrategy, ["unacquired_bin_nrmse"]) == []
 
 
 def test_diffusion_routes_its_trust_functionals_and_nothing_else() -> None:

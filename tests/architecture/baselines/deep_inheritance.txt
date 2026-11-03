@@ -123,6 +123,7 @@ PaDNetTrainingStrategy  # depth 4
 PairedSynthesisStrategy  # depth 4
 PerfusionKineticMappingStrategy  # depth 4
 PhaseContrastFlowStrategy  # depth 4
+PhaseContrastReconStrategy  # depth 3
 PhysResidualConformalStrategy  # depth 3
 PhysicsDrivenTrainingStrategy  # depth 4
 PhysicsEquivariantSSLStrategy  # depth 3

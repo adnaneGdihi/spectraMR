@@ -18,8 +18,9 @@ from pathlib import Path
 import pytest
 import torch
 
+import spectramr.data.datasets.kspace_volume_stack as kio
+import spectramr.data.datasets.pseudo_gt_reference as pgt
 import spectramr.infrastructure.physics.coil_sensitivity as csm_mod
-import spectramr.infrastructure.physics.m4raw_pseudo_gt as pgt
 
 
 @pytest.fixture()
@@ -28,10 +29,11 @@ def fake_kspace(monkeypatch):
     torch.manual_seed(0)
     ks = torch.complex(torch.randn(3, 2, 8, 8), torch.randn(3, 2, 8, 8))
 
-    def _load(_path: Path) -> torch.Tensor:
-        return ks
+    def _load(_path: Path, slice_index: int | None = None) -> torch.Tensor:
+        return ks if slice_index is None else ks[slice_index]
 
-    monkeypatch.setattr(pgt, "_load_kspace_from_h5", _load)
+    monkeypatch.setattr(kio, "kspace_shape_from_h5", lambda _p: tuple(ks.shape))
+    monkeypatch.setattr(kio, "load_kspace_from_h5", _load)
     return ks
 
 
@@ -52,7 +54,7 @@ def test_espirit_failure_warns_not_silent(fake_kspace, monkeypatch, caplog) -> N
 
     monkeypatch.setattr(csm_mod, "estimate_csm_espirit", _boom)
 
-    with caplog.at_level("ERROR", logger=pgt.logger.name):
+    with caplog.at_level("ERROR", logger="spectramr"):
         coil_images, smaps, x_gt_mag, _p99 = pgt.synthesize_pseudo_gt(
             [Path("r1.h5"), Path("r2.h5")]
         )
@@ -78,7 +80,7 @@ def test_espirit_success_emits_no_rss_warning(fake_kspace, monkeypatch, caplog) 
 
     monkeypatch.setattr(csm_mod, "estimate_csm_espirit", _ok)
 
-    with caplog.at_level("WARNING", logger=pgt.logger.name):
+    with caplog.at_level("WARNING", logger="spectramr"):
         _ci, smaps, x_gt_mag, _p99 = pgt.synthesize_pseudo_gt(
             [Path("r1.h5"), Path("r2.h5")]
         )

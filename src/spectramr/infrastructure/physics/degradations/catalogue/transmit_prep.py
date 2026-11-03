@@ -76,6 +76,7 @@ def imperfect_fat_sat_volume(
     fat_map: Tensor | None = None,
     b0_map_hz: Tensor | None = None,
     band_hz: float = BAND_HZ,
+    max_db0_hz: float = MAX_DB0_HZ,
 ) -> Tensor:
     """``x`` (the water image) plus residual fat ``F (1 - eta)``, ``eta = exp(-(dB0 / w)^2)``.
 
@@ -99,7 +100,7 @@ def imperfect_fat_sat_volume(
         batch, shape, generator=_generator(x.device, _fat_seed(seed)), device=x.device
     )
     if b0_map_hz is None:
-        db0 = theta * MAX_DB0_HZ * s_b0
+        db0 = theta * max_db0_hz * s_b0
     else:
         db0 = theta * torch.as_tensor(b0_map_hz, device=x.device)
     if fat_map is None:
@@ -132,6 +133,7 @@ def imperfect_inversion_volume(
     *,
     qmaps: Mapping[str, Any] | None = None,
     ti_ms: float | None = None,
+    max_inefficiency: float = MAX_INEFFICIENCY,
 ) -> Tensor:
     """``x`` (the ideal-inversion IR image) plus ``pd (|Mz(kappa)| - |Mz(1)|)``.
 
@@ -149,7 +151,7 @@ def imperfect_inversion_volume(
         return x
     t1 = torch.as_tensor(t1, device=x.device)
     pd = torch.as_tensor(pd, device=x.device)
-    kappa = 1.0 - MAX_INEFFICIENCY * theta
+    kappa = 1.0 - max_inefficiency * theta
     delta = pd * (inversion_signal(kappa, ti_ms, t1).abs() - inversion_signal(1.0, ti_ms, t1).abs())
     return x + delta * _in_phase(x)
 

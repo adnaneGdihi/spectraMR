@@ -208,18 +208,6 @@ def make_certificate_paths():
     return {"r1_path": d / "r1.json"}
 
 
-def make_acquisition_arms():
-    from spectramr.infrastructure.reporting.plotters.learnable_acquisition_pareto import (
-        ArmResult,
-    )
-
-    return [
-        ArmResult("full", 0.5, 33.0, 0.92),
-        ArmResult("mid", 0.25, 31.0, 0.88),
-        ArmResult("low", 0.125, 28.0, 0.82),
-    ]
-
-
 def make_slice_df(n_arms: int = 3, n_subjects: int = 6, n_slices: int = 8) -> Any:
     """Long per-slice rows (``Arms.per_case`` schema) for the distribution figures."""
     import pandas as pd
@@ -239,6 +227,11 @@ def make_slice_df(n_arms: int = 3, n_subjects: int = 6, n_slices: int = 8) -> An
                     "mae": float(abs(rng.normal(0.05, 0.01))),
                     "bias_squared": float(np.exp(rng.normal(-7, 0.6))),
                     "rep_variance": float(np.exp(rng.normal(-7, 0.6))),
+                    # the network's input scored the same way, and error per k-space band
+                    "zf_psnr": base - (2.5 + a) + rng.normal(0, 0.8),
+                    "zf_ssim": float(np.clip(0.2 + 0.02 * base + rng.normal(0, 0.03), 0, 1)),
+                    **{f"band_corrected_mse_{b}": float(np.exp(rng.normal(mu - 0.3 * a, 0.4)))
+                       for b, mu in (("low", -9.0), ("mid", -7.5), ("high", -6.5))},
                 }
                 rows += [
                     {

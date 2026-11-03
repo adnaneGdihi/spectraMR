@@ -120,6 +120,13 @@ _BUILD_KWARGS: dict[str, dict] = {
     "graph_encoding": {},
     "hardware_unwarp": {"artifact_path": _identity_hardware_warp_artifact()},
     "simulate_ulf_from_qmaps": {"b0_source": 3.0},
+    "mrf_spiral_trajectory_sim": {
+        "schedule": "golden_angle",
+        "n_timepoints": 8,
+        "seed": 0,
+        "frames_per_input": 2,
+        "n_interleaves": 4,
+    },
 }
 
 
@@ -250,9 +257,26 @@ class TestEveryRegisteredTransformReachesBothChains:
         )
         from tests.utils.data_config_stub import DataConfigStub
 
+        # Kwargs a run-level block owns travel through that block, as in production.
+        owned = getattr(TRANSFORM_REGISTRY[name].cls, "RUN_BLOCK_KWARGS", None) or {}
+        blocks: dict[str, dict] = {}
+        for kwarg, (block, field_name) in owned.items():
+            blocks.setdefault(block, {})[field_name] = kwargs[kwarg]
+        kwargs = {k: v for k, v in kwargs.items() if k not in owned}
         cfg = DataConfigStub(
             processing=DataProcessingConfigSchema(transforms=[{"name": name, "kwargs": kwargs}])
         )
+        if owned:
+            from types import SimpleNamespace
+
+            from spectramr.data.builders.torchio_transform_builder import _DataWithRunBlocks
+
+            cfg = _DataWithRunBlocks(
+                cfg,
+                undersampling=None,
+                physics=None,
+                **{b: SimpleNamespace(**f) for b, f in blocks.items()},
+            )
         return build(TorchIOTransformConfig.from_training_config(cfg))
 
     @pytest.mark.parametrize("name", sorted(TRANSFORM_REGISTRY))

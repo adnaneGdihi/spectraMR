@@ -5,7 +5,7 @@ This is phase-contrast MRI, **not** flow matching (see
 
 The vertical it completes: real physics
 (``infrastructure/physics/signal_models/flow_encoding``), a registered
-``phase_contrast`` operator, FLOW-tagged losses and metrics have all existed
+``phase_contrast`` signal model, FLOW-tagged losses and metrics have all existed
 since the EVAL_ONLY -> PARTIAL promotion, but nothing trainable consumed them —
 so ``mri_flow`` could not honestly claim LIVE.
 
@@ -23,8 +23,9 @@ import torch
 
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.infrastructure.physics.signal_models.flow_encoding import (
-    four_point_reference_decode,
-    four_point_reference_encode,
+    encoding_directions,
+    referenced_decode_phases,
+    referenced_encode,
 )
 from spectramr.models.capabilities import StrategyCapabilities
 
@@ -34,21 +35,45 @@ from .reconstruction import ReconstructionTrainingStrategy
 _COMPONENT_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
-def encode_velocity_four_point(velocity: torch.Tensor, venc: float) -> torch.Tensor:
-    """``[B, 3, H, W]`` velocity -> ``[B, 4, H, W]`` four-point phases.
+#: Terminal activations that bound the output, which a velocity in m/s must not have.
+_BOUNDED_ACTIVATIONS = {
+    "tanh": torch.nn.Tanh,
+    "sigmoid": torch.nn.Sigmoid,
+    "hardtanh": torch.nn.Hardtanh,
+}
 
-    A thin channel-first adapter over
-    :func:`~spectramr.infrastructure.physics.signal_models.flow_encoding.four_point_reference_encode`,
-    which operates on the LAST axis (``[..., 3] -> [..., 4]``). Kept as a
-    module-level pure function so the permute is unit-testable without building
-    a strategy.
-    """
-    return four_point_reference_encode(velocity.permute(0, 2, 3, 1), venc).permute(0, 3, 1, 2)
+
+def encode_velocity_four_point(velocity: torch.Tensor, venc: float) -> torch.Tensor:
+    """``[B, 3, *spatial]`` velocity -> ``[B, 4, *spatial]`` four-point phases (channel axis)."""
+    return referenced_encode(velocity, venc, "four_point_reference", dim=1)
 
 
 def decode_velocity_four_point(phases: torch.Tensor, venc: float) -> torch.Tensor:
-    """``[B, 4, H, W]`` four-point phases -> ``[B, 3, H, W]`` velocity."""
-    return four_point_reference_decode(phases.permute(0, 2, 3, 1), venc).permute(0, 3, 1, 2)
+    """``[B, 4, *spatial]`` four-point phases -> ``[B, 3, *spatial]`` velocity, re-wrapped."""
+    return referenced_decode_phases(phases, venc, "four_point_reference", dim=1)
+
+
+def bounded_velocity_output(
+    declared_units: str | None, output_activation: str | None, generator: Any
+) -> str | None:
+    """Why a generator cannot emit velocity in m/s, or None.
+
+    A model that declares other units, or ends in a bounded activation, would
+    clip every velocity and void both the encoding and the unwrap hinge. An
+    undeclared model passes: no registered generator declares velocity units yet.
+    The last-module test reads registration order, so it catches the common
+    ``Sequential(..., Tanh())`` / ``self.final_act`` shapes, not every forward.
+    """
+    if declared_units is not None and declared_units != "m/s":
+        return f"the model declares output_field_units={declared_units!r}, not 'm/s'"
+    if output_activation is not None and output_activation.lower() in _BOUNDED_ACTIVATIONS:
+        return f"model.output_activation={output_activation!r} bounds the output"
+    if generator is None:
+        return None
+    leaves = [m for m in generator.modules() if not any(True for _ in m.children())]
+    if leaves and isinstance(leaves[-1], tuple(_BOUNDED_ACTIVATIONS.values())):
+        return f"the generator's last module is {type(leaves[-1]).__name__}"
+    return None
 
 
 class PhaseContrastFlowStrategy(ReconstructionTrainingStrategy):
@@ -64,13 +89,11 @@ class PhaseContrastFlowStrategy(ReconstructionTrainingStrategy):
         - ``inlet_mask`` / ``outlet_mask``: ``[B, 1, H, W]``, if flux_conservation
     """
 
-    #: The trainable backing for the mri_flow regime's LIVE claim. Velocity IS
-    #: the estimated physical parameter, hence PARAMETER_MAPPING; RECONSTRUCTION
-    #: is declared because the profile supports it and the same objective serves
-    #: an undersampled-flow recon arm.
+    #: Velocity IS the estimated physical parameter, hence PARAMETER_MAPPING.
+    #: Reconstruction from undersampled k-space is PhaseContrastReconStrategy's.
     capabilities: ClassVar[StrategyCapabilities] = StrategyCapabilities(
         workflows=frozenset({Regime.FLOW}),
-        tasks=frozenset({Task.PARAMETER_MAPPING, Task.RECONSTRUCTION}),
+        tasks=frozenset({Task.PARAMETER_MAPPING}),
     )
 
     def _setup_strategy_specific_components(self) -> None:
@@ -90,13 +113,35 @@ class PhaseContrastFlowStrategy(ReconstructionTrainingStrategy):
         self._through_plane_index = _COMPONENT_INDEX[pc.through_plane_axis]
         self._flux_conservation = bool(pc.flux_conservation)
 
+        self._encoding_scheme = pc.encoding_scheme
+        n_dir = encoding_directions(self._encoding_scheme)
         out_channels = int(getattr(self.config.model, "out_channels", 0))
-        if out_channels != 3:
+        if out_channels != n_dir:
             raise ValueError(
-                "PhaseContrastFlowStrategy predicts a 3-component velocity field "
-                f"(vx, vy, vz); got model.out_channels={out_channels}. A "
+                f"PhaseContrastFlowStrategy predicts a {n_dir}-component velocity field "
+                f"({self._encoding_scheme}); got model.out_channels={out_channels}. A "
                 "1-channel generator would broadcast silently into the velocity "
                 "losses and grade a scalar against a vector field."
+            )
+        in_channels = int(getattr(self.config.model, "in_channels", 0))
+        if in_channels != n_dir + 1:
+            raise ValueError(
+                f"{self._encoding_scheme} yields {n_dir + 1} encoded phases per voxel; "
+                f"got model.in_channels={in_channels}."
+            )
+        from spectramr.models.registry import get_model_capabilities
+
+        caps = get_model_capabilities(self.config.model.model_type)
+        reason = bounded_velocity_output(
+            getattr(caps, "output_field_units", None),
+            getattr(self.config.model, "output_activation", None),
+            getattr(self.env, "generator", None),
+        )
+        if reason is not None:
+            raise ValueError(
+                f"PhaseContrastFlowStrategy needs velocity in m/s, but {reason}. "
+                "phi = pi * v / venc and the |v| > venc hinge are meaningless on a "
+                "bounded or rescaled output."
             )
 
         cfg = getattr(self.config.training, "phase_contrast", None)

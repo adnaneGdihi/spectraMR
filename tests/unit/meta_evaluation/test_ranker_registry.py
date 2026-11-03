@@ -271,3 +271,13 @@ def test_from_registry_runs_end_to_end(metric_set, clean_volumes) -> None:
     assert "flagged_pairs" in red
     assert red["threshold"] == pytest.approx(0.95)
     assert "ranker_redundancy" in out.to_summary()
+
+
+def test_opt_in_ranker_is_registered_but_never_pooled(clean_registry) -> None:
+    pool_before = [s.name for s in available_rankers()]
+    register_ranker("dummy_opt_in", generation=5, opt_in=True)(_DummyRanker)
+    assert get_ranker("dummy_opt_in").opt_in
+    assert [s.name for s in available_rankers()] == pool_before
+    assert [s.name for s in available_rankers(have_likert=True, have_task_net=True)].count(
+        "dummy_opt_in"
+    ) == 0

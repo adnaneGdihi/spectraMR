@@ -54,10 +54,11 @@ class FlowMatchingStrategy(DiffusionTrainingStrategy):
     introspection, no ``except TypeError`` swallow).
     """
 
-    #: Loss ownership (issue #1918). mse_loss(pred, u_t) regresses the VELOCITY FIELD, not the target image;
-    #: the hook does not route to the builder's losses.
+    #: Loss ownership (issue #1918). mse_loss(pred, u_t) regresses the VELOCITY FIELD; declared
+    #: ``losses.image_losses`` are folded onto the endpoint estimate x_t + (1 - t) * v.
     inline_losses: ClassVar[frozenset[str]] = frozenset()
-    folds_image_losses: ClassVar[bool] = False
+    folds_image_losses: ClassVar[bool] = True
+    empty_loss_stack_is_design: ClassVar[bool] = True
 
     def _compute_losses_impl(
         self,
@@ -151,7 +152,12 @@ class FlowMatchingStrategy(DiffusionTrainingStrategy):
             pred = gen(x_t)
 
         loss = func.mse_loss(pred, u_t)
-        return {"loss_total": loss, "loss_fm_velocity": loss.detach()}
+        # Endpoint estimate on the straight path: x_t + (1 - t) * v is x1 when v = x1 - x0.
+        components = {"loss_fm_velocity": loss.detach()}
+        aux = self._apply_builder_image_losses(x_t + (1 - t) * pred, x1, components)
+        if aux is not None:
+            loss = loss + aux
+        return {"loss_total": loss, **components}
 
     @torch.no_grad()
     def sample(

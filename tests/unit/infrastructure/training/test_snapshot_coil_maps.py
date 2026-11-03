@@ -56,23 +56,19 @@ def test_an_odd_real_channel_count_is_refused() -> None:
 
 
 def test_the_snapshot_writes_the_per_coil_grid(tmp_path) -> None:
-    """Wiring: ``save_debug_snapshot`` routes ``coil_maps`` through the grid, not the RSS preview."""
+    """Wiring: the snapshot writer routes ``coil_maps`` through the grid, not the RSS preview."""
     from PIL import Image
 
-    from spectramr.infrastructure.training.debug_snapshot import save_debug_snapshot
-    from tests.unit.infrastructure.training.test_debug_snapshot import _make_logging, _reset_budget
+    from spectramr.core import snapshot_trace as st
+    from spectramr.infrastructure.training.snapshot.writer import TraceWriter
 
     assert "coil_maps" in COIL_MAP_KEYS
-    _reset_budget()
-    out = save_debug_snapshot(
-        run_dir=tmp_path,
-        step=0,
-        tag="coil",
-        tensors={"coil_maps": _maps(size=16)},
-        paradigm="Test",
-        config_section=_make_logging(),
-    )
-    with Image.open(out / "coil_maps.png") as png:
+    trace = st.SnapshotTrace(phase="train", step=0)
+    with st.active(trace):
+        st.record("batch", "input_raw", {"coil_maps": _maps(size=16)})
+    TraceWriter(tmp_path).write(trace, {})
+    (png_path,) = tmp_path.rglob("*coil_maps.png")
+    with Image.open(png_path) as png:
         width, height = png.size
     # nrow=4 with torchvision's 2-px padding: 4 tiles wide, 3 rows (mags, phases, rss).
     assert width == 4 * 16 + 5 * 2

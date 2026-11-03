@@ -55,6 +55,11 @@ from spectramr.data.annotations.fastmri_plus import LesionBox, YOrigin, pooled_l
 from spectramr.data.annotations.fastmri_plus_classes import LesionGroup, is_poolable
 from spectramr.data.annotations.manifest_qc import verify_approval
 from spectramr.data.annotations.matched_control import sample_matched_controls
+from spectramr.data.datasets.contrast_grid import (
+    ContrastMismatchError,
+    brain_filename_contrast,
+    resolve_brain_contrast,
+)
 from spectramr.data.io_strategies import FastMRIH5Strategy
 from spectramr.data.regions.mask_cache import RegionMaskCache
 from spectramr.data.regions.region_registry import REGION_SPECS, RegionTier, region_spec
@@ -113,10 +118,6 @@ class QCNotApprovedError(RuntimeError):
     """The fastMRI+ manifest's y-origin has not been confirmed by a human."""
 
 
-class ContrastMismatchError(ValueError):
-    """The h5 ``acquisition`` attr and the filename disagree."""
-
-
 class CohortDropError(RuntimeError):
     """Too many records were dropped for the surviving cohort to be representative."""
 
@@ -152,21 +153,18 @@ def _check_mask_grid(file_id: str, mask_shape: tuple[int, ...], image_hw: tuple[
 
 
 def acquisition_from_filename(file_id: str) -> str:
-    """Exact underscore-token match -- never a substring test.
+    """Exact underscore-token match -- never a substring test -- restricted to the allow-list.
 
     ``"AXT1" in "file_brain_AXT1POST_201.h5"`` is True, which would label a
     post-contrast scan as pre-contrast and quietly merge two contrasts into one
-    cell of the anatomy axis.
+    cell of the anatomy axis. The token parse is owned by ``contrast_grid``.
     """
-    tokens = set(Path(file_id).stem.split("_"))
-    found = [a for a in ALLOWED_ACQUISITIONS if a in tokens]
-    if len(found) != 1:
+    found = brain_filename_contrast(file_id)
+    if found not in ALLOWED_ACQUISITIONS:
         raise ContrastMismatchError(
-            f"{file_id!r} contains {len(found)} recognised acquisition tokens "
-            f"({found}); expected exactly 1 of {list(ALLOWED_ACQUISITIONS)}. Tokens "
-            f"found: {sorted(tokens)}."
+            f"{file_id!r}: acquisition {found!r} is not one of {list(ALLOWED_ACQUISITIONS)}."
         )
-    return found[0]
+    return found
 
 
 class FastMRIBrainSource:
@@ -318,26 +316,9 @@ class FastMRIBrainSource:
         return iter(self._eligible)
 
     def _resolve_contrast(self, file_id: str, metadata: Mapping[str, object]) -> str:
-        """Header vs filename. Disagreement raises -- guessing is a silent fallback."""
-        from_name = acquisition_from_filename(file_id)
-
+        """Header vs filename through the one resolver; disagreement raises."""
         raw = metadata.get("acquisition")
-        if raw is None:
-            # No attr to cross-check against. The filename token is still an exact
-            # match, so this is usable -- but say so rather than pretending we
-            # verified it.
-            return from_name
-
-        from_attr = raw.decode() if isinstance(raw, bytes) else str(raw)
-        from_attr = from_attr.strip()
-        if from_attr != from_name:
-            raise ContrastMismatchError(
-                f"{file_id}: the h5 'acquisition' attr says {from_attr!r} but the "
-                f"filename token says {from_name!r}. A file whose header and name "
-                "disagree about its contrast has broken provenance, and picking one "
-                "to believe would be a silent fallback. Fix the file or exclude it."
-            )
-        return from_attr
+        return resolve_brain_contrast(file_id, raw if raw is None or isinstance(raw, bytes) else str(raw))
 
     def _boxes(self, rec: dict) -> list[LesionBox]:
         return [
@@ -486,6 +467,8 @@ class FastMRIBrainSource:
                 contrast=contrast,
                 file_id=file_id,
                 slice_index=slice_index,
+                # fastMRI de-identifies patients; one file is the finest subject unit known.
+                subject_id=file_id,
                 kspace=loaded.get("kspace"),
                 region_masks=masks,
                 provenance={

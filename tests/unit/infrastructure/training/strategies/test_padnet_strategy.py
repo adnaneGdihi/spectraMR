@@ -194,28 +194,11 @@ def test_compute_losses_impl_missing_predict_q_maps(strategy, mock_env):
 
 
 class TestModelInputContract:
-    """Non-negotiable 14, wrong in the OPPOSITE direction to the family.
-
-    PaDNet subclasses ``DiffusionTrainingStrategy`` and so inherited
-    ``snapshot_prepared_is_model_input = False`` + ``snapshot_model_input_tag =
-    "diffusion_step"`` — the cold-diffusion carve-out for a forward process it
-    does not run. Every PaDNet artifact therefore *under-claimed* an honest
-    snapshot and pointed readers at a ``diffusion_step`` that neither exists nor
-    should. The six sibling fixes add a declaration; this one removes a lie.
-    """
-
-    def test_declares_prepared_is_the_model_input(self):
-        assert PaDNetTrainingStrategy.snapshot_prepared_is_model_input is True
-        assert PaDNetTrainingStrategy.snapshot_model_input_tag is None
+    """PaDNet subclasses ``DiffusionTrainingStrategy`` but runs no forward process."""
 
     def test_the_network_receives_input_batch_verbatim(self, strategy, mock_env):
-        """The claim above is only honest because nothing degrades the input.
-
-        This is the assertion that earns the ``True``: ``input_batch`` reaches
-        ``predict_q_maps`` unchanged, and the Bloch physics happen downstream on
-        the PREDICTED q-maps. Asserting the flag without asserting this would
-        pin the declaration to itself.
-        """
+        """``input_batch`` reaches ``predict_q_maps`` unchanged; the Bloch physics
+        happen downstream on the PREDICTED q-maps."""
         seen = {}
 
         def _predict_q_maps(x):
@@ -232,29 +215,7 @@ class TestModelInputContract:
             batch={"tr": 500.0, "te": 10.0},
         )
 
-        assert seen["x"] is input_batch, (
-            "PaDNet must feed input_batch verbatim; anything else would make "
-            "snapshot_prepared_is_model_input=True a false claim"
-        )
-
-    def test_no_declaration_is_stashed(self, strategy, mock_env):
-        """`True` and a stashed declaration would contradict each other.
-
-        The wrapper returns early on ``snapshot_prepared_is_model_input`` and
-        would never emit a stashed tensor, so a declaration here would be dead
-        weight that silently pinned one step's activations.
-        """
-        mock_env.generator.predict_q_maps = lambda x: torch.randn(1, 3, 32, 32, requires_grad=True)
-        strategy._declared_model_input = None
-
-        strategy._compute_losses_impl(
-            torch.randn(1, 1, 32, 32),
-            torch.randn(1, 1, 32, 32),
-            0,
-            batch={"tr": 500.0, "te": 10.0},
-        )
-
-        assert strategy._declared_model_input is None
+        assert seen["x"] is input_batch, "PaDNet must feed input_batch verbatim"
 
 
 def test_it_declares_its_own_loss_ownership() -> None:

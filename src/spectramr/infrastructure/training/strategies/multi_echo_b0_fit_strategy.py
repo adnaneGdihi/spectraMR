@@ -33,10 +33,7 @@ import torch.nn.functional as F
 from spectramr.config.schemas.enums import Regime, Task
 from spectramr.core.metrics.b0_field_rmse import B0FieldRMSE
 from spectramr.data.batch_types import read_batch_field
-from spectramr.infrastructure.physics.b0_mapping import (
-    estimate_b0_tikhonov,
-    phase_difference,
-)
+from spectramr.infrastructure.physics.b0_mapping import estimate_b0_tikhonov
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.models.capabilities import StrategyCapabilities
 
@@ -98,25 +95,25 @@ class MultiEchoB0FitStrategy(BaseTrainingStrategy):
         return echoes
 
     def _fit_b0(self, echoes: torch.Tensor) -> torch.Tensor:
-        """Analytic ΔB0 (Hz) from the first two echoes.
+        """Analytic ΔB0 (Hz) from the first two echoes, in the GRE convention.
 
-        ``map_b0`` (phase_difference + estimate_b0_tikhonov) is written per image
-        (global median + squeeze), so we loop over the batch. The CG solve is
-        differentiable, so gradients flow back to the echoes.
+        ``Δf = +angle(E2 · conj(E1)) / (2π·ΔTE)`` with the global offset kept, the
+        convention of the reference map (``extract_oracle_bssfp.b0_hz_from_dual_echo``).
+        ``phase_difference`` is not used: its per-image median centring drops the mean
+        off-resonance. ``estimate_b0_tikhonov`` uses the readout-shift sign
+        (alpha = -2π·t_shift) and is linear in φ, so negating its output gives alpha = +2π·ΔTE.
+        It is written per image (squeeze), so the CG solve loops over the batch.
         """
-        e0 = echoes[:, 0:1]
-        e1 = echoes[:, 1:2]
-        maps = []
-        for b in range(echoes.shape[0]):
-            phi = phase_difference(e0[b : b + 1], e1[b : b + 1])
-            maps.append(
-                estimate_b0_tikhonov(
-                    phi,
-                    self._t_shift,
-                    gamma=self._gamma,
-                    max_cg_iterations=self._max_cg,
-                )
+        phi = torch.angle(echoes[:, 1:2] * torch.conj(echoes[:, 0:1]))
+        maps = [
+            -estimate_b0_tikhonov(
+                phi[b : b + 1],
+                self._t_shift,
+                gamma=self._gamma,
+                max_cg_iterations=self._max_cg,
             )
+            for b in range(echoes.shape[0])
+        ]
         return torch.cat(maps, dim=0)  # [B, 1, H, W] real Hz
 
     @staticmethod

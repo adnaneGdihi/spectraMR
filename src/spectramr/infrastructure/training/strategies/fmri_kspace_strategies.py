@@ -2,10 +2,9 @@
 
 * :class:`SpatiotemporalAdaptiveSFCReconStrategy`
   (``spatiotemporal_adaptive_sfc_recon``) — 4D Beltrami SFC over the
-  ``(x, y, z, t)`` BOLD volume. The strategy invokes
-  :class:`SeparableBeltrami4DSolver` to recover the joint warp, and
-  combines an L1 reconstruction loss with a Beltrami regulariser and
-  a temporal-smoothness term.
+  ``(x, y, z, t)`` BOLD volume. The strategy combines a weighted L1
+  reconstruction loss with a Beltrami regulariser and a temporal-smoothness
+  term on the :class:`SeparableBeltrami4DSolver` time warp.
 
 * :class:`BeltramiEPIDistortionStrategy`
   (``beltrami_epi_distortion``) — estimates the susceptibility-driven
@@ -38,6 +37,7 @@ from spectramr.infrastructure.physics.manifolds.beltrami_4d import (
 )
 from spectramr.infrastructure.training.builders.environment import TrainingEnvironment
 from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
+from spectramr.infrastructure.training.strategies.loss_folding import declared_loss_weights
 from spectramr.models.capabilities import StrategyCapabilities
 
 
@@ -46,8 +46,8 @@ class SpatiotemporalAdaptiveSFCReconStrategy(BaseTrainingStrategy):
 
     Treats ``input_batch`` as ``[B, C, T, H, W]`` BOLD-volume features
     and runs the generator over the spatial slices with a Beltrami
-    regularisation term computed from a small μ-head and a separable
-    4D Beltrami solver.
+    regularisation term computed from the output gradient and the separable
+    4D Beltrami time warp. No scan order is built (#2363).
     """
 
     #: The whole objective is inline: an L1 fidelity term plus the two Beltrami
@@ -60,7 +60,13 @@ class SpatiotemporalAdaptiveSFCReconStrategy(BaseTrainingStrategy):
         cfg = getattr(self.config.training, "spatiotemporal_adaptive_sfc_recon", None)
         self.lambda_mu = float(getattr(cfg, "lambda_mu", 0.01)) if cfg else 0.01
         self.lambda_T = float(getattr(cfg, "lambda_t", 0.01)) if cfg else 0.01
-        self.solver = SeparableBeltrami4DSolver()
+        weight = declared_loss_weights(self.config).get("l1")
+        if weight is None:
+            raise ValueError(
+                "SpatiotemporalAdaptiveSFCReconStrategy computes an inline L1 term whose "
+                "weight lives on losses.image_losses: declare `- {name: l1, weight: <w>}`."
+            )
+        self.lambda_l1 = float(weight)
 
     def _compute_losses_impl(
         self,
@@ -75,25 +81,26 @@ class SpatiotemporalAdaptiveSFCReconStrategy(BaseTrainingStrategy):
         recon_loss = F.l1_loss(recon, target_batch)
         # 4D Beltrami regulariser over the spatiotemporal reconstruction.
         if recon.dim() == 5:  # [B, C, T, H, W]
-            # Derive the SFC-Beltrami coefficients from the model OUTPUT
-            # (``recon``) so the regulariser carries a gradient back to the
-            # model parameters. Previously mu/nu came from the no-grad
-            # ``input_batch[:, 0]``, making beltrami_reg/temporal_reg constants
-            # (zero gradient) and ``lambda_mu``/``lambda_T`` inert — pitfall #15.
-            # This mirrors the MRF sibling fix in mrf_kspace_strategies.py.
+            # mu/nu come from the model OUTPUT so both regularisers carry a gradient.
             x = recon[:, 0]  # [B, T, H, W] — first channel, grad-carrying
             _, T, _, _ = x.shape
-            mu = 0.1 * x.diff(dim=-1, prepend=x[..., :1]).to(torch.cfloat)  # [B,T,H,W]
+            mu = 0.1 * x.diff(dim=-1, prepend=x[..., :1])  # [B,T,H,W]
             nu = 0.05 * torch.tanh(x.mean(dim=(-2, -1)))  # [B, T]
-            res = self.solver(mu, nu)  # temporal warp is grad-carrying via nu
-            beltrami_reg = mu.abs().pow(2).mean()
+            beltrami_reg = mu.pow(2).mean()
+            # Smoothness is the warp's second difference; its normalised first
+            # difference reduced to a first-frame intensity bias (#2363).
+            phi_temporal = SeparableBeltrami4DSolver.time_warp(nu, T)
             temporal_reg = (
-                res.phi_temporal.diff(dim=-1).abs().mean() if T >= 2 else recon.new_zeros(())
+                phi_temporal.diff(n=2, dim=-1).abs().mean() if T >= 3 else recon.new_zeros(())
             )
         else:
             beltrami_reg = recon.new_zeros(())
             temporal_reg = recon.new_zeros(())
-        total = recon_loss + self.lambda_mu * beltrami_reg + self.lambda_T * temporal_reg
+        total = (
+            self.lambda_l1 * recon_loss
+            + self.lambda_mu * beltrami_reg
+            + self.lambda_T * temporal_reg
+        )
         return {
             "g_total_loss": total,
             "spatiotemporal_sfc_recon": recon_loss.detach(),

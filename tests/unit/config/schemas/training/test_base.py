@@ -460,7 +460,32 @@ class TestRicianColdDiffusionKnobs:
         with pytest.raises(ValueError, match="read only by GraphColdDiffusionStrategy"):
             TrainingStrategyConfigSchema(strategy_class=other, diffusion=block)
 
-    def test_kspace_mask_stays_legal_everywhere(self) -> None:
+    def test_a_declared_kspace_mask_is_refused_elsewhere(self) -> None:
         other = "spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy"
-        cfg = TrainingStrategyConfigSchema(strategy_class=other, diffusion={"degradation": "kspace_mask"})
+        with pytest.raises(ValueError, match="read only by GraphColdDiffusionStrategy"):
+            TrainingStrategyConfigSchema(strategy_class=other, diffusion={"degradation": "kspace_mask"})
+
+    def test_an_unset_degradation_is_legal_everywhere(self) -> None:
+        other = "spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy"
+        cfg = TrainingStrategyConfigSchema(strategy_class=other, diffusion={"timesteps": 10})
+        assert cfg.diffusion.degradation is None
+
+    @pytest.mark.parametrize("degradation", ["physical", "gaussian_blur", "kspace_undersample"])
+    def test_a_forward_process_only_graphcold_builds_is_refused_elsewhere(self, degradation) -> None:
+        other = "spectramr.infrastructure.training.strategies.diffusion.DiffusionTrainingStrategy"
+        with pytest.raises(ValueError, match="read only by GraphColdDiffusionStrategy"):
+            TrainingStrategyConfigSchema(strategy_class=other, diffusion={"degradation": degradation})
+
+    def test_a_forward_process_is_accepted_by_graphcold(self) -> None:
+        cfg = TrainingStrategyConfigSchema(
+            strategy_class=_GRAPH_COLD, diffusion={"degradation": "kspace_mask"}
+        )
         assert cfg.diffusion.degradation == "kspace_mask"
+
+
+def test_validate_only_is_a_declared_bool_not_an_allowed_extra() -> None:
+    """``training.validate_only`` is typed, so a non-bool spelling fails at load."""
+    assert TrainingStrategyConfigSchema().validate_only is False
+    assert TrainingStrategyConfigSchema(validate_only=True).validate_only is True
+    with pytest.raises(ValueError):
+        TrainingStrategyConfigSchema(validate_only="sometimes")

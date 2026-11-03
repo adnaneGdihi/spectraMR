@@ -91,3 +91,10 @@ def test_quality_matching_is_registered_and_loadable(forget_logged_paths) -> Non
         TrainingStrategyFactory.STRATEGY_CLASS_PATHS["quality_matching"]
     )
     assert cls.__name__ == "QualityMatchingStrategy"
+
+
+def test_cascaded_diffusion_mode_routes_to_the_cascade_strategy() -> None:
+    cls = TrainingStrategyFactory()._load_strategy_class(
+        TrainingStrategyFactory.STRATEGY_CLASS_PATHS["cascaded_diffusion"]
+    )
+    assert cls.__name__ == "CascadedDiffusionStrategy"

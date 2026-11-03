@@ -46,3 +46,61 @@ def test_no_id_and_no_keyword_raises_instead_of_defaulting_to_zero() -> None:
 def test_out_of_range_id_raises() -> None:
     with pytest.raises(ConfigurationError, match="outside"):
         resolve_predict_contrast(3, Path("a.h5"), 3, M4RAW)
+
+
+def _multi_contrast(enabled: bool = True, rows: list[dict] | None = None):
+    from types import SimpleNamespace
+
+    params = [SimpleNamespace(model_dump=lambda r=r: r) for r in (rows or [])]
+    return SimpleNamespace(
+        enabled=enabled, contrast_map={"T1": 0, "T2": 1, "FLAIR": 2}, acquisition_params=params
+    )
+
+
+_ROWS = [
+    {"name": "T1", "TE": 18.4, "TR": 500.0, "TI": 0.0, "FA": 90.0, "B0": 0.3,
+     "contrast_type": "spin_echo"},
+    {"name": "T2", "TE": 128.0, "TR": 5500.0, "TI": 0.0, "FA": 90.0, "B0": 0.3,
+     "contrast_type": "spin_echo"},
+    {"name": "FLAIR", "TE": 98.0, "TR": 7500.0, "TI": 1655.0, "FA": 90.0, "B0": 0.3,
+     "contrast_type": "inversion_recovery"},
+]  # fmt: skip
+
+
+def _conditioned_forward(x, contrast_idx=None, acquisition_params=None):
+    return x
+
+
+def test_predict_conditions_a_generator_training_conditioned() -> None:
+    from spectramr.infrastructure.inference.predict_contrast import (
+        expand_conditioning,
+        resolve_predict_conditioning,
+    )
+
+    cond = resolve_predict_conditioning(
+        _multi_contrast(rows=_ROWS), _conditioned_forward, Path("sub_FLAIR_rep1.h5"), None
+    )
+    assert cond is not None and cond["contrast_idx"].tolist() == [2]
+    assert cond["acquisition_params"]["TI"].tolist() == [1655.0]
+    wide = expand_conditioning(cond, 4)
+    assert wide["contrast_idx"].tolist() == [2] * 4
+    assert wide["acquisition_params"]["TR"].tolist() == [7500.0] * 4
+
+
+def test_predict_refuses_a_conditioned_generator_without_a_contrast() -> None:
+    from spectramr.infrastructure.inference.predict_contrast import resolve_predict_conditioning
+
+    with pytest.raises(ConfigurationError, match="--contrast-idx"):
+        resolve_predict_conditioning(
+            _multi_contrast(), _conditioned_forward, Path("file1000123.h5"), None
+        )
+
+
+def test_predict_leaves_an_unconditioned_arm_alone() -> None:
+    from spectramr.infrastructure.inference.predict_contrast import resolve_predict_conditioning
+
+    off = resolve_predict_conditioning(
+        _multi_contrast(enabled=False), _conditioned_forward, Path("a_T1.h5"), None
+    )
+    plain = resolve_predict_conditioning(_multi_contrast(), lambda x: x, Path("a_T1.h5"), None)
+    assert off is None and plain is None

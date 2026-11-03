@@ -35,7 +35,6 @@ from ..gans.vit_kan_gan import ViTKANGenerator
 # Automatically scanned and verified generators
 from .adversarial_purification import AdversarialPurificationDiffusion
 from .anisotropic_voxel_generator import AnisotropicVoxelGenerator
-from .artifact_aware_augmentation import ArtifactAwareAugmentation
 from .autoencoder_pretrain_generator import AutoencoderPretrainGenerator
 from .base_3d_generator import Base3DGenerator
 from .bloch_cycle_network import BlochCycleNetwork
@@ -138,7 +137,9 @@ import spectramr.models.generators.geo_mamba_unet
 # audit_plan_novel — Idea 1: Hermitian-equivariant operators
 # (registers "hermitian_fno" and "hermitian_kspace_unet")
 import spectramr.models.generators.hermitian_fno_unet
+import spectramr.models.generators.prompt_lora_fno  # noqa: E402  registers "prompt_lora_hermitian_fno"
 import spectramr.models.generators.mrf_models
+import spectramr.models.generators.mrf_pulse_design  # noqa: E402  registers "mrf_pulse_design"
 import spectramr.models.generators.vf_kspace_operators  # noqa: F401  registers "kspace_phase_ramp"
 
 from ..experimental.implicit_kan import ImplicitMRIField  # noqa: F401
@@ -356,7 +357,6 @@ __all__ = [
     "create_configurable_unet_generator",
     "AdversarialPurificationDiffusion",
     "AnisotropicVoxelGenerator",
-    "ArtifactAwareAugmentation",
     "Base3DGenerator",
     "BlochCycleNetwork",
     "CascadedDiffusionGenerator",

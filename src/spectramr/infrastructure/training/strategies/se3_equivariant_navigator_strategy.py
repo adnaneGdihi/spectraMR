@@ -46,6 +46,9 @@ class SE3EquivariantNavigatorStrategy(BaseTrainingStrategy, ReconstructionMixin,
         _lambda_eq: weight on the equivariance-defect monitoring term.
     """
 
+    # #183: the training step never scores train_* metrics; declare none.
+    reports_train_metrics = False
+
     # parallel_compat: Calls generator.estimate_motion_latent outside the wrapped forward, so
     # DDP/ZeRO reduce no gradient for it and FSDP reads a shard.
     parallel_compat = frozenset()

@@ -10,7 +10,7 @@ were then graded against a made-up acquisition.
 
 This module assembles a :class:`MetricContext` from the *real* reference the
 acquisition provides — the exact ``(coil_images, smaps, x_gt_mag, p99)`` tuple
-:func:`spectramr.infrastructure.physics.m4raw_pseudo_gt.synthesize_pseudo_gt`
+:func:`spectramr.data.datasets.pseudo_gt_reference.synthesize_pseudo_gt`
 returns. Because ``coil_images`` is the image-domain reference, the fully-sampled
 acquired k-space is recovered exactly as ``fft2c(coil_images)`` (no producer
 signature change needed). Fields the acquisition genuinely cannot supply

@@ -15,6 +15,12 @@ according to a declared :class:`DomainBalancingStrategy`. Three strategies:
 - :class:`ConcatBalancer` — zips loaders without balancing. Each yielded
   dict carries one batch from each loader simultaneously.
 
+- :class:`DomainLabelledBalancer` — concatenates one batch from each of two
+  loaders along the batch dimension into ONE flat batch and stamps a
+  per-sample ``domain_label`` (1.0 for ``domains[0]``, 0.0 for ``domains[1]``),
+  so a strategy that reads the ordinary batch contract can run a
+  domain-adversarial term.
+
 The strategy receives a dict keyed by domain name and dispatches the
 appropriate model passes. Compare with the legacy code in
 ``DomainAdaptationTrainingStrategy`` which manually advanced two
@@ -23,14 +29,16 @@ DataLoader iterators — easy to desync, no per-batch domain tag.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any
 
+import torch
 from torch.utils.data import DataLoader
 
 __all__ = [
     "Balancer",
     "ConcatBalancer",
+    "DomainLabelledBalancer",
     "RoundRobinBalancer",
     "StratifiedBalancer",
     "build_balancer",
@@ -187,18 +195,140 @@ class ConcatBalancer(Balancer):
         return min(len(loader) for loader in self.loaders.values())
 
 
+#: Label of each domain position: ``domains[0]`` is the source (synthetic) side,
+#: ``domains[1]`` the target (real) side, matching the DANN objective
+#: ``-log d(source) - log(1 - d(target))``.
+DOMAIN_LABEL_SOURCE = 1.0
+DOMAIN_LABEL_TARGET = 0.0
+
+
+def _leading_size(batch: Any) -> int | None:
+    """Batch-dimension size of the first tensor found in a collated batch."""
+    if isinstance(batch, torch.Tensor):
+        return int(batch.shape[0]) if batch.dim() > 0 else None
+    if isinstance(batch, Mapping):
+        for value in batch.values():
+            size = _leading_size(value)
+            if size is not None:
+                return size
+    return None
+
+
+def _concat_batches(batches: list[Any], path: str) -> Any:
+    """Concatenate collated batches along dim 0; raise on any shape it cannot merge."""
+    first = batches[0]
+    if isinstance(first, Mapping):
+        keys = set(first)
+        for other in batches[1:]:
+            if not isinstance(other, Mapping) or set(other) != keys:
+                other_keys = sorted(other) if isinstance(other, Mapping) else type(other).__name__
+                raise ValueError(
+                    f"DomainLabelledBalancer: domain batches disagree at '{path or '<root>'}': "
+                    f"{sorted(keys)} vs {other_keys}. Every domain must emit the same keys."
+                )
+        return {k: _concat_batches([b[k] for b in batches], f"{path}.{k}".lstrip(".")) for k in first}
+    if isinstance(first, torch.Tensor):
+        return torch.cat(batches, dim=0)
+    if isinstance(first, (list, tuple)):
+        return [item for b in batches for item in b]
+    raise TypeError(
+        f"DomainLabelledBalancer: cannot concatenate '{path}' of type "
+        f"{type(first).__name__}; expected a tensor, list or mapping."
+    )
+
+
+class DomainLabelledBalancer(Balancer):
+    """One flat batch per step: ``domains[0]`` samples, then ``domains[1]`` samples.
+
+    Each step draws one batch from each loader, concatenates every key along the
+    batch dimension and adds ``domain_label`` (``float32``, shape ``[B0 + B1]``).
+    One epoch is the source loader's length; the target loader cycles.
+    """
+
+    def __init__(
+        self,
+        loaders: dict[str, DataLoader],
+        weights: dict[str, float] | None = None,
+    ):
+        super().__init__(loaders)
+        if len(self.names) != 2:
+            raise ValueError(
+                "DomainLabelledBalancer stamps a binary domain label and needs exactly "
+                f"2 domains; got {len(self.names)} ({self.names})."
+            )
+        if not _weights_are_uniform(weights):
+            raise NotImplementedError(
+                f"DomainLabelledBalancer received non-uniform domain weights ({weights}); "
+                "it draws one batch per domain per step and cannot oversample. "
+                "Use uniform weights or 'round_robin' balancing."
+            )
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        source, target = self.names
+        target_iter = iter(self.loaders[target])
+        for source_batch in self.loaders[source]:
+            try:
+                target_batch = next(target_iter)
+            except StopIteration:
+                target_iter = iter(self.loaders[target])
+                target_batch = next(target_iter)
+            yield self._merge(source_batch, target_batch)
+
+    @staticmethod
+    def _merge(source_batch: Any, target_batch: Any) -> dict[str, Any]:
+        if not isinstance(source_batch, Mapping) or not isinstance(target_batch, Mapping):
+            raise TypeError("DomainLabelledBalancer needs dict batches from both loaders.")
+        if "domain_label" in source_batch or "domain_label" in target_batch:
+            raise ValueError("DomainLabelledBalancer: a loader already emits 'domain_label'.")
+        sizes = (_leading_size(source_batch), _leading_size(target_batch))
+        if None in sizes:
+            raise ValueError("DomainLabelledBalancer: a domain batch carries no batched tensor.")
+        merged = _concat_batches([source_batch, target_batch], "")
+        merged["domain_label"] = torch.cat(
+            (
+                torch.full((sizes[0],), DOMAIN_LABEL_SOURCE),
+                torch.full((sizes[1],), DOMAIN_LABEL_TARGET),
+            )
+        )
+        return merged
+
+    def __len__(self) -> int:
+        return len(self.loaders[self.names[0]])
+
+
+_BALANCERS: dict[str, Callable[[dict[str, DataLoader], dict[str, float] | None], Balancer]] = {
+    "round_robin": RoundRobinBalancer,
+    "stratified": StratifiedBalancer,
+    "concat": lambda loaders, _weights: ConcatBalancer(loaders),
+    "domain_labelled": DomainLabelledBalancer,
+}
+
+
+def _federated_blocks(loaders, weights, local_epochs):
+    from spectramr.data.builders.federated_balancer import federated_blocks
+
+    return federated_blocks(loaders, weights, local_epochs)
+
+
+#: Balancers with a round structure: the only ones that read ``local_epochs``.
+_ROUND_BALANCERS = {"federated_blocks": _federated_blocks}
+
+
 def build_balancer(
     loaders: dict[str, DataLoader],
     strategy: str = "round_robin",
     weights: dict[str, float] | None = None,
+    local_epochs: int | None = None,
 ) -> Balancer:
     """Dispatch on strategy string to the right balancer class."""
-    if strategy == "round_robin":
-        return RoundRobinBalancer(loaders, weights)
-    if strategy == "stratified":
-        return StratifiedBalancer(loaders, weights)
-    if strategy == "concat":
-        return ConcatBalancer(loaders)
-    raise ValueError(
-        f"Unknown balancing strategy: {strategy}. Must be one of: round_robin, stratified, concat."
-    )
+    if strategy in _ROUND_BALANCERS:
+        return _ROUND_BALANCERS[strategy](loaders, weights, local_epochs)
+    if local_epochs is not None:
+        raise ValueError(f"local_epochs={local_epochs}: only 'federated_blocks' reads it")
+    factory = _BALANCERS.get(strategy)
+    if factory is None:
+        raise ValueError(
+            f"Unknown balancing strategy: {strategy}. Must be one of: "
+            f"{', '.join([*_BALANCERS, *_ROUND_BALANCERS])}."
+        )
+    return factory(loaders, weights)

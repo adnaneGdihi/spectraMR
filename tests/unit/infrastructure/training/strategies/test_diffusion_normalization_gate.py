@@ -256,15 +256,18 @@ class TestWhyTheSnapshotProvesItWasNeverCompressed:
 
         ``kspace_normalized`` exists to be consumed by the gate, so a grep that
         finds only the write site is a regression in this change specifically.
+        The gate reads it through the shared ``loader_normalization``.
         """
         import inspect
 
         from spectramr.data.transforms import normalization
 
         writer = inspect.getsource(normalization.KSpaceNormalizationTransform)
-        reader = inspect.getsource(DiffusionTrainingStrategy._batch_is_already_normalized)
+        reader = inspect.getsource(normalization.loader_normalization)
+        gate = inspect.getsource(DiffusionTrainingStrategy._batch_is_already_normalized)
         assert "kspace_normalized" in writer
         assert "kspace_normalized" in reader
+        assert "loader_normalization(" in gate
 
 
 class TestTheVerdictDoesNotDependOnTheContainerType:

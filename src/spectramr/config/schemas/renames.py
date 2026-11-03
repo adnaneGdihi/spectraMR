@@ -1637,6 +1637,21 @@ RENAMES: dict[str, RenameRecord] = _index(
             reason="Boolean switches are `enable_<thing>` (test_naming_convention).",
             mount="training.quality_matching",
         ),
+        # Scoring-only store removed (#2664 reversed): SENSE, Rep-BV and the
+        # certificate now score with the batch's own maps. DELETE the key; do
+        # not copy its value to `coil_maps_root`, which is the training store.
+        RenameRecord(
+            legacy="data.coil_maps_reference_root",
+            canonical="data.coil_maps_root",
+            since="2026-11-01",
+            posture="raise",
+            reason=(
+                "The all-repetitions scoring store leaked the leave-one-out "
+                "reference into Rep-BV and SENSE metrics; scoring now uses the "
+                "training maps in `data.coil_maps_root` (input-repetition store). "
+                "Delete this key; it has no replacement."
+            ),
+        ),
     ]
 )
 

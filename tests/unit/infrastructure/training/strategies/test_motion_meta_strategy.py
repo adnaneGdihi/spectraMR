@@ -194,3 +194,85 @@ def test_raw_category_lambda_read_is_gone_from_source() -> None:
     """Belt-and-braces name pin, so a partial revert is visible in review."""
     assert "self.config.losses.reconstruction" not in _SRC
     assert "declared_loss_weights(self.config)" in _SRC
+
+
+# ---------------------------------------------------------------------------
+# Single-task control (training.motion.fixed_trajectory_seed): the meta arm draws
+# a fresh trajectory per training batch, the control reuses one seeded trajectory,
+# and both validate on random motion. Driven from the real arm YAMLs through the
+# strategy factory.
+# ---------------------------------------------------------------------------
+
+_VF = pathlib.Path(__file__).resolve().parents[5] / "experiments/inprogress/vf"
+
+
+def _strategy_from_arm(name: str) -> ConcreteMotionMetaTrainingStrategy:
+    from spectramr.config.settings import TrainingSettings
+    from spectramr.infrastructure.physics.kinematic_forward import KinematicForwardOperator
+    from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+
+    config = TrainingSettings.from_yaml(str(_VF / f"{name}.yaml"))
+    cls = TrainingStrategyFactory().get_strategy_class(config)
+    assert cls is ConcreteMotionMetaTrainingStrategy
+    s = cls.__new__(cls)
+    s.config = config
+    s.device = torch.device("cpu")
+    s.kinematic_op = KinematicForwardOperator(im_size=(16, 16))
+    s._setup_motion()
+    return s
+
+
+def _losses_with_theta_spy(s: ConcreteMotionMetaTrainingStrategy, validation: bool) -> torch.Tensor:
+    from spectramr.infrastructure.physics.virtual_fiducial import VirtualFiducial
+
+    seen: list[torch.Tensor] = []
+    op = s.kinematic_op
+
+    def spy(image: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        seen.append(theta)
+        return op(image, theta)
+
+    s.kinematic_op = spy  # type: ignore[assignment]
+    s.kinematic_op.generate_random_motion = op.generate_random_motion  # type: ignore[attr-defined]
+    s.fiducial = VirtualFiducial(im_size=(16, 16), grid_spacing=4, sigma=1.0, learnable=False)
+    s.env = SimpleNamespace(generator=lambda x, **kw: x)  # identity backbone
+    identity_loss = torch.nn.L1Loss()
+    s.loss_l1 = s.loss_ssim = s.loss_hfen = identity_loss
+    s._lambda_l1, s._lambda_ssim, s._lambda_hfen = 1.0, 0.0, 0.0
+    target = torch.randn(2, 2, 16, 16)
+    out = s._compute_losses_impl(target, target, epoch=0, validation=validation)
+    assert torch.isfinite(out["g_total_loss"])
+    s.kinematic_op = op
+    return seen[0]
+
+
+def test_single_task_control_reuses_one_trajectory_in_training() -> None:
+    s = _strategy_from_arm("experiment_vf_hyper_mamba_single_task_v2")
+    assert s._fixed_theta is not None
+    a = _losses_with_theta_spy(s, validation=False)
+    b = _losses_with_theta_spy(s, validation=False)
+    assert torch.equal(a, b), "the single-task control must train on one fixed trajectory"
+    assert torch.equal(a[0], a[1]), "every sample in the batch shares the trajectory"
+
+
+def test_single_task_control_validates_on_random_motion() -> None:
+    s = _strategy_from_arm("experiment_vf_hyper_mamba_single_task_v2")
+    v = _losses_with_theta_spy(s, validation=True)
+    assert not torch.equal(v, s._fixed_theta.expand_as(v))
+
+
+def test_meta_arm_draws_a_new_trajectory_per_batch() -> None:
+    s = _strategy_from_arm("experiment_vf_hyper_mamba_meta_v2")
+    assert s._fixed_theta is None
+    a = _losses_with_theta_spy(s, validation=False)
+    b = _losses_with_theta_spy(s, validation=False)
+    assert not torch.equal(a, b)
+
+
+def test_pair_differs_only_in_the_seed() -> None:
+    meta = _strategy_from_arm("experiment_vf_hyper_mamba_meta_v2").config.training.motion
+    ctrl = _strategy_from_arm("experiment_vf_hyper_mamba_single_task_v2").config.training.motion
+    assert meta.model_dump(exclude={"fixed_trajectory_seed"}) == ctrl.model_dump(
+        exclude={"fixed_trajectory_seed"}
+    )
+    assert meta.fixed_trajectory_seed is None and ctrl.fixed_trajectory_seed is not None

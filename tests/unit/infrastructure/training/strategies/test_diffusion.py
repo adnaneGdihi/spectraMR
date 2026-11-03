@@ -37,6 +37,7 @@ from spectramr.infrastructure.training.strategies.diffusion import (
 )
 from spectramr.infrastructure.training.utils.kspace_view import decompress_for_view
 from spectramr.infrastructure.training.utils.metric_views import MetricViews
+from spectramr.models.losses.build_set import declared_build_set
 
 
 def _gen(conditional: bool):
@@ -165,6 +166,27 @@ def test_forward_through_model_latent_forwards_condition_and_context() -> None:
     )
     assert torch.equal(received["condition_image"], cond)
     assert received["context"] == {"contrast_idx": cidx}
+
+
+def test_forward_through_model_binds_a_named_t_not_the_kwargs_catch_all() -> None:
+    """#2086: `timesteps=` landed in `**kwargs` and `t` ran at its None default."""
+
+    class _NamedT:
+        def forward(self, x, t=None, **kwargs):
+            return t, kwargs
+
+        __call__ = forward
+
+    mock = MagicMock()
+    mock.generator_model = _NamedT()
+    t, rest = DiffusionTrainingStrategy._forward_through_model(
+        mock,
+        model_input=torch.randn(1, 2, 8, 8),
+        timesteps=torch.tensor([5]),
+        is_latent_diffusion=False,
+        gen_kwargs={},
+    )
+    assert int(t[0]) == 5 and "timesteps" not in rest
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +690,10 @@ def _strategy_declaring(prediction_type: str, model_type: str):
     mock._effective_prediction_type = lambda: DiffusionTrainingStrategy._effective_prediction_type(
         mock
     )
+    mock._declared_prediction_type = lambda: DiffusionTrainingStrategy._declared_prediction_type(
+        mock
+    )
+    mock._is_cold_diffusion = lambda: DiffusionTrainingStrategy._is_cold_diffusion(mock)
     return mock
 
 
@@ -698,18 +724,52 @@ def test_agreeing_declaration_is_accepted(model_type, declared) -> None:
     DiffusionTrainingStrategy._validate_prediction_type(mock)  # must not raise
 
 
-@pytest.mark.parametrize("declared", ["epsilon", "sample", "v_prediction"])
-def test_pixel_space_path_defers_rather_than_crashing(declared) -> None:
-    """Scoped to latent diffusion on purpose.
-
-    9 arms on this strategy declare `epsilon` on the pixel path, whose target is
-    target_batch (x0). That is a real defect (issue #641), but whether the YAML
-    or the path is wrong is those cohorts' decision -- the check must not turn it
-    into a startup crash as a side effect of an LDM review. When #641 is settled,
-    this test should be inverted to expect a raise.
-    """
+@pytest.mark.parametrize("declared", ["epsilon", "sample"])
+def test_pixel_space_declaration_is_accepted(declared) -> None:
+    """Pixel arms now have a real objective per declaration (issue #641)."""
     mock = _strategy_declaring(declared, "enhanced_deep_unet")
     DiffusionTrainingStrategy._validate_prediction_type(mock)  # must not raise
+    assert mock._pixel_epsilon is (declared == "epsilon")
+
+
+def test_pixel_epsilon_is_reported_as_the_effective_objective() -> None:
+    mock = _strategy_declaring("epsilon", "enhanced_deep_unet")
+    DiffusionTrainingStrategy._validate_prediction_type(mock)
+    assert DiffusionTrainingStrategy._effective_prediction_type(mock) == "epsilon"
+
+
+def test_undeclared_pixel_arm_keeps_the_x0_objective() -> None:
+    """The schema default is epsilon; an arm that never wrote the knob must not inherit it."""
+    mock = MagicMock()
+    mock.config = SimpleNamespace(
+        model=SimpleNamespace(model_type="enhanced_deep_unet"),
+        training=SimpleNamespace(
+            diffusion=SimpleNamespace(
+                prediction_type=PredictionType.EPSILON, model_fields_set=set()
+            )
+        ),
+    )
+    mock._is_latent_diffusion = lambda: False
+    mock._is_cold_diffusion = lambda: False
+    mock._declared_prediction_type = lambda: DiffusionTrainingStrategy._declared_prediction_type(
+        mock
+    )
+    DiffusionTrainingStrategy._validate_prediction_type(mock)
+    assert mock._pixel_epsilon is False
+
+
+@pytest.mark.parametrize("model_type", ["kspace_cold_diffusion", "cold_diffusion"])
+def test_epsilon_on_a_masking_forward_process_raises(model_type) -> None:
+    mock = _strategy_declaring("epsilon", model_type)
+    mock._is_cold_diffusion = lambda: True
+    with pytest.raises(ConfigurationError, match="epsilon"):
+        DiffusionTrainingStrategy._validate_prediction_type(mock)
+
+
+def test_v_prediction_raises_on_the_pixel_path() -> None:
+    mock = _strategy_declaring("v_prediction", "enhanced_deep_unet")
+    with pytest.raises(ConfigurationError, match="v_prediction"):
+        DiffusionTrainingStrategy._validate_prediction_type(mock)
 
 
 @pytest.mark.parametrize(
@@ -821,10 +881,7 @@ def test_reverse_schedule_binding_hands_over_betas_not_just_the_name() -> None:
     """
     mock = MagicMock()
     mock._is_latent_diffusion.return_value = True
-    mock.num_timesteps = 200
-    mock.beta_schedule = "cosine"
-    mock.device = torch.device("cpu")
-    mock.scheduler = SimpleNamespace(betas=torch.linspace(0.01, 0.2, 200))
+    mock.scheduler = DiffusionScheduler(num_timesteps=200, beta_schedule="cosine")
 
     gen = MagicMock()
     mock.generator_model = gen
@@ -1070,41 +1127,6 @@ def test_the_cold_snapshot_gate_is_not_derived_from_the_logging_interval() -> No
     assert "self._cached_log_interval * 5" not in src, (
         "the degraded-model-input snapshot is gated on a logging knob again"
     )
-
-
-@pytest.mark.unit
-def test_save_debug_snapshots_forwards_extra_under_the_diffusion_tag() -> None:
-    """`degradation_source` belongs in the artifact that shows its result.
-
-    The snapshot shows a zero-filled tensor; which tensor was zero-filled — the
-    single-repetition measurement or the NEX-averaged target (#536) — is not
-    recoverable from the pixels, so it rides `extra` rather than forcing a
-    cross-reference to `resolved_config.json`.
-    """
-    mock = MagicMock()
-    tensors = {"noisy_kspace": torch.zeros(1, 2, 4, 4), "mask": torch.ones(1, 1, 4, 4)}
-
-    DiffusionTrainingStrategy._save_debug_snapshots(
-        mock, tensors, 1, extra={"degradation_source": "input"}
-    )
-
-    _, kwargs = mock.save_debug_snapshot.call_args
-    assert kwargs["tag"] == "diffusion_step"
-    assert kwargs["extra"] == {"degradation_source": "input"}
-    assert "noisy_kspace" in kwargs["in_kspace_keys"]
-    assert "mask" not in kwargs["in_kspace_keys"]
-
-
-@pytest.mark.unit
-def test_extra_is_optional_so_other_callers_are_unaffected() -> None:
-    mock = MagicMock()
-
-    DiffusionTrainingStrategy._save_debug_snapshots(
-        mock, {"noisy_kspace": torch.zeros(1, 2, 4, 4)}, 1
-    )
-
-    _, kwargs = mock.save_debug_snapshot.call_args
-    assert kwargs["extra"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1631,11 +1653,10 @@ def test_the_model_input_key_follows_whether_smaps_were_concatenated() -> None:
 
 
 def test_both_cold_emitters_answer_through_the_same_rule() -> None:
-    """The declaring path and the direct `diffusion_step` emitter must agree.
+    """The declaring path answers 'which key is the model input' through the shared rule.
 
-    They are in different methods 2000 lines apart. Written out twice, one of
-    them gets a later fix the other misses -- which is #697, and #1298 is what a
-    snapshot disagreeing with its own label costs.
+    Written out by hand, a later fix misses one copy -- which is #697, and #1298 is
+    what a snapshot disagreeing with its own label costs.
     """
     import inspect
 
@@ -1643,10 +1664,7 @@ def test_both_cold_emitters_answer_through_the_same_rule() -> None:
         DiffusionTrainingStrategy,
     )
 
-    for method in (
-        DiffusionTrainingStrategy._prepare_diffusion_inputs,
-        DiffusionTrainingStrategy._save_debug_snapshots,
-    ):
+    for method in (DiffusionTrainingStrategy._prepare_diffusion_inputs,):
         src = inspect.getsource(method)
         assert "cold_model_input_key(" in src, (
             f"{method.__name__} answers 'which key is the model input' without "
@@ -2693,8 +2711,8 @@ class TestMeasurementAwareMetricsReachTheProductionPath:
     """
 
     @staticmethod
-    def _mock(names: list[str], mask: torch.Tensor | None):
-        measurement = torch.rand(2, 2, 8, 8)
+    def _mock(names: list[str], mask: torch.Tensor | None, size: int = 8):
+        measurement = torch.rand(2, 2, size, size)
         mock = _zf_mock(measurement=measurement, metrics=names)
         # The real seam, bound to the mock host: a MagicMock would stub it out
         # and the test would observe nothing while claiming to observe firing.
@@ -2711,12 +2729,13 @@ class TestMeasurementAwareMetricsReachTheProductionPath:
     def test_the_columns_are_finite_when_the_arm_asks_for_them(self) -> None:
         torch.manual_seed(0)
         wanted = list(DiffusionTrainingStrategy._MEASUREMENT_AWARE_METRICS)
-        mask = torch.zeros(2, 1, 8, 8)
-        mask[..., 2:6, :] = 1.0
-        mock = self._mock(["psnr", *wanted], mask)
+        # 16x16, not 8x8: the innermost ring (|k| in [N/16, N/8)) holds no bin on an 8x8 grid.
+        mask = torch.zeros(2, 1, 16, 16)
+        mask[..., 4:12, :] = 1.0
+        mock = self._mock(["psnr", *wanted], mask, size=16)
 
         out = _run_validation_metrics(
-            mock, torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8), torch.rand(2, 2, 8, 8)
+            mock, torch.rand(2, 2, 16, 16), torch.rand(2, 2, 16, 16), torch.rand(2, 2, 16, 16)
         )
 
         for name in wanted:
@@ -3926,7 +3945,7 @@ class TestFillSetMatchesTheCsvHeader:
         # The CSV header's own owner: `training_loop` builds it from this call.
         header = {
             canonical_loss_name(name)
-            for name, weight in strategy.config.losses.get_enabled_losses().items()
+            for name, weight in declared_build_set(strategy.config.losses).items()
             if weight > 0
         } - STRATEGY_MANAGED_LOSSES
 
@@ -4104,29 +4123,6 @@ def test_the_clamp_statistics_reach_the_training_metrics_as_device_tensors():
     assert '"clip_bind_frac"] = clip_stats[0]' in src
     assert '"clip_overshoot_mean"] = clip_stats[1]' in src
     assert "float(clip_stats" not in src and ".item()" not in src.split("clip_stats = ")[1][:400]
-
-
-def test_the_output_snapshot_also_fires_at_each_validation_step():
-    """The early cadence spends its budget mid-curriculum; a second tag covers validation."""
-    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
-
-    s = object.__new__(DiffusionTrainingStrategy)
-    s._cached_log_interval = 5000
-    s._cached_val_interval = 10000
-    due = DiffusionTrainingStrategy._output_snapshot_tags_due
-    assert due(s, 500) == ("model_output_dc",)
-    assert due(s, 10000) == ("model_output_dc", "model_output_dc_validation")
-    assert due(s, 10250) == ()
-    assert due(s, 0) == ("model_output_dc",)
-
-
-def test_no_validation_tag_when_validation_is_off():
-    from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
-
-    s = object.__new__(DiffusionTrainingStrategy)
-    s._cached_log_interval = 5000
-    s._cached_val_interval = 0
-    assert DiffusionTrainingStrategy._output_snapshot_tags_due(s, 10000) == ("model_output_dc",)
 
 
 def test_the_t0_probe_drops_the_metrics_a_fully_sampled_mask_leaves_undefined():
@@ -4667,6 +4663,36 @@ def test_training_metrics_score_decompressed_denormalised_kspace(monkeypatch) ->
     torch.testing.assert_close(got_pred, pred * s, rtol=1e-4, atol=1e-4)
 
 
+def test_latent_training_metrics_score_the_decoded_image_not_latent_noise() -> None:
+    """#186: train_psnr on a latent arm graded eps_hat vs eps; it must grade decoded x0 vs target."""
+    torch.manual_seed(0)
+    scheduler = DiffusionScheduler(num_timesteps=50, beta_schedule="cosine")
+    z0 = torch.randn(2, 4, 8, 8)
+    eps = torch.randn_like(z0)
+    t = torch.tensor([3, 40])
+    noisy = scheduler.q_sample(z0, t, eps)
+
+    class _Decoder(torch.nn.Module):
+        def decode_from_latent(self, z: torch.Tensor) -> torch.Tensor:
+            return torch.nn.functional.interpolate(z[:, :1], scale_factor=8.0)
+
+    gen = _Decoder()
+    image_target = gen.decode_from_latent(z0)
+    stub = SimpleNamespace(
+        _train_metric_latent=(noisy, t, image_target),
+        _is_cold_diffusion=lambda: False,
+        generator_model=gen,
+        scheduler=scheduler,
+    )
+    stub._decode_latent_metric_pair = MethodType(
+        DiffusionTrainingStrategy._decode_latent_metric_pair, stub
+    )
+    got_pred, got_target = DiffusionTrainingStrategy._training_metric_inputs(stub, eps, eps)
+    assert got_pred.shape == (2, 1, 64, 64)
+    torch.testing.assert_close(got_target, image_target)
+    torch.testing.assert_close(got_pred, image_target, rtol=1e-4, atol=1e-4)
+
+
 # ── PR4: rung and timestep provenance on the output snapshots ─────────────────
 
 
@@ -4719,14 +4745,13 @@ def test_realised_acceleration_is_unknown_without_a_line_axis():
         assert DiffusionTrainingStrategy._snapshot_realised_acceleration(s, None, None) is None
 
 
-def test_the_output_snapshot_extras_are_deferred_and_name_their_rung_and_cadence():
+def test_the_output_snapshot_extras_are_deferred_and_name_their_rung():
     """Wiring: the model_output_dc emitter passes callables, so no sync runs unless written."""
     from spectramr.infrastructure.training.strategies.diffusion import DiffusionTrainingStrategy
 
     src = inspect.getsource(DiffusionTrainingStrategy._compute_losses_impl)
     assert '"timesteps": lambda: timesteps.detach().flatten().tolist()' in src
     assert "lambda: self._snapshot_realised_acceleration(" in src
-    assert '"train_step_at_val_cadence"' in src and '"train_step_at_log_cadence"' in src
 
 
 def test_cascade_val_8x_is_emitted_for_the_8x_rung_on_the_first_batch_under_val_source():
@@ -4778,17 +4803,18 @@ def test_cascade_val_8x_is_gated_to_the_8x_first_batch_before_the_metrics_pop_th
     assert emit < src.index("level_metrics = self._compute_validation_metrics(")
 
 
-def test_cascade_val_8x_writes_nothing_when_snapshots_are_disabled(tmp_path):
-    """Real writer, disabled config: no directory, and the control run with snapshots on writes one."""
-    s_off = _bare_diffusion_for_snapshots(tmp_path / "off", enabled=False)
+def test_cascade_val_8x_records_only_inside_a_snapshot_step(tmp_path):
+    """No active trace (snapshots off, or a step the schedule skipped): nothing is recorded."""
+    from spectramr.core import snapshot_trace as st
+    from spectramr.infrastructure.training.snapshot.policy import ViewPolicy
     from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 
-    s_off.save_debug_snapshot = BaseTrainingStrategy.save_debug_snapshot.__get__(s_off)
+    s = _bare_diffusion_for_snapshots(tmp_path)
+    s._snapshot_view_policy = ViewPolicy()
+    s.save_debug_snapshot = BaseTrainingStrategy.save_debug_snapshot.__get__(s)
     hr = torch.rand(1, 1, 4, 8)
-    s_off._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
-    assert not list((tmp_path / "off").rglob("cascade_val_8x*"))
-
-    s_on = _bare_diffusion_for_snapshots(tmp_path / "on", enabled=True)
-    s_on.save_debug_snapshot = BaseTrainingStrategy.save_debug_snapshot.__get__(s_on)
-    s_on._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
-    assert list((tmp_path / "on").rglob("cascade_val_8x*")), "control run wrote nothing"
+    s._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
+    trace = st.SnapshotTrace(phase="val", step=0)
+    with st.active(trace):
+        s._emit_cascade_val_snapshot(hr, torch.rand(1, 1, 4, 8), accel=8, timestep=3)
+    assert [(x.group, x.name) for x in trace.stages] == [("strategy", "cascade_val_8x")]

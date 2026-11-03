@@ -161,8 +161,8 @@ image**, i.e. the adjoint :math:`A^H` never ran. Measured on an untrained
      -
      - 11.6%
 
-Confirm it from the arm's first ``debug_snapshots/first_steps_*`` entry: if
-``input_raw`` and ``input_prepared`` are identical **and** span a k-space dynamic
+Confirm it from the arm's first ``snapshots/<run_id>/train/step_*/manifest.json``: if
+``batch/input_raw`` and ``model/input[...]`` are identical **and** span a k-space dynamic
 range (``|max|`` in the tens against a ``std`` near 0.2), the adjoint is missing.
 
 Who is supposed to apply it depends on what the model registered:

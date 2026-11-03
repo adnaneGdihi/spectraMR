@@ -10,6 +10,7 @@ from typing import Any, ClassVar, Self
 
 import torch
 
+from spectramr.domain.exceptions import ConfigurationError
 from spectramr.models.losses.weights import (
     LossWeightTable,
     build_loss_weight_table,
@@ -319,6 +320,15 @@ class BaseLossComputer(torch.nn.Module, ABC):
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
         if applied_weight_sum == 0.0:
+            # Only the warm-up gate can explain a zero objective, and only before it lifts;
+            # a training step with none would back-propagate zeros and report success (#177).
+            if torch.is_grad_enabled() and iteration >= self._weight_table.warmup_iterations:
+                raise ConfigurationError(
+                    f"Loss objective is zero: all {n_candidates - n_skipped} finite loss "
+                    "component(s) are weighted to 0.0 after warm-up. Declare a weighted term "
+                    "under losses.image_losses (or losses.reconstruction) and check that "
+                    "its enable flag is not off."
+                )
             _logger.error(
                 "[LossComputer] DEAD LOSS: all %d finite loss component(s) were "
                 "weighted to 0.0 (Σ|weight|=0) — total loss is 0.0 and the model "

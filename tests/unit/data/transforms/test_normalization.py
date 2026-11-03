@@ -1701,3 +1701,57 @@ class TestTheAcsWindowScaleSurvivesA2DMask:
 
         with pytest.raises(ValueError, match="acs_window"):
             KSpaceNormalizationSpec(enabled=True, scale_domain="acs_window", center_fraction=None)
+
+
+class TestLoaderNormalization:
+    """The one reader of the transform's ``kspace_normalized``/``kspace_scale`` evidence."""
+
+    @pytest.mark.parametrize(
+        ("batch", "scale", "expected"),
+        [
+            ({"kspace_normalized": torch.tensor([True, True])}, None, "APPLIED"),
+            ({"kspace_normalized": torch.tensor([True, False])}, None, "MARKED_RAW"),
+            ({"kspace_normalized": [True]}, None, "APPLIED"),
+            ({"kspace_normalized": False}, torch.tensor(224.4), "MARKED_RAW"),
+            ({}, None, "NO_EVIDENCE"),
+            (None, None, "NO_EVIDENCE"),
+            ({}, torch.tensor([1.0, 1.0]), "IDENTITY_SCALE"),
+            ({}, 1.0, "IDENTITY_SCALE"),
+            ({}, torch.tensor([224.4]), "APPLIED"),
+        ],
+    )
+    def test_the_verdict(self, batch, scale, expected) -> None:
+        from spectramr.data.transforms.normalization import (
+            LoaderNormalization,
+            loader_normalization,
+        )
+
+        assert loader_normalization(batch, scale) is LoaderNormalization[expected]
+
+    def test_a_training_batch_marker_is_read_from_its_metadata(self) -> None:
+        from spectramr.data.batch_types import BatchAdapter
+        from spectramr.data.transforms.normalization import (
+            LoaderNormalization,
+            loader_normalization,
+        )
+
+        t = torch.randn(1, 2, 8, 8)
+        batch = BatchAdapter.from_dict(
+            {"input": t, "target": t.clone(), "kspace_normalized": torch.tensor([True])}
+        )
+        assert loader_normalization(batch, None) is LoaderNormalization.APPLIED
+
+    def test_the_transforms_output_reads_as_applied(self) -> None:
+        from spectramr.data.transforms.normalization import (
+            KSpaceNormalizationTransform,
+            LoaderNormalization,
+            loader_normalization,
+        )
+
+        torch.manual_seed(0)
+        k = torch.randn(2, 16, 16, 1)
+        k[:, 8, 8, :] = 2500.0
+        subject = KSpaceNormalizationTransform(percentile=0.95, log_scaling=True)(
+            tio.Subject(input=tio.ScalarImage(tensor=k))
+        )
+        assert loader_normalization(subject, subject["kspace_scale"]) is LoaderNormalization.APPLIED

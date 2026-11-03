@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -78,6 +78,7 @@ import torch.nn.functional as F
 from spectramr.core.quantile import (  # noqa: F401  (re-export: tests read the cap)
     QUANTILE_MAX_ELEMS as _QUANTILE_MAX_ELEMS,
 )
+from spectramr.config.schemas.severity_axes import SeverityAxis, reject_severity_overlap
 from spectramr.core.quantile import robust_quantile as _robust_quantile
 from spectramr.infrastructure.physics.emi_degradation import add_readout_tones
 from spectramr.infrastructure.physics.fft_ops import centred_freqs, fft2c, fftnc, ifft2c, ifftnc
@@ -95,6 +96,7 @@ from spectramr.infrastructure.physics.spherical_harmonics import (
 
 if TYPE_CHECKING:
     from spectramr.infrastructure.physics.scanner_profile import ScannerProfile
+    from spectramr.infrastructure.physics.severity_local import LocalSeverity
 
 logger = logging.getLogger(__name__)
 
@@ -1926,6 +1928,7 @@ class DigitalTwinSimulator(nn.Module):
         degradation_schedule: str = "linear",
         degradation_schedules: dict[str, str] | None = None,
         degradation_schedule_power: float = 2.0,
+        severity_axes: Mapping[str, SeverityAxis | Mapping[str, Any]] | None = None,
         # ── Wave 5 (digital-twin review) opt-in architectural flags ──
         marker_is_water_only: bool = False,
         per_channel_marker_prior: bool = False,
@@ -2071,6 +2074,7 @@ class DigitalTwinSimulator(nn.Module):
         self._registry_degradations: tuple[str, ...] = tuple(
             d for d in self.progressive_degradations if d not in NATIVE_DEGRADATION_AXES
         )
+        self._local = self._resolve_severity_axes(severity_axes or {})
         # #244: the range bounds are now READ (see _get_effective_cf), so they must
         # also be VALIDATED — an out-of-range or inverted pair would silently produce
         # a negative or >1 severity multiplier.
@@ -2121,7 +2125,7 @@ class DigitalTwinSimulator(nn.Module):
             "chem_shift=%s(%.1f), eddy=%s(%.2f), spikes=%s(%.3f), crosstalk=%s(%.3f), "
             "b0_distort=%s, grad_nl=%s(%.1e), zipper=%s(%.2f), magic=%s, "
             "progressive=%s, ranges=%s, schedule=%s, per_axis_schedules=%s, "
-            "scanner_profile=%s, undersamp_line_axis=%s",
+            "scanner_profile=%s, undersamp_line_axis=%s, severity_axes=%s",
             im_size,
             marker_type,
             motion_type,
@@ -2156,7 +2160,61 @@ class DigitalTwinSimulator(nn.Module):
             self.degradation_schedules,
             None if scanner_profile is None else scanner_profile.to_meta(),
             self.undersampling_line_axis,
+            self.severity_axes_provenance(),
         )
+
+    def _resolve_severity_axes(
+        self, settings: Mapping[str, SeverityAxis | Mapping[str, Any]]
+    ) -> dict[str, LocalSeverity]:
+        """Validate ``severity_axes`` against what this twin applies and build its resolvers."""
+        # Deferred: severity_local imports the registry, whose 2-D kernels import this module.
+        from spectramr.infrastructure.physics.degradations.registry import DEGRADATION_REGISTRY
+        from spectramr.infrastructure.physics.severity_local import (
+            reject_profile_conflicts,
+            resolve_axes,
+        )
+
+        parsed = {
+            name: s if isinstance(s, SeverityAxis) else SeverityAxis.model_validate(s)
+            for name, s in settings.items()
+        }
+        reject_severity_overlap(
+            parsed,
+            degradation_ranges=self.degradation_ranges,
+            degradation_schedules=self.degradation_schedules,
+        )
+        for name in parsed:
+            if name not in DEGRADATION_REGISTRY:
+                raise ValueError(
+                    f"severity_axes[{name!r}] is not in DEGRADATION_REGISTRY; only registry "
+                    "axes have a declared physical range."
+                )
+            if name in NATIVE_DEGRADATION_AXES:
+                raise ValueError(
+                    f"severity_axes[{name!r}] names a native twin axis, which the twin "
+                    "handles natively and never applies as a registry operator; use "
+                    "degradation_ranges for it."
+                )
+            if parsed[name].n_steps is not None:
+                raise ValueError(
+                    f"severity_axes[{name!r}].n_steps is a Sim2Rank grid size; the twin's "
+                    "theta is the corruption factor, so n_steps would be unread. Drop it."
+                )
+            if name not in self._registry_degradations:
+                raise ValueError(
+                    f"severity_axes[{name!r}] is never applied: the twin runs a registry "
+                    f"axis only when progressive_degradations lists it (applied: "
+                    f"{list(self._registry_degradations)}). Add it there or drop the setting."
+                )
+        local = resolve_axes(tuple(parsed), parsed)
+        if self.scanner_profile is not None:
+            for sev in local.values():
+                reject_profile_conflicts(sev, self.scanner_profile)
+        return local
+
+    def severity_axes_provenance(self) -> dict[str, dict[str, object]]:
+        """Declared-vs-applied record of every ``severity_axes`` entry; empty without any."""
+        return {name: local.provenance() for name, local in self._local.items()}
 
     @property
     def marker_mask(self) -> torch.Tensor:
@@ -2186,6 +2244,11 @@ class DigitalTwinSimulator(nn.Module):
         """
         progressive = not self.progressive_degradations or (feat in self.progressive_degradations)
         eff = base_cf if progressive else 1.0
+        local = self._local.get(feat)
+        if local is not None:
+            # The SeverityAxis schedule already shapes the ramp; reshaping or remapping it here
+            # would apply a second schedule to the same axis.
+            return local.native_theta(eff)
         # Shape the ramp before the range remap. 'linear' returns eff unchanged
         # by early return, so every config written before this field existed is
         # bit-identical. A degenerate range (t, t) still pins t under EVERY
@@ -2300,6 +2363,7 @@ class DigitalTwinSimulator(nn.Module):
             degradation_schedule=getattr(dt, "degradation_schedule", "linear"),
             degradation_schedules=dict(getattr(dt, "degradation_schedules", {}) or {}),
             degradation_schedule_power=getattr(dt, "degradation_schedule_power", 2.0),
+            severity_axes=dict(getattr(dt, "severity_axes", {}) or {}),
             snr_range=(dt.snr_min, dt.snr_max),
             max_translation=dt.max_translation,
             max_rotation=dt.max_rotation,
@@ -2373,6 +2437,27 @@ class DigitalTwinSimulator(nn.Module):
         finally:
             self.acceleration, self.enable_undersampling = previous
             self.last_undersampling_mask = None
+
+    @contextmanager
+    def at_severity(self, scale: float) -> Iterator[None]:
+        """Scale the motion, B0 and B1 strengths by ``scale`` (> 1), then restore them.
+
+        The held-out-severity readout's seam: the three amplitudes the severity prompt reports.
+        Acceleration has its own owner (:meth:`at_acceleration`) and noise is left at its range.
+        """
+        if scale <= 1.0:
+            raise ValueError(
+                f"at_severity({scale}) is not beyond the training severity; "
+                "a held-out multiplier must exceed 1.0."
+            )
+        previous = (self._motion_severity, self.b0_strength, self.b1_strength)
+        self._motion_severity *= float(scale)
+        self.b0_strength *= float(scale)
+        self.b1_strength *= float(scale)
+        try:
+            yield
+        finally:
+            self._motion_severity, self.b0_strength, self.b1_strength = previous
 
     def degrade_at(
         self,
@@ -3011,6 +3096,7 @@ class DigitalTwinSimulator(nn.Module):
                     seed=derive_axis_seed(master, axis),
                     geometry=geometry,
                     profile=self.scanner_profile,
+                    **(self._local[axis].degrader_kwargs() if axis in self._local else {}),
                 )
                 # Some registry ops are intrinsically real (rician acts on the
                 # magnitude), and this pipeline is complex end to end. Casting

@@ -9,8 +9,8 @@ artifact metrics:
   of full image) — flags long-tailed intensity distributions caused by
   bright-vessel or fat contamination.
 
-HD95 is omitted because it requires MONAI as a runtime dep — covered in
-the integration tier.
+HD95 boundary distances need MONAI (integration tier); its Otsu mask is
+tested here.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from spectramr.core.metrics.qa_metrics import QI1Metric, WM2MaxMetric
+from spectramr.core.metrics.qa_metrics import HD95Metric, QI1Metric, WM2MaxMetric
 
 pytestmark = pytest.mark.unit
 
@@ -238,3 +238,20 @@ def test_qa_metrics_registered_under_documented_names() -> None:
     available = list_available()
     assert "qi1" in available
     assert "wm2max" in available
+
+
+def test_hd95_otsu_mask_is_invariant_to_minus_one_one_normalisation() -> None:
+    """#174: a [-1, 1] image must threshold the same anatomy as its [0, 1] original."""
+    torch.manual_seed(0)
+    img = torch.zeros(1, 1, 32, 32)
+    img[..., 8:24, 8:24] = 0.3
+    img[..., 12:20, 12:20] = 0.9
+    img = (img + 0.02 * torch.rand_like(img)).clamp(0.0, 1.0)
+    mask_unit = HD95Metric._otsu_threshold(img)
+    mask_signed = HD95Metric._otsu_threshold(img * 2.0 - 1.0)
+    assert torch.equal(mask_unit, mask_signed)
+    assert 0 < mask_unit.sum() < img.numel()
+
+
+def test_hd95_otsu_constant_image_gives_empty_mask() -> None:
+    assert HD95Metric._otsu_threshold(torch.full((1, 1, 8, 8), -0.5)).sum() == 0

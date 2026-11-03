@@ -114,6 +114,58 @@ def _callable_accepts_kwarg(callable_obj: Any, argument: str) -> bool:
     return result
 
 
+def _names_parameter(callable_obj: Any, argument: str) -> bool:
+    """Return True only if the callable declares ``argument`` by name (``**kwargs`` does not count)."""
+    try:
+        return argument in inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):  # pragma: no cover - best effort only
+        return False
+
+
+#: Names a forward may give its diffusion-time parameter, in binding order (#2086).
+_TIMESTEP_PARAMETER_NAMES: tuple[str, ...] = ("timesteps", "time", "t")
+_TIMESTEP_KWARG_CACHE: dict[Any, str | None] = {}
+
+
+def timestep_kwarg_for(callable_obj: Any) -> str | None:
+    """The keyword that delivers the diffusion timestep to ``callable_obj``, or ``None``.
+
+    ``_callable_accepts_kwarg`` answers "will this call raise?", so a ``**kwargs``
+    catch-all says yes to every name. Used as "will this be consumed?", it sent
+    ``timesteps=`` into the ``**kwargs`` of ``forward(x, t=None, **kwargs)``, where it
+    was dropped and ``t`` ran at its default (#2086). This binds to a NAMED parameter
+    first; ``**kwargs`` stands in only when the signature names no time parameter.
+
+    Raises:
+        TypeError: when the only time-like parameter is ``sigma``: an integer step is
+            not a noise level, and dropping it into ``**kwargs`` trains unconditioned.
+    """
+    cache_key = _cache_key(callable_obj)
+    if cache_key in _TIMESTEP_KWARG_CACHE:
+        return _TIMESTEP_KWARG_CACHE[cache_key]
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):  # pragma: no cover - best effort only
+        return None
+    named = {
+        name
+        for name, p in parameters.items()
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    result = next((name for name in _TIMESTEP_PARAMETER_NAMES if name in named), None)
+    if result is None and "sigma" in named:
+        raise TypeError(
+            f"{getattr(callable_obj, '__qualname__', callable_obj)!r} takes its time "
+            "argument as `sigma`, a noise level; this strategy passes an integer "
+            "diffusion step. Name the parameter `timesteps`, or train it on a strategy "
+            "that feeds sigma."
+        )
+    if result is None and any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        result = "timesteps"
+    _TIMESTEP_KWARG_CACHE[cache_key] = result
+    return result
+
+
 def _get_config_value(config: Any, key: str, default: Any = None) -> Any:
     """Helper to safely get config values supporting dot notation and Pydantic models."""
     if config is None:

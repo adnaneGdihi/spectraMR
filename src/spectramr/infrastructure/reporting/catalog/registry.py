@@ -30,9 +30,11 @@ from .examples_frames import (
     make_stratified_df,
     make_task_ablation_frame,
 )
+from ..plotters.differences import IDENTITY_FIGURES
+from ..plotters.dynamics import FIGURES as DYNAMICS_FIGURES
+from .examples_dynamics import make_dynamics_df
 from .examples_long import make_long_metrics_df
 from .examples_payloads import (
-    make_acquisition_arms,
     make_arms,
     make_beltrami_mu,
     make_certificate_paths,
@@ -71,10 +73,6 @@ EXAMPLES: dict[str, tuple[Any, Any]] = {
         make_long_metrics_df,
         lambda: {"predictions_df": make_predictions_df()},
     ),
-    "fig_1_9_ablation_strip": (
-        make_metric_frame,
-        lambda: {"primary_metric": "psnr", "full_method": "full"},
-    ),
     "fig_1_11_stratified_performance": (
         make_long_metrics_df,
         lambda: {"stratified_df": make_stratified_df()},
@@ -87,11 +85,10 @@ EXAMPLES: dict[str, tuple[Any, Any]] = {
     "gen_gan_diagnostics": (make_long_metrics_df, dict),
     "gen_vae_diagnostics": (make_long_metrics_df, dict),
     "gen_diffusion_diagnostics": (make_long_metrics_df, dict),
-    "metric_distribution": (make_metric_frame, dict),
+    "metric_distribution": (make_long_metrics_df, lambda: {"slice_df": make_slice_df()}),
     "significance_matrix": (make_metric_frame, lambda: {"metric": "psnr"}),
     "bland_altman": (make_bland_frame, lambda: {"metric": "ssim"}),
     "calibration_coverage": (make_calibration_frame, dict),
-    "forest_plot": (make_metric_frame, lambda: {"metric": "psnr"}),
     "ablation_heatmap": (make_heatmap_frame, dict),
     "acceleration_sweep": (make_accel_frame, lambda: {"metric": "psnr"}),
     "mri_a1_sr_triptych": (
@@ -99,7 +96,6 @@ EXAMPLES: dict[str, tuple[Any, Any]] = {
         lambda: {"cases": make_image_cases(), "show_spectrum": True},
     ),
     "mri_a2_synthesis_c2c": (make_long_metrics_df, lambda: {"cases": make_image_cases()}),
-    "mri_a7_kspace_recon": (make_long_metrics_df, lambda: {"cases": make_image_cases()}),
     "mri_recon_panel": (make_long_metrics_df, lambda: {"cases": make_image_cases()}),
     "kspace_error_spectrum": (make_long_metrics_df, lambda: {"cases": make_image_cases()}),
     "mri_a11_cohort_table": (make_long_metrics_df, lambda: {"cohort": make_cohort_dict()}),
@@ -130,7 +126,6 @@ EXAMPLES: dict[str, tuple[Any, Any]] = {
     "qc_group_strip": (make_metric_frame, dict),
     "qc_subject_mosaic": (make_long_metrics_df, lambda: {"cases": make_image_cases()}),
     "qc_carpet": (make_long_metrics_df, lambda: {"cases": make_image_cases()}),
-    "fig_3_1_metric_violin": (make_long_metrics_df, lambda: {"slice_df": make_slice_df()}),
     "fig_3_2_subject_bars": (make_long_metrics_df, lambda: {"slice_df": make_slice_df()}),
     "fig_3_3_metric_scatter": (make_long_metrics_df, lambda: {"slice_df": make_slice_df()}),
     "cmp_paired_slice_scatter": (
@@ -141,6 +136,8 @@ EXAMPLES: dict[str, tuple[Any, Any]] = {
     "fig_3_6_error_decomposition": (make_long_metrics_df, lambda: {"slice_df": make_slice_df()}),
     "fig_3_7_metric_embedding": (make_long_metrics_df, lambda: {"slice_df": make_slice_df()}),
     "fig_3_8_intensity_joint": (make_long_metrics_df, lambda: {"cases": make_image_cases()}),
+    **dict.fromkeys(DYNAMICS_FIGURES, (make_dynamics_df, dict)),
+    **{fid: (make_long_metrics_df, lambda: {"slice_df": make_slice_df()}) for fid in IDENTITY_FIGURES},
     "fig_3_9_background_zoom": (make_long_metrics_df, lambda: {"cases": make_image_cases()}),
     "fig_4_1_weight_trajectory": (
         make_long_metrics_df,
@@ -158,10 +155,6 @@ EXAMPLES: dict[str, tuple[Any, Any]] = {
         lambda: {"certificate_paths": make_certificate_paths()},
     ),
     "ksd_certificate": (make_long_metrics_df, lambda: {"ksd_result": make_ksd_result()}),
-    "learnable_acquisition_pareto": (
-        make_long_metrics_df,
-        lambda: {"acquisition_arms": make_acquisition_arms()},
-    ),
     # Cohort task-ablation bars (faceted validation metrics, method vs ablation).
     "cohort_task_ablation_bars": (make_task_ablation_frame, dict),
     "cmp_mosaic": (make_long_metrics_df, lambda: {"arms": make_arms()}),
@@ -283,14 +276,15 @@ def render_catalog(
 ) -> dict[str, Any]:
     """Render every registered figure and table from its example into ``out_dir``.
 
-    Returns ``{"figures": {id: Path | None}, "reasons": {id: why}, "tables": {...}}``;
-    an id with no example is reported as ``no_example``, never skipped quietly.
+    Returns ``{"figures": {id: Path | None}, "reasons": {id: why}, "tables": {...},
+    "html": Path}``; an id with no example is reported as ``no_example``, never skipped
+    quietly, and is listed under "Not drawn" on ``catalog.html``.
     """
     from .. import plotters, tables
-    from ..style import use_default_style
+    from ..style import select_style
 
     out_dir = Path(out_dir)
-    use_default_style(style)
+    select_style(style)
     figures: dict[str, Path | None] = {}
     reasons: dict[str, str] = {}
     for fid in plotters.list_available():
@@ -313,4 +307,7 @@ def render_catalog(
             continue
         frame, kwargs = example
         table_out.update(tables.dispatch(frame(), [tid], out_dir / "tables", **kwargs()))
-    return {"figures": figures, "reasons": reasons, "tables": table_out}
+    from ..dashboard.catalog import catalog_page
+
+    html = catalog_page(out_dir, figures=figures, reasons=reasons, tables=table_out)
+    return {"figures": figures, "reasons": reasons, "tables": table_out, "html": html}

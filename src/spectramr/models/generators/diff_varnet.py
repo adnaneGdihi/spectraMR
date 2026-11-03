@@ -27,6 +27,12 @@ from spectramr.models.blocks.contrast_conditioning import (
 )
 from spectramr.models.blocks.timestep_embedding import sinusoidal_timestep_embedding
 from spectramr.models.blocks.grad_checkpointing import GradCheckpointingMixin
+from spectramr.models.blocks.pipeline_stages import (
+    CascadeStage,
+    Payload,
+    build_cascade_stages,
+    cascade_at,
+)
 from spectramr.models.interfaces.models import IGenerator
 from spectramr.models.layers.complex_conv import ComplexConv2d
 from spectramr.models.registry import register_model
@@ -284,81 +290,28 @@ class DiffVarNet(GradCheckpointingMixin, nn.Module, IGenerator):
 
         Hardware/Device Context:
             Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # [FIX] Alias for strategy compatibility
-        if measured_kspace is None:
-            measured_kspace = kwargs.get("kspace_measured")
+        payload = _enter(self, x, timesteps, acceleration, mask, measured_kspace, kwargs)
+        everything = range(len(self.blocks))
+        return _exit(_cascade(self, everything, payload, self._checkpointing_active()))
 
-        # [FIX] Handle 5D volumetric input [B, C, D, H, W] → [B*D, C, H, W]
-        _was_5d = False
-        if x.ndim == 5:
-            _was_5d = True
-            B, C, D, H, W = x.shape
-            x = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
-            if measured_kspace is not None and measured_kspace.ndim == 5:
-                measured_kspace = measured_kspace.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
-            if mask is not None and mask.ndim == 5:
-                mask = mask.permute(0, 2, 1, 3, 4).reshape(B * D, mask.shape[1], H, W)
+    def pipeline_stages(self, n: int) -> list[CascadeStage]:
+        """``n`` contiguous, balanced runs of unrolled blocks (pipeline parallelism).
 
-        # 1. Embedding
-        cond_input = acceleration if acceleration is not None else timesteps.float().unsqueeze(1)
-        if cond_input.ndim == 1:
-            cond_input = cond_input.unsqueeze(1)
+        The first stage also owns the conditioning embedding, whose output rides in the
+        payload so every block's AdaGN reads it and its gradient returns to stage 0.
+        """
 
-        # Handle batch dimension for 5D inputs
-        if _was_5d and cond_input.shape[0] != x.shape[0]:
-            cond_input = cond_input.repeat_interleave(D, dim=0)
+        def paths(cascades: range, first: bool, _last: bool) -> list[str]:
+            owned = [f"blocks.{i}" for i in cascades]
+            if first:
+                owned.append("time_pos_enc")
+                if self.contrast_proj is not None:
+                    owned.append("contrast_proj")
+            return owned
 
-        # Sinusoidal encoding of whichever scalar was chosen. ``max_timesteps``
-        # is already forwarded by the generator (kspace_cold_diffusion_generator
-        # sets filtered_kwargs["max_timesteps"]); it was previously swallowed
-        # here. When conditioning on ``acceleration`` instead of ``timesteps``
-        # the horizon is the max acceleration, so fall back to the raw value
-        # rather than dividing an R by a step count.
-        _max_t = kwargs.get("max_timesteps") if acceleration is None else None
-        t_sin = sinusoidal_timestep_embedding(
-            cond_input.squeeze(-1),
-            self.physics_emb_dim,
-            max_timesteps=_max_t,
-            scale=kwargs.get("timestep_scale", "unit_interval") if acceleration is None
-            else "unit_interval",
+        return build_cascade_stages(
+            self, n, len(self.blocks), _DiffVarNetStage, paths, physics_emb_dim=self.physics_emb_dim
         )
-        emb = self.time_pos_enc(t_sin)
-
-        # Contrast conditioning, mirroring ComplexUNet (complex_unet.py:333):
-        # added onto the timestep embedding so it reaches every unrolled block
-        # through the existing AdaGN path.
-        contrast_emb = kwargs.get("contrast_emb")
-        if contrast_emb is not None:
-            if contrast_emb.shape[-1] != self.physics_emb_dim:
-                if self.contrast_proj is None:
-                    raise ValueError(
-                        f"contrast_emb width {contrast_emb.shape[-1]} != "
-                        f"physics_emb_dim {self.physics_emb_dim}. Set "
-                        "model_kwargs.physics_emb_dim to match "
-                        "model_kwargs.time_embedding_dim (the generator builds "
-                        "contrast_embedding at that width)."
-                    )
-                contrast_emb = self.contrast_proj(contrast_emb)
-            if _was_5d:
-                contrast_emb = expand_contrast_over_slices(contrast_emb, emb.shape[0], D)
-            emb = fuse_contrast_embedding(emb, contrast_emb, owner="DiffVarNet")
-
-        # 2. Iterative Unrolling
-        curr_x = x
-
-        ckpt = self._checkpointing_active()
-        for block in self.blocks:
-            curr_x = (
-                checkpoint(block, curr_x, emb, measured_kspace, mask, use_reentrant=False)
-                if ckpt
-                else block(curr_x, emb, measured_kspace, mask)
-            )
-
-        # [FIX] Restore 5D shape if input was volumetric
-        if _was_5d:
-            curr_x = curr_x.reshape(B, D, C, *curr_x.shape[2:]).permute(0, 2, 1, 3, 4)
-
-        return curr_x
 
     @property
     def name(self) -> str:
@@ -385,3 +338,132 @@ class DiffVarNet(GradCheckpointingMixin, nn.Module, IGenerator):
             timesteps = torch.zeros(z.shape[0], device=device)
 
         return self(z, timesteps=timesteps, **kwargs)
+
+
+def _enter(
+    owner: nn.Module,
+    x: torch.Tensor,
+    timesteps: torch.Tensor,
+    acceleration: torch.Tensor | None,
+    mask: torch.Tensor | None,
+    measured_kspace: torch.Tensor | None,
+    kwargs: dict[str, Any],
+) -> Payload:
+    """Fold a volume into slices and build the conditioning embedding.
+
+    Payload: ``(estimate, emb, measured_kspace, mask, restore)``; ``restore`` is the
+    ``(B, D, C)`` of a folded volume, or ``None``.
+    """
+    # [FIX] Alias for strategy compatibility
+    if measured_kspace is None:
+        measured_kspace = kwargs.get("kspace_measured")
+
+    # [FIX] Handle 5D volumetric input [B, C, D, H, W] → [B*D, C, H, W]
+    _was_5d = False
+    if x.ndim == 5:
+        _was_5d = True
+        B, C, D, H, W = x.shape
+        x = x.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+        if measured_kspace is not None and measured_kspace.ndim == 5:
+            measured_kspace = measured_kspace.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+        if mask is not None and mask.ndim == 5:
+            mask = mask.permute(0, 2, 1, 3, 4).reshape(B * D, mask.shape[1], H, W)
+
+    # 1. Embedding
+    cond_input = acceleration if acceleration is not None else timesteps.float().unsqueeze(1)
+    if cond_input.ndim == 1:
+        cond_input = cond_input.unsqueeze(1)
+
+    # Handle batch dimension for 5D inputs
+    if _was_5d and cond_input.shape[0] != x.shape[0]:
+        cond_input = cond_input.repeat_interleave(D, dim=0)
+
+    # Sinusoidal encoding of whichever scalar was chosen. ``max_timesteps``
+    # is already forwarded by the generator (kspace_cold_diffusion_generator
+    # sets filtered_kwargs["max_timesteps"]); it was previously swallowed
+    # here. When conditioning on ``acceleration`` instead of ``timesteps``
+    # the horizon is the max acceleration, so fall back to the raw value
+    # rather than dividing an R by a step count.
+    _max_t = kwargs.get("max_timesteps") if acceleration is None else None
+    t_sin = sinusoidal_timestep_embedding(
+        cond_input.squeeze(-1),
+        owner.physics_emb_dim,
+        max_timesteps=_max_t,
+        scale=kwargs.get("timestep_scale", "unit_interval") if acceleration is None
+        else "unit_interval",
+    )
+    emb = owner.time_pos_enc(t_sin)
+
+    # Contrast conditioning, mirroring ComplexUNet (complex_unet.py:333):
+    # added onto the timestep embedding so it reaches every unrolled block
+    # through the existing AdaGN path.
+    contrast_emb = kwargs.get("contrast_emb")
+    if contrast_emb is not None:
+        if contrast_emb.shape[-1] != owner.physics_emb_dim:
+            projection = getattr(owner, "contrast_proj", None)
+            if projection is None:
+                raise ValueError(
+                    f"contrast_emb width {contrast_emb.shape[-1]} != "
+                    f"physics_emb_dim {owner.physics_emb_dim}. Set "
+                    "model_kwargs.physics_emb_dim to match "
+                    "model_kwargs.time_embedding_dim (the generator builds "
+                    "contrast_embedding at that width)."
+                )
+            contrast_emb = projection(contrast_emb)
+        if _was_5d:
+            contrast_emb = expand_contrast_over_slices(contrast_emb, emb.shape[0], D)
+        emb = fuse_contrast_embedding(emb, contrast_emb, owner="DiffVarNet")
+
+    restore = torch.tensor([B, D, C]) if _was_5d else None
+    return (x, emb, measured_kspace, mask, restore)
+
+
+def _cascade(owner: nn.Module, cascades: range, payload: Payload, ckpt: bool) -> Payload:
+    """The unrolled blocks in ``cascades``, each ending in its data-consistency step."""
+    curr_x, emb, measured_kspace, mask = payload[:4]
+    for i in cascades:
+        block = cascade_at(owner.blocks, i)
+        curr_x = (
+            checkpoint(block, curr_x, emb, measured_kspace, mask, use_reentrant=False)
+            if ckpt
+            else block(curr_x, emb, measured_kspace, mask)
+        )
+    return (curr_x, *payload[1:])
+
+
+def _exit(payload: Payload) -> torch.Tensor:
+    """Unfold a volume that ``_enter`` folded into slices."""
+    curr_x, restore = payload[0], payload[4]
+    if restore is not None:
+        B, D, C = (int(v) for v in restore)
+        curr_x = curr_x.reshape(B, D, C, *curr_x.shape[2:]).permute(0, 2, 1, 3, 4)
+    return curr_x
+
+
+class _DiffVarNetStage(CascadeStage):
+    """Payload: ``(estimate, emb, measured_kspace, mask, restore)``."""
+
+    def __init__(self, cascades: range, *, physics_emb_dim: int, **kwargs: Any):
+        super().__init__(cascades, **kwargs)
+        self.physics_emb_dim = physics_emb_dim
+
+    def _enter(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        acceleration: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        measured_kspace: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> Payload:
+        return _enter(self, x, timesteps, acceleration, mask, measured_kspace, kwargs)
+
+    def _cascade(self, payload: Payload) -> Payload:
+        return _cascade(self, self.cascades, payload, self._checkpointing_active())
+
+    def _exit(self, payload: Payload) -> torch.Tensor:
+        return _exit(payload)
+
+    def batched_entries(self, payload: Payload, batch: int) -> tuple[bool, ...]:
+        # ``restore`` is three integers, never a per-sample tensor.
+        return (*super().batched_entries(payload[:4], batch), False)

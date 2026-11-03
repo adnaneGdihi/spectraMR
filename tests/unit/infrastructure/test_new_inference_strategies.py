@@ -586,15 +586,13 @@ class MockLatentGANModel(nn.Module):
 
 
 class MockLatentDiffusionModel(nn.Module):
-    """Mock latent diffusion model."""
+    """Mock latent diffusion model: owns a reverse schedule and a decoded-image sample()."""
 
     def __init__(self):
         super().__init__()
-        self.sample = MagicMock(return_value=torch.randn(1, 64, 16, 16))
-        self.first_stage_model = MagicMock()
-        self.first_stage_model.decode = MagicMock(
-            return_value=torch.randn(1, 1, 64, 64)
-        )
+        self.diffusion = MagicMock()
+        self.set_diffusion_schedule = MagicMock()
+        self.sample = MagicMock(return_value=torch.randn(1, 1, 64, 64))
 
 
 class MockMAEModel(nn.Module):
@@ -685,14 +683,25 @@ class TestLatentDiffusionInferenceStrategy:
 
         model = MockLatentDiffusionModel()
         device = torch.device("cpu")
-        return LatentDiffusionInferenceStrategy(model, device)
+        config = {
+            "training": {
+                "diffusion": {
+                    "timesteps": 20,
+                    "noise_schedule": "linear",
+                    "beta_start": 1e-4,
+                    "beta_end": 0.02,
+                }
+            }
+        }
+        return LatentDiffusionInferenceStrategy(model, device, config)
 
-    def test_run_inference_samples_and_decodes(self, strategy: Any) -> None:
+    def test_run_inference_samples_the_decoded_image(self, strategy: Any) -> None:
         input_tensor = torch.randn(1, 1, 64, 64)
-        result = strategy.run_inference(input_tensor)
-        output, metadata = result
+        output, metadata = strategy.run_inference(input_tensor)
         assert isinstance(output, torch.Tensor)
-        assert "latents" in metadata
+        assert output.shape == (1, 1, 64, 64)
+        assert metadata == {}
+        assert strategy.model.set_diffusion_schedule.call_count == 1
 
 
 class TestMAEInferenceStrategy:

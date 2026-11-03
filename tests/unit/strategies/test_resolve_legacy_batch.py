@@ -51,7 +51,7 @@ STRATEGIES_DIR = REPO_ROOT / "src" / "spectramr" / "infrastructure" / "training"
 F6_REFACTORED = [
     # Round 5 representatives
     "mri_slam_strategy.py",
-    "diffeomorphic_recon_strategy.py",
+    # diffeomorphic_recon left: it reads the reconstruction seam, not the batch dict.
     "coord_kspace_gen_strategy.py",
     # Round 6 — 13 remaining legacy strategies refactored in bulk
     "spin_sde_strategy.py",
@@ -171,8 +171,8 @@ def test_f6_refactored_strategy_does_not_use_legacy_batch_positional(filename: s
 
 def test_f6_round_6_queue_resolved() -> None:
     """All 13 round-6 strategies now refactored — only JEPA remains queued."""
-    assert len(F6_REFACTORED) == 16, (
-        f"Expected 16 refactored strategies (3 round-5 + 13 round-6), "
+    assert len(F6_REFACTORED) == 15, (
+        f"Expected 15 refactored strategies (2 round-5 + 13 round-6), "
         f"got {len(F6_REFACTORED)}. Update F6_REFACTORED."
     )
     assert "jepa_strategy.py" in F6_QUEUED_FOR_ROUND_7_PLUS, (

@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from spectramr.config.schemas.campaign import EvaluationConfigSchema
+from spectramr.config.schemas.campaign import CampaignConfigSchema, EvaluationConfigSchema
 from spectramr.core.metrics.statistical_tests import StatisticalTests
 from spectramr.core.metrics.uncertainty import UncertaintyMetrics
 from spectramr.data.builders.eval_dataset_builder import (
@@ -32,6 +32,10 @@ from spectramr.data.builders.eval_dataset_builder import (
     load_uncertainty_bundle,
 )
 from spectramr.infrastructure.checkpointing.restore import weights
+from spectramr.infrastructure.orchestration.campaign_seed_pooling import (
+    pool_replicates,
+    seed_members,
+)
 from spectramr.infrastructure.orchestration.campaign_state import (
     CampaignState,
     ExperimentStatus,
@@ -160,13 +164,22 @@ class CampaignEvaluator:
 
     # ── Main entry point ─────────────────────────────────────────
 
-    def evaluate(self, campaign_state: CampaignState) -> CampaignReport:
+    def evaluate(
+        self,
+        campaign_state: CampaignState,
+        campaign: CampaignConfigSchema | None = None,
+    ) -> CampaignReport:
         """Run full evaluation on a completed campaign.
 
         Respects all EvaluationConfigSchema flags:
         - per_sample_inference: run inference on shared test set
         - compute_uncertainty: evaluate calibration metrics
         - generate_plots / export_latex: consumed by CLI/report generator
+
+        ``campaign`` supplies the declarations the state does not carry:
+        ``compare_to`` (restricts an arm's pairings) and ``tags.seed``
+        (replicates pooled into one arm). Without it, every arm is compared
+        against every baseline and no replicates are pooled.
         """
         report = CampaignReport(campaign_name=campaign_state.campaign_name)
 
@@ -176,6 +189,20 @@ class CampaignEvaluator:
 
         # Step 2: Load per-sample metrics
         all_metrics = self._load_all_metrics(campaign_state)
+
+        # Step 2b: pool seed replicates into one arm each.
+        members = seed_members(campaign.enabled_experiments if campaign else [])
+        if members:
+            rows = sorted(n for n in members if n in self._slice_passes)
+            if rows:
+                raise NotImplementedError(
+                    f"Seed replicates {rows} are read from per-slice validation rows; "
+                    "pooling is implemented for per-sample NPZ metrics only."
+                )
+            all_metrics = pool_replicates(all_metrics, members)
+
+        def group_of(name: str) -> str:
+            return members[name].group if name in members else name
 
         if len(all_metrics) < 2:
             report.summary = (
@@ -188,15 +215,51 @@ class CampaignEvaluator:
         report.leaderboard = self._build_leaderboard(all_metrics)
 
         # Step 4: Pairwise comparisons
-        baseline_names = [e.name for e in campaign_state.experiments if e.role == "baseline"]
+        baseline_names = list(
+            dict.fromkeys(
+                group_of(e.name) for e in campaign_state.experiments if e.role == "baseline"
+            )
+        )
         if not baseline_names:
             baseline_names = [next(iter(all_metrics.keys()))]
+
+        # compare_to arms are tested only against their named targets (step 4b).
+        restricted = (
+            {
+                exp.name: [group_of(t) for t in exp.compare_to]
+                for exp in campaign.all_declared_experiments
+                if exp.compare_to
+            }
+            if campaign
+            else {}
+        )
 
         for bl in baseline_names:
             if bl not in all_metrics:
                 continue
             for metric in self.config.metrics:
-                report.pairwise_results.extend(self._pairwise_vs_baseline(bl, all_metrics, metric))
+                report.pairwise_results.extend(
+                    self._pairwise_vs_baseline(bl, all_metrics, metric, exclude=restricted)
+                )
+
+        seen_pairs: set[frozenset[str]] = set()
+        for arm, targets in restricted.items():
+            if arm not in all_metrics:
+                logger.warning(f"compare_to: '{arm}' has no metrics; no pairings computed")
+                continue
+            for target in targets:
+                if target not in all_metrics:
+                    logger.warning(f"compare_to: '{target}' for '{arm}' has no metrics; skipped")
+                    continue
+                if frozenset((arm, target)) in seen_pairs:
+                    continue
+                seen_pairs.add(frozenset((arm, target)))
+                for metric in self.config.metrics:
+                    va = all_metrics[target].get(metric)
+                    vb = all_metrics[arm].get(metric)
+                    if va is None or vb is None:
+                        continue
+                    report.pairwise_results.append(self._compare_pair(target, arm, va, vb, metric))
 
         # Step 5: Multiple comparison correction
         if report.pairwise_results:
@@ -736,13 +799,19 @@ class CampaignEvaluator:
 
     # ── Pairwise Comparison ──────────────────────────────────────
 
-    def _pairwise_vs_baseline(self, bl: str, all_m: dict, metric: str) -> list[PairwiseResult]:
+    def _pairwise_vs_baseline(
+        self,
+        bl: str,
+        all_m: dict,
+        metric: str,
+        exclude: dict[str, list[str]] | None = None,
+    ) -> list[PairwiseResult]:
         results: list[PairwiseResult] = []
         bl_vals = all_m.get(bl, {}).get(metric)
         if bl_vals is None:
             return results
         for name, m in all_m.items():
-            if name == bl:
+            if name == bl or (exclude and name in exclude):
                 continue
             v = m.get(metric)
             if v is None:

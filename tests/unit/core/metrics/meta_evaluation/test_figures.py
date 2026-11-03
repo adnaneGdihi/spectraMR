@@ -25,6 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
+import torch
 
 
 def _p99_normalised_brain(rng: np.random.Generator) -> np.ndarray:
@@ -112,3 +113,74 @@ def test_percentile_clip_is_below_max_for_heavy_tails(pct: float) -> None:
     rng = np.random.default_rng(2)
     img = _p99_normalised_brain(rng)
     assert float(np.percentile(img, pct)) < float(img.max())
+
+
+def _traj_output(physical: bool):
+    from types import SimpleNamespace
+
+    from spectramr.core.metrics.meta_evaluation.types import (
+        DegradationSample,
+        MetricEvaluationDataset,
+    )
+
+    img = torch.zeros(1, 4, 4)
+    samples, vals = [], []
+    for fam, scale in (("noise", 1.0), ("blur", 0.0003)):
+        for k, th in enumerate((0.25, 0.5, 0.75, 1.0)):
+            sev = {"theta": th}
+            if physical:
+                sev["physical"] = 2.0 * 2.0**k
+            samples.append(DegradationSample(img, img, fam, sev, "c0", 0))
+            vals.append(0.5 + scale * th * 0.5)
+    prov = {"severity_axes": {"noise": {"units": "R", "schedule": "log"}}}
+    ds = MetricEvaluationDataset(samples=samples, metric_values={"m": vals, "k": [2.0] * len(vals)})
+    return SimpleNamespace(dataset=ds, degradation_provenance=prov)
+
+
+def test_core_metric_trajectories_fixed_ylim(tmp_path, monkeypatch) -> None:
+    from spectramr.core.metrics.meta_evaluation import figures
+
+    seen: list[tuple] = []
+    real = figures.rs.save_figure
+
+    def spy(fig, path, *a, **k):
+        seen.append((path.name, [tuple(ax.get_ylim()) for ax in fig.axes if ax.lines]))
+        return real(fig, path, *a, **k)
+
+    monkeypatch.setattr(figures.rs, "save_figure", spy)
+    figures.metric_trajectories(_traj_output(physical=False), tmp_path)
+    per_metric = dict(seen)["m.png"][0]
+    sheet = dict(seen)["fig9_metric_trajectories_index.png"]
+    assert per_metric == pytest.approx(sheet[1])  # thumbnails follow sorted metric order: k, m
+    # The wider family (0.5..1.0) sets the range even though "blur" only moves 0.0003.
+    assert per_metric[0] < 0.5 and per_metric[1] > 0.99
+    # A constant metric gets the fixed span, not matplotlib's own singular expansion.
+    assert dict(seen)["k.png"][0] == pytest.approx((1.95, 2.05))
+
+
+def test_core_metric_trajectories_physical_x_for_one_family(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from spectramr.core.metrics.meta_evaluation import figures
+
+    out = _traj_output(physical=True)
+    keep = [i for i, s in enumerate(out.dataset.samples) if s.degradation_family == "noise"]
+    ds = out.dataset
+    one = SimpleNamespace(
+        dataset=type(ds)(
+            samples=[ds.samples[i] for i in keep],
+            metric_values={"m": [ds.metric_values["m"][i] for i in keep]},
+        ),
+        degradation_provenance=out.degradation_provenance,
+    )
+    seen: list[tuple] = []
+    real = figures.rs.save_figure
+
+    def spy(fig, path, *a, **k):
+        ax = fig.axes[0]
+        seen.append((path.name, ax.get_xscale(), ax.get_xlabel()))
+        return real(fig, path, *a, **k)
+
+    monkeypatch.setattr(figures.rs, "save_figure", spy)
+    figures.metric_trajectories(one, tmp_path)
+    assert {n: (s, x) for n, s, x in seen}["m.png"] == ("log", "R")

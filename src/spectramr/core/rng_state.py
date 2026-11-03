@@ -63,6 +63,8 @@ def capture_rng_state() -> dict[str, Any]:
     }
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
+        # Which of them this rank drew from, for a peer on another device (restore's peer=True).
+        state["cuda_device"] = torch.cuda.current_device()
     return state
 
 
@@ -82,8 +84,12 @@ def _as_cpu_byte(state: Any) -> Any:
     return state.cpu() if torch.is_tensor(state) else state
 
 
-def restore_rng_state(state: dict[str, Any]) -> None:
+def restore_rng_state(state: dict[str, Any], *, peer: bool = False) -> None:
     """Reverse of :func:`capture_rng_state`.
+
+    ``peer=True`` is for a model-parallel peer of the capturing rank, which draws the
+    same timesteps and noise on its own device: its current CUDA device takes the
+    stream the capturing rank drew from, rather than one state per device.
 
     Tolerates partial state, for checkpoints that pre-date one of the streams.
     The CUDA entry is skipped when this process has no CUDA — a CPU resume of a
@@ -102,6 +108,9 @@ def restore_rng_state(state: dict[str, Any]) -> None:
     if "cuda" not in state or not torch.cuda.is_available():
         return
     saved = [_as_cpu_byte(entry) for entry in state["cuda"]]
+    if peer:
+        torch.cuda.set_rng_state(saved[int(state.get("cuda_device", 0))])
+        return
     if len(saved) == torch.cuda.device_count():
         torch.cuda.set_rng_state_all(saved)
     else:

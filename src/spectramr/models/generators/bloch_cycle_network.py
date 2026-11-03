@@ -5,11 +5,25 @@ A physics-informed network that incorporates Bloch equation constraints
 or cycle consistency for MRI reconstruction.
 """
 
+from collections.abc import Mapping
+from typing import Any
+
 import torch
 from torch import nn
 
+from spectramr.models.generators.bloch_cycle_maps import (
+    BlochSequence,
+    build_refinement_modules,
+    maps_from_logits,
+    resolve_fixed_relaxation,
+)
 from spectramr.models.interfaces.models import IGenerator
-from spectramr.models.reconstruction.unet import AttentionType, BlockType, NormalizationType
+from spectramr.models.reconstruction.unet import (
+    AttentionType,
+    BlockType,
+    NormalizationType,
+    UNetConfig,
+)
 from spectramr.models.reconstruction.unet import UNet as ConfigurableUNetGenerator
 from spectramr.models.registry import register_model
 
@@ -23,6 +37,7 @@ from spectramr.models.registry import register_model
     accepts_complex=False,
     expects_real_imag_interleaved=True,
     requires_paired_data=False,
+    strict_kwargs=True,
 )
 @register_model(
     name="bloch_cycle_network",
@@ -33,139 +48,132 @@ from spectramr.models.registry import register_model
     accepts_complex=False,
     expects_real_imag_interleaved=True,
     requires_paired_data=False,
+    strict_kwargs=True,
 )
 class BlochCycleNetwork(nn.Module, IGenerator):
     """Bloch Cycle Network for MRI Reconstruction.
 
-    This model implements a physics-informed network where the forward pass
-    predicts quantitative tissue maps (PD, T1, T2) and the backward pass
-    (decoder) uses the analytical Bloch equations to reconstruct the signal.
+    A UNet predicts bounded quantitative maps (PD, T1, T2 in ms) and the analytical
+    Bloch equation renders the signal at the declared sequence. With
+    ``num_bloch_modules > 1`` each further module refines the map logits from the
+    input and the previous render, and renders again.
     """
 
     def __init__(
         self,
         in_channels: int = 1,
         out_channels: int = 1,
-        features: tuple[int, ...] = (64, 128, 256, 512),
+        features: tuple[int, ...] = (64, 128, 256, 512, 1024),
         depth: int = 4,
         bilinear: bool = True,
         dropout: float = 0.0,
-        normalization: str = "batch",
-        activation: str = "relu",
         sequence_type: str = "SE",
-        **kwargs,
+        bloch_config: Mapping[str, Any] | None = None,
+        t1_learnable: bool = True,
+        t2_learnable: bool = True,
+        t1_fixed_ms: float | None = None,
+        t2_fixed_ms: float | None = None,
+        num_bloch_modules: int = 1,
+        feature_dim: int | None = None,
+        num_residual_blocks: int | None = None,
     ):
         """Initialize Bloch Cycle Network.
 
         Args:
-            in_channels: Number of input channels (e.g. k-space or image)
-            out_channels: Number of output channels (target image)
-            features: Feature map sizes
-            depth: Network depth
-            bilinear: Upsampling mode
-            dropout: Dropout rate
-            normalization: Normalization type
-            activation: Activation function
-            sequence_type: MRI sequence type ("SE" or "GRE")
+            in_channels: Number of input channels (e.g. k-space or image).
+            out_channels: Declared output width; the rendered signal has one channel.
+            features: UNet widths, one per level (``depth + 1`` entries).
+            depth: UNet depth.
+            bilinear: Upsampling mode.
+            dropout: Dropout rate.
+            sequence_type: ``SE`` or ``GRE``, the signal equation the simulator applies.
+            bloch_config: ``{TR, TE[, flip_angle, use_physics_backward]}`` in ms / deg;
+                ``None`` keeps spin echo at TR 3000 / TE 100 ms.
+            t1_learnable / t2_learnable: predict the map (true) or hold it at
+                ``t1_fixed_ms`` / ``t2_fixed_ms`` (false).
+            num_bloch_modules: Bloch render stages; stages after the first refine the logits.
+            feature_dim / num_residual_blocks: width and depth of each refinement stage.
         """
         super().__init__()
+        features = tuple(int(f) for f in features)
+        if len(features) != depth + 1:
+            raise ValueError(
+                f"features={features} must give depth + 1 = {depth + 1} widths, one per level."
+            )
+        self.sequence = BlochSequence.from_config(bloch_config, sequence_type)
+        self._t1_fixed = resolve_fixed_relaxation("t1", bool(t1_learnable), t1_fixed_ms)
+        self._t2_fixed = resolve_fixed_relaxation("t2", bool(t2_learnable), t2_fixed_ms)
 
-        # 1. Forward Generator (Encoder): Image -> Q-Maps (PD, T1, T2)
-        # We enforce 3 output channels for the quantitative maps
+        # Encoder: image -> logits of the quantitative maps (PD, T1, T2).
         self.map_generator = ConfigurableUNetGenerator(
-            in_channels=in_channels,
-            out_channels=3,  # PD, T1, T2
-            features=features,
-            depth=depth,
-            bilinear=bilinear,
-            dropout=dropout,
-            attention_type=AttentionType.CHANNEL,
-            norm_type=NormalizationType.BATCH,
-            block_type=BlockType.STANDARD,
-            use_attention=True,
-            use_residual=True,
-            deep_supervision=False,  # We usually want just the final maps
+            config=UNetConfig(
+                in_channels=in_channels,
+                out_channels=3,
+                features=features,
+                depth=depth,
+                bilinear=bilinear,
+                dropout=float(dropout),
+                attention_type=AttentionType.CHANNEL,
+                norm_type=NormalizationType.BATCH,
+                block_type=BlockType.STANDARD,
+                use_attention=True,
+                use_residual=True,
+                deep_supervision=False,
+            )
+        )
+        self.refiners = build_refinement_modules(
+            in_channels, int(num_bloch_modules), feature_dim, num_residual_blocks
         )
 
-        # 2. Backward Generator (Decoder): Q-Maps -> Image
-        # Analytical Differentiable Physics Simulator
+        # Decoder: the analytical, differentiable Bloch simulator.
         from spectramr.infrastructure.physics.bloch_simulation import (
             DifferentiableBlochSimulator,
         )
 
         self.bloch_simulator = DifferentiableBlochSimulator(sequence_type=sequence_type)
+        self.sequence_provenance: dict[str, Any] = {
+            "sequence_type": self.sequence.sequence_type,
+            "tr_ms": self.sequence.tr_ms,
+            "te_ms": self.sequence.te_ms,
+            "flip_deg": self.sequence.flip_deg,
+            "num_bloch_modules": int(num_bloch_modules),
+            "t1_fixed_ms": self._t1_fixed,
+            "t2_fixed_ms": self._t2_fixed,
+        }
 
-        # Default acquisition parameters (can be overridden in forward)
-        # Spin Echo defaults
-        self.default_tr = 3000.0  # ms
-        self.default_te = 100.0  # ms
+    def _render(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        maps = maps_from_logits(logits, self._t1_fixed, self._t2_fixed)
+        alpha = self.sequence.flip_deg if self.sequence.sequence_type == "GRE" else None
+        signal = self.bloch_simulator(
+            maps, TR=self.sequence.tr_ms, TE=self.sequence.te_ms, alpha=alpha
+        )
+        return maps, signal
 
-    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input tensor [B, C, H, W]
-            kwargs:
-                tr: Repetition time (ms)
-                te: Echo time (ms)
-
-        Returns:
-            Reconstructed image (Signal) [B, 1, H, W]
-
-        forward method for BlochCycleNetwork.
-
-        Executes PyTorch tensor operations.
-
-        Args:
-            x (torch.Tensor, shape (B, C, H, W) or (B, C, D, H, W)): Expected input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor.
-
-        Hardware/Device Context:
-            Supports Mixed Precision (AMP) and CUDA streams if configured in DataStagingService."""
-        # Handle NHWC -> NCHW if necessary
+    def _run(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """(signal, final maps, whether the input was NHWC) through every Bloch module."""
         needs_permute = x.ndim == 4 and x.shape[1] > 16 and x.shape[3] <= 16
         if needs_permute:
             x = x.permute(0, 3, 1, 2)
-
-        # Handle complex input: extract magnitude to get real-valued tensor
         if torch.is_complex(x):
-            x = x.abs()  # [B, C, H, W] magnitude
+            x = x.abs()
+        logits = self.map_generator(x)
+        maps, signal = self._render(logits)
+        for refine in self.refiners:
+            logits = refine(x, signal, logits)
+            maps, signal = self._render(logits)
+        return signal, maps, needs_permute
 
-        # 1. Predict Quantitative Maps (PD, T1, T2)
-        q_maps = self.map_generator(x)
-
-        # Apply physical constraints (positivity)
-        # T1, T2 must be positive. PD positive.
-        q_maps = torch.abs(q_maps)
-
-        # 2. Simulate Signal using Bloch Equations
-        tr = kwargs.get("tr", self.default_tr)
-        te = kwargs.get("te", self.default_te)
-
-        signal = self.bloch_simulator(q_maps, TR=tr, TE=te)
-
-        # Signal is [B, 1, H, W] (PD is channel 0, etc. handled in simulator)
-
-        if needs_permute:
-            signal = signal.permute(0, 2, 3, 1)
-
-        return signal
+    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """[B, C, H, W] (or NHWC, or complex) -> rendered signal [B, 1, H, W]."""
+        signal, _, needs_permute = self._run(x)
+        return signal.permute(0, 2, 3, 1) if needs_permute else signal
 
     def forward_with_intermediates(self, x: torch.Tensor, **kwargs):
-        """Forward pass enabling deep supervision or visualization."""
-        # Similar logic but return maps
-        if x.ndim == 4 and x.shape[1] > 16 and x.shape[3] <= 16:
-            x = x.permute(0, 3, 1, 2)
-
-        q_maps = torch.abs(self.map_generator(x))
-        tr = kwargs.get("tr", self.default_tr)
-        te = kwargs.get("te", self.default_te)
-        signal = self.bloch_simulator(q_maps, TR=tr, TE=te)
-
-        # Return q_maps as intermediates AND signal as final
-        return signal, [q_maps, signal]
+        """The signal, plus ``[maps, signal]`` of the final Bloch module."""
+        signal, maps, needs_permute = self._run(x)
+        if needs_permute:
+            signal = signal.permute(0, 2, 3, 1)
+        return signal, [maps, signal]
 
     def generate(self, x: torch.Tensor) -> torch.Tensor:
         """generate.
@@ -195,7 +203,7 @@ class BlochCycleNetwork(nn.Module, IGenerator):
         Returns:
             int: Description.
         """
-        return self.map_generator.get_parameter_count()
+        return sum(p.numel() for p in self.parameters())
 
     @property
     def name(self) -> str:

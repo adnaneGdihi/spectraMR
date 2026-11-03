@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import matplotlib as mpl
 import pandas as pd
 
 PlotterFn = Callable[..., Path | None]
@@ -29,7 +30,21 @@ def register(fig_id: str, fn: PlotterFn) -> None:
     PLOTTERS[fig_id] = fn
 
 
+def reject_retired(fig_ids) -> None:
+    """Raise when ``fig_ids`` names a figure merged into another: dispatch would skip it quietly."""
+    from spectramr.config.schemas.reporting import RETIRED_FIGURE_IDS
+
+    hits = {f: RETIRED_FIGURE_IDS[f] for f in fig_ids if f in RETIRED_FIGURE_IDS}
+    if hits:
+        moves = ", ".join(f"{old} -> {new}" for old, new in hits.items())
+        raise ValueError(f"retired figure id(s): {moves}; use the replacement")
+
+
 def get(fig_id: str) -> PlotterFn:
+    from spectramr.config.schemas.reporting import RETIRED_FIGURE_IDS
+
+    if fig_id in RETIRED_FIGURE_IDS:
+        raise KeyError(f"figure '{fig_id}' was merged into '{RETIRED_FIGURE_IDS[fig_id]}'; use that id")
     if fig_id not in PLOTTERS:
         raise KeyError(f"unknown plotter '{fig_id}'. Available: {sorted(PLOTTERS)}")
     return PLOTTERS[fig_id]
@@ -47,7 +62,6 @@ def _ensure_dir(path: str | Path) -> Path:
 
 # Canonical Phase 1 plotters
 from . import (  # noqa: E402
-    ablation_strip,
     computational_profile,
     failure_gallery,
     headline_pareto,
@@ -62,7 +76,6 @@ from .mri_specific import (  # noqa: E402
     cohort_table,
     fiducial_check,
     kspace_error_spectrum,
-    kspace_recon,
     recon_panel,
     sr_triptych,
     synthesis_c2c,
@@ -73,7 +86,6 @@ register("fig_1_2_learning_curves", learning_curves.make)
 register("fig_1_3_loss_decomposition", loss_decomposition.make)
 register("fig_1_4_residual_diagnostics", residual_diagnostics.make)
 register("fig_1_5_predicted_vs_true", predicted_vs_true.make)
-register("fig_1_9_ablation_strip", ablation_strip.make)
 register("fig_1_11_stratified_performance", stratified_performance.make)
 register("fig_1_12_failure_gallery", failure_gallery.make)
 register("fig_1_15_computational_profile", computational_profile.make)
@@ -84,7 +96,6 @@ register("gen_vae_diagnostics", vae_diagnostics.make)
 
 register("mri_a1_sr_triptych", sr_triptych.make)
 register("mri_a2_synthesis_c2c", synthesis_c2c.make)
-register("mri_a7_kspace_recon", kspace_recon.make)
 register("mri_a11_cohort_table", cohort_table.make)
 register("mri_a12_fiducial_check", fiducial_check.make)
 register("mri_recon_panel", recon_panel.make)
@@ -129,9 +140,6 @@ from . import calibration_coverage  # noqa: E402
 
 register("calibration_coverage", calibration_coverage.make)
 
-from . import forest_plot  # noqa: E402
-
-register("forest_plot", forest_plot.make)
 
 from . import ablation_heatmap  # noqa: E402
 
@@ -172,6 +180,13 @@ from .images import FIGURES as _IMAGE_FIGURES  # noqa: E402
 from .weights import FIGURES as _WEIGHT_FIGURES  # noqa: E402
 
 for _fig_id, _make in {**_WEIGHT_FIGURES, **_IMAGE_FIGURES}.items():
+    register(_fig_id, _make)
+
+# Training dynamics (step-wise frame) and where arms differ (identity-keyed slice rows).
+from .differences import FIGURES as _DIFFERENCE_FIGURES  # noqa: E402
+from .dynamics import FIGURES as _DYNAMICS_FIGURES  # noqa: E402
+
+for _fig_id, _make in {**_DYNAMICS_FIGURES, **_DIFFERENCE_FIGURES}.items():
     register(_fig_id, _make)
 
 # Figures whose callable is not ``make(df, out_path, **kw)``: certificates,
@@ -243,7 +258,9 @@ def dispatch_detailed(
         candidate = {"formats": formats, "dpi": dpi, **kwargs}
         call_kwargs = {k: v for k, v in candidate.items() if _accepts(fn, k)}
         try:
-            path = fn(df, out_path, **call_kwargs)
+            # Plotters apply the house style to the global rcParams; restore them per figure.
+            with mpl.rc_context():
+                path = fn(df, out_path, **call_kwargs)
         except Exception as exc:  # report-time soft-fail
             import logging
 

@@ -177,6 +177,45 @@ def rung_mask(
     return mask
 
 
+def process_rung_mask(
+    process: Any,
+    measurement: Tensor,
+    start_timestep: int | None,
+    acquired: Tensor | None = None,
+) -> Tensor:
+    """The mask a caller omitted, taken from the arm's own cascade at ``start_timestep`` (#2555).
+
+    Args:
+        process: The generator's forward process; it must expose ``cascade_batch_masks``.
+        measurement: ``[B, C, H, W]`` k-space the reverse loop starts from.
+        start_timestep: The rung the measurement is degraded at; ``None`` is ``T - 1``.
+        acquired: ``[B, N]`` bool acquired lines, as :func:`rung_mask` takes them.
+
+    Returns:
+        ``[B, 1, H, W]`` float mask.
+
+    Raises:
+        ValueError: The process has no cascade to supply a mask, or the measurement
+            carries data outside that rung's mask, so it was not degraded at that rung.
+    """
+    if process is None or not hasattr(process, "cascade_batch_masks"):
+        raise ValueError(
+            f"sample() received no mask and the forward process ({type(process).__name__}) "
+            "has no Cartesian cascade to supply one. Pass the acquisition mask explicitly."
+        )
+    t = int(process.num_timesteps) - 1 if start_timestep is None else int(start_timestep)
+    steps = torch.full((measurement.shape[0],), t, dtype=torch.long, device=measurement.device)
+    mask = rung_mask(process, steps, measurement, acquired)[:, :1].to(measurement.device)
+    carried = measurement.abs().sum(dim=1, keepdim=True) > 1e-6
+    if bool((carried & (mask < 0.5)).any()):
+        raise ValueError(
+            f"sample() received no mask, and the measurement carries data outside the "
+            f"arm's rung-{t} mask, so it was not degraded at that rung. Pass the mask, or "
+            "the start_timestep the measurement was degraded at."
+        )
+    return mask
+
+
 def acceleration_over_acquired(sampled: Tensor, acquired: Tensor) -> Tensor:
     """``[B]`` acceleration of a mask, counted over each row's acquired lines.
 
@@ -197,6 +236,7 @@ __all__ = [
     "RungStatus",
     "acceleration_over_acquired",
     "level_is_declared",
+    "process_rung_mask",
     "rung_for_acceleration",
     "rung_mask",
     "schedule_accelerator",

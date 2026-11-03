@@ -363,7 +363,7 @@ class TestTemporalSeriesGroup:
         assert "tsnr" not in keys and "temporal_fidelity" not in keys
 
         why_temporal, temporal_keys = elig._NOT_RESTRICTABLE_GROUPS["temporal_series"]
-        assert set(temporal_keys) == {"tsnr", "temporal_fidelity"}
+        assert set(temporal_keys) == {"tsnr", "temporal_fidelity", "temporal_difference_nrmse"}
         assert "time axis" in why_temporal
 
 

@@ -37,19 +37,14 @@ def _radial_profile(err2d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _fft_mag(img: np.ndarray) -> np.ndarray:
-    # Centered FFT magnitude via the physics SSOT; fall back to numpy fftshift
-    # if torch is unavailable in the report environment.
-    try:
-        import torch
+    # Centred, orthonormal FFT via the physics SSOT (rule 2); a numpy fallback
+    # would silently change both centring and scale.
+    import torch
 
-        from spectramr.infrastructure.physics.fft_ops import fft2c
+    from spectramr.infrastructure.physics.fft_ops import fft2c
 
-        t = torch.from_numpy(np.asarray(img, dtype=np.float32))[None, None]
-        k = fft2c(t)
-        return torch.abs(k)[0, 0].cpu().numpy()
-    except Exception:
-        k = np.fft.fftshift(np.fft.fft2(np.asarray(img, dtype=np.float64)))
-        return np.abs(k)
+    t = torch.from_numpy(np.asarray(img, dtype=np.float32))[None, None]
+    return torch.abs(fft2c(t))[0, 0].cpu().numpy()
 
 
 def make(

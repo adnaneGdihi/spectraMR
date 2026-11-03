@@ -19,6 +19,9 @@ from spectramr.domain.exceptions import (
     DimensionMismatchError,
 )
 
+#: ``data.multi_contrast`` as the schema defaults it: predict conditions nothing.
+_MC_OFF = SimpleNamespace(enabled=False)
+
 
 class MockModel(nn.Module):
     """Simple mock model for testing."""
@@ -1169,7 +1172,10 @@ class TestInferEmitsTheReportArtifactContract:
                 MockModel(),
                 _Strategy(),
                 torch.device("cpu"),
-                SimpleNamespace(model=SimpleNamespace(model_type="unet", model_kwargs={})),
+                SimpleNamespace(
+                    model=SimpleNamespace(model_type="unet", model_kwargs={}),
+                    data=SimpleNamespace(multi_contrast=_MC_OFF),
+                ),
                 batch_size=2,
                 results={"outputs": [], "num_processed": 0},
                 evaluator=_Spy(),
@@ -1232,7 +1238,7 @@ class TestPredictDataConsistencyInputs:
     @staticmethod
     def _config(dataset_type="kspace"):
         return SimpleNamespace(
-            data=SimpleNamespace(dataset_type=dataset_type),
+            data=SimpleNamespace(dataset_type=dataset_type, multi_contrast=_MC_OFF),
             model=SimpleNamespace(model_type="unet", model_kwargs={}),
         )
 
@@ -1479,7 +1485,7 @@ class TestPredictAcquiredLines:
             _Strategy(),
             torch.device("cpu"),
             SimpleNamespace(
-                data=SimpleNamespace(dataset_type="kspace"),
+                data=SimpleNamespace(dataset_type="kspace", multi_contrast=_MC_OFF),
                 model=SimpleNamespace(model_type="unet", model_kwargs={}),
             ),
             batch_size=2,
@@ -1556,7 +1562,7 @@ def test_the_volume_scale_is_consumed_before_the_cold_reverse_path() -> None:
     )
     assert strategy.kspace_norm.enabled
     config = SimpleNamespace(
-        data=SimpleNamespace(slice_level_records=False, **data),
+        data=SimpleNamespace(slice_level_records=False, multi_contrast=_MC_OFF, **data),
         validation=SimpleNamespace(scoring=SimpleNamespace(recorrupted_inference=None)),
         model=SimpleNamespace(model_type="unet", model_kwargs={}),
     )
@@ -1720,3 +1726,59 @@ def test_predict_contrast_is_not_asked_of_other_model_types() -> None:
     assert _predict_contrast(cfg, Path("a_T1.h5"), None) is None
     with pytest.raises(ConfigurationError):
         _predict_contrast(cfg, Path("a_T1.h5"), 1)
+
+
+class _ConditionedGenerator(torch.nn.Module):
+    def forward(self, x, contrast_idx=None):
+        return x
+
+
+def _conditioned_config(model_type: str = "hypernetwork_contrast"):
+    return SimpleNamespace(
+        model=SimpleNamespace(model_type=model_type, model_kwargs={}),
+        data=SimpleNamespace(
+            dataset_type="m4raw",
+            multi_contrast=SimpleNamespace(
+                enabled=True, contrast_map={"T1": 0, "T2": 1, "FLAIR": 2}, acquisition_params=[]
+            ),
+        ),
+    )
+
+
+def test_predict_refuses_a_strategy_that_drops_contrast_conditioning() -> None:
+    from spectramr.pipelines.infer import _predict_conditioning
+
+    with pytest.raises(ConfigurationError, match="unconditioned output"):
+        _predict_conditioning(
+            _conditioned_config(), _ConditionedGenerator(), object(), Path("a_T2.h5"), None
+        )
+
+
+def test_reconstruction_predict_feeds_the_contrast_to_the_forward() -> None:
+    from spectramr.infrastructure.inference.reconstruction_inference_strategy import (
+        ReconstructionInferenceStrategy,
+    )
+    from spectramr.pipelines.infer import _predict_conditioning
+
+    seen: dict = {}
+
+    class _Recording(_ConditionedGenerator):
+        def forward(self, x, contrast_idx=None):
+            seen["contrast_idx"] = contrast_idx
+            return x
+
+    model = _Recording()
+    strategy = SimpleNamespace(forwards_contrast_conditioning=True)
+    cond = _predict_conditioning(_conditioned_config(), model, strategy, Path("a_T2.h5"), None)
+    assert cond is not None and cond["contrast_idx"].tolist() == [1]
+    runner = object.__new__(ReconstructionInferenceStrategy)
+    runner.model = model
+    ReconstructionInferenceStrategy.run_inference(runner, torch.zeros(1, 1, 4, 4), **cond)
+    assert seen["contrast_idx"].tolist() == [1]
+
+
+def test_cold_diffusion_contrast_stays_with_its_own_resolver() -> None:
+    from spectramr.pipelines.infer import _predict_conditioning
+
+    cfg = _conditioned_config("kspace_cold_diffusion")
+    assert _predict_conditioning(cfg, _ConditionedGenerator(), object(), Path("a.h5"), None) is None

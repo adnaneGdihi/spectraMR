@@ -41,7 +41,7 @@ def test_a_disabled_recommendation_declares_no_weight() -> None:
 def test_the_mse_alias_reaches_the_l2_flag() -> None:
     config = LossRecommender().recommend(task_type=TaskType.DENOISING).suggested_config
     assert config.reconstruction.enable_l2 is True
-    assert config.get_enabled_losses()["l2"] == pytest.approx(1.0)
+    assert build_loss_weight_table(config)["l2"].weight == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("text", ["denoising pipeline", "denoise the scan", "remove noise"])

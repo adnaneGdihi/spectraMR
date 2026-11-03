@@ -15,9 +15,10 @@ import types
 import torch
 import torch.nn as nn
 
-from spectramr.infrastructure.physics.manifolds.beltrami_4d import (
-    SeparableBeltrami4DSolver,
-)
+import pytest
+
+from spectramr.infrastructure.training.strategies import fmri_kspace_strategies as mod
+from spectramr.infrastructure.training.strategies.base import BaseTrainingStrategy
 from spectramr.infrastructure.training.strategies.fmri_kspace_strategies import (
     SpatiotemporalAdaptiveSFCReconStrategy,
 )
@@ -36,13 +37,63 @@ class _Gen(nn.Module):
         return y.reshape(b, t, c, h, w).permute(0, 2, 1, 3, 4)
 
 
-def _make_strategy(gen: nn.Module) -> SpatiotemporalAdaptiveSFCReconStrategy:
+def _make_strategy(
+    gen: nn.Module, lambda_l1: float = 1.0
+) -> SpatiotemporalAdaptiveSFCReconStrategy:
     s = object.__new__(SpatiotemporalAdaptiveSFCReconStrategy)
     s.lambda_mu = 1.0
     s.lambda_T = 1.0
-    s.solver = SeparableBeltrami4DSolver()
+    s.lambda_l1 = lambda_l1
     s.env = types.SimpleNamespace(generator=gen)
     return s
+
+
+class _Ident(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+def test_temporal_reg_is_zero_when_frames_share_their_mean() -> None:
+    """#2363: the first-difference form was 1 - (1 + nu_0) / sum(1 + nu_t), i.e.
+    1 - 1/T for a temporally constant series; smoothness must give zero."""
+    frame = torch.randn(1, 1, 1, 8, 8)
+    series = frame.expand(1, 1, 6, 8, 8).contiguous()
+    out = _make_strategy(_Ident())._compute_losses_impl(series, series, epoch=0)
+    assert float(out["spatiotemporal_sfc_temporal_reg"]) < 1e-5  # old form: 1 - 1/6
+
+
+def test_temporal_reg_no_longer_biases_the_first_frame() -> None:
+    torch.manual_seed(0)
+    recon = torch.randn(2, 1, 8, 16, 16, requires_grad=True)
+    s = _make_strategy(_Ident())
+    s.lambda_mu = 0.0
+    out = s._compute_losses_impl(recon, recon.detach(), epoch=0)
+    out["g_total_loss"].backward()
+    signs = torch.sign(recon.grad[0, 0].mean(dim=(-2, -1)))
+    # The old term pushed frame 0 one way and every other frame the other way.
+    assert not (signs[0] < 0 and bool((signs[1:] > 0).all()))
+
+
+def test_inline_l1_takes_the_declared_weight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#2331: the arms declare l1 at 10.0; the strategy computed it at 1.0."""
+
+    def _init(self, env=None, **kwargs):
+        self.config = types.SimpleNamespace(training=types.SimpleNamespace())
+
+    monkeypatch.setattr(BaseTrainingStrategy, "__init__", _init)
+    monkeypatch.setattr(mod, "declared_loss_weights", lambda config: {"l1": 10.0})
+    s = SpatiotemporalAdaptiveSFCReconStrategy(env=None)
+    assert s.lambda_l1 == 10.0
+    s.env = types.SimpleNamespace(generator=_Ident())
+    s.lambda_mu = s.lambda_T = 0.0
+    x, y = torch.zeros(1, 1, 4, 8, 8), torch.ones(1, 1, 4, 8, 8)
+    out = s._compute_losses_impl(x, y, epoch=0)
+    assert float(out["g_total_loss"]) == pytest.approx(10.0)
+    assert float(out["spatiotemporal_sfc_recon"]) == pytest.approx(1.0)
+
+    monkeypatch.setattr(mod, "declared_loss_weights", lambda config: {})
+    with pytest.raises(ValueError, match=r"losses\.image_losses"):
+        SpatiotemporalAdaptiveSFCReconStrategy(env=None)
 
 
 def test_beltrami_regulariser_carries_gradient_to_model() -> None:

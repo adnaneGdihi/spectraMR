@@ -70,7 +70,16 @@ ENTRIES = (
         family="field",
         description="Linear main-field drift over the scan",
         severity=SeveritySpec(
-            (_P("max_frequency_offset", "Hz", 0.0, 50.0),),
+            (
+                _P(
+                    "max_frequency_offset",
+                    "Hz",
+                    0.0,
+                    50.0,
+                    endpoint_kwargs=(None, "max_offset_hz"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="df(t) = theta 50 Hz t / T_scan, t the line's acquisition time (reaches the "
             "maximum at the last line). A spin-warp line shifts df / BW_px px along readout; an "
             "EPI line shifts df N_pe ESP px along phase-encode (profile.esp_ms, required for "
@@ -92,7 +101,16 @@ ENTRIES = (
         family="field",
         description="EPI readout-gradient delay (N/2 ghost)",
         severity=SeveritySpec(
-            (_P("echo_displacement", "dwell", 0.0, 0.5),),
+            (
+                _P(
+                    "echo_displacement",
+                    "dwell",
+                    0.0,
+                    0.5,
+                    endpoint_kwargs=(None, "max_delay_dwell"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="odd/even echoes sample k_x at +/- tau/2, tau = theta 0.5 dwell; in time tau "
             "= theta 0.5 / (BW_px N_ro) (7.8 us at 250 Hz/px, N_ro = 256; "
             "tau_us = theta 0.5e6 / (BW_px N_ro)). Odd/even is the ky index parity. "
@@ -112,7 +130,16 @@ ENTRIES = (
         family="geometric",
         description="Gradient calibration error with linear drift (FOV scaling)",
         severity=SeveritySpec(
-            (_P("peak_fov_scale_error", "fraction", 0.0, 0.02),),
+            (
+                _P(
+                    "peak_fov_scale_error",
+                    "fraction",
+                    0.0,
+                    0.02,
+                    endpoint_kwargs=(None, "max_scale"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="eps_a(t) = theta 2% s_a (0.5 + 0.5 t / T_scan), s_a = +/-1 seeded per axis "
             "and sample; the peak |eps| is reached at the last line. In-plane axes only in 2-D "
             "and multislice, all three in 3-D. The drift is rendered in 8 scale states.",
@@ -131,7 +158,16 @@ ENTRIES = (
         family="motion",
         description="Table or gradient-coil vibration (PE sidebands)",
         severity=SeveritySpec(
-            (_P("vibration_amplitude", "mm", 0.0, 1.0),),
+            (
+                _P(
+                    "vibration_amplitude",
+                    "mm",
+                    0.0,
+                    1.0,
+                    endpoint_kwargs=(None, "max_amplitude_mm"),
+                    valid_min=0.0,
+                ),
+            ),
             notes="d(t) = A sin(2 pi f_v t + phi), f_v = 20 Hz, A = theta 1 mm, along a seeded "
             "axis (1 mm voxels without voxel_mm). Lines are TR apart, so the sampling is "
             "stroboscopic: sidebands sit at +/- frac_fold(f_v TR) N_pe px along phase-encode "

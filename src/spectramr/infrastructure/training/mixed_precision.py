@@ -34,8 +34,23 @@ class MixedPrecisionConfig:
     loss_scaling: float | str = "dynamic"  # fixed value or "dynamic"
     dynamic_loss_scaling: bool = True
     enable_complex_support: bool = True  # Enable for MRI/Complex flows, disable for standard float
-    # True under FSDP: grads are DTensor shards, and the non-finite flag is all-reduced.
+    # True when ranks hold different gradients (``needs_cross_rank_inf_flag``): the
+    # non-finite flag is then all-reduced over the world.
     sharded_grads: bool = False
+
+
+def needs_cross_rank_inf_flag(parallel: object) -> bool:
+    """Whether ranks can see different gradients, so one rank's inf must skip everyone.
+
+    FSDP holds shards; a tensor, pipeline, context or spatial peer holds a different
+    slice or stage, and DDP's gradient group never spans the tensor or pipeline dim.
+    Plain data parallelism averages identical-shape grads, so an inf already reaches
+    every replica through the all-reduce.
+    """
+    if getattr(parallel, "strategy", None) == "fsdp":
+        return True
+    mesh = getattr(parallel, "mesh", None)
+    return int(getattr(mesh, "non_dp_size", 1) or 1) > 1
 
 
 # Maps the schema-facing ``optimization.precision.dtype`` to MixedPrecisionConfig.precision.
@@ -270,9 +285,9 @@ class ComplexGradScaler(NativeScaler):
     torch's foreach unscale kernel has no complex dtype, so a complex gradient is
     unscaled through ``torch.view_as_real`` (the same storage, real and imaginary
     parts), and a DTensor gradient through its local shard. Every non-finite
-    check therefore sees both parts. Under FSDP (``sharded=True``) the non-finite
-    flag is all-reduced with MAX, so every rank skips the same step and backs off
-    the scale identically.
+    check therefore sees both parts. With ``sharded=True`` the non-finite flag is
+    all-reduced with MAX over the whole world (every dp replica and every tp, cp, sp
+    or pp peer), so every rank skips the same step and backs off the scale identically.
     """
 
     def __init__(
@@ -358,7 +373,7 @@ class ComplexGradScaler(NativeScaler):
             total = found_inf.clone()
             for flag in found.values():
                 total = torch.maximum(total, flag.to(found_inf.device))
-            dist.all_reduce(total, op=dist.ReduceOp.MAX)
+            dist.all_reduce(total, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
             for flag in found.values():
                 flag.copy_(total.to(flag.device))
         return found

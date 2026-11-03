@@ -120,6 +120,79 @@ def test_run_validation_tier_subset() -> None:
     )
     result = NRMetricValidationUseCase(cfg).run_validation(_phantoms(2))
     assert result["tiers_run"] == ["concordance", "fr_proxy"]
+    assert result["provenance"]["seed_scheme"] == "blake2b_v1"
     assert set(result["cards"]["gri"]["tiers"]) == {"concordance", "fr_proxy"}
     assert result["aggregator"] is None
     assert result["redundancy"] is None
+
+
+def _axes(**kw):
+    from spectramr.config.schemas.severity_axes import SeverityAxis
+
+    return {name: SeverityAxis(**v) for name, v in kw.items()}
+
+
+def test_library_uses_local_native_theta() -> None:
+    from spectramr.infrastructure.physics.degradations import apply_degradation
+
+    lib = build_physics_operator_library(
+        ["cartesian_undersamp"], _axes(cartesian_undersamp={"start": 2, "end": 16})
+    )
+    assert lib.local["cartesian_undersamp"].physical(1.0) == 16.0
+    clean = torch.rand(1, 32, 32)
+    seed = 5
+    out = lib["cartesian_undersamp"](clean, 1.0, torch.Generator().manual_seed(seed))
+    direct = apply_degradation("cartesian_undersamp", clean[None], 1.0, seed=seed, R_max=16.0)
+    assert torch.equal(out, direct.abs().reshape(clean.shape) if direct.is_complex() else direct[0])
+    default = build_physics_operator_library(["cartesian_undersamp"])
+    plain = default["cartesian_undersamp"](clean, 1.0, torch.Generator().manual_seed(seed))
+    assert not torch.equal(out, plain)
+
+
+def test_passthrough_library_calls_op_with_identical_theta() -> None:
+    from spectramr.infrastructure.physics.degradations import apply_degradation
+
+    clean = torch.rand(1, 32, 32)
+    lib = build_physics_operator_library(["rician", "gibbs"])
+    assert all(loc.is_passthrough for loc in lib.local.values())
+    for name in ("rician", "gibbs"):
+        out = lib[name](clean, 0.37, torch.Generator().manual_seed(9))
+        ref = apply_degradation(name, clean[None], 0.37, seed=9)
+        ref = ref.abs() if ref.is_complex() else ref
+        assert torch.equal(out, ref[0].to(clean.dtype))
+
+
+def test_n_steps_rejected_on_meta_evaluate() -> None:
+    with pytest.raises(ValueError, match=r"cartesian_undersamp.*--severities"):
+        build_physics_operator_library(
+            ["cartesian_undersamp"],
+            _axes(cartesian_undersamp={"start": 2, "end": 16, "n_steps": 4}),
+        )
+
+
+def test_axes_outside_families_raise() -> None:
+    with pytest.raises(ValueError, match="outside the swept set"):
+        build_physics_operator_library(["rician"], _axes(gibbs={"start": 0.1, "end": 0.5}))
+
+
+def test_no_axes_bit_identical() -> None:
+    from spectramr.core.metrics.meta_evaluation.simulator import SimulatorConfig, run_simulator
+    from spectramr.infrastructure.physics.degradations import apply_degradation
+
+    families = ["rician", "gibbs", "cartesian_undersamp"]
+    clean = torch.rand(1, 32, 32)
+    cfg = SimulatorConfig(
+        families=families,
+        n_severities_per_family=3,
+        seed=1,
+        operator_library=build_physics_operator_library(families),
+    )
+    samples = run_simulator([("c0", clean)], cfg)
+    assert len(samples) == 9
+    for s in samples:
+        assert s.severity == {"theta": s.severity["theta"]}
+        ref = apply_degradation(
+            s.degradation_family, clean[None], s.severity["theta"], seed=s.seed
+        )
+        ref = ref.abs() if ref.is_complex() else ref
+        assert torch.equal(s.degraded, ref[0].to(clean.dtype).reshape(clean.shape))

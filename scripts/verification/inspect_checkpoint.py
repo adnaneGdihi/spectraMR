@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Report what a checkpoint would restore, and what no checkpoint carries.
 
-Run this against a real run directory before trusting a 120 h chain to it::
+Run this against a real run directory before trusting a 96 h chain to it::
 
     python scripts/verification/inspect_checkpoint.py \\
         --checkpoint experiments/results/<arm>/checkpoints/step_00040000.safetensors

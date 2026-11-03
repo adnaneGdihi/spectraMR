@@ -16,6 +16,7 @@ import math
 
 import torch
 
+from spectramr.core.metrics.context import MetricContext
 from spectramr.core.metrics.registry import register_metric
 
 
@@ -139,7 +140,7 @@ class NEMASNR:
             return 0.0
 
         snr = (mean_signal / (sigma_bg * self.RAYLEIGH_CORRECTION)).item()
-        return max(snr, 0.0)
+        return max(float(snr), 0.0)
 
 
 @register_metric("nema_cnr", aliases=["NEMA_CNR", "NemaCNR"], requires_reference=False)
@@ -266,7 +267,7 @@ class NEMACNR:
             return 0.0
 
         cnr = torch.abs(mean_a - mean_b) / (sigma_bg * self.RAYLEIGH_CORRECTION)
-        return max(cnr.item(), 0.0)
+        return max(float(cnr.item()), 0.0)
 
 
 @register_metric("g_factor", aliases=["GFactor", "geometry_factor"], requires_reference=False)
@@ -329,6 +330,7 @@ class GFactor:
         target: torch.Tensor | None = None,
         sensitivity_maps: torch.Tensor | None = None,
         acceleration: int | float | None = None,
+        context: MetricContext | None = None,
         **kwargs: object,
     ) -> float:
         """Compute the mean SENSE g-factor from sensitivity maps.
@@ -352,7 +354,10 @@ class GFactor:
             target: Ignored.
             sensitivity_maps: Complex sensitivity maps ``[num_coils, H, W]`` or
                 ``[num_coils, 2, H, W]`` (real/imag) or batched ``[B, C, H, W]``.
-            acceleration: SENSE factor R; defaults to ``self.acceleration``.
+            acceleration: SENSE factor R; defaults to ``context.acceleration``,
+                then ``self.acceleration``.
+            context: Validation-loop :class:`MetricContext`; its ``coil_maps``
+                and ``acceleration`` fill whichever explicit argument is absent.
 
         Returns:
             Mean g-factor (>= 1; 1.0 = no noise amplification). Returns
@@ -363,6 +368,13 @@ class GFactor:
             the module-wide convention for "could not measure" and matches the
             sibling metrics in this file.
         """
+        if context is not None and sensitivity_maps is None:
+            sensitivity_maps = context.coil_maps
+            if acceleration is None:
+                acceleration = context.acceleration
+            # Context maps with no rate: the constructor default R would be a guess.
+            if sensitivity_maps is not None and acceleration is None:
+                return float("nan")
         if sensitivity_maps is None:
             return float("nan")
 
@@ -385,10 +397,13 @@ class GFactor:
         num_coils, h, w = smaps.shape[0], smaps.shape[-2], smaps.shape[-1]
 
         r = int(round(float(acceleration if acceleration is not None else self.acceleration)))
-        # No parallel imaging, or an infeasible R (> coils / > rows): g == 1.
+        # No parallel imaging: g == 1. R > coils (or > rows) leaves SENSE
+        # underdetermined, so g is unbounded: report "could not measure", not 1.0.
         step = h // r if r >= 1 else 0
-        if r <= 1 or r > num_coils or step < 1:
+        if r <= 1:
             return 1.0
+        if r > num_coils or step < 1:
+            return float("nan")
 
         # Each base row in [0, step) defines one aliased group of R rows spaced
         # ``step`` apart. Compute the g-factor for every group, vectorised over
@@ -574,7 +589,7 @@ class PowerSpectrumDecayConformity:
         prediction: torch.Tensor,
         target: torch.Tensor | None = None,
         *,
-        context: object | None = None,
+        context: MetricContext | None = None,
         **kwargs: object,
     ) -> float:
         from spectramr.core.metrics.context import resolve_context
@@ -827,7 +842,7 @@ class HighFrequencyResidualWhiteness:
         prediction: torch.Tensor,
         target: torch.Tensor | None = None,
         *,
-        context: object | None = None,
+        context: MetricContext | None = None,
         **kwargs: object,
     ) -> float:
         from spectramr.core.metrics.context import resolve_context
@@ -911,7 +926,7 @@ class QuantitativeVarianceToCRLBRatio:
         prediction: torch.Tensor,
         target: torch.Tensor | None = None,
         *,
-        context: object | None = None,
+        context: MetricContext | None = None,
         **kwargs: object,
     ) -> float:
         from spectramr.core.metrics.context import resolve_context

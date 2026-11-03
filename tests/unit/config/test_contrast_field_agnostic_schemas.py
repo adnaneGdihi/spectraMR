@@ -97,9 +97,17 @@ class TestMCGIConfig:
         assert cfg.hard_rank_eval is True
         assert cfg.symmetrize_order_reversal is True
 
-    def test_rejects_non_positive_temperature(self) -> None:
+    def test_rank_transform_defaults_on_and_the_control_is_legal(self) -> None:
+        assert MCGIConfig().rank_transform is True
+        assert MCGIConfig(rank_transform=False).hard_rank_eval is True
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"hard_rank_eval": False}, {"soft_rank_temperature": 0.05}, {"backbone": "conv"}],
+    )
+    def test_retired_and_illegal_knobs_raise(self, kwargs: dict) -> None:
         with pytest.raises(ValidationError):
-            MCGIConfig(soft_rank_temperature=0.0)
+            MCGIConfig(**kwargs)
 
     def test_frozen_and_strict(self) -> None:
         cfg = MCGIConfig()

@@ -177,11 +177,10 @@ def test_rejects_multichannel() -> None:
         InputConvexNeuralNetwork(in_channels=2)
 
 
-# --- intensity_adaptation knob (Route 0/1/2): let the convex map adapt intensity/contrast ---
-# Co-registered, normalised source/7T pairs leave a CONTRAST residual, not a geometric one. The
-# default ("none") mean-pools the potential to a ~1/N-damped gradient => the map is pinned at
-# identity. Route 1 ("undamped") un-damps it; Route 2 ("transfer") composes a field-conditioned
-# monotone per-pixel intensity transfer. Both must stay monotone (Brenier-valid) under convexity.
+# --- intensity_adaptation knob: let the convex map adapt intensity/contrast ---
+# Co-registered, normalised source/7T pairs leave a CONTRAST residual, not a geometric one. "none"
+# is the displacement map alone; "transfer" composes a field-conditioned monotone per-pixel
+# intensity transfer. Both must stay monotone (Brenier-valid) under convexity.
 
 
 def test_unknown_intensity_adaptation_raises() -> None:
@@ -190,29 +189,46 @@ def test_unknown_intensity_adaptation_raises() -> None:
         InputConvexNeuralNetwork(intensity_adaptation="bogus")
 
 
-def _potential_grad_mean(mode: str) -> float:
+def test_retired_undamped_value_raises() -> None:
+    # #192: sum pooling is now the only pooling, so "undamped" would be a silent alias of "none".
+    with pytest.raises(ValueError, match="intensity_adaptation"):
+        InputConvexNeuralNetwork(intensity_adaptation="undamped")
+
+
+def _mean_displacement(enforce: bool, hw: tuple[int, int], h: int = 64, n: int = 4) -> float:
     torch.manual_seed(0)
-    m = InputConvexNeuralNetwork(
-        hidden_channels=16, n_layers=3, intensity_adaptation=mode
-    ).eval()
-    x = torch.rand(2, 1, 32, 32).requires_grad_(True)
-    (g,) = torch.autograd.grad(m.potential(x).sum(), x)
-    return float(g.abs().mean())
+    m = InputConvexNeuralNetwork(hidden_channels=h, n_layers=n, enforce_convexity=enforce).eval()
+    x = torch.rand(1, 1, *hw)
+    return float((m.brenier_map(x) - x).abs().mean().detach())
 
 
-def test_undamped_unblocks_the_potential_gradient() -> None:
-    # THE mechanism: "none" mean-pools (grad ~ O(1/N), identity-pinned); "undamped" sum-pools so
-    # the per-pixel intensity gradient is O(1). Same seeded weights, only the pooling differs.
-    none_g, undamped_g = _potential_grad_mean("none"), _potential_grad_mean("undamped")
-    assert undamped_g > 50.0 * none_g
+@pytest.mark.parametrize("enforce", [True, False])
+def test_default_map_is_not_pinned_at_identity(enforce: bool) -> None:
+    # REGRESSION #192: the 1/N mean pool made grad psi O(1/N), so at 364x436 both b15 arms moved
+    # the image by ~1e-4 (convex) and ~1e-7 (free) and the convexity A/B compared two identities.
+    # Sum pooling + fan-in-correct normalisation give a ~0.03-0.07 near-identity start.
+    d = _mean_displacement(enforce, (48, 48))
+    assert 5e-3 < d < 0.2
 
 
-def test_undamped_map_stays_monotone() -> None:
+@pytest.mark.parametrize("enforce", [True, False])
+def test_displacement_scale_is_independent_of_image_size(enforce: bool) -> None:
+    # The per-pixel gradient of a sum-pooled potential does not depend on N (a mean scaled it 1/N).
+    small, large = _mean_displacement(enforce, (24, 24)), _mean_displacement(enforce, (72, 72))
+    assert 0.67 < small / large < 1.5
+
+
+def test_convex_and_free_arms_start_at_matched_scale() -> None:
+    # The convexity ablation is one knob: both arms should start at a comparable displacement
+    # (the old sqrt(fan_in) divisor left the convex arm ~400x larger under a sum pool).
+    convex, free = _mean_displacement(True, (32, 32)), _mean_displacement(False, (32, 32))
+    assert 0.33 < convex / free < 3.0
+
+
+def test_default_map_stays_monotone() -> None:
     # Sum-pool of a convex function is still convex => its gradient map stays monotone (Brenier).
     torch.manual_seed(0)
-    m = InputConvexNeuralNetwork(
-        hidden_channels=16, n_layers=3, intensity_adaptation="undamped"
-    ).eval()
+    m = InputConvexNeuralNetwork(hidden_channels=16, n_layers=3).eval()
     a, b = torch.rand(6, 1, 16, 16), torch.rand(6, 1, 16, 16)
     ta, tb = m.brenier_map(a), m.brenier_map(b)
     mono = ((ta - tb) * (a - b)).flatten(1).sum(1).detach()
@@ -220,8 +236,7 @@ def test_undamped_map_stays_monotone() -> None:
 
 
 def _fit_intensity(mode: str, *, field_dim: int = 0, slope: float = 1.0, shift: float = 0.2) -> float:
-    # Fit a monotone affine intensity remap tgt = slope*x + shift. "none" is pinned at identity
-    # (grad psi ~ O(1/N)) so it cannot reach any intensity offset; the adapting modes can.
+    # Fit a monotone affine intensity remap tgt = slope*x + shift.
     torch.manual_seed(0)
     x = torch.rand(4, 1, 20, 20)
     fld = torch.rand(4, 1) if field_dim else None
@@ -243,21 +258,19 @@ def _fit_intensity(mode: str, *, field_dim: int = 0, slope: float = 1.0, shift: 
     return float(loss.detach())
 
 
-def test_undamped_adapts_brightness_where_none_cannot() -> None:
-    # A pure intensity offset (tgt = x + 0.2): the convex displacement map can realise it (its
-    # affine input-skip contributes a constant gradient), "none" cannot (gradient ~ 0).
-    assert _fit_intensity("undamped", slope=1.0, shift=0.2) < 0.5 * _fit_intensity(
-        "none", slope=1.0, shift=0.2
-    )
+def test_default_map_adapts_brightness() -> None:
+    # A pure intensity offset (tgt = x + 0.2): the identity scores L1 = 0.2; the default
+    # displacement map must move well below it (the 1/N-pooled map could not, #192).
+    assert _fit_intensity("none", slope=1.0, shift=0.2) < 0.1
 
 
-def test_undamped_convex_map_cannot_compress_contrast() -> None:
-    # Documents WHY Route 2 exists: a convex displacement map has T'(x)=1+map_scale*psi'' >= 1, so
-    # it can only EXPAND intensities, never COMPRESS them (slope < 1). The transfer route (learned
-    # gain(b) < 1) lifts exactly this ceiling. Prevents "simplifying" Route 2 away.
-    undamped_l1 = _fit_intensity("undamped", slope=0.4, shift=0.3)
+def test_convex_map_cannot_compress_contrast() -> None:
+    # Documents WHY "transfer" exists: a convex displacement map has T'(x)=1+map_scale*psi'' >= 1,
+    # so it can only EXPAND intensities, never COMPRESS them (slope < 1). The transfer route
+    # (learned gain(b) < 1) lifts exactly this ceiling.
+    none_l1 = _fit_intensity("none", field_dim=1, slope=0.4, shift=0.3)
     transfer_l1 = _fit_intensity("transfer", field_dim=1, slope=0.4, shift=0.3)
-    assert transfer_l1 < 0.6 * undamped_l1
+    assert transfer_l1 < 0.6 * none_l1
 
 
 def test_transfer_map_is_monotone_in_input() -> None:
@@ -304,7 +317,7 @@ def test_transfer_near_identity_at_init() -> None:
 
 
 def test_transfer_adapts_contrast() -> None:
-    # Compressive remap (slope 0.5): only an intensity-adapting map fits it; "none" stays pinned.
+    # Compressive remap (slope 0.5): the expand-only displacement map cannot fit it; transfer can.
     assert _fit_intensity("transfer", field_dim=1, slope=0.5, shift=0.25) < 0.6 * _fit_intensity(
         "none", field_dim=1, slope=0.5, shift=0.25
     )

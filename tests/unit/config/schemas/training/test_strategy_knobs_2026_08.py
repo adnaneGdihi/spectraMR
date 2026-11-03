@@ -77,6 +77,10 @@ STRATEGY_FALLBACKS = [
     ("conformal_diffusion_recon", "sigma_max", 1.0),
     ("conformal_mrf_dictless_recon", "lambda_conformality", 1e-2),
     ("crlb_mrf_pulse_design", "lambda_beltrami", 1e-3),
+    ("crlb_mrf_pulse_design", "prior_samples", 64),
+    ("crlb_mrf_pulse_design", "te_ms", 2.0),
+    ("crlb_mrf_pulse_design", "t1_range_ms", (100.0, 3000.0)),
+    ("crlb_mrf_pulse_design", "t2_range_ms", (20.0, 500.0)),
     ("cross_scanner_mrf_harmonisation", "lambda_anchor", 1e-3),
     ("bloch_equivariant_translation", "t1_scale_ulf", 0.30),
     ("bloch_equivariant_translation", "tr_ulf", 8.0),
@@ -158,6 +162,13 @@ class TestTyposRaiseInsteadOfSittingUnread:
             BeltramiEPIDistortionTrainingConfigSchema(t_esp=0.0)  # gt=0
         with pytest.raises(ValidationError):
             AdaptiveSFCHSSCTrainingConfigSchema(grid_size=0)  # ge=1
+
+    @pytest.mark.parametrize(
+        "knob,value", [("acceleration", 1.0), ("center_fraction", 0.0), ("center_fraction", 1.0)]
+    )
+    def test_ib_line_budget_bounds_raise(self, knob: str, value: float) -> None:
+        with pytest.raises(ValidationError):
+            IBActiveAcquisitionTrainingConfigSchema(**{knob: value})
 
 
 class TestTheAblationAblates:
@@ -373,3 +384,28 @@ class TestPreviouslyBypassedSpecsAreNowMounted:
             "the deferred sub-block rebuild must precede "
             "StageEnvironmentSchema.model_rebuild(), which forces the schema"
         )
+
+
+def test_adaptive_sfc_learn_scan_order_defaults_on_and_is_strict_bool() -> None:
+    assert AdaptiveSFCHSSCTrainingConfigSchema().learn_scan_order is True
+    assert AdaptiveSFCHSSCTrainingConfigSchema(learn_scan_order=False).learn_scan_order is False
+    with pytest.raises(ValidationError):
+        AdaptiveSFCHSSCTrainingConfigSchema(learn_scan_order="maybe")
+
+
+@pytest.mark.parametrize("bounds", [(0.0, 10.0), (500.0, 100.0)])
+def test_crlb_prior_range_must_be_ordered_and_positive(bounds: tuple[float, float]) -> None:
+    with pytest.raises(ValidationError, match="prior range"):
+        CRLBMRFPulseDesignTrainingConfigSchema(t1_range_ms=bounds)
+
+
+class TestRiemannianBlochHeldoutKnob:
+    def test_heldout_eval_t_is_accepted_and_must_be_positive(self):
+        from spectramr.config.schemas.training.strategy_knobs_2026_08 import (
+            RiemannianBlochDiffusionTrainingConfigSchema as Schema,
+        )
+
+        assert Schema().heldout_eval_t is None
+        assert Schema(heldout_eval_t=0.25).heldout_eval_t == 0.25
+        with pytest.raises(ValidationError):
+            Schema(heldout_eval_t=0.0)

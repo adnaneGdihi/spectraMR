@@ -4,6 +4,8 @@ Implements an unrolled Variational Network (VarNet) structure that supports
 stateless functional calls for efficient meta-learning steps (MAML).
 """
 
+from typing import ClassVar
+
 import torch
 import torch.nn as nn
 from jaxtyping import Complex, Float
@@ -60,6 +62,9 @@ class NormUnet(nn.Module):
 
 class DataConsistency(nn.Module):
     """Data Consistency Layer in k-space."""
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(self, noise_lvl: float | None = None):
         """__init__.

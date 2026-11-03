@@ -19,6 +19,7 @@ import pandas as pd
 from spectramr.infrastructure.reporting.metadata import RunMetadata, stamp_figure, write_sidecar
 from spectramr.infrastructure.reporting.style import (
     panel_label,
+    panel_letter,
     pretty_label,
     save_figure,
     use_default_style,
@@ -88,7 +89,7 @@ def make(
         if med.values.max() / max(med.values.min(), 1e-12) > 100:
             ax.set_yscale("log")
         if n_panels > 1:
-            panel_label(ax, chr(ord("a") + panel_i))
+            panel_label(ax, panel_letter(panel_i))
         panel_i += 1
 
     # Memory bars (peak across steps)
@@ -104,7 +105,7 @@ def make(
         ax.set_ylabel("peak memory (GB)")
         ax.set_title("memory")
         if n_panels > 1:
-            panel_label(ax, chr(ord("a") + panel_i))
+            panel_label(ax, panel_letter(panel_i))
         panel_i += 1
 
     for key, unit in _RUN_FACTS:
@@ -116,7 +117,7 @@ def make(
         ax.set_ylabel(unit)
         ax.set_title(pretty_label(key))
         if n_panels > 1:
-            panel_label(ax, chr(ord("a") + panel_i))
+            panel_label(ax, panel_letter(panel_i))
         panel_i += 1
 
     fig.tight_layout()

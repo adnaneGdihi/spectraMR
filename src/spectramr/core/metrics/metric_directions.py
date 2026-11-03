@@ -38,6 +38,7 @@ from __future__ import annotations
 # annotated list); zipper_detection has no spec entry (artifact-detection metric,
 # higher == more zipper artifact == worse).
 METRIC_HIGHER_IS_BETTER: dict[str, bool] = {
+    "abs_bland_altman_bias": False,
     "att_mae": False,
     "auprc": True,
     "auroc": True,
@@ -63,6 +64,7 @@ METRIC_HIGHER_IS_BETTER: dict[str, bool] = {
     "dice": True,
     "dists": False,
     "divergence": False,
+    "divergence_normalised": False,
     "dss": True,
     "dvf_mae": False,
     "edge_preservation_index": True,
@@ -94,13 +96,14 @@ METRIC_HIGHER_IS_BETTER: dict[str, bool] = {
     "kid": False,
     "kspace_error": False,
     "ktrans": True,
+    "limits_of_agreement_halfwidth": False,
     "limits_of_agreement_lower": True,
     "limits_of_agreement_upper": False,
     "lpips": False,
     "lpips_alex": False,
     "mad": False,
     "mae": False,
-    "mass_conservation": True,
+    "mass_conservation": False,
     "mdsi": False,
     "med_fid": False,
     "mlv": True,
@@ -143,6 +146,7 @@ METRIC_HIGHER_IS_BETTER: dict[str, bool] = {
     "total_variation": False,
     "uqi": True,
     "velocity_rmse": False,
+    "velocity_rmse_roi": False,
     "vif": True,
     "vif_p": True,
     "vnr": True,
@@ -196,6 +200,10 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     "guarded_ring_fidelity_mean": False,
     "guarded_ring_fidelity_mean_partial": False,
     "selection_guard_tripped": False,
+    # multi_contrast_contrastive validation: InfoNCE on the val pairs, and the share of
+    # views whose nearest neighbour is their own co-registered partner.
+    "infonce": False,
+    "view_retrieval_top1": True,
     "val_t1_mape": False,  # mean absolute percentage error
     # conformal coverage / certificates — higher is better (coverage → 1 - alpha)
     "coverage_at_alpha": True,
@@ -210,8 +218,6 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     #     KspaceConsistencyTTALoss data-consistency term, i.e. a loss.
     #   entropy — exp_tta_sotadit.yaml declares `mode: min` alongside it
     #     (test-time entropy MINIMIZATION).
-    #   no_crash_lowering — a cosim wiring smoke: 1 = the GEMM lowered onto the
-    #     SPECTRA array without crashing. Higher is better.
     "val_kspace_consistency_tta": False,
     "kspace_consistency_tta": False,
     # Disentanglement readings of DisentangledTrainingStrategy.finalize_validation
@@ -223,6 +229,11 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     "val_content_contrast_leak": False,
     "val_swap_content_distance": False,
     "val_swap_style_distance": False,
+    # The field-strength axis of DisentangledVAETrainingStrategy (paired_field_stamps): the
+    # content code should not carry the field, and the target field's physics code should
+    # bring the render closer to the target than the source field's does (ratio < 1).
+    "val_content_field_leak": False,
+    "val_field_swap_error_ratio": False,
     "entropy": False,
     "perplexity": False,
     "hallucination_rate": False,
@@ -240,7 +251,6 @@ NON_REGISTRY_METRIC_DIRECTIONS: dict[str, bool] = {
     "per_pair_consistency_residual": False,
     "nll": False,
     "certified_recall_lower_bound": True,
-    "no_crash_lowering": True,
     # ---------------------------------------------------------------
     # Names carried over from the legacy ``types.DEFAULT_METRIC_DIRECTIONS``
     # table. None of these is a registered metric (no @register_metric class),

@@ -66,7 +66,6 @@ _ALLOWLIST: dict[str, str] = {
     # Physics layer: loads coil maps / sampling patterns (config-like, not Datasets).
     "src/spectramr/infrastructure/physics/coil_sensitivity.py": "loads coil-sensitivity maps as physics primitive",
     "src/spectramr/infrastructure/physics/integration.py": "loads pre-computed coil maps for sense_forward",
-    "src/spectramr/infrastructure/physics/m4raw_pseudo_gt.py": "loads m4raw multi-rep pseudo-GT (physics helper)",
     "src/spectramr/infrastructure/physics/sampling.py": "loads externally-provided sampling masks",
 
     # IO adapter layer: bottom-of-stack primitives the data layer composes from.

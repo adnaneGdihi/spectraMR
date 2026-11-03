@@ -6,9 +6,10 @@ reconstruction loss PLUS two structural penalties on the learned atoms:
 
 * a **Parseval-tightness** term (always-on, ``lambda_parseval``) so the
   analyse/synthesise pair stays a tight frame (energy-preserving round-trip);
-* a **mutual-coherence** term (the A-6.5 **one-knob**, ``lambda_coherence``) that
-  drives the atom Gram off-diagonal toward 0, making the atoms incoherent — the
-  property that makes sparse recovery well-posed.
+* a **mutual-coherence** term (the A-6.5 **one-knob**, ``lambda_coherence``) whose form is
+  ``coherence_penalty``: the default ``smooth_max`` (log-sum-exp over the squared atom Gram
+  off-diagonal, sharpness ``coherence_beta``) minimises ``mu`` itself; ``frobenius`` lowers
+  the average squared coherence only.
 
 The one-knob ablation (``training.sparse_frame.lambda_coherence`` 0 vs >0) isolates
 coherence optimisation from tightness and reconstruction: the oracle is that the
@@ -41,14 +42,28 @@ class SparseFrameStrategy(ReconstructionTrainingStrategy):
         cfg = getattr(self.config.training, "sparse_frame", None)
         self._lambda_coherence = float(getattr(cfg, "lambda_coherence", 0.0)) if cfg else 0.0
         self._lambda_parseval = float(getattr(cfg, "lambda_parseval", 0.0)) if cfg else 0.0
-        self._coherence_loss = create_loss("frame_coherence")
+        penalty = str(getattr(cfg, "coherence_penalty", "smooth_max")) if cfg else "smooth_max"
+        beta = float(getattr(cfg, "coherence_beta", 1000.0)) if cfg else 1000.0
+        # The loss constructor validates both and raises on an unknown penalty or bad beta.
+        self._coherence_loss = create_loss("frame_coherence", penalty=penalty, beta=beta)
+        self.sparse_frame_provenance: dict[str, Any] = {
+            "lambda_coherence": self._lambda_coherence,
+            "lambda_parseval": self._lambda_parseval,
+            "coherence_penalty": penalty,
+            "coherence_beta": beta,
+        }
+        gen = getattr(getattr(self, "env", None), "generator", None)
+        if hasattr(gen, "atoms"):
+            # Constant log(N)/beta the logged smooth-max sits above mu^2 at most.
+            n_atoms = int(gen.atoms().shape[0])
+            offset = self._coherence_loss.penalty_offset(n_atoms)
+            self.sparse_frame_provenance["coherence_offset"] = offset
 
         if getattr(self, "logging_service", None):
-            gen = getattr(self.env, "generator", None)
             mu = gen.mutual_coherence() if hasattr(gen, "mutual_coherence") else float("nan")
             self.logging_service.log_info(
-                f"[A-6.5 SCO-Frame] lambda_coherence={self._lambda_coherence}, "
-                f"lambda_parseval={self._lambda_parseval}; initial mutual_coherence={mu:.4g}"
+                f"[A-6.5 SCO-Frame] resolved knobs {self.sparse_frame_provenance}; "
+                f"initial mutual_coherence={mu:.4g}"
             )
 
     def _compute_losses_impl(
@@ -69,7 +84,12 @@ class SparseFrameStrategy(ReconstructionTrainingStrategy):
         extra: torch.Tensor | None = None
         lam_c = getattr(self, "_lambda_coherence", 0.0)
         lam_p = getattr(self, "_lambda_parseval", 0.0)
-        if lam_c > 0.0 and hasattr(gen, "coherence_penalty"):
+        if lam_c > 0.0:
+            if not hasattr(gen, "atoms"):
+                raise ValueError(
+                    f"lambda_coherence={lam_c} > 0 but generator {type(gen).__name__} exposes "
+                    "no atoms(); the coherence penalty has nothing to act on."
+                )
             coh = self._coherence_loss(frame=gen)
             losses["frame_coherence"] = coh.detach()
             extra = lam_c * coh if extra is None else extra + lam_c * coh

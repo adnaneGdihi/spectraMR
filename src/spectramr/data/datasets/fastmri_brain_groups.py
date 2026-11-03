@@ -1,170 +1,90 @@
-"""fastMRI-brain contrast-aware group discovery (data SSOT).
+"""fastMRI-brain contrast grid discovery (data SSOT).
 
-Unlike M4Raw (several phase-incoherent repetitions per anatomy), fastMRI brain
-stores **one fully-sampled acquisition per file**, tagged with a contrast
-(``AXT1`` / ``AXT2`` / ``AXT2FLAIR`` / ``AXFLAIR`` / ``AXT1POST`` / ``AXT1PRE``).
+fastMRI brain stores **one fully-sampled acquisition per file**, tagged with a
+contrast (``AXT1`` / ``AXT2`` / ``AXT2FLAIR`` / ``AXFLAIR`` / ``AXT1POST`` /
+``AXT1PRE``), and does not link contrasts across exams. The grid is therefore
+``linked=False``: each content's ``subject_id`` is its exam id, and a grid row is a
+positional ``index`` across contrasts, never a patient. Stem-grouping these names
+(the M4Raw law) would NEX-average two patients into one pseudo-GT (#344).
 
-sim2rank's native path assigns ``(subject, contrast)`` by *flat filename-order
-index* (``group_idx = s * n_contrasts + c``). fastMRI names sort **contrast
--major** (``file_brain_AXT1_*`` < ``AXT2_*`` < ``AXT2FLAIR_*``), so passing brain
-data straight through ``discover_repetition_groups`` chops three *same-contrast*
-files onto one subject's "three contrasts" and the per-contrast LOCO concordance
-grades mislabelled buckets (issue #308).
-
-This module builds a **balanced, interleaved** grid instead: each ``.h5`` is its
-own single-rep reference, and the returned order is subject-major / contrast
--minor across the chosen contrasts, so ``c_idx`` maps to a *real* contrast. The
-grid dimensions are returned explicitly because sim2rank's ``n_subjects`` /
-``n_contrasts`` heuristic (derived from ``len(rep_groups)``) assumes M4Raw
-ordering and cannot recover a C-wide grid on its own.
-
-Grouping / labelling is a file->dataset concern, so per the data-loading SSOT
-(CLAUDE.md pitfall #11 / #13) it lives here, not in ``scripts/sim2rank``.
+Contrast parsing is owned by :mod:`spectramr.data.datasets.contrast_grid`; this
+module only reads the header attr and builds the balanced grid.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 
 import h5py
 
-from spectramr.infrastructure.physics.m4raw_pseudo_gt import extract_contrast_label
+from spectramr.data.datasets.contrast_grid import (
+    ContentKey,
+    ContrastGrid,
+    choose_contrasts,
+    h5_files,
+    resolve_brain_contrast,
+)
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["BrainContrastGrid", "brain_contrast_of", "discover_brain_contrast_groups"]
-
-
-@dataclass(frozen=True)
-class BrainContrastGrid:
-    """A rectangular ``n_subjects x n_contrasts`` grid of single-acquisition refs.
-
-    ``groups`` is subject-major / contrast-minor so that ``group_idx =
-    s * n_contrasts + c`` selects volume ``s`` of contrast ``contrasts[c]`` — the
-    ordering sim2rank's ``(subject, contrast)`` loop expects. Each entry is a
-    one-element list (one fully-sampled acquisition = one clean reference).
-    """
-
-    groups: list[list[Path]]
-    n_subjects: int
-    n_contrasts: int
-    contrasts: list[str]
+__all__ = ["brain_contrast_of", "discover_brain_grid"]
 
 
 def brain_contrast_of(path: Path) -> str:
-    """Contrast for a fastMRI-brain file.
+    """:func:`resolve_brain_contrast` with the ``acquisition`` attr read from the file.
 
-    Prefers the authoritative ``attrs['acquisition']`` written by fastMRI; falls
-    back to the ``AX*`` filename token via :func:`extract_contrast_label`. Raises
-    when neither yields a recognisable contrast rather than mislabelling the
-    volume with its full filename (no silent fallback, pitfall #9).
+    Raises when the attr and the ``AX*`` filename token disagree, and when neither
+    yields a contrast.
     """
-    acquisition: str | None = None
+    acquisition = None
     try:
         with h5py.File(str(path), "r") as f:
-            raw = f.attrs.get("acquisition")
-        if raw is not None:
-            acquisition = raw.decode() if isinstance(raw, bytes) else str(raw)
-    except (OSError, KeyError) as exc:  # unreadable / no attrs -> try the filename
+            acquisition = f.attrs.get("acquisition")
+    except OSError as exc:
         logger.debug("No readable acquisition attr in %s (%s); using filename.", path, exc)
-
-    if acquisition:
-        return acquisition.strip().upper()
-
-    label = extract_contrast_label(path)
-    if label == path.stem:
-        raise ValueError(
-            f"Cannot determine a contrast for {path.name}: no 'acquisition' attr "
-            f"and no recognisable AX* / M4Raw token in the filename."
-        )
-    return label
+    return resolve_brain_contrast(path, acquisition)
 
 
-def discover_brain_contrast_groups(
+def _exam_id(path: Path, contrast: str) -> str:
+    tokens = path.name.split(".")[0].split("_")
+    upper = [t.upper() for t in tokens]
+    tail = tokens[upper.index(contrast) + 1 :] if contrast in upper else []
+    return "_".join(tail) or path.name.split(".")[0]
+
+
+def discover_brain_grid(
     data_dir: Path,
+    contrasts: list[str] | None = None,
     max_subjects: int = 5,
     max_contrasts: int = 3,
-    contrasts: list[str] | None = None,
-) -> BrainContrastGrid:
-    """Discover a balanced contrast grid from a directory of fastMRI-brain ``.h5``.
+) -> ContrastGrid:
+    """Unlinked grid: one file per content, ``subject_id`` = exam id.
 
-    Args:
-        data_dir: directory of single-acquisition ``.h5`` files (searched
-            non-recursively first, then recursively).
-        max_subjects: cap on volumes *per contrast* (the grid's ``n_subjects``).
-        max_contrasts: cap on the number of contrasts (the grid's ``n_contrasts``).
-        contrasts: optional explicit allow-list (e.g. ``["AXT1", "AXT2",
-            "AXT2FLAIR"]``). When given, every requested contrast must be present
-            in the data or a ``ValueError`` is raised (fail-loud). When omitted,
-            the ``max_contrasts`` most-populated contrasts are chosen.
-
-    Returns:
-        A :class:`BrainContrastGrid`. The grid is balanced (``n_subjects`` =
-        smallest chosen bucket, capped by ``max_subjects``); volumes beyond the
-        rectangle are dropped and the drop count is logged (no silent cap).
-
-    Raises:
-        FileNotFoundError: no ``.h5`` under ``data_dir``.
-        ValueError: a requested contrast is absent, or a chosen bucket is empty.
+    Buckets are balanced to the smallest chosen contrast (capped by
+    ``max_subjects``) so rows stay rectangular; the drop count is logged.
     """
-    h5_files = sorted(data_dir.glob("*.h5")) or sorted(data_dir.rglob("*.h5"))
-    if not h5_files:
-        raise FileNotFoundError(f"No H5 files found in {data_dir}")
-
     buckets: dict[str, list[Path]] = {}
-    for f in h5_files:
+    for f in h5_files(data_dir):
         buckets.setdefault(brain_contrast_of(f), []).append(f)
-
-    if contrasts:
-        requested = [c.strip().upper() for c in contrasts]
-        missing = [c for c in requested if c not in buckets]
-        if missing:
-            raise ValueError(
-                f"Requested contrast(s) {missing} not found in {data_dir}. "
-                f"Present: {sorted(buckets)}"
-            )
-        chosen = requested[:max_contrasts]
-    else:
-        # Most-populated first, name as a deterministic tie-break.
-        chosen = sorted(buckets, key=lambda c: (-len(buckets[c]), c))[:max_contrasts]
-
-    if not chosen:
-        raise ValueError(f"No usable contrasts discovered in {data_dir}")
-
+    present = {c: len(v) for c, v in buckets.items()}
+    chosen = choose_contrasts(present, contrasts, max_contrasts, data_dir)
     per_contrast = min(min(len(buckets[c]) for c in chosen), max_subjects)
-    if per_contrast < 1:
-        raise ValueError(f"Chosen contrasts {chosen} have no volumes to grade.")
-
     total = sum(len(buckets[c]) for c in chosen)
-    used = per_contrast * len(chosen)
-    if used < total:
+    if per_contrast * len(chosen) < total:
         logger.info(
-            "fastMRI-brain grid balanced to %d/%d volumes (%d per contrast x %d "
-            "contrasts); dropped %d to keep a rectangular subject x contrast grid.",
-            used,
-            total,
+            "fastMRI-brain grid balanced to %d per contrast x %d; dropped %d volumes.",
             per_contrast,
             len(chosen),
-            total - used,
+            total - per_contrast * len(chosen),
         )
-
-    groups: list[list[Path]] = []
-    for s in range(per_contrast):
-        for c in chosen:
-            groups.append([buckets[c][s]])
-
+    keys = tuple(
+        ContentKey(_exam_id(buckets[c][i], c), c, None, (str(buckets[c][i]),))
+        for i in range(per_contrast)
+        for c in chosen
+    )
+    subjects = tuple(dict.fromkeys(k.subject_id for k in keys))
     logger.info(
-        "Discovered fastMRI-brain grid: %d subjects x %d contrasts %s (%d h5 files).",
-        per_contrast,
-        len(chosen),
-        chosen,
-        len(h5_files),
+        "fastMRI-brain grid: %d index rows x %d contrasts %s", per_contrast, len(chosen), chosen
     )
-    return BrainContrastGrid(
-        groups=groups,
-        n_subjects=per_contrast,
-        n_contrasts=len(chosen),
-        contrasts=chosen,
-    )
+    return ContrastGrid(keys, subjects, tuple(chosen), False)

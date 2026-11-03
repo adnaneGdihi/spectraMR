@@ -125,39 +125,35 @@ class VonMisesFisher:
         # Householder reflection mapping e_1 -> mu.
         return self._householder_rotate(z_canonical, self.mu)
 
-    def _sample_w(self, kappa: Tensor) -> Tensor:
+    def _sample_w(self, kappa: Tensor, rounds: int = 50) -> Tensor:
         r"""Sample the polar coordinate ``w = z·e_1`` via Wood's scheme.
 
-        Implements the acceptance-rejection sampler for the marginal of
-        the first coordinate under vMF (Wood 1994; used in [2]). Runs a
-        fixed number of vectorised rejection rounds and falls back to the
-        last proposal for any still-unaccepted entry (probability of a
-        miss after 50 rounds is < 1e-9 for the kappa range here).
+        Wood (1994): with :math:`x_0 = (1-b)/(1+b)` and
+        :math:`c = \kappa x_0 + (d-1)\log(1-x_0^2)`, a Beta proposal ``W`` is
+        accepted when :math:`\kappa W + (d-1)\log(1 - x_0 W) - c \ge \log U`.
+        ``b``, :math:`1-x_0^2` and :math:`1-x_0W` are evaluated in rationalised
+        form so float32 neither cancels ``b`` to 0 at large ``kappa`` nor hits
+        ``log 0`` as ``kappa -> 0``. All ``rounds`` proposals are drawn in one
+        batch and the first accepted one is kept, which is exact rejection
+        sampling without a per-round host sync; an entry with no acceptance
+        keeps the last proposal (probability < 1e-9 for 50 rounds).
         """
         d = self.d
-        b = (-2.0 * kappa + torch.sqrt(4.0 * kappa * kappa + (d - 1) ** 2)) / (d - 1)
-        a = (d - 1 + 2.0 * kappa + torch.sqrt(4.0 * kappa * kappa + (d - 1) ** 2)) / 4.0
-        c = kappa * b + (d - 1) * torch.log(1.0 - b * b)
+        b = (d - 1) / (2.0 * kappa + torch.sqrt(4.0 * kappa * kappa + (d - 1) ** 2))
+        log_one_minus_x0_sq = torch.log(4.0 * b) - 2.0 * torch.log1p(b)
+        x0 = (1.0 - b) / (1.0 + b)
+        c = kappa * x0 + (d - 1) * log_one_minus_x0_sq
 
-        w = torch.zeros_like(kappa)
-        accepted = torch.zeros_like(kappa, dtype=torch.bool)
-        for _ in range(50):
-            eps = torch.distributions.Beta(
-                torch.full_like(kappa, (d - 1) / 2.0),
-                torch.full_like(kappa, (d - 1) / 2.0),
-            ).sample()
-            w_prop = (1.0 - (1.0 + b) * eps) / (1.0 - (1.0 - b) * eps)
-            t = kappa * w_prop + (d - 1) * torch.log(1.0 - (1.0 - b) * eps) - c
-            u = torch.rand_like(kappa)
-            accept = t >= torch.log(u)
-            take = accept & (~accepted)
-            w = torch.where(take, w_prop, w)
-            accepted = accepted | accept
-            if bool(accepted.all()):
-                break
-        # Fallback for any unaccepted entries.
-        w = torch.where(accepted, w, w_prop)
-        return w
+        conc = torch.full_like(kappa, (d - 1) / 2.0)
+        eps = torch.distributions.Beta(conc, conc).sample((rounds,))  # (R, *kappa.shape)
+        denom = 1.0 - (1.0 - b) * eps
+        w_prop = (1.0 - (1.0 + b) * eps) / denom
+        log_one_minus_x0w = torch.log(2.0 * b) - torch.log1p(b) - torch.log(denom)
+        t = kappa * w_prop + (d - 1) * log_one_minus_x0w - c
+        accept = t >= torch.log(torch.rand_like(t))
+        accept[-1] = True  # fallback: the last proposal when nothing was accepted
+        first = accept.to(torch.uint8).argmax(dim=0, keepdim=True)
+        return w_prop.gather(0, first).squeeze(0)
 
     @staticmethod
     def _householder_rotate(x: Tensor, mu: Tensor) -> Tensor:

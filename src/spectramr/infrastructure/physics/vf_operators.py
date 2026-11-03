@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
@@ -63,6 +64,9 @@ class MarkerPriorProjection(nn.Module):
         marker_mask:  Binary spatial mask ``[1, 1, H, W]``  (1 = marker region).
         marker_prior: Ideal marker image ``[1, 1, H, W]``.
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(
         self,
@@ -142,6 +146,9 @@ class MarkerKSpaceDCProjection(nn.Module):
         marker_mask: Image-space marker mask ``[1, 1, H, W]``.
         marker_prior: Ideal marker image ``[1, 1, H, W]``.
     """
+
+    #: Recorded as a ``post`` stage of the debug snapshot (``snapshot.hooks``).
+    snapshot_stage: ClassVar[str] = "post"
 
     def __init__(
         self,

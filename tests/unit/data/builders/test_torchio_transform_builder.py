@@ -4,6 +4,8 @@ Tests the TorchIOTransformConfig dataclass and TorchIOTransformBuilder
 for correct transform pipeline composition.
 """
 
+import dataclasses
+
 import pytest
 import torchio as tio
 
@@ -848,6 +850,38 @@ class TestConfigDrivenTransformRegistry:
                 DataConfigStub(transforms=[{"type": "scout_acquisition"}])
             )
 
+    def test_run_block_kwargs_are_injected_and_cannot_be_restated(self):
+        """``mrf_spiral_trajectory_sim`` takes its schedule from ``mrf:``, the one owner."""
+        from types import SimpleNamespace
+
+        import pytest
+
+        from spectramr.data.builders.torchio_transform_builder import _DataWithRunBlocks
+
+        def view(entry, mrf):
+            return _DataWithRunBlocks(
+                DataConfigStub(transforms=[entry]),
+                undersampling=None,
+                physics=None,
+                mrf=mrf,
+                run=SimpleNamespace(seed=3),
+            )
+
+        mrf = SimpleNamespace(spiral_rotation_schedule="linear", n_timepoints=50)
+        entry = {"name": "mrf_spiral_trajectory_sim", "kwargs": {"frames_per_input": 4}}
+        cfg = TorchIOTransformConfig.from_training_config(view(entry, mrf))
+        assert cfg.extra_transforms == [
+            (
+                "mrf_spiral_trajectory_sim",
+                {"frames_per_input": 4, "schedule": "linear", "n_timepoints": 50, "seed": 3},
+            )
+        ]
+        restated = {"name": "mrf_spiral_trajectory_sim", "kwargs": {"schedule": "golden_angle"}}
+        with pytest.raises(ValueError, match="one owner"):
+            TorchIOTransformConfig.from_training_config(view(restated, mrf))
+        with pytest.raises(ValueError, match=r"mrf\.spiral_rotation_schedule"):
+            TorchIOTransformConfig.from_training_config(view(entry, None))
+
     def test_registered_name_lands_in_extra_transforms(self):
         cfg = TorchIOTransformConfig.from_training_config(
             DataConfigStub(transforms=[{"name": "phase_residual", "kwargs": {"kernel_size": 7}}])
@@ -1334,3 +1368,160 @@ class TestTheTwinIsReachableFromTheRunConfig:
     def test_a_bare_data_config_builds_without_run_blocks(self):
         cfg = TorchIOTransformConfig.from_settings(DataConfigStub(patch_size=(32, 32, 1)))
         assert cfg.digital_twin_apply is False
+
+
+class TestSamplingPatternReachesTheLoaderMask:
+    """``undersampling.sampling_pattern`` is read from the run config into the Cartesian mask."""
+
+    @staticmethod
+    def _settings(base: float, pattern: str | None):
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+
+        return SimpleNamespace(
+            data=DataConfigStub(patch_size=(256, 256, 1), trajectory="cartesian"),
+            undersampling=AccelerationConfigSchema(
+                base_acceleration=base,
+                center_fraction=0.08,
+                mask_direction="phase",
+                sampling_pattern=pattern,
+            ),
+        )
+
+    def test_variable_density_lines_on_the_phase_axis_at_the_uniform_budget(self):
+        import torch
+
+        from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+        cfg = TorchIOTransformConfig.from_settings(self._settings(8.0, "cartesian_vd"))
+        cfg = dataclasses.replace(cfg, phase_encode_axis=-1)
+        vd = TorchIOTransformBuilder._build_physics_transform(cfg)
+        uni = TorchIOTransformBuilder._build_physics_transform(
+            dataclasses.replace(cfg, sampling_pattern=None)
+        )
+        assert isinstance(vd, PhysicsInformedMasking) and vd.line_axis == "x"
+        assert vd.applied_record()["pattern"] == "variable_density_1d_outer_lines"
+        m_vd, m_uni = vd._generate_mask(256, 256), uni._generate_mask(256, 256)
+        assert torch.equal(m_vd, m_vd[:1].expand_as(m_vd))  # lines vary along dim -1 only
+        lines_vd, lines_uni = m_vd[0], m_uni[0]
+        assert int(lines_vd.sum()) == int(lines_uni.sum()) == 49
+        dist = (torch.arange(256) - 128).abs().float()
+        acs = dist < 10
+        assert dist[(lines_vd > 0) & ~acs].mean() < dist[(lines_uni > 0) & ~acs].mean()
+
+    def test_a_pattern_on_the_unmasked_route_raises(self):
+        with pytest.raises(ValueError, match="sampling_pattern"):
+            TorchIOTransformConfig.from_settings(self._settings(1.0, "variable_density_1d"))
+
+    def test_a_pattern_the_loader_cannot_draw_raises(self):
+        cfg = TorchIOTransformConfig(
+            trajectory_type="cartesian", acceleration=8, center_fraction=0.08, sampling_pattern="radial"
+        )
+        with pytest.raises(ValueError, match="cannot draw"):
+            TorchIOTransformBuilder._build_physics_transform(cfg)
+
+    def test_a_pattern_on_a_non_cartesian_route_raises(self):
+        cfg = TorchIOTransformConfig(
+            trajectory_type="radial", acceleration=8, sampling_pattern="variable_density_1d"
+        )
+        with pytest.raises(ValueError, match="Cartesian loader mask"):
+            TorchIOTransformBuilder._build_physics_transform(cfg)
+
+
+_SHEAF_MC_ARM = "experiments/inprogress/novel_2026/breakthrough_sheaf_multi_contrast.yaml"
+
+
+def test_joint_stacked_combine_keeps_one_coil_group():
+    assert TorchIOTransformConfig.from_training_config(DataConfigStub()).coil_channel_groups == 1
+
+
+@pytest.mark.parametrize("which", ["train", "val"])
+def test_per_contrast_combine_reaches_the_pipeline_from_the_arm(which):
+    """Reachability: the sheaf multi-contrast arm's YAML -> loaded settings -> the built
+    pipeline serves one channel per stacked contrast, each combined from its own coils."""
+    import numpy as np
+    import torch
+
+    from spectramr.config.settings import TrainingSettings
+
+    cfg = TorchIOTransformConfig.from_settings(TrainingSettings.from_yaml(_SHEAF_MC_ARM))
+    assert cfg.coil_channel_groups == 2
+    build = {
+        "train": TorchIOTransformBuilder.build_train_transforms,
+        "val": TorchIOTransformBuilder.build_val_transforms,
+    }[which]
+    # Real-interleaved coils, 2 source then 2 target, as the M4Raw stacked route serves them;
+    # the target contrast is zero so its channel must come out zero.
+    k = torch.randn(8, 32, 32, 1, generator=torch.Generator().manual_seed(0))
+    k[4:] = 0.0
+    subject = tio.Subject(
+        **{
+            key: tio.ScalarImage(tensor=k.clone(), affine=np.eye(4))
+            for key in ("input", "target", "kspace", "measured_kspace")
+        }
+    )
+    out = build(cfg)(subject)
+    for key in ("input", "target"):
+        data = out[key].data
+        assert data.shape[0] == 2, key
+        assert data[0].abs().sum() > 0, key
+        assert data[1].abs().sum() == 0, key
+
+
+class TestSleKappaMaskIsReachableFromTheRunConfig:
+    """`undersampling.sampling_pattern: sle_kappa` reaches the loader mask in both chains."""
+
+    @staticmethod
+    def _settings(**undersampling):
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.acceleration import AccelerationConfigSchema
+
+        return SimpleNamespace(
+            data=DataConfigStub(
+                patch_size=(32, 32, 1), coil_processing_mode="none", trajectory="cartesian"
+            ),
+            undersampling=AccelerationConfigSchema(**undersampling),
+        )
+
+    @staticmethod
+    def _masking(pipeline):
+        from spectramr.data.transforms.tio_physics import PhysicsInformedMasking
+
+        (masking,) = [t for t in pipeline.transforms if isinstance(t, PhysicsInformedMasking)]
+        return masking
+
+    @pytest.mark.parametrize("which", ["train", "val"])
+    def test_the_declared_sle_mask_fires_at_the_line_mask_budget(self, which):
+        import torch
+
+        sle_cfg = TorchIOTransformConfig.from_settings(
+            self._settings(base_acceleration=4, center_fraction=0.08, sampling_pattern="sle_kappa")
+        )
+        line_cfg = TorchIOTransformConfig.from_settings(
+            self._settings(base_acceleration=4, center_fraction=0.08)
+        )
+        masking = self._masking(_builder(which)(sle_cfg))
+        assert masking.sampling_pattern == "sle_kappa"
+        subject = tio.Subject(kspace=tio.ScalarImage(tensor=torch.randn(2, 32, 32, 1)))
+        mask = masking(subject)["mask"].data[0, :, :, 0]
+        rows = mask.sum(dim=1)
+        assert bool(((rows > 0) & (rows < 32)).any()), "an SLE mask is not line-separable"
+        line_mask = self._masking(_builder(which)(line_cfg))._generate_mask(32, 32)
+        assert int(mask.sum()) == int(line_mask.sum())
+        assert masking.applied_record()["pattern"].endswith("sle_kappa_points")
+
+    @pytest.mark.parametrize(
+        "undersampling, trajectory",
+        [({"base_acceleration": 1.0}, "cartesian"), ({"base_acceleration": 4}, "radial")],
+    )
+    def test_an_sle_pattern_the_loader_never_builds_raises(self, undersampling, trajectory):
+        cfg = TorchIOTransformConfig(
+            trajectory_type=trajectory,
+            acceleration=undersampling["base_acceleration"],
+            center_fraction=0.08,
+            sampling_pattern="sle_kappa",
+        )
+        with pytest.raises(ValueError, match="sampling_pattern='sle_kappa'"):
+            TorchIOTransformBuilder._build_physics_transform(cfg)

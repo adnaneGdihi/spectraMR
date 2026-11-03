@@ -2,7 +2,7 @@
 
 The routing rule is the one that protects existing arms: a metric is handed a
 context only when this path can fill every field it declares, so an NR metric
-that needs a sampling mask keeps the context-free call it had before.
+that needs a reconstructor keeps the context-free call it had before.
 """
 
 from __future__ import annotations
@@ -36,16 +36,27 @@ def _computer(names: list[str]):
 
 class TestRouting:
     def test_only_fully_suppliable_context_metrics_are_routed(self) -> None:
-        names = ["psnr", "null_space_residual", "ndcr", "rep_variance", "csoe"]
+        names = ["psnr", "null_space_residual", "dpst", "rep_variance", "csoe"]
         routed = context_metric_names(_computer(names))
         assert routed == ("null_space_residual", "rep_variance", "csoe")
 
-    def test_a_metric_needing_a_mask_keeps_its_old_call(self) -> None:
-        """ndcr needs `mask`, which this path does not supply."""
+    def test_a_metric_needing_a_prior_model_keeps_its_old_call(self) -> None:
+        """dpst needs `prior_model`, which this path does not supply."""
         from spectramr.core.metrics.registry import MetricsRegistry
 
-        assert "mask" in MetricsRegistry.needs("ndcr") and "mask" not in SUPPLIED_FIELDS
-        assert context_metric_names(_computer(["ndcr"])) == ()
+        assert "prior_model" in MetricsRegistry.needs("dpst")
+        assert "prior_model" not in SUPPLIED_FIELDS
+        assert context_metric_names(_computer(["dpst"])) == ()
+
+    def test_a_metric_needing_a_reconstructor_is_routed(self) -> None:
+        assert "reconstructor" in SUPPLIED_FIELDS
+        assert context_metric_names(_computer(["fmrs"])) == ("fmrs",)
+
+    def test_the_held_out_line_metric_is_routed(self) -> None:
+        assert "mask" in SUPPLIED_FIELDS
+        assert context_metric_names(_computer(["unacquired_bin_nrmse"])) == (
+            "unacquired_bin_nrmse",
+        )
 
     def test_a_computer_that_cannot_list_its_metrics_routes_nothing(self) -> None:
         assert context_metric_names(object()) == ()
@@ -176,6 +187,80 @@ class TestComputeContextMetrics:
         assert float(out["val_rep_variance"]) == 0.0
 
 
+class TestModelRerunMetrics:
+    """monotone_remap_invariance gets the validation forward and the model input."""
+
+    def _run(self, rank_transform: bool, input_type: str = "image") -> dict[str, float]:
+        from spectramr.core.metrics.computer import ValidationMetricsComputer
+        from spectramr.core.metrics.types import ValidationMetricsConfig
+        from spectramr.infrastructure.training.strategies.mixins.validation_context import (
+            compute_context_metrics,
+        )
+        from spectramr.models.encoders.mcgi_encoder import MCGIEncoder
+
+        name = "monotone_remap_invariance"
+        computer = ValidationMetricsComputer(ValidationMetricsConfig.from_dict({"metrics": [name]}))
+        assert context_metric_names(computer) == (name,)
+        torch.manual_seed(0)
+        model = MCGIEncoder(hidden_channels=4, depth=2, rank_transform=rank_transform).eval()
+        x = torch.rand(2, 1, 12, 12)
+        with torch.no_grad():
+            pred = model(x)
+        cfg = types.SimpleNamespace(input_type=input_type, output_type="image")
+        return compute_context_metrics(
+            computer, (name,), pred, torch.rand_like(pred), x, {}, cfg, model,
+            signal_domain="image",
+        )
+
+    def test_rank_on_reads_zero_rank_off_does_not(self) -> None:
+        assert float(self._run(True)["val_monotone_remap_invariance"]) == 0.0
+        assert float(self._run(False)["val_monotone_remap_invariance"]) > 1e-3
+
+    def test_a_non_image_input_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="input_type"):
+            self._run(True, input_type="latent")
+
+
+class TestSamplingMask:
+    """The loader's mask reaches ``unacquired_bin_nrmse`` (the held-out-line error)."""
+
+    def _call(self, batch):
+        from spectramr.core.metrics.computer import ValidationMetricsComputer
+        from spectramr.core.metrics.types import ValidationMetricsConfig
+        from spectramr.infrastructure.training.strategies.mixins.validation_context import (
+            compute_context_metrics,
+        )
+
+        names = ("unacquired_bin_nrmse", "acquired_bin_nrmse")
+        computer = ValidationMetricsComputer(ValidationMetricsConfig.from_dict({"metrics": list(names)}))
+        target = as_interleaved(_complex(2, 1, 8, 6, seed=1))
+        model = types.SimpleNamespace(input_type="kspace", output_type="kspace")
+        return target, lambda pred: compute_context_metrics(
+            computer, names, pred, target, target, batch, model, lambda x: x,
+            signal_domain="kspace",
+        )
+
+    def test_error_lands_only_on_the_withheld_lines(self) -> None:
+        mask = torch.zeros(2, 1, 8, 6, 1)  # (B, 1, H, W, D) as the loader collates it
+        mask[:, :, ::2] = 1.0
+        target, score = self._call({"mask": mask})
+        pred = target.clone()
+        pred[:, :, 1::2] += 1.0  # wrong only on the rows the mask withheld
+        out = score(pred)
+        assert out["val_acquired_bin_nrmse"] == 0.0
+        assert out["val_unacquired_bin_nrmse"] > 0.0
+
+    def test_a_training_batch_carries_its_mask_as_a_field(self) -> None:
+        mask = torch.ones(2, 1, 8, 6)
+        batch = BatchAdapter.from_dict({"input": mask, "target": mask, "mask": mask})
+        assert batch_tensor(batch, "mask") is batch.mask
+
+    def test_a_batch_without_a_mask_raises(self) -> None:
+        target, score = self._call({})
+        with pytest.raises(ValueError, match="carries no `mask`"):
+            score(target)
+
+
 class TestFoldDepth:
     """TorchIO's (B, C, H, W, D) folds into the batch once and unfolds exactly."""
 
@@ -197,63 +282,14 @@ class TestFoldDepth:
         assert none is None and same is four and unfold_depth(same, none) is four
 
 
-class TestScoringMaps:
-    """#2664: sense_* combine with the validation-only scoring maps when present."""
+class TestScoringMapsAreTheBatchMaps:
+    """The SENSE, Rep-BV and certificate metrics score with the batch's own coil maps."""
 
-    def _batch(self, *, with_reference: bool):
-        from spectramr.core.coil_map_names import REFERENCE_MAPS_KEY
-
+    def _batch(self):
         training_maps = _complex(2, 4, 16, 16, seed=1)
-        scoring_maps = _complex(2, 4, 16, 16, seed=2)
-        data = {"sensitivity_complex": training_maps}
-        if with_reference:
-            data[REFERENCE_MAPS_KEY] = scoring_maps
-        return data, training_maps, scoring_maps
+        return {"sensitivity_complex": training_maps}, training_maps
 
-    def _sense_psnr(self, batch, prediction, target) -> float:
-        from spectramr.core.metrics.computer import create_validation_metrics_computer
-        from spectramr.infrastructure.training.strategies.mixins.validation_context import (
-            compute_context_metrics,
-        )
-
-        computer = create_validation_metrics_computer(["sense_psnr"], device="cpu", data_range=1.0)
-        model = types.SimpleNamespace(input_type="kspace", output_type="kspace")
-        out = compute_context_metrics(
-            computer, ("sense_psnr",), prediction, target, prediction, batch, model,
-            lambda x: x, signal_domain="kspace",
-        )  # fmt: skip
-        return float(out["val_sense_psnr"])
-
-    def _expected(self, prediction, target, maps) -> float:
-        from spectramr.core.metrics.context import MetricContext
-        from spectramr.core.metrics.registry import MetricsRegistry
-
-        metric = MetricsRegistry.get("sense_psnr")
-        context = MetricContext(coil_maps=maps, signal_domain="kspace")
-        return float(metric(prediction, target, context=context, data_range=1.0))
-
-    def test_the_scoring_maps_win_when_the_batch_carries_them(self) -> None:
-        from spectramr.infrastructure.training.strategies.mixins.validation_context import (
-            scoring_maps,
-        )
-
-        batch, training_maps, scoring = self._batch(with_reference=True)
-        prediction = as_interleaved(_complex(2, 4, 16, 16, seed=3))
-        target = as_interleaved(_complex(2, 4, 16, 16, seed=4))
-        assert torch.equal(scoring_maps(batch, prediction)[0], scoring)
-        assert torch.equal(coil_maps(batch, prediction)[0], training_maps)  # operators unchanged
-        got = self._sense_psnr(batch, prediction, target)
-        assert got == pytest.approx(self._expected(prediction, target, scoring), rel=1e-5)
-
-    def test_planted_without_them_the_training_maps_score(self) -> None:
-        batch, training_maps, scoring = self._batch(with_reference=False)
-        prediction = as_interleaved(_complex(2, 4, 16, 16, seed=3))
-        target = as_interleaved(_complex(2, 4, 16, 16, seed=4))
-        got = self._sense_psnr(batch, prediction, target)
-        assert got == pytest.approx(self._expected(prediction, target, training_maps), rel=1e-5)
-        assert got != pytest.approx(self._expected(prediction, target, scoring), rel=1e-3)
-
-    def _context(self, batch, prediction, target, names, **kw) -> dict[str, float]:
+    def _context(self, batch, prediction, target, names) -> dict[str, float]:
         from spectramr.core.metrics.computer import create_validation_metrics_computer
         from spectramr.infrastructure.training.strategies.mixins.validation_context import (
             compute_context_metrics,
@@ -263,46 +299,33 @@ class TestScoringMaps:
         model = types.SimpleNamespace(input_type="kspace", output_type="kspace")
         return compute_context_metrics(
             computer, tuple(names), prediction, target, prediction, batch, model,
-            lambda x: x, signal_domain="kspace", **kw,
+            lambda x: x, signal_domain="kspace",
         )  # fmt: skip
 
-    def test_the_corrected_mse_reads_the_scoring_maps_too(self) -> None:
-        """The noise term must rest on the map set every family is scored with."""
+    def test_sense_psnr_scores_with_the_batch_maps_and_ignores_a_retired_reference_key(self) -> None:
+        """The retired reference store (all repetitions, #2510) must never reach a metric."""
         from spectramr.core.metrics.context import MetricContext
         from spectramr.core.metrics.registry import MetricsRegistry
 
-        batch, training_maps, scoring = self._batch(with_reference=True)
+        batch, training_maps = self._batch()
+        batch["reference_sensitivity_complex"] = _complex(2, 4, 16, 16, seed=2)
+        prediction = as_interleaved(_complex(2, 4, 16, 16, seed=3))
+        target = as_interleaved(_complex(2, 4, 16, 16, seed=4))
+        got = self._context(batch, prediction, target, ["sense_psnr"])["val_sense_psnr"]
+        metric = MetricsRegistry.get("sense_psnr")
+        ctx = MetricContext(coil_maps=training_maps, signal_domain="kspace")
+        assert got == pytest.approx(float(metric(prediction, target, context=ctx, data_range=1.0)), rel=1e-5)
+
+    def test_the_corrected_mse_noise_term_reads_the_batch_maps(self) -> None:
+        from spectramr.core.metrics.context import MetricContext
+        from spectramr.core.metrics.registry import MetricsRegistry
+
+        batch, training_maps = self._batch()
         prediction = as_interleaved(_complex(2, 4, 16, 16, seed=3))
         target = as_interleaved(_complex(2, 4, 16, 16, seed=4))
         got = self._context(batch, prediction, target, ["reference_noise_corrected_mse"])
         metric = MetricsRegistry.get("reference_noise_corrected_mse")
-
-        def expected(maps):
-            ctx = MetricContext(coil_maps=maps, signal_domain="kspace")
-            return float(metric(prediction, target, context=ctx))
-
-        value = got["val_reference_noise_corrected_mse"]
-        assert value == pytest.approx(expected(scoring), rel=1e-5)
-        # Planted: the training maps, which the noise term used to read.
-        assert value != pytest.approx(expected(training_maps), rel=1e-3)
-
-    def test_an_image_prediction_is_scored_as_it_is(self) -> None:
-        """An image network's x_hat, not |S_ref^H S_train x_hat| (validation audit 2026-10-09)."""
-        from spectramr.core.metrics.context import MetricContext
-        from spectramr.core.metrics.registry import MetricsRegistry
-
-        batch, training_maps, scoring = self._batch(with_reference=True)
-        image = as_interleaved(_complex(2, 1, 16, 16, seed=5))
-        # What a strategy's context adapter grades: F S_train x_hat.
-        from spectramr.infrastructure.physics.fft_ops import fft2c
-
-        re_expanded = as_interleaved(fft2c(training_maps * torch.complex(image[:, 0:1], image[:, 1:2])))
-        target = as_interleaved(_complex(2, 4, 16, 16, seed=4))
-        got = self._context(batch, re_expanded, target, ["sense_psnr"], image_prediction=image)
-        ctx = MetricContext(coil_maps=scoring, signal_domain="kspace")
-        metric = MetricsRegistry.get("sense_psnr")
-        assert got["val_sense_psnr"] == pytest.approx(
-            float(metric(image, target, context=ctx, data_range=1.0)), rel=1e-5
+        ctx = MetricContext(coil_maps=training_maps, signal_domain="kspace")
+        assert got["val_reference_noise_corrected_mse"] == pytest.approx(
+            float(metric(prediction, target, context=ctx)), rel=1e-5
         )
-        planted = self._context(batch, re_expanded, target, ["sense_psnr"])
-        assert planted["val_sense_psnr"] != pytest.approx(got["val_sense_psnr"], rel=1e-3)

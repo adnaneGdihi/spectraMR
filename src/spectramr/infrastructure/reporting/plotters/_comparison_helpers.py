@@ -23,7 +23,11 @@ histogram with the L1 mean called out. This module supplies both.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Per-IEEE-style baseline — readable on a single-column figure.
 _FS_TITLE = 8  # column titles
@@ -88,13 +92,13 @@ def _format_metric_str(
             # printed negative dB on every magnitude image outside [0, 1].
             peak = float(np.abs(ref).max()) or 1.0
             parts.append(f"PSNR {psnr(pred, ref, data_range=peak):.1f}")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("PSNR annotation dropped: %s", exc)
     if "ssim" in show:
         try:
             parts.append(f"SSIM {ssim_simple(pred, ref):.3f}")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("SSIM annotation dropped: %s", exc)
     if "l1" in show:
         parts.append(f"L1 {l1(pred, ref):.4f}")
     return ("\n" if multiline else "  ").join(parts)

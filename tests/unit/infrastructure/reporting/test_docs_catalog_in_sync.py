@@ -6,14 +6,14 @@ from spectramr.infrastructure.reporting import plotters
 _NEW_FIGURES = (
     "mri_recon_panel", "kspace_error_spectrum", "metric_distribution",
     "bland_altman", "significance_matrix", "calibration_coverage",
-    "forest_plot", "ablation_heatmap", "acceleration_sweep", "contact_sheet",
+    "ablation_heatmap", "acceleration_sweep", "contact_sheet",
     # 2026-07-01 reporting upgrade
     "fig_1_16_run_summary_card", "fig_1_17_metric_correlation",
     "fig_1_18_train_val_gap",
     # QC QC report
     "qc_group_strip", "qc_subject_mosaic", "qc_carpet",
     # 2026-07-03 plotting-SSOT hardening — orphans registered via adapters.
-    "certificate_summary", "ksd_certificate", "learnable_acquisition_pareto",
+    "certificate_summary", "ksd_certificate",
 )
 
 

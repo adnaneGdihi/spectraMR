@@ -3,14 +3,14 @@
 Composes the frozen tissue prior (Phase 1), the Bloch forward
 operator, and the frozen ULF + HF corruption operators (Phase 2) into a
 single forward pass that emits a dict of
-``{ulf, hf, theta, p_ulf, p_hf, defensibility_flag}``.
+``{ulf, hf, ulf_clean, hf_clean, theta, residual*, defensibility_flag}``.
 
 Inputs: a sampled tissue map ``theta`` (B, 3, H, W). Acquisition
 vectors ``P_ULF`` and ``P_HF`` are passed via kwargs.
 
 Outputs: dict with the synthesised pair plus metadata. The
 ``defensibility_flag`` is a Boolean tensor (B,) derived from the
-per-pair residual.
+noise-standardised residual of both images.
 """
 
 from __future__ import annotations
@@ -43,10 +43,11 @@ class PairedSynthesisGenerator(nn.Module, IGenerator):
     :class:`DifferentiableBlochLayer` (the encoder path) — that is a
     runtime-component swap, not a schema change.
 
-    The defensibility flag is computed from the residual between
-    ``hf_synth`` and a back-Bloch-recovered ``hf_synth`` (the latter
-    only differs by stochastic corruption components, so a small
-    residual indicates consistency).
+    The defensibility flag reads both images. For each, the residual is
+    ``mean((y - y_clean)^2) / (2 sigma^2)`` with ``sigma`` the operator's
+    ``noise_sigma()``: about 1 in air and 0.5 on high-SNR tissue when the
+    corruption is noise alone, larger as the field and motion add deviation.
+    A pair passes when the larger of the two is below ``defensibility_threshold``.
     """
 
     def __init__(
@@ -64,6 +65,8 @@ class PairedSynthesisGenerator(nn.Module, IGenerator):
         self.ulf_corruption = ulf_corruption
         self.hf_corruption = hf_corruption
         self.defensibility_threshold = defensibility_threshold
+        # Frozen and empty: the harness builds an optimizer over parameters(), and torch refuses [].
+        self.frozen_anchor = nn.Parameter(torch.zeros(0), requires_grad=False)
 
     @property
     def in_channels(self) -> int:
@@ -106,6 +109,24 @@ class PairedSynthesisGenerator(nn.Module, IGenerator):
         denom = (1.0 - cos_a * e1).clamp_min(1e-6)
         return m0 * sin_a * (1.0 - e1) / denom * e2
 
+    @staticmethod
+    def _corrupt(
+        op: nn.Module | None, clean: torch.Tensor, role: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply ``op`` and return the output with its noise-standardised residual (B,)."""
+        if op is None:
+            return clean, clean.new_zeros(clean.shape[0])
+        noise_sigma = getattr(op, "noise_sigma", None)
+        if not callable(noise_sigma):
+            raise TypeError(
+                f"PairedSynthesisGenerator: {role} must expose noise_sigma() so the "
+                f"defensibility gate can standardise its residual; got {type(op).__name__}."
+            )
+        out = op(clean)
+        sigma = noise_sigma().to(out).view(1, -1, 1, 1).expand(1, out.shape[1], 1, 1)
+        residual = ((out - clean).pow(2) / (2.0 * sigma.pow(2))).mean(dim=(1, 2, 3))
+        return out, residual
+
     def forward(
         self,
         x: torch.Tensor,
@@ -118,24 +139,26 @@ class PairedSynthesisGenerator(nn.Module, IGenerator):
             raise ValueError(
                 f"PairedSynthesisGenerator expects (B, ≥3, H, W) tissue maps; got {tuple(x.shape)}."
             )
-        # Default protocols if not supplied (e.g. for smoke tests).
-        p_ulf = p_ulf or {"te": 80.0, "tr": 3000.0, "fa_rad": 1.5708}
-        p_hf = p_hf or {"te": 80.0, "tr": 3000.0, "fa_rad": 1.5708}
+        if p_ulf is None or p_hf is None:
+            raise ValueError(
+                "PairedSynthesisGenerator needs both p_ulf and p_hf protocols "
+                "({'te', 'tr', 'fa_rad'}); with one shared default the pair is identical."
+            )
         ulf_clean = self._bloch_spgr(x, p_ulf["te"], p_ulf["tr"], p_ulf["fa_rad"])
         hf_clean = self._bloch_spgr(x, p_hf["te"], p_hf["tr"], p_hf["fa_rad"])
-        ulf = self.ulf_corruption(ulf_clean) if self.ulf_corruption is not None else ulf_clean
-        hf = self.hf_corruption(hf_clean) if self.hf_corruption is not None else hf_clean
-        # Defensibility flag: L1 residual between (frozen-Bloch hf_clean)
-        # and (hf back through inverse-of-known corruption) — here, we
-        # approximate with the residual between hf and hf_clean since
-        # the corruption operators are non-invertible at this scope.
-        residual = (hf - hf_clean).abs().mean(dim=(1, 2, 3))
+        ulf, residual_ulf = self._corrupt(self.ulf_corruption, ulf_clean, "ulf_corruption")
+        hf, residual_hf = self._corrupt(self.hf_corruption, hf_clean, "hf_corruption")
+        residual = torch.maximum(residual_ulf, residual_hf)
         flag = residual < self.defensibility_threshold
         return {
             "ulf": ulf,
             "hf": hf,
+            "ulf_clean": ulf_clean,
+            "hf_clean": hf_clean,
             "theta": x,
             "residual": residual,
+            "residual_ulf": residual_ulf,
+            "residual_hf": residual_hf,
             "defensibility_flag": flag,
         }
 

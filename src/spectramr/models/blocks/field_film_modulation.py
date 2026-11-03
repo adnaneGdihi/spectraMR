@@ -36,7 +36,8 @@ class FieldFiLMBlock(nn.Module):
             (output ``γ, β`` have the same channel count).
         sequence_dim: Length of the sequence-conditioning vector
             :math:`\tau` (e.g. one-hot of (T1, T2, FLAIR) plus
-            normalised TR/TE/TI).
+            normalised TR/TE/TI). 0 conditions on the field alone; the
+            caller then passes an empty ``[B, 0]`` vector.
         hidden_dim: Width of the conditioning MLP.
 
     The block initialises the final layer with zero weights so the
@@ -66,8 +67,8 @@ class FieldFiLMBlock(nn.Module):
         super().__init__()
         if num_channels < 1:
             raise ValueError(f"num_channels must be ≥ 1; got {num_channels}")
-        if sequence_dim < 1:
-            raise ValueError(f"sequence_dim must be ≥ 1; got {sequence_dim}")
+        if sequence_dim < 0:
+            raise ValueError(f"sequence_dim must be ≥ 0; got {sequence_dim}")
 
         self.num_channels = num_channels
         self.sequence_dim = sequence_dim

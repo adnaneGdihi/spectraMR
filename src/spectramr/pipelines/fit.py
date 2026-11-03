@@ -102,7 +102,7 @@ _PARADIGM_DEFAULTS: dict[str, dict[str, Any]] = {
         # losses.gan is MANDATORY: AdversarialMixin._resolve_disc_updates raises
         # if it is None (invoked from GANTrainingStrategy.__init__).
         # enable_adversarial:True is LOAD-BEARING — the adversarial term is gated
-        # on it (config/schemas/loss.py), so without it get_enabled_losses()
+        # on it (config/schemas/loss.py), so without it the build set
         # returns only {"l1"} and the GAN silently collapses to an L1 denoiser
         # (the discriminator is built but never updated) — a pitfall-#16 facade.
         "losses": {

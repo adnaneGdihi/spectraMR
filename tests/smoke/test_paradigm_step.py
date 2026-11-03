@@ -421,7 +421,7 @@ EXECUTING_FLOOR = 4        # survive actually running those closures
 # how the duplication surfaced. Mutate each constant on its own.
 
 
-def _execution_census() -> dict[str, int]:
+def _execution_census() -> dict[str, Any]:
     """How far each covered strategy gets: constructed, then drivable work.
 
     `precision.dtype` is set HERE rather than in `_make_mock_config`, on
@@ -454,9 +454,11 @@ def _execution_census() -> dict[str, int]:
     drop is only a real regression once the mock supplies a legal value.
     """
     from spectramr.infrastructure.training.strategy_factory import TrainingStrategyFactory
+    from tests.utils.snapshot_census import records_a_model_stage, traced_step
 
     factory = TrainingStrategyFactory()
     built = yielded = executed = 0
+    unsnapshotted: list[str] = []
     for key in covered_keys():
         class_path = TrainingStrategyFactory.STRATEGY_CLASS_PATHS.get(key)
         if class_path is None:
@@ -493,22 +495,30 @@ def _execution_census() -> dict[str, int]:
         # executing it. Counting only the former would make this floor a
         # duplicate of `built` and unable to fail on its own.
         try:
-            for item in work:
-                item["optimizer"].step(item["closure"])
+            trace = traced_step(
+                strategy, lambda work=work: [i["optimizer"].step(i["closure"]) for i in work]
+            )
         except Exception:  # any failure means "did not execute"
             continue
         executed += 1
-    return {"built": built, "yielded": yielded, "executed": executed}
+        if not records_a_model_stage(trace):
+            unsnapshotted.append(key)
+    return {
+        "built": built,
+        "yielded": yielded,
+        "executed": executed,
+        "unsnapshotted": unsnapshotted,
+    }
 
 
 #: Memoised rather than a module-scoped fixture: the census needs the
 #: function-scoped `ensure_di_container_initialized`, and a module-scoped
 #: fixture cannot depend on a narrower one.
-_CENSUS_CACHE: dict[str, int] = {}
+_CENSUS_CACHE: dict[str, Any] = {}
 
 
 @pytest.fixture
-def execution_census(ensure_di_container_initialized: None) -> dict[str, int]:
+def execution_census(ensure_di_container_initialized: None) -> dict[str, Any]:
     if not _CENSUS_CACHE:
         _CENSUS_CACHE.update(_execution_census())
     return _CENSUS_CACHE
@@ -607,4 +617,19 @@ def test_strategies_still_execute_their_step(execution_census: dict[str, int]) -
     assert executed >= EXECUTING_FLOOR, (
         f"{executed} strategies execute a full step, below the floor of "
         f"{EXECUTING_FLOOR}."
+    )
+
+
+def test_every_executing_strategy_records_its_model_input(execution_census) -> None:
+    """A strategy whose step runs must leave a ``model/`` stage in its snapshot.
+
+    The hooks reach a model only through ``env.models`` or
+    ``_capture_model_output(module=...)``; any other route hides what the model was
+    fed. Covers exactly the strategies that execute here (``EXECUTING_FLOOR``), and
+    widens as #1033 lets more of them run.
+    """
+    missing = execution_census["unsnapshotted"]
+    assert not missing, (
+        f"{missing} ran a step that recorded no model call: register the module in "
+        "env.models or pass it to _capture_model_output(module=...)"
     )

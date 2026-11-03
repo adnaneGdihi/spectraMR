@@ -129,7 +129,6 @@ _make_fingerprint_embedding = _payloads.make_fingerprint_embedding
 _make_task_ablation_frame = _frames.make_task_ablation_frame
 _make_ksd_result = _payloads.make_ksd_result
 _make_certificate_paths = _payloads.make_certificate_paths
-_make_acquisition_arms = _payloads.make_acquisition_arms
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +145,6 @@ _DISPATCH: dict[str, tuple[str, Any]] = {
     "loss_decomposition": ("make", lambda: {}),
     "residual_diagnostics": ("make", lambda: {"predictions_df": _make_predictions_df()}),
     "predicted_vs_true": ("make", lambda: {"predictions_df": _make_predictions_df()}),
-    "ablation_strip": ("make", lambda: {"primary_metric": "psnr", "full_method": "full"}),
     "stratified_performance": ("make", lambda: {"stratified_df": _make_stratified_df()}),
     "failure_gallery": ("make", lambda: {"cases": _make_image_cases()}),
     "computational_profile": ("make", lambda: {}),
@@ -170,7 +168,6 @@ _MODULE_FIXTURES: dict[str, tuple[Any, Any]] = {
     "ablation_heatmap": (_make_heatmap_frame, dict),
     "bland_altman": (_make_bland_frame, lambda: {"metric": "ssim"}),
     "calibration_coverage": (_make_calibration_frame, dict),
-    "forest_plot": (_make_metric_frame, lambda: {"metric": "psnr"}),
     "metric_distribution": (_make_metric_frame, dict),
     "significance_matrix": (_make_metric_frame, lambda: {"metric": "psnr"}),
     "acceleration_sweep": (_make_accel_frame, lambda: {"metric": "psnr"}),
@@ -203,15 +200,6 @@ def _invoke_plotter(module: Any, out_path: Path) -> Path | None:
         return module.make(frame_factory(), out_path, **kwargs_factory())
 
     # Wrapper plotters with bespoke signatures.
-    if short == "learnable_acquisition_pareto":
-        fn = module.render_learnable_acquisition_pareto
-        ArmResult = module.ArmResult  # noqa: N806 — holds a class, not a value
-        arms = [
-            ArmResult(name=f"arm_{i}", sampling_budget=1.0 / (i + 2),
-                      psnr=28.0 + i, ssim=0.8 + 0.02 * i)
-            for i in range(4)
-        ]
-        return fn(out_path, arms)
 
     if short == "certificate_summary":
         # Optional artefact paths default to None — the plotter should
@@ -342,7 +330,6 @@ def test_plotter_dispatch_runs_against_synthetic_df(out_dir: Path) -> None:
         "fig_1_1_headline_pareto",
         "fig_1_2_learning_curves",
         "fig_1_3_loss_decomposition",
-        "fig_1_9_ablation_strip",
         "fig_1_15_computational_profile",
         "gen_gan_diagnostics",
         "gen_vae_diagnostics",

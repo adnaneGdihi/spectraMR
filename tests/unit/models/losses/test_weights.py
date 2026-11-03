@@ -796,8 +796,9 @@ class TestAccessorReadPathsAreTheExecutedReadSet:
     def test_the_static_export_equals_the_executed_read_set(self):
         leaves = _leaf_fields()
         lambdas = [p for p, _ in leaves if len(p) == 2 and p[1].startswith("lambda_")]
-        assert len(lambdas) == 107, (
-            f"expected 107 lambda_* leaves, walked {len(lambdas)}. A section typed "
+        # 110: dev's 108 plus losses.physics.lambda_phase_contrast_{image_nmse,phasor}.
+        assert len(lambdas) == 110, (
+            f"expected 110 lambda_* leaves, walked {len(lambdas)}. A section typed "
             "`X | None` has no `.model_fields`, so a permissive walk silently "
             "enumerates zero and every verdict below becomes vacuous."
         )
@@ -943,3 +944,18 @@ def test_declared_list_kwargs_stamps_entry_knobs_by_source():
         "losses.kspace_losses[frequency_weighted_l1_kspace]": {"profile": "ring_band"},
         "losses.image_losses[spectral_radial_prior]": {"comparison": "log_ratio"},
     }
+
+
+def test_declared_only_never_falls_back_to_the_schema_default():
+    """#2280: with declared_only an undeclared term weighs 0.0, never a schema default."""
+    from spectramr.models.losses.weights import resolve_loss_weight
+
+    config = LossConfigSchema(output_domain="image", image_losses=[{"name": "l1", "weight": 2.0}])
+    table = build_loss_weight_table(config)
+
+    def weight(name, **kw):
+        return resolve_loss_weight(table, name, iteration=2000, declared_only=True, **kw)
+
+    assert weight("l1") == 2.0
+    assert weight("l2") == 0.0
+    assert weight("l2", scheduled={"l2": 0.5}) == 0.5

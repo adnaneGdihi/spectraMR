@@ -41,19 +41,23 @@ def _lcah_cfg(acq: dict | None, *, expose: bool = True, per_class: bool = False)
     )
 
 
-def _dlbae_cfg(dl: dict | None):
+def _dlbae_cfg(dl: dict | None, kwargs: dict | None = None):
     return SimpleNamespace(
         training=SimpleNamespace(dispersion_bloch_ae=dl),
         data=SimpleNamespace(),
-        model=SimpleNamespace(name="disp_bloch_ae", model_kwargs={}),
+        model=SimpleNamespace(name="disp_bloch_ae", model_kwargs=kwargs or {}),
     )
 
 
-def _mcgi_cfg(model_name: str, kwargs: dict):
+_FIVE = [0.1, 1.5, 3.0, 5.0, 7.0]
+_PROTOCOL = {"repetition_times_s": [0.5] * 5, "echo_times_s": [0.015] * 5}
+
+
+def _mcgi_cfg(model_type: str, kwargs: dict):
     return SimpleNamespace(
         training=SimpleNamespace(),
         data=SimpleNamespace(),
-        model=SimpleNamespace(name=model_name, model_kwargs=kwargs),
+        model=SimpleNamespace(model_type=model_type, model_kwargs=kwargs),
     )
 
 
@@ -108,20 +112,19 @@ class TestDispersionBlochAEChecks:
         res = _by_name(
             ConfigHealthChecker().check_dispersion_bloch_ae_config(
                 _dlbae_cfg(
-                    {
-                        "num_pools": 2,
-                        "fields_present": [0.055, 0.3, 1.5, 3.0, 7.0],
-                        "monotonicity_weight": 1.0,
-                    }
+                    {"num_pools": 1, "fields_present": _FIVE, "monotonicity_weight": 1.0},
+                    _PROTOCOL,
                 )
             )
         )
         assert res["dispersion_identifiability"].passed
         assert res["dispersion_monotonicity_weight_positive"].passed
+        assert res["dispersion_protocol_declared"].passed
 
     @pytest.mark.parametrize(
         ("n_pools", "fields"),
-        [(1, [0.3, 1.5]), (2, [0.3, 1.5, 3.0]), (3, [0.055, 0.3, 1.5, 3.0, 7.0])],
+        # (2, five fields) is the dlbae_brain_5field shape the 2P+1 count passed (#2417).
+        [(1, [0.3, 1.5, 3.0, 7.0]), (2, _FIVE), (2, [0.055, *_FIVE]), (3, [0.055, 0.3, *_FIVE])],
     )
     def test_under_determined_arm_is_an_error(self, n_pools: int, fields: list) -> None:
         res = _by_name(
@@ -131,13 +134,34 @@ class TestDispersionBlochAEChecks:
         )
         assert not res["dispersion_identifiability"].passed
         assert res["dispersion_identifiability"].severity == "error"
-        assert "Reduce num_pools" in res["dispersion_identifiability"].fix_hint
+        assert "reduce num_pools" in res["dispersion_identifiability"].fix_hint
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            {"echo_times_s": [0.015] * 5},
+            {"repetition_times_s": [0.5] * 5},
+            {**_PROTOCOL, "echo_times_s": [0.015] * 4},
+            {**_PROTOCOL, "repetition_times_s": [0.5, 0.5, 0.0, 0.5, 0.5]},
+        ],
+        ids=["absent", "no_tr", "no_te", "short", "non_positive"],
+    )
+    def test_undeclared_protocol_is_an_error(self, kwargs: dict) -> None:
+        """#1712: the render has no default TR/TE, so the audit must catch an absent one."""
+        res = _by_name(
+            ConfigHealthChecker().check_dispersion_bloch_ae_config(
+                _dlbae_cfg({"num_pools": 1, "fields_present": _FIVE}, kwargs)
+            )
+        )
+        assert not res["dispersion_protocol_declared"].passed
+        assert res["dispersion_protocol_declared"].severity == "error"
 
     def test_duplicate_fields_do_not_buy_identifiability(self) -> None:
         """The check counts DISTINCT fields; repeats add no rank."""
         res = _by_name(
             ConfigHealthChecker().check_dispersion_bloch_ae_config(
-                _dlbae_cfg({"num_pools": 1, "fields_present": [1.5, 1.5, 1.5]})
+                _dlbae_cfg({"num_pools": 1, "fields_present": [1.5, 1.5, 1.5, 1.5, 1.5]})
             )
         )
         assert not res["dispersion_identifiability"].passed
@@ -177,9 +201,27 @@ class TestMCGIInvarianceCheck:
         )
         assert res.passed
 
-    def test_soft_rank_at_inference_is_an_error(self) -> None:
-        """Claiming exact invariance while soft-ranking is a facade (pitfall #16)."""
+    @pytest.mark.parametrize(
+        "kwargs",
+        [{"hard_rank_eval": False}, {"soft_rank_temperature": 0.05}, {"hidden_chanels": 8}],
+    )
+    def test_planted_illegal_kwargs_are_an_error(self, kwargs: dict) -> None:
+        """Planted: the soft rank, the retired knob and a misspelt key turn it red."""
         res = ConfigHealthChecker().check_mcgi_invariance_declared(
-            _mcgi_cfg("mcgi_encoder", {"hard_rank_eval": False})
+            _mcgi_cfg("mcgi_encoder", kwargs)
         )
         assert not res.passed and res.severity == "error"
+
+    def test_rank_off_control_is_info_not_a_warning(self) -> None:
+        res = ConfigHealthChecker().check_mcgi_invariance_declared(
+            _mcgi_cfg("mcgi_encoder", {"rank_transform": False})
+        )
+        assert res.passed and res.severity == "info" and "control" in res.message
+
+    def test_reads_model_type_not_model_name(self) -> None:
+        """The check was inert: it read `model.name`, which the arms never set."""
+        cfg = SimpleNamespace(
+            model=SimpleNamespace(name="unet", model_type="mcgi_encoder",
+                                  model_kwargs={"hard_rank_eval": False})
+        )
+        assert not ConfigHealthChecker().check_mcgi_invariance_declared(cfg).passed

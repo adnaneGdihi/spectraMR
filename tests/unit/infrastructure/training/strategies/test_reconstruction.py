@@ -740,3 +740,60 @@ class TestTheLossComputerComponentsReachTheCsv:
         assert _Declares.forwards_loss_components is True
         assert EquivariantImagingStrategy.forwards_loss_components is False
         assert SSDUReconstructionStrategy.forwards_loss_components is False
+
+
+class TestTwoFieldForwardGetsEachField:
+    """#197: a forward declaring ``field_strength`` AND ``field_strength_target`` gets each under
+    its own name; the target-first rule for one-field forwards fed the renderer 7 T twice."""
+
+    @staticmethod
+    def _kwargs(generator) -> dict:
+        from types import SimpleNamespace
+
+        import torch
+
+        from spectramr.infrastructure.training.strategies.reconstruction import (
+            ReconstructionTrainingStrategy,
+        )
+
+        s = object.__new__(ReconstructionTrainingStrategy)
+        s.env = SimpleNamespace(generator=generator)
+        s.config = SimpleNamespace(
+            training=SimpleNamespace(enforce_output_range=False),
+            losses=SimpleNamespace(lambda_deep_supervision=0.0),
+            model=SimpleNamespace(model_type="test", in_channels=1),
+            data=SimpleNamespace(multislice_enabled=False),
+            validation=None,
+        )
+        s.logging_service = None
+        s._needs_kspace_adjoint = lambda batch_context: False
+        s._is_implicit_model = lambda: False
+        ctx = {
+            "use_dc": False,
+            "field_strength": torch.tensor([0.1, 3.0]),
+            "field_strength_target": torch.tensor([7.0, 7.0]),
+        }
+        _, kwargs = s._prepare_generator_inputs(ctx, torch.rand(2, 1, 4, 4), validation=True)
+        return kwargs
+
+    def test_two_field_forward(self) -> None:
+        import torch
+
+        class _TwoField(torch.nn.Module):
+            def forward(self, x, *, field_strength, field_strength_target, **_):
+                return x
+
+        kwargs = self._kwargs(_TwoField())
+        assert kwargs["field_strength"].tolist() == pytest.approx([0.1, 3.0])
+        assert kwargs["field_strength_target"].tolist() == [7.0, 7.0]
+
+    def test_one_field_forward_keeps_the_target_first_rule(self) -> None:
+        import torch
+
+        class _OneField(torch.nn.Module):
+            def forward(self, x, *, field_strength, **_):
+                return x
+
+        kwargs = self._kwargs(_OneField())
+        assert kwargs["field_strength"].tolist() == [7.0, 7.0]
+        assert "field_strength_target" not in kwargs

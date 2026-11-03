@@ -178,7 +178,7 @@ class TestJacobian:
     """Test Jacobian sensitivity computation."""
 
     def test_axis_specific_metric(self):
-        """A metric sensitive to only one axis should have high sparsity."""
+        """A metric sensitive to one axis covers fewer axes than a uniform responder."""
         pytest.importorskip("scripts.sim2rank.scoring")  # not in the public export
         from scripts.sim2rank.scoring import compute_jacobian_sensitivity
 
@@ -205,16 +205,15 @@ class TestJacobian:
         axis_trajectories["motion"][2] = np.linspace(0, 0.5, T)
         axis_trajectories["undersampling"][2] = np.full(T, 0.3)
 
-        jacobian, sparsity = compute_jacobian_sensitivity(axis_trajectories)
+        from scripts.sim2rank.scoring import compute_adr_batch
+
+        responds = np.stack(
+            [compute_adr_batch(v, [False] * M) > 0 for v in axis_trajectories.values()], 1
+        )
+        jacobian, coverage = compute_jacobian_sensitivity(axis_trajectories, responds=responds)
 
         assert jacobian.shape == (M, 3)
-        assert sparsity.shape == (M,)
-
-        # Metric 0 should have highest sparsity (targeted to one axis)
-        assert sparsity[0] > sparsity[1], (
-            f"Axis-specific metric sparsity ({sparsity[0]:.4f}) "
-            f"should > uniform ({sparsity[1]:.4f})"
-        )
+        np.testing.assert_allclose(coverage, [1 / 3, 1.0, 2 / 3])
 
     def test_jacobian_non_negative(self):
         """Jacobian entries should be non-negative (absolute gradients)."""
@@ -233,41 +232,6 @@ class TestJacobian:
 
 # ──────────────────────────────────────────────────────────────────────
 # Composite Score Tests
-# ──────────────────────────────────────────────────────────────────────
-
-
-class TestCompositeScore:
-    """Test composite scoring."""
-
-    def test_composite_range(self):
-        """Composite score should be in [0, 1]."""
-        pytest.importorskip("scripts.sim2rank.scoring")  # not in the public export
-        from scripts.sim2rank.scoring import compute_composite_score
-
-        M = 10
-        adr = np.random.rand(M)
-        scvr = np.random.rand(M) * 100
-        sparsity = np.random.rand(M)
-
-        composite = compute_composite_score(adr, scvr, sparsity)
-
-        assert composite.shape == (M,)
-        assert np.all(composite >= -0.01)
-        assert np.all(composite <= 1.01)
-
-    def test_composite_without_optional_scores(self):
-        """Composite should work with only ADR (no SCVR or sparsity)."""
-        pytest.importorskip("scripts.sim2rank.scoring")  # not in the public export
-        from scripts.sim2rank.scoring import compute_composite_score
-
-        M = 5
-        adr = np.random.rand(M)
-        composite = compute_composite_score(adr)
-        assert composite.shape == (M,)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Metrics List Tests
 # ──────────────────────────────────────────────────────────────────────
 
 
@@ -296,15 +260,17 @@ class TestMetricsList:
         assert len(METRIC_KEYS) == len(set(METRIC_KEYS))
 
     def test_per_image_summary_domain_partition(self):
-        """Per-image + summary + domain should equal total."""
+        """Per-image + summary + domain + report-only signed should equal total."""
         pytest.importorskip("scripts.sim2rank.metrics_list")  # not in the public export
         from scripts.sim2rank.metrics_list import (
             DOMAIN_SPECS,
             METRIC_SPECS,
             PER_IMAGE_SPECS,
+            SIGNED_AGREEMENT_KEYS,
             SUMMARY_SPECS,
         )
-        assert len(PER_IMAGE_SPECS) + len(SUMMARY_SPECS) + len(DOMAIN_SPECS) == len(METRIC_SPECS)
+        n_split = len(PER_IMAGE_SPECS) + len(SUMMARY_SPECS) + len(DOMAIN_SPECS)
+        assert n_split + len(SIGNED_AGREEMENT_KEYS) == len(METRIC_SPECS)
 
     def test_polarity_lookup(self):
         """HIGHER_IS_BETTER dict should cover all metrics."""
@@ -639,3 +605,138 @@ class TestSweepMetricsAreMeasurable:
             f"{key} is CONSTANT under degradation ({scores}) — it cannot rank "
             "anything and must not be in the sweep."
         )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# B9: SCVR's content factor is the subject, per contrast
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _two_contrast_scvr(seed: int = 0, s: int = 4, t: int = 6) -> tuple[np.ndarray, list[str]]:
+    """``(M=2, 2s, 1, t)`` contents, ``s`` subjects in each of two contrasts."""
+    rng = np.random.default_rng(seed)
+    grid = np.linspace(0.0, 1.0, t)
+    raw = np.empty((2, 2 * s, 1, t))
+    for n in range(2 * s):
+        raw[:, n, 0] = 1.0 - grid + rng.normal(0, 0.05, (2, t)) + rng.normal(0, 0.2, (2, 1))
+    return raw, ["T1"] * s + ["T2"] * s
+
+
+class TestSCVRByContrast:
+    def test_a_contrast_offset_does_not_inflate_the_nuisance(self) -> None:
+        from scripts.sim2rank.scoring import compute_scvr_ranking, scvr_by_contrast
+
+        raw, contrasts = _two_contrast_scvr()
+        shifted = raw.copy()
+        shifted[:, 4:] += 5.0  # T2 reads 5 units higher on every subject and level
+        flat = [compute_scvr_ranking(torch.from_numpy(x))[0].numpy() for x in (raw, shifted)]
+        assert not np.allclose(*flat)  # the flat content factor counts the contrast
+        np.testing.assert_allclose(
+            scvr_by_contrast(shifted, contrasts), scvr_by_contrast(raw, contrasts)
+        )
+
+    def test_opposite_subject_effects_per_contrast_stay_finite(self) -> None:
+        # A (subject, contrast) reshape averages +e and -e away and reads zero nuisance.
+        from scripts.sim2rank.scoring import scvr_by_contrast
+
+        raw, contrasts = _two_contrast_scvr()
+        raw[:, 4:] = raw[:, :4] - 2 * (raw[:, :4] - raw[:, :4].mean(axis=1, keepdims=True))
+        assert np.isfinite(scvr_by_contrast(raw, contrasts)).all()
+
+    def test_a_missing_cell_takes_its_level_mean(self) -> None:
+        from scripts.sim2rank.scoring import scvr_by_contrast
+
+        raw, contrasts = _two_contrast_scvr()
+        others = [0, 2, 3]
+        raw[0, 1, 0, 3] = raw[0, others, 0, 3].mean()
+        full = scvr_by_contrast(raw, contrasts)
+        holed = raw.copy()
+        holed[0, 1, 0, 3] = np.nan
+        np.testing.assert_allclose(scvr_by_contrast(holed, contrasts), full)
+
+    def test_a_metric_needs_half_its_cells_in_a_contrast(self) -> None:
+        from scripts.sim2rank.scoring import SCVR_MIN_FINITE_FRACTION, scvr_by_contrast
+
+        raw, contrasts = _two_contrast_scvr()
+        assert SCVR_MIN_FINITE_FRACTION == 0.5
+        raw[1, :4, 0, :4] = np.nan  # 16 of 24 T1 cells missing: T1 no longer scores it
+        out = scvr_by_contrast(raw, contrasts)
+        np.testing.assert_allclose(out[1], scvr_by_contrast(raw[:, 4:], contrasts[4:])[1])
+
+    def test_an_unmeasured_metric_is_nan_not_zero(self) -> None:
+        from scripts.sim2rank.scoring import scvr_by_contrast
+
+        raw, contrasts = _two_contrast_scvr()
+        raw[1] = np.nan
+        out = scvr_by_contrast(raw, contrasts)
+        assert np.isfinite(out[0]) and np.isnan(out[1])
+
+    def test_gen1_scvr_uses_the_per_contrast_rule(self) -> None:
+        from scripts.sim2rank.run_all_generations import compute_gen1_sub_scores
+        from scripts.sim2rank.scoring import scvr_by_contrast
+
+        raw, contrasts = _two_contrast_scvr()
+        raw[0, 1, 0, 3] = np.nan
+        axes = {a: raw[:, :, 0].mean(axis=1) + 0.01 * k for k, a in enumerate(("x", "y"))}
+        axes = {a: np.nan_to_num(v) for a, v in axes.items()}
+        out = compute_gen1_sub_scores(
+            axes, raw, [False, False], np.linspace(0, 1, 6), content_contrast=contrasts
+        )
+        np.testing.assert_allclose(out["Gen1_SCVR"], scvr_by_contrast(raw, contrasts))
+
+
+# ──────────────────────────────────────────────────────────────────────
+# B9: Jacobian coverage replaces the Gini sparsity
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestJacobianCoverage:
+    def test_only_significant_directed_responses_count(self) -> None:
+        # Pure seed jitter must not read as a response; a monotone row must.
+        from scripts.sim2rank.scoring import directed_response
+
+        rng = np.random.default_rng(0)
+        t = 8
+        noise = rng.normal(size=(400, t))
+        assert directed_response(noise, [False] * 400).mean() <= 0.1
+        ramp = np.tile(np.linspace(0, 1, t), (3, 1))
+        assert directed_response(ramp, [False] * 3).all()
+        assert not directed_response(-ramp, [False] * 3).any()  # wrong direction
+        assert directed_response(-ramp, [True] * 3).all()
+
+    def test_the_critical_value_is_one_sided_alpha(self) -> None:
+        from scripts.sim2rank.scoring import spearman_critical
+
+        assert spearman_critical(3) > 1.0  # 1/6 > 0.05: three levels cannot respond
+        assert spearman_critical(4) == pytest.approx(1.0)  # P(rho = 1) = 1/24
+        assert 0.48 < spearman_critical(12) < 0.53  # table value 0.503 at n = 12
+
+    def test_gen1_coverage_uses_the_directed_test(self) -> None:
+        from scripts.sim2rank.run_all_generations import compute_gen1_sub_scores
+        from scripts.sim2rank.scoring import directed_response
+
+        rng = np.random.default_rng(1)
+        t = np.linspace(0, 1, 8)
+        rates = np.array([1.0, 0.6, 0.3])[:, None]
+        axes = {a: rates * t + rng.normal(0, 0.05, (3, 8)) for a in ("x", "y", "z")}
+        axes["z"][2] = rng.normal(0, 0.05, 8)
+        out = compute_gen1_sub_scores(axes, None, [False] * 3, t)
+        want = np.stack([directed_response(v, [False] * 3) for v in axes.values()], 1).mean(1)
+        np.testing.assert_allclose(out["Gen1_JacobianCoverage"], want)
+
+    def test_nan_steps_count_against_coverage(self) -> None:
+        from scripts.sim2rank.scoring import compute_jacobian_sensitivity
+
+        t = np.linspace(0, 1, 6)
+        holed = 1.0 - t
+        holed[2:] = np.nan
+        axes = {"a": np.stack([1.0 - t, 1.0 - t]), "b": np.stack([1.0 - t, holed])}
+        _, coverage = compute_jacobian_sensitivity(axes, responds=np.ones((2, 2), bool))
+        np.testing.assert_allclose(coverage, [1.0, 0.5])
+
+    def test_without_a_response_mask_coverage_is_not_computed(self) -> None:
+        from scripts.sim2rank.scoring import compute_jacobian_sensitivity
+
+        t = np.linspace(0, 1, 6)
+        _, coverage = compute_jacobian_sensitivity({"a": np.stack([t, t])})
+        assert np.isnan(coverage).all()

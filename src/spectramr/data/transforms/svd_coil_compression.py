@@ -24,7 +24,6 @@ from __future__ import annotations
 import torch
 import torchio as tio
 
-from spectramr.core.coil_map_names import REFERENCE_MAPS_KEY
 from spectramr.data.transforms.registry import register_transform
 from spectramr.data.transforms.tio_physics import MEASURED_KSPACE_KEY
 from spectramr.infrastructure.physics.coil_compression import (
@@ -53,7 +52,6 @@ _PHYSICAL_COIL_KEYS: tuple[str, ...] = (
     "sensitivity_complex",
     "sensitivity",
     "noise_covariance",
-    REFERENCE_MAPS_KEY,
 )
 
 

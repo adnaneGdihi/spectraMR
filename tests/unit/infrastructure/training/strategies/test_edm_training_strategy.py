@@ -34,7 +34,6 @@ def _bare(recorder: dict) -> EDMTrainingStrategy:
     s._edm_schedule = SimpleNamespace(
         sample_sigma=lambda b, device: torch.full((b,), 1.5, device=device)
     )
-    s._declared_model_input = None
 
     def _gen(x: torch.Tensor, c_noise: torch.Tensor) -> torch.Tensor:
         recorder["model_saw"] = x
@@ -44,17 +43,17 @@ def _bare(recorder: dict) -> EDMTrainingStrategy:
     return s
 
 
-def test_edm_declares_the_preconditioned_input_not_the_noised_one() -> None:
+def test_edm_declares_the_preconditioned_input_not_the_noised_one(declared) -> None:
     recorder: dict = {}
     s = _bare(recorder)
     clean = torch.randn(2, 1, 8, 8)
 
     s._compute_losses_impl(input_batch={"target": clean}, target_batch=clean, epoch=0)
 
-    assert s._declared_model_input is not None, (
-        "EDM inherits the carve-out, so it owes the wrapper a declaration"
+    assert declared() is not None, (
+        "EDM builds its model input inside the step, so it names it for the snapshot"
     )
-    tensors, extra, in_kspace_keys = s._declared_model_input
+    tensors, extra, _in_kspace_keys = declared()
 
     # The contract: what was declared IS what the network received.
     assert torch.equal(tensors["model_input"], recorder["model_saw"])
@@ -67,7 +66,7 @@ def test_edm_declares_the_preconditioned_input_not_the_noised_one() -> None:
     assert extra["model_input_key"] == "model_input"
 
 
-def test_edm_names_kspace_keys_explicitly() -> None:
+def test_edm_names_kspace_keys_explicitly(declared) -> None:
     """`None` would fall back to a `"kspace"` substring match over key names.
 
     That fallback misses `target` entirely (findings booklet VIS-1). An empty
@@ -82,7 +81,7 @@ def test_edm_names_kspace_keys_explicitly() -> None:
 
     s._compute_losses_impl(input_batch={"target": clean}, target_batch=clean, epoch=0)
 
-    _tensors, _extra, in_kspace_keys = s._declared_model_input
+    _tensors, _extra, in_kspace_keys = declared()
     assert in_kspace_keys == set(), "must be explicit, not None"
 
 
@@ -99,7 +98,7 @@ def test_edm_still_returns_its_loss() -> None:
 
 
 def test_it_declares_its_own_loss_ownership() -> None:
-    """Issue #1918: EDM score matching computes no image loss and routes nowhere.
+    """Issue #1918: EDM computes its denoising term inline and folds declared image losses.
 
     Read off ``__dict__``, never the inherited value: this class sits under
     ``DiffusionTrainingStrategy``, whose ``folds_image_losses = True`` is truthful for ITSELF and
@@ -108,5 +107,57 @@ def test_it_declares_its_own_loss_ownership() -> None:
     PASS every declared ``losses.image_losses`` entry on this strategy's arms
     while the training step discards them.
     """
-    assert EDMTrainingStrategy.__dict__["folds_image_losses"] is False
+    assert EDMTrainingStrategy.__dict__["folds_image_losses"] is True
+    assert EDMTrainingStrategy.__dict__["empty_loss_stack_is_design"] is True
     assert EDMTrainingStrategy.__dict__["inline_losses"] == frozenset()
+
+
+def _image_cfg(weight: float) -> SimpleNamespace:
+    entry = SimpleNamespace(name="l1", weight=weight, enabled=True, role="target")
+    return SimpleNamespace(losses=SimpleNamespace(image_losses=[entry]))
+
+
+class _RecordingLoss:
+    """Image loss that records what it was asked to compare."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        self.calls.append((pred, target))
+        return (pred - target).abs().mean()
+
+
+def test_edm_declared_image_loss_is_folded_onto_the_denoised_estimate() -> None:
+    clean = torch.randn(2, 1, 8, 8)
+    weight = 0.5
+
+    torch.manual_seed(0)
+    s_off = _bare({})
+    s_off.config = _image_cfg(weight)
+    loss_off = s_off._compute_losses_impl(input_batch={"target": clean}, target_batch=clean)[
+        "loss_total"
+    ]
+
+    torch.manual_seed(0)
+    s_on = _bare({})
+    s_on.config = _image_cfg(weight)
+    l1 = _RecordingLoss()
+    s_on.env.losses = {"l1": l1}
+    out = s_on._compute_losses_impl(input_batch={"target": clean}, target_batch=clean)
+
+    assert "loss_l1" in out, "a folded declared term must reach the per-step dict"
+    ((pred, target),) = l1.calls
+    assert torch.equal(target, clean), "the declared term compares the denoised estimate to clean"
+    expected = weight * (pred - clean).abs().mean()
+    assert torch.allclose(out["loss_total"] - loss_off, expected)
+
+
+def test_edm_fold_ignores_terms_not_declared_as_image_losses() -> None:
+    clean = torch.randn(2, 1, 8, 8)
+    s = _bare({})
+    s.config = _image_cfg(0.5)
+    kspace = _RecordingLoss()
+    s.env.losses = {"kspace_l1": kspace}
+    s._compute_losses_impl(input_batch={"target": clean}, target_batch=clean)
+    assert kspace.calls == [], "an undeclared (k-space) term must never be applied to image tensors"

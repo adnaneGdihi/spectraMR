@@ -28,10 +28,11 @@ logger = logging.getLogger(__name__)
 class EDMTrainingStrategy(DiffusionTrainingStrategy):
     """Diffusion strategy with Karras EDM noise schedule + preconditioning."""
 
-    #: Loss ownership (issue #1918). EDM preconditioned denoising score matching; computes no image loss and
-    #: reaches neither the parent's builder path nor the computer.
+    #: Loss ownership (issue #1918). The EDM denoising term is computed inline; declared
+    #: ``losses.image_losses`` are folded onto it against the clean target.
     inline_losses: ClassVar[frozenset[str]] = frozenset()
-    folds_image_losses: ClassVar[bool] = False
+    folds_image_losses: ClassVar[bool] = True
+    empty_loss_stack_is_design: ClassVar[bool] = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -117,4 +118,8 @@ class EDMTrainingStrategy(DiffusionTrainingStrategy):
         denoised = c_skip * noised + c_out * f
         weight = edm_loss_weight(sigma).view(b, *([1] * (clean.dim() - 1)))
         loss = (weight * (denoised - clean).pow(2)).mean()
-        return {"loss_total": loss, "loss_edm": loss.detach()}
+        components = {"loss_edm": loss.detach()}
+        aux = self._apply_builder_image_losses(denoised, clean, components)
+        if aux is not None:
+            loss = loss + aux
+        return {"loss_total": loss, **components}

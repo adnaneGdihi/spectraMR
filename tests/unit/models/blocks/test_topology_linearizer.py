@@ -334,3 +334,25 @@ def test_hilbert_2d_rect_children_of_a_coarse_token_are_contiguous(fine_hw, coar
     rows, cols = np.divmod(fine_perm, fine_hw[1])
     parent = coarse_pos[(rows // 2) * coarse_hw[1] + cols // 2]
     np.testing.assert_array_equal(parent, np.arange(fine_perm.size) // 4)
+
+
+class TestArcLengthStepsReference:
+    """#2365: the arc step is measured in reference-grid units, not the current extent."""
+
+    def test_default_reference_matches_extent_normalised_step(self):
+        lin = ImageTopologyLinearizer((16, 16), mode="hilbert_2d")
+        coords = np.array(np.unravel_index(lin.forward_idx.numpy(), (16, 16)), dtype=np.float64).T
+        legacy = np.concatenate([[0.0], np.linalg.norm(np.diff(coords / 16.0, axis=0), axis=1)])
+        assert torch.equal(lin.physical_arc_delta(), torch.from_numpy(legacy.astype(np.float32)))
+
+    def test_validation_extent_keeps_construction_step(self):
+        lin = ImageTopologyLinearizer((221, 221), mode="hilbert_2d_rect")
+        delta = lin.physical_arc_delta((128, 128))
+        assert float(delta[0]) == 0.0
+        assert float(torch.mode(delta[1:]).values) == pytest.approx(1.0 / 128)
+
+    def test_rank_mismatch_raises(self):
+        from spectramr.models.blocks.topology_linearizer import arc_length_steps
+
+        with pytest.raises(ValueError, match="rank"):
+            arc_length_steps(np.arange(16), (4, 4), (4, 4, 4))

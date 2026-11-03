@@ -193,3 +193,11 @@ def test_read_metadata_missing_bids_sidecar_returns_empty(tmp_path: Path) -> Non
 def test_read_metadata_unknown_source_raises() -> None:
     with pytest.raises(ValueError, match="Unknown"):
         _read_metadata("csv_sidecar", image_path=None, defaults={})  # type: ignore[arg-type]
+
+
+def test_ismrmrd_reader_is_the_data_layer_one() -> None:
+    """The header file read moved out of physics (#3421); the transform binds the data-layer reader."""
+    from spectramr.data.datasets import kspace_volume_stack
+    from spectramr.data.transforms import acquisition_metadata
+
+    assert acquisition_metadata.read_acquisition_params is kspace_volume_stack.read_acquisition_params

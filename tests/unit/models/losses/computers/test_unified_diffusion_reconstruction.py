@@ -711,3 +711,20 @@ def test_a_declared_loss_that_fails_is_never_dropped_in_silence():
     target = torch.zeros(1, 1, 4, 4)
     with pytest.raises(RuntimeError, match="planted: coil maps missing"):
         comp.compute(pred=pred, target=target, iteration=5000, losses_dict={"barrier": broken})
+
+
+def test_an_undeclared_l1_is_not_trained_at_the_schema_default():
+    """#2280: an arm declaring only l2 must not pick up the schema-default L1 term."""
+    comp = UnifiedReconstructionLossComputer(
+        config=SimpleNamespace(
+            losses=LossConfigSchema(
+                reconstruction=ReconstructionLossesConfig(lambda_l2=1.0, warmup_iterations=0)
+            )
+        ),
+        device=torch.device("cpu"),
+    )
+    pred = torch.rand(1, 1, 4, 4, requires_grad=True)
+    target = torch.rand(1, 1, 4, 4)
+    out = comp.compute(pred=pred, target=target, iteration=5000)
+    assert "l2" in out.components
+    assert "l1" not in out.components

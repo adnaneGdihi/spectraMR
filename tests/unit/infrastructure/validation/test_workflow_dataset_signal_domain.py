@@ -128,7 +128,7 @@ class TestDoesNotRejectLegitimateArms:
 
 
 def test_the_check_is_wired_into_the_audit_run(monkeypatch) -> None:
-    """An unwired check is the facade this repo polices (severity_calibration #279).
+    """An unwired check is the facade this repo polices (#279).
 
     Asserted BEHAVIOURALLY — by monkeypatching the check and driving the real
     ``run_all_checks`` — not by grepping ``inspect.getsource`` for the call site.

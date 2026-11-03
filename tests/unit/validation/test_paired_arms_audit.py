@@ -35,6 +35,13 @@ _ARM_B_REL = (
 )
 
 
+# The locus pair's treatment (#934): per-step proximal hard DC, and the multi-step cold
+# sampler that only the k-space locus reads. Everything else must match.
+_LOCUS_TREATMENT = frozenset(
+    {"physics.data_consistency", "validation.sampling.enable_multistep_cold"}
+)
+
+
 def _arm_a() -> Path:
     return require_repo_file(_ARM_A_REL)
 
@@ -56,19 +63,10 @@ class TestCampaignHappyPath:
     def test_arm_b_exists(self) -> None:
         assert _arm_b().is_file()
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "#934: the ablation drifted to multi-factor. The arms differ on 12 "
-            "paths -- not only the plausible locus marker (physics.data_consistency.*, "
-            "the loss re-weighting) but undersampling.center_fraction 0.08 vs 0.03 "
-            "and data.multi_contrast.enabled, which are a different acquisition and "
-            "a different input. This guard is doing its job; strict=True means it "
-            "turns RED once the arms are repaired, so the marker cannot rot."
-        ),
-    )
     def test_paired_arms_audit_passes(self) -> None:
-        result = audit_paired_arms(_arm_a(), _arm_b())
+        result = audit_paired_arms(
+            _arm_a(), _arm_b(), allowed_diff_paths=_DEFAULT_DIFF_PATHS | _LOCUS_TREATMENT
+        )
         assert (
             result.passed
         ), f"Paired-arms audit failed unexpectedly:\n{result.render()}"

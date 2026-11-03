@@ -236,6 +236,9 @@ class TrainingStrategyFactory:
         "frontdoor_federated": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "hodge_motion": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "levy_diffusion": "spectramr.infrastructure.training.strategies.levy_denoising_strategy.LevyDenoisingStrategy",
+        # Two-stage spectral cascade: low-band DDPM, then a high-pass residual DDPM
+        # conditioned on the stage-1 output.
+        "cascaded_diffusion": "spectramr.infrastructure.training.strategies.cascaded_diffusion_strategy.CascadedDiffusionStrategy",
         "koopman_fmri": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "sheaf_multi_contrast": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
         "hjb_waveform": "spectramr.infrastructure.training.strategies.reconstruction.ReconstructionTrainingStrategy",
@@ -299,6 +302,7 @@ class TrainingStrategyFactory:
         # walks THIS dict, so a strategy absent here is invisible to it however
         # well it is tagged.
         "phase_contrast_flow": "spectramr.infrastructure.training.strategies.phase_contrast_flow_strategy.PhaseContrastFlowStrategy",
+        "phase_contrast_recon": "spectramr.infrastructure.training.strategies.phase_contrast_recon_strategy.PhaseContrastReconStrategy",
         "perfusion_kinetic": "spectramr.infrastructure.training.strategies.perfusion_kinetic_strategy.PerfusionKineticMappingStrategy",
         "mrs_quantification": "spectramr.infrastructure.training.strategies.mrs_quantification_strategy.MRSQuantificationStrategy",
         "qsm_pipeline": "spectramr.infrastructure.training.strategies.qsm_pipeline_strategy.QSMPipelineStrategy",
@@ -326,6 +330,7 @@ class TrainingStrategyFactory:
         "bloch_bottleneck": "spectramr.infrastructure.training.strategies.bloch_bottleneck_strategy.BlochBottleneckStrategy",
         "cycle_bloch_digital_twin": "spectramr.infrastructure.training.strategies.cycle_bloch_digital_twin_strategy.CycleBlochDigitalTwinStrategy",
         "cross_contrast_kspace_diffusion": "spectramr.infrastructure.training.strategies.cross_contrast_kspace_diffusion_strategy.CrossContrastKspaceDiffusionStrategy",
+        "complex_kspace_diffusion": "spectramr.infrastructure.training.strategies.complex_kspace_diffusion_strategy.ComplexKspaceDiffusionStrategy",
         "synthetic_pathology_aug": "spectramr.infrastructure.training.strategies.synthetic_pathology_aug_strategy.SyntheticPathologyAugStrategy",
         # ============================================================
         # TODO/audit/audit_plan_novel.md — seven novel research ideas.

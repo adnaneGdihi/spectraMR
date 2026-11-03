@@ -131,6 +131,7 @@ def _admm_with_spy(iteration: int) -> tuple[object, _SpyLossComputer]:
     s.noise_estimator = lambda *a, **k: torch.zeros(1)
     s._lambda_prior = 0.1
     s._lambda_marker = 0.1
+    s._score_training_views = lambda views: {}  # train metrics have their own tests
     return s, spy
 
 
@@ -158,3 +159,99 @@ def test_the_iteration_advances_with_the_loop() -> None:
     strategy.loop_state.iteration = _LIVE_ITERATION
     strategy._compute_losses_impl(input_batch=target, target_batch=target, epoch=0)
     assert [c["iteration"] for c in spy.calls] == [0, _LIVE_ITERATION]
+
+
+# --------------------------------------------------------------------------- #
+# Train-side metrics (#183): the ``train_*`` columns were declared and never written.
+# --------------------------------------------------------------------------- #
+
+
+def _spy_train_metrics(strategy, monkeypatch) -> list[object]:
+    calls: list[object] = []
+
+    def spy(views):
+        calls.append(views)
+        return {"train_psnr": 1.0}
+
+    monkeypatch.setattr(strategy, "_score_training_views", spy)
+    return calls
+
+
+#: On the schema-default train_metric_interval (100) cadence.
+_DUE_ITERATION = 1400
+
+
+def test_a_training_step_reports_train_metrics_on_the_magnitude_pair(monkeypatch) -> None:
+    strategy, _ = _admm_with_spy(_DUE_ITERATION)
+    calls = _spy_train_metrics(strategy, monkeypatch)
+    target = torch.complex(torch.randn(1, 1, 32, 32), torch.randn(1, 1, 32, 32))
+    out = strategy._compute_losses_impl(input_batch=target, target_batch=target, epoch=0)
+    assert out["train_psnr"] == 1.0 and len(calls) == 1
+    views = calls[0]
+    assert not torch.is_complex(views.pred) and views.pred.shape == views.target.shape
+    assert views.complex_pair is not None  # phase metrics score on phase
+
+
+def test_phase_metrics_run_on_a_real_computer(monkeypatch) -> None:
+    """Magnitudes alone raised PhaseBlindInputError on every arm declaring complex_hfen."""
+    from spectramr.core.metrics.computer import create_validation_metrics_computer
+
+    strategy, _ = _admm_with_spy(1)
+    del strategy._score_training_views
+    strategy._training_computer = create_validation_metrics_computer(
+        ["psnr", "complex_hfen", "phase_mse"], device="cpu"
+    )
+    target = torch.complex(torch.randn(1, 1, 32, 32), torch.randn(1, 1, 32, 32))
+    out = strategy._compute_losses_impl(input_batch=target, target_batch=target, epoch=0)
+    assert {"train_psnr", "train_complex_hfen", "train_phase_mse"} <= set(out)
+
+
+def test_an_off_cadence_step_prepares_nothing(monkeypatch) -> None:
+    strategy, _ = _admm_with_spy(_LIVE_ITERATION)
+    calls = _spy_train_metrics(strategy, monkeypatch)
+    target = torch.complex(torch.randn(1, 1, 32, 32), torch.randn(1, 1, 32, 32))
+    strategy._compute_losses_impl(input_batch=target, target_batch=target, epoch=0)
+    assert calls == []
+
+
+def test_validation_reuse_of_the_impl_reports_no_train_metrics(monkeypatch) -> None:
+    strategy, _ = _admm_with_spy(_DUE_ITERATION)
+    calls = _spy_train_metrics(strategy, monkeypatch)
+    strategy.generator_model.eval()
+    target = torch.complex(torch.randn(1, 1, 32, 32), torch.randn(1, 1, 32, 32))
+    out = strategy._compute_losses_impl(input_batch=target, target_batch=target, epoch=0)
+    assert calls == [] and "train_psnr" not in out
+
+
+def _coil_target(num_coils: int = 4) -> torch.Tensor:
+    from spectramr.infrastructure.physics.coil_sensitivity import create_synthetic_csm
+
+    maps = create_synthetic_csm((1, 1, 32, 32), num_coils=num_coils)  # (1, C, 32, 32)
+    yy, xx = torch.meshgrid(torch.linspace(-1, 1, 32), torch.linspace(-1, 1, 32), indexing="ij")
+    obj = ((yy**2 + xx**2) < 0.6).to(torch.complex64)
+    return (maps * obj).expand(2, -1, -1, -1).contiguous()
+
+
+def _admm_scoring_g_factor(acceleration: float):
+    from spectramr.core.metrics.computer import create_validation_metrics_computer
+
+    strategy = _admm(None)
+    strategy.simulator.acceleration = acceleration
+    type(strategy).validation_metrics_computer = create_validation_metrics_computer(
+        ["psnr", "g_factor"], device="cpu"
+    )
+    return strategy
+
+
+def test_g_factor_is_measured_from_target_coil_maps_at_the_twin_rate() -> None:
+    """Reachability: the real computer's g_factor receives maps + R from the strategy."""
+    strategy = _admm_scoring_g_factor(2.0)
+    with torch.no_grad():
+        scores = strategy._score_at_current_twin(_coil_target(), cache_visuals=False)
+    assert torch.isfinite(torch.tensor(scores["g_factor"])) and scores["g_factor"] > 1.0
+
+
+def test_g_factor_at_a_rate_above_the_coil_count_raises() -> None:
+    strategy = _admm_scoring_g_factor(6.0)
+    with torch.no_grad(), pytest.raises(ValueError, match="underdetermined"):
+        strategy._score_at_current_twin(_coil_target(), cache_visuals=False)

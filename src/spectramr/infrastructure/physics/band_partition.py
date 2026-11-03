@@ -7,11 +7,11 @@ from detail that was *fabricated* (a plausible prior, unconstrained by data).
 Separating the two needs a frequency axis anchored to the acquisition, not to
 the storage grid.
 
-The anchor here is the normalised radial frequency
+The anchor here is the per-axis normalised frequency
 
 .. math::
 
-    \\rho(\\mathbf{f}) = \\sqrt{\\sum_i \\left(f_i / f^{c}_i\\right)^2},
+    \\rho_\\infty(\\mathbf{f}) = \\max_i \\left|f_i / f^{c}_i\\right|,
     \\qquad f^{c}_i = 1 / (2\\,\\Delta^{\\mathrm{eff}}_i),
 
 where :math:`f_i` is in cycles/mm and :math:`\\Delta^{\\mathrm{eff}}_i` is the
@@ -22,9 +22,13 @@ resolution the *scanner* achieved on axis *i*. By construction:
   unfolded from inter-frame aliasing or invented.
 
 Normalising per axis makes the boundary exact under anisotropy: the ULF
-protocol resolves 1.6 mm in-plane and 5.0 mm through-plane, so the true
-passband is an ellipsoid and a scalar cutoff would misclassify whole bands on
-the thin axis.
+protocol resolves 1.6 mm in-plane and 5.0 mm through-plane, and a scalar cutoff
+would misclassify whole bands on the thin axis. Cartesian truncation and
+``s``-fold pooling both measure a box, so the default is the L-infinity
+coordinate above. The radial (L2) coordinate ``geometry="radial"`` fits radial
+or spiral sampling only: on a Cartesian passband its band ``[1, 1.5)`` holds
+about a fifth of the measured square's corners, so a zero-filled frame scores
+there as if it had recovered unmeasured detail.
 
 Two ways to state the passband, both explicit:
 
@@ -34,12 +38,13 @@ Two ways to state the passband, both explicit:
 ``sr_scale``
     The synthetic decimation path, where frames are ``s``-fold pooled views of
     the HR grid. Then :math:`\\Delta^{\\mathrm{eff}} = s\\,\\Delta^{\\mathrm{grid}}`
-    exactly and ``rho = 2 s |f|`` with ``f`` in cycles per HR pixel.
+    exactly and ``rho = 2 s max_i |f_i|`` with ``f`` in cycles per HR pixel.
 """
 
 from __future__ import annotations
 
 from itertools import pairwise
+from typing import Literal
 
 import torch
 
@@ -51,6 +56,7 @@ from spectramr.infrastructure.physics.subpixel_registration import (
 )
 
 __all__ = [
+    "PASSBAND_GEOMETRIES",
     "acquisition_rho",
     "band_edges",
     "band_masks",
@@ -58,6 +64,8 @@ __all__ = [
     "band_transfer",
     "super_nyquist_band_indices",
 ]
+
+PASSBAND_GEOMETRIES = ("cartesian", "radial")
 
 
 def acquisition_rho(
@@ -68,8 +76,9 @@ def acquisition_rho(
     sr_scale: int | None = None,
     voxel_mm: tuple[float, ...] | None = None,
     effective_voxel_mm: tuple[float, ...] | None = None,
+    geometry: Literal["cartesian", "radial"] = "cartesian",
 ) -> torch.Tensor:
-    """Radial frequency normalised so ``1.0`` is the acquisition Nyquist.
+    """Frequency coordinate normalised so ``1.0`` is the acquisition Nyquist.
 
     Args:
         size: Spatial extent, 2-D ``(H, W)`` or 3-D ``(D, H, W)``.
@@ -79,6 +88,9 @@ def acquisition_rho(
             with the millimetre pair.
         voxel_mm: Spacing of the STORED grid, per axis, in mm.
         effective_voxel_mm: Resolution the acquisition achieved, per axis, in mm.
+        geometry: Shape of the measured passband. ``"cartesian"`` (box,
+            L-infinity) for Cartesian k-space and pooled frames; ``"radial"``
+            (ellipsoid, L2) for radial or spiral sampling.
 
     Returns:
         ``[*size]`` real tensor. ``rho <= 1`` is measured, ``rho > 1`` is
@@ -91,6 +103,8 @@ def acquisition_rho(
             (``effective < grid``), which would make every band sub-Nyquist and
             the probe vacuous.
     """
+    if geometry not in PASSBAND_GEOMETRIES:
+        raise ValueError(f"geometry must be one of {PASSBAND_GEOMETRIES}, got {geometry!r}")
     ndim = len(size)
     if ndim not in (2, 3):
         raise ValueError(f"size must be 2-D or 3-D, got {size}")
@@ -138,13 +152,14 @@ def acquisition_rho(
     # f_i in cycles per grid pixel -> cycles/mm is f_i / grid_i; the axis
     # cutoff is 1 / (2 * eff_i) cycles/mm, so the normalised coordinate is
     # (f_i / grid_i) * 2 * eff_i.
-    rho_sq = torch.zeros(size, device=device, dtype=dtype)
+    rho = torch.zeros(size, device=device, dtype=dtype)
     for axis, n in enumerate(size):
         shape = [1] * ndim
         shape[axis] = n
         f = centred_freqs(n, torch.device(device), dtype).view(shape)
-        rho_sq = rho_sq + (f * (2.0 * eff[axis] / grid[axis])) ** 2
-    return rho_sq.sqrt()
+        u = f * (2.0 * eff[axis] / grid[axis])
+        rho = torch.maximum(rho, u.abs()) if geometry == "cartesian" else rho + u**2
+    return rho if geometry == "cartesian" else rho.sqrt()
 
 
 def band_edges(n_sub: int = 2, n_super: int = 2, rho_max: float = 2.0) -> tuple[float, ...]:
@@ -181,10 +196,10 @@ def super_nyquist_band_indices(edges: tuple[float, ...]) -> tuple[int, ...]:
 
 
 def band_masks(rho: torch.Tensor, edges: tuple[float, ...], *, min_bins: int = 16) -> torch.Tensor:
-    """Half-open annular masks ``[edges[l], edges[l+1])`` over ``rho``.
+    """Half-open shell masks ``[edges[l], edges[l+1])`` over ``rho``.
 
     Args:
-        rho: Normalised radial frequency from :func:`acquisition_rho`.
+        rho: Normalised frequency from :func:`acquisition_rho`.
         edges: Monotone band boundaries.
         min_bins: Smallest population a band may have. A band with a handful of
             bins yields a correlation dominated by sampling noise, which reads

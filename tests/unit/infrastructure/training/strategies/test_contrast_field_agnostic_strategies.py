@@ -98,7 +98,12 @@ class TestComputeDispersionBlochAELoss:
     def _model() -> DispersionBlochAutoencoder:
         torch.manual_seed(0)
         return DispersionBlochAutoencoder(
-            fields_present=FIVE_FIELDS, n_pools=1, hidden_channels=8, depth=2
+            fields_present=FIVE_FIELDS,
+            n_pools=1,
+            hidden_channels=8,
+            depth=2,
+            repetition_times_s=(0.5,) * len(FIVE_FIELDS),
+            echo_times_s=(0.015,) * len(FIVE_FIELDS),
         )
 
     def _call(self, batch, **kw):

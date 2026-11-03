@@ -96,7 +96,6 @@ def _m4raw_cfg(**overrides) -> SimpleNamespace:
         "coil_maps_missing": _DataSchema.model_fields["coil_maps_missing"].default,
         "coil_maps_recipe": _DataSchema.model_fields["coil_maps_recipe"].default,
         "coil_maps_acs_size": _DataSchema.model_fields["coil_maps_acs_size"].default,
-        "coil_maps_reference_root": _DataSchema.model_fields["coil_maps_reference_root"].default,
         "noise_fit_support_policy": _DataSchema.model_fields["noise_fit_support_policy"].default,
         "noise_covariance_root": _DataSchema.model_fields["noise_covariance_root"].default,
         "noise_covariance_missing": _DataSchema.model_fields["noise_covariance_missing"].default,
@@ -1506,24 +1505,6 @@ def test_m4raw_resolves_the_coil_maps_root_for_both_splits(monkeypatch) -> None:
     assert [kw["coil_maps_root"] for kw in calls] == ["/resolved/databases/m4raw/coil_maps"] * 2
 
 
-def test_m4raw_hands_the_scoring_maps_to_the_validation_split_only(monkeypatch) -> None:
-    """#2664: the training split never receives the all-repetitions scoring store."""
-    from spectramr.data.metadata.path_resolver import PathResolver
-
-    monkeypatch.setattr(PathResolver, "resolve", staticmethod(lambda p: f"/resolved/{p}"))
-    calls = _capture_m4raw_both(monkeypatch)
-    DatasetInstantiator._create_m4raw_repetition(
-        _m4raw_cfg(coil_maps_reference_root="databases/m4raw/coil_maps"),
-        [{"primary_path": "/x/a.h5"}],
-        [{"primary_path": "/x/b.h5"}],
-        None,
-        None,
-    )
-    train, val = calls
-    assert train.get("coil_maps_reference_root") is None
-    assert val["coil_maps_reference_root"] == "/resolved/databases/m4raw/coil_maps"
-
-
 def test_m4raw_passes_no_coil_maps_root_when_the_arm_declares_none(monkeypatch) -> None:
     calls = _capture_m4raw_both(monkeypatch)
     DatasetInstantiator._create_m4raw_repetition(
@@ -1573,10 +1554,21 @@ def test_m4raw_pairing_kwargs_forward_the_cross_contrast_choice() -> None:
 
     from spectramr.data.builders.dataset_instantiator import _m4raw_pairing_kwargs
 
-    default = SimpleNamespace(cross_contrast_source="T1", cross_contrast_targets=None)
+    default = SimpleNamespace(
+        cross_contrast_source="T1", cross_contrast_targets=None, stacked_combine="joint"
+    )
     assert _m4raw_pairing_kwargs(default) == {"source_contrast": "T1"}
-    t2 = SimpleNamespace(cross_contrast_source="T2", cross_contrast_targets=["FLAIR"])
+    t2 = SimpleNamespace(
+        cross_contrast_source="T2", cross_contrast_targets=["FLAIR"], stacked_combine="joint"
+    )
     assert _m4raw_pairing_kwargs(t2) == {"source_contrast": "T2", "target_contrasts": ("FLAIR",)}
+    grouped = SimpleNamespace(
+        cross_contrast_source="T1", cross_contrast_targets=None, stacked_combine="per_contrast"
+    )
+    assert _m4raw_pairing_kwargs(grouped) == {
+        "source_contrast": "T1",
+        "stacked_combine": "per_contrast",
+    }
 
 
 def test_m4raw_triplet_is_a_self_indexed_route() -> None:
@@ -1609,6 +1601,7 @@ def test_m4raw_triplet_builds_train_and_val_from_their_splits(monkeypatch) -> No
         train_split="tr",
         val_split="va",
         raw_repetition_root=None,
+        contrastive_views=False,
     )
     cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block)
     assert DatasetInstantiator._create_m4raw_triplet(cfg, None, None) == ("tr", "va")
@@ -1631,6 +1624,7 @@ def test_m4raw_triplet_with_a_repetition_root_serves_independent_repetitions(mon
         train_split="tr",
         val_split="va",
         raw_repetition_root="R",
+        contrastive_views=False,
     )
     cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block)
     assert DatasetInstantiator._create_m4raw_triplet(cfg, None, None) == ("tr", "va")
@@ -1747,3 +1741,41 @@ def test_fastmri_route_receives_staged_records_when_staging_is_on(monkeypatch, t
     )
     assert all(r[0]["primary_path"].startswith(str(tmp_path / "local")) for r in seen)
     assert [r[0]["slice_index"] for r in seen] == [2, 5]
+
+
+def test_m4raw_triplet_contrastive_views_read_the_multi_contrast_block(monkeypatch) -> None:
+    import spectramr.data.datasets.m4raw_triplet_dataset as mod
+
+    seen = []
+    monkeypatch.setattr(
+        mod, "M4RawTripletDataset", lambda t2, flair, split, views: seen.append(views) or split
+    )
+    block = SimpleNamespace(
+        t2_registered_root="A",
+        flair_registered_root="B",
+        train_split="tr",
+        val_split="va",
+        raw_repetition_root=None,
+        contrastive_views=True,
+    )
+    mc = SimpleNamespace(
+        contrast_map={"T1": 0, "T2": 1, "FLAIR": 2}, positive_sampling="co_registered_subject"
+    )
+    cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block, multi_contrast=mc)
+    assert DatasetInstantiator._create_m4raw_triplet(cfg, None, None) == ("tr", "va")
+    assert [v.deterministic for v in seen] == [False, True]
+    assert seen[0].ids.tolist() == [0, 1, 2]
+
+
+def test_m4raw_triplet_contrastive_views_refuse_the_repetition_route() -> None:
+    block = SimpleNamespace(
+        t2_registered_root="A",
+        flair_registered_root="B",
+        train_split="tr",
+        val_split="va",
+        raw_repetition_root="R",
+        contrastive_views=True,
+    )
+    cfg = SimpleNamespace(dataset_type="m4raw_triplet", m4raw_triplet=block)
+    with pytest.raises(ValueError, match="raw_repetition_root"):
+        DatasetInstantiator._create_m4raw_triplet(cfg, None, None)

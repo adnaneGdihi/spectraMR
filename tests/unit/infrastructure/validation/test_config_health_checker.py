@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -2399,10 +2399,8 @@ class TestM4RawNexTargetModeDeclared:
     signal, so the "high-SNR NEX reference" lands BELOW one repetition in SNR with
     scrambled phase.
 
-    Measured 2026-08-03 over `git ls-files experiments` -- stating the roots,
-    because a count whose scope is unstated is how this repo produced four
-    different wrong migration numbers: 110 arms declare `dataset_type: m4raw`,
-    107 resolve (3 unloadable), of which **63 pass and 44 are flagged**.
+    Silence is an error on the m4raw route only (plan decisions 15 and 17); every
+    loadable m4raw arm under `git ls-files experiments` declares the key.
     """
 
     @staticmethod
@@ -2444,7 +2442,7 @@ class TestM4RawNexTargetModeDeclared:
 
         result = self._check(settings)
         assert result.passed is False
-        assert result.severity == "info"  # advisory: 47 arms would newly fail
+        assert result.severity == "error"
         assert "does not declare" in result.message
         assert result.yaml_keys == ["data.target_mode"]
         assert "phase_aligned_mean" in result.fix_hint
@@ -2480,6 +2478,75 @@ class TestM4RawNexTargetModeDeclared:
         result = self._check(settings)
         assert result.passed is True
         assert "n/a" in result.message
+
+    def test_target_mode_on_a_route_that_never_reads_it_is_flagged(self, tmp_path):
+        """#1870: baseline_m4raw_unet_4x declared phase_aligned_mean on kspace."""
+        settings = self._load(
+            tmp_path, "inert", dataset_type="kspace", target_mode="phase_aligned_mean"
+        )
+        result = self._check(settings)
+        assert result.passed is False
+        assert result.severity == "warning"
+        assert "never reads it" in result.message
+
+    @staticmethod
+    def _triplet(target_mode: str):
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.data import DataConfigSchema
+
+        data = DataConfigSchema.model_construct(
+            _fields_set={"dataset_type", "target_mode"},
+            dataset_type="m4raw_triplet",
+            target_mode=target_mode,
+        )
+        return SimpleNamespace(data=data)
+
+    def test_the_triplet_routes_pinned_target_mode_is_not_flagged(self):
+        """The schema requires phase_aligned_mean on m4raw_triplet (its builder serves the
+        registered NEX averages), so declaring it states the route's fact. Flagging it
+        made every triplet arm fail the audit: deleting the key fails the schema."""
+        result = self._check(self._triplet("phase_aligned_mean"))
+        assert result.passed is True
+
+    def test_another_target_mode_on_the_triplet_route_is_flagged(self):
+        """Planted: a value the triplet builder never serves is still an inert declaration."""
+        result = self._check(self._triplet("rep_pair"))
+        assert result.passed is False
+        assert result.severity == "warning"
+        assert "never reads it" in result.message
+
+    def test_explicit_complex_mean_stays_advisory(self, tmp_path):
+        chosen = self._load(tmp_path, "legacy", dataset_type="m4raw", target_mode="complex_mean")
+        result = self._check(chosen)
+        assert result.passed is False
+        assert result.severity == "info"
+
+    @pytest.mark.parametrize("dataset_type", ["m4raw_triplet", "kspace"])
+    def test_silence_off_the_m4raw_route_is_not_a_missing_key(self, dataset_type):
+        """The triplet and kspace routes never read target_mode, so it is never demanded there."""
+        from types import SimpleNamespace
+
+        from spectramr.config.schemas.data import DataConfigSchema
+
+        data = DataConfigSchema.model_construct(
+            _fields_set={"dataset_type"}, dataset_type=dataset_type
+        )
+        result = self._check(SimpleNamespace(data=data))
+        assert result.passed is True
+        assert "n/a" in result.message
+
+    def test_a_silent_m4raw_arm_is_an_error_through_run_all_checks(self, tmp_path):
+        """Planted violation on the production path: the aggregate audit report blocks it."""
+        from spectramr.infrastructure.validation.config_health_checker import (
+            ConfigHealthChecker,
+        )
+
+        settings = self._load(tmp_path, "silent_run_all", dataset_type="m4raw")
+        report = ConfigHealthChecker().run_all_checks(settings)
+        found = [r for r in report.results if r.check_name == "m4raw_nex_target_mode_declared"]
+        assert len(found) == 1
+        assert found[0].passed is False and found[0].severity == "error"
 
     def test_the_check_is_wired_into_run_all_checks(self):
         import inspect
@@ -3368,172 +3435,6 @@ class TestDeclaredModelKwargsAreRead:
         assert "check_declared_model_kwargs_are_read" in invoked
 
 
-class TestRepetitionCountIsAchievable:
-    """``model_kwargs.num_repetitions`` must match what the data can supply.
-
-    M4Raw ships 3 repetitions for T1/T2 and 2 for FLAIR, so the ``4`` that four
-    arms declared is satisfiable by no contrast at all (#1173). Built from the
-    REAL schema rather than a SimpleNamespace: the tautology this check had to
-    dodge (a materialised ``contrast_map`` default) only exists on the real
-    model, so a stub would test a different object than the one that ships.
-    """
-
-    @staticmethod
-    def _settings(
-        *,
-        model_kwargs: dict[str, Any] | None = None,
-        dataset_type: str = "m4raw",
-        contrast_map: dict[str, int] | None = None,
-    ) -> Any:
-        from spectramr.config.schemas.base import CANONICAL_CONFIG_VERSION
-        from spectramr.config.settings import TrainingSettings
-
-        data: dict[str, Any] = {"dataset_type": dataset_type}
-        if contrast_map is not None:
-            data["multi_contrast"] = {"contrast_map": contrast_map}
-        return TrainingSettings.settings_from_dict(
-            {
-                "config_version": CANONICAL_CONFIG_VERSION,
-                "model": {"model_type": "unet", "model_kwargs": model_kwargs or {}},
-                "data": data,
-                "optimization": {},
-                "logging": {},
-            }
-        )
-
-    def test_undeclared_is_skipped(self) -> None:
-        """Applicability is gated on the same opt-in that gates building the
-        layer, so the red count equals the set of arms that actually asked."""
-        r = ConfigHealthChecker().check_repetition_count_is_achievable(self._settings())
-        assert r.passed and r.severity == "info"
-
-    def test_declared_on_a_dataset_that_serves_no_repetitions_is_rejected(self) -> None:
-        """PLANT (shape 1): ``dataset_type: kspace`` is UniversalMRIDataset,
-        which has no repetition handling at all -- the knob sizes a fusion layer
-        this data can never feed."""
-        r = ConfigHealthChecker().check_repetition_count_is_achievable(
-            self._settings(model_kwargs={"num_repetitions": 4}, dataset_type="kspace")
-        )
-        assert not r.passed and r.severity == "error"
-        assert "serves no repetitions" in r.message
-
-    def test_a_single_literal_across_heterogeneous_contrasts_is_rejected(self) -> None:
-        """PLANT (shape 2): the sharpest outcome. An arm that does not restrict
-        its contrasts spans counts {3, 3, 2}, so NO literal is correct -- which
-        is why the four arms cannot be fixed by find-and-replace."""
-        r = ConfigHealthChecker().check_repetition_count_is_achievable(
-            self._settings(model_kwargs={"num_repetitions": 4})
-        )
-        assert not r.passed and r.severity == "error"
-        assert "DIFFER" in r.message
-
-    def test_a_homogeneous_contrast_subset_with_the_right_value_passes(self) -> None:
-        """PLANT (shape 3) and the NON-VACUITY guard for contrast resolution.
-
-        If the contrast lookup were vacuous -- as it was when it read the
-        nonexistent ``data.contrasts``, or as it would be if it read the
-        materialised ``contrast_map`` default by value -- this arm would fall
-        into the heterogeneous branch above and fail. Passing here is the proof
-        that restricting the contrasts actually reaches the check.
-        """
-        r = ConfigHealthChecker().check_repetition_count_is_achievable(
-            self._settings(
-                model_kwargs={"num_repetitions": 3},
-                contrast_map={"T1": 0, "T2": 1},
-            )
-        )
-        assert r.passed, r.message
-
-    def test_a_homogeneous_contrast_subset_with_the_wrong_value_is_rejected(
-        self,
-    ) -> None:
-        """PLANT (shape 4): same restriction, wrong count."""
-        r = ConfigHealthChecker().check_repetition_count_is_achievable(
-            self._settings(
-                model_kwargs={"num_repetitions": 4},
-                contrast_map={"T1": 0, "T2": 1},
-            )
-        )
-        assert not r.passed and r.severity == "error"
-        assert "supplies 3" in r.message
-
-    def test_flair_alone_accepts_two(self) -> None:
-        """PLANT (shape 5): the low count is reachable too, so the check is not
-        merely 'anything but 3 is wrong'."""
-        r = ConfigHealthChecker().check_repetition_count_is_achievable(
-            self._settings(model_kwargs={"num_repetitions": 2}, contrast_map={"FLAIR": 0})
-        )
-        assert r.passed, r.message
-
-    def test_an_unknown_contrast_is_skipped_not_defaulted(self) -> None:
-        """PLANT (shape 6): PD's count is documented as "variable", so it has no
-        entry in the producer map. A missing key must read as "cannot validate"
-        -- never as zero, and never as a default (non-negotiable 3)."""
-        r = ConfigHealthChecker().check_repetition_count_is_achievable(
-            self._settings(model_kwargs={"num_repetitions": 4}, contrast_map={"PD": 0})
-        )
-        assert r.passed and r.severity == "info"
-        assert "cannot validate" in r.message
-
-    def test_contrast_declaration_is_read_through_model_fields_set(self) -> None:
-        """The guard that a BEHAVIOURAL test cannot currently distinguish.
-
-        ``multi_contrast.contrast_map`` defaults to a fully-populated
-        ``{T1, T2, FLAIR, PD}`` on every arm, so reading it by value would treat
-        every config as having declared all four contrasts. Today that happens
-        to yield the same achievable set as "unrestricted" ({3, 2}), because the
-        default IS the whole corpus -- so a by-value implementation passes every
-        behavioural test in this class. Verified by planting it: all 8 stayed
-        green.
-
-        That coincidence is exactly what makes the wrong implementation look
-        right, and it evaporates the moment the default changes: a default of
-        ``{"T1": 0}`` would make a by-value read report a homogeneous ``{3}`` for
-        every arm that never mentioned contrasts, silently converting the
-        "no literal is correct" finding into a confident wrong number.
-
-        So this pins the MECHANISM, and says plainly that it is doing so.
-        """
-        import ast
-        import inspect
-        import textwrap
-
-        # Read the AST with the docstring stripped, NOT the raw source: the
-        # explanatory comment above the code and this test's own docstring both
-        # contain the string "model_fields_set", so a substring check on
-        # getsource() matches the prose and passes even when the code no longer
-        # does it. Verified by planting exactly that -- the first version of this
-        # gate stayed green against a by-value implementation.
-        fn = ast.parse(
-            textwrap.dedent(
-                inspect.getsource(ConfigHealthChecker.check_repetition_count_is_achievable)
-            )
-        ).body[0]
-        body = fn.body[1:] if ast.get_docstring(fn) else fn.body
-        code = "\n".join(ast.unparse(n) for n in body)
-        assert "model_fields_set" in code, (
-            "contrast declaration must be resolved through model_fields_set in "
-            "CODE, not by reading the materialised contrast_map default"
-        )
-
-    def test_the_check_is_registered_in_the_report(self) -> None:
-        """A check nobody calls is not a gate (non-negotiable 16)."""
-        import inspect
-
-        src = inspect.getsource(ConfigHealthChecker)
-        assert "self.check_repetition_count_is_achievable(config)" in src
-
-
-# ---------------------------------------------------------------------------
-# check_dc_knobs_inert_by_method (#1525)
-#
-# ``inert_knobs.py`` coins "inert by method" using dc_weight-under-hard as its
-# worked example and records that nothing reports it. This is the report, so it
-# ships with a planted violation per shape AND the negatives that prove it
-# discriminates (non-negotiable 15).
-# ---------------------------------------------------------------------------
-
-
 class TestDCKnobsInertByMethod:
     @staticmethod
     def _config(model_kwargs=None, with_physics=True, **dc_overrides):
@@ -3730,7 +3631,7 @@ class TestConditionOnInputDoublesTheInput:
             data=SimpleNamespace(
                 dataset_type="nifti_paired",
                 coils=SimpleNamespace(processing_mode="rss", num_virtual_coils=None),
-                pairing=SimpleNamespace(single_contrast=True),
+                pairing=SimpleNamespace(single_contrast=True, stacked_combine="joint"),
                 multi_contrast=SimpleNamespace(enabled=False),
                 domain=SimpleNamespace(target_channels=None),
             ),
@@ -4584,6 +4485,55 @@ class TestALossThatAppliesTheForwardOperatorIsBridged:
         assert any(not r.passed and r.severity == "error" for r in results)
 
 
+class TestAStrategyThatFftsTheImagePredictionIsBridged:
+    """The VF strategy fft2c's an image prediction before each ``kspace_losses`` entry.
+
+    exp_vf_34 declares ``weighted_kspace_l1`` on an image-output arm; LossBuilder has no
+    bridge for that, but ``ConcreteVirtualFiducialStrategy._apply_domain_losses`` is one.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, strategy_cls, target_domain):
+        from spectramr.config.schemas.loss import LossConfigSchema
+
+        monkeypatch.setattr(
+            ConfigHealthChecker, "_resolve_strategy_class", staticmethod(lambda _c: strategy_cls)
+        )
+        config = SimpleNamespace(
+            losses=LossConfigSchema(
+                kspace_losses=[{"name": "weighted_kspace_l1", "weight": 0.5}],
+                policy={"output_domain": "image"},
+            ),
+            model=SimpleNamespace(target_domain=target_domain),
+            adapters=None,
+        )
+        checker = ConfigHealthChecker.__new__(ConfigHealthChecker)
+        return checker.check_loss_domain_consistency(config)
+
+    def test_the_vf_strategy_declares_the_bridge(self) -> None:
+        from spectramr.infrastructure.training.strategies.virtual_fiducial_strategy import (
+            ConcreteVirtualFiducialStrategy,
+        )
+
+        assert ConcreteVirtualFiducialStrategy.fft_bridges_kspace_losses is True
+
+    def test_an_image_output_vf_arm_passes(self, monkeypatch) -> None:
+        bridging = type("Bridging", (), {"fft_bridges_kspace_losses": True})
+        results = self._run(monkeypatch, bridging, "image")
+        assert all(r.passed for r in results), [r.message for r in results]
+
+    def test_a_strategy_without_the_bridge_is_still_an_error(self, monkeypatch) -> None:
+        """PLANTED: the same arm under a strategy that hands the loss the image."""
+        results = self._run(monkeypatch, type("Plain", (), {}), "image")
+        assert any(not r.passed and r.severity == "error" for r in results)
+
+    def test_a_kspace_output_model_is_still_an_error(self, monkeypatch) -> None:
+        """PLANTED: fft2c of a k-space prediction is not a bridge."""
+        bridging = type("Bridging", (), {"fft_bridges_kspace_losses": True})
+        results = self._run(monkeypatch, bridging, "kspace")
+        assert any(not r.passed and r.severity == "error" for r in results)
+
+
 class TestMaskDirectionAxisDeclared:
     """``mask_direction: phase`` needs ``data.acquisition`` at audit, not hours in (#2160)."""
 
@@ -4728,7 +4678,7 @@ class TestLevyDenoiserWidensTheInput:
             data=SimpleNamespace(
                 dataset_type="nifti_paired",
                 coils=SimpleNamespace(processing_mode="rss", num_virtual_coils=None),
-                pairing=SimpleNamespace(single_contrast=True),
+                pairing=SimpleNamespace(single_contrast=True, stacked_combine="joint"),
                 multi_contrast=SimpleNamespace(enabled=False),
                 domain=SimpleNamespace(target_channels=None),
             ),
@@ -4753,3 +4703,158 @@ class TestLevyDenoiserWidensTheInput:
         """Planted violation: the widened input with no block that widens it."""
         results = ConfigHealthChecker().check_domain_alignment(self._cfg(3, levy=False))
         assert [r.check_name for r in _errors(results)] == ["domain_alignment"]
+
+
+def test_svd_channel_table_carves_out_m4raw():
+    """The m4raw route applies no SVD, so the table must not expect 2 * num_virtual_coils (#392)."""
+    from spectramr.infrastructure.validation.config_health_checker import ConfigHealthChecker
+
+    expected, _ = ConfigHealthChecker._derive_expected_channels("svd", "m4raw", 2, 5)
+    assert expected is None
+    expected, _ = ConfigHealthChecker._derive_expected_channels("svd", "kspace", 2, 4)
+    assert expected == 4
+
+
+class TestCoordinateInputStrategy:
+    """A strategy that feeds its network k-space coordinates is outside coil-channel alignment."""
+
+    @staticmethod
+    def _run(monkeypatch, strategy_cls) -> list[HealthCheckResult]:
+        monkeypatch.setattr(
+            ConfigHealthChecker, "_resolve_strategy_class", staticmethod(lambda _c: strategy_cls)
+        )
+        config = _make_config(
+            coil_processing_mode="rss_image", in_channels=2, out_channels=8, model_type="siren"
+        )
+        return ConfigHealthChecker().check_domain_alignment(config)
+
+    def test_the_kspace_inr_strategy_declares_coordinate_input(self) -> None:
+        from spectramr.infrastructure.training.strategies.kspace_inr_strategy import (
+            KSpaceINRStrategy,
+        )
+
+        assert KSpaceINRStrategy.model_input_is_coordinates is True
+
+    def test_a_coordinate_strategy_passes(self, monkeypatch) -> None:
+        coords = type("Coords", (), {"model_input_is_coordinates": True})
+        results = self._run(monkeypatch, coords)
+        assert _errors(results) == [], [r.message for r in results]
+
+    def test_the_same_channels_under_an_image_strategy_are_an_error(self, monkeypatch) -> None:
+        """PLANTED: a 2-in/8-out network on a 1-channel RSS loader, fed the loader's image."""
+        assert _errors(self._run(monkeypatch, type("Plain", (), {})))
+
+    def test_an_unresolved_strategy_is_not_exempt(self, monkeypatch) -> None:
+        """PLANTED: the exemption needs the class; an unresolvable one keeps the check."""
+        assert _errors(self._run(monkeypatch, None))
+
+
+class TestAdvertisedOptionsDottedKeys:
+    """An OPTION_SCHEMA key ``a.b`` names the nested ``model_kwargs["a"]["b"]`` option."""
+
+    class _Nested:
+        OPTION_SCHEMA: ClassVar[dict[str, list[str]]] = {
+            "rendering.engine": ["DiffSliceSim"],
+            "rendering.physics.slice_profile": ["hamming_windowed_sinc"],
+        }
+
+        def __init__(self, rendering: dict | None = None) -> None:
+            pass
+
+    def _check(self, monkeypatch: pytest.MonkeyPatch, model_kwargs: dict) -> list:
+        from spectramr.models import registry as registry_mod
+
+        monkeypatch.setattr(registry_mod, "get_model_class", lambda name: self._Nested)
+        cfg = SimpleNamespace(model=SimpleNamespace(model_type="nested", model_kwargs=model_kwargs))
+        return ConfigHealthChecker().check_advertised_options(cfg)
+
+    def test_nested_value_in_set_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        results = self._check(monkeypatch, {"rendering": {"engine": "DiffSliceSim"}})
+        assert results and all(r.passed for r in results)
+
+    @pytest.mark.parametrize(
+        "rendering",
+        [
+            {"engine": "NoSuchEngine"},
+            {"engine": "DiffSliceSim", "physics": {"slice_profile": "gauss"}},
+        ],
+    )
+    def test_nested_value_outside_set_fails(
+        self, monkeypatch: pytest.MonkeyPatch, rendering: dict
+    ) -> None:
+        """Planted violations: an unknown engine (depth 2) and slice profile (depth 3)."""
+        results = self._check(monkeypatch, {"rendering": rendering})
+        assert [r.check_name for r in results if not r.passed] == ["advertised_options"]
+
+    def test_absent_nested_key_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._check(monkeypatch, {"rendering": {}}) == []
+
+
+def test_rss_image_expects_one_channel_per_contrast_under_per_contrast_combine():
+    """``pairing.stacked_combine: per_contrast`` serves the stacked M4Raw contrasts as 2 channels."""
+    from spectramr.infrastructure.validation.config_health_checker import ConfigHealthChecker
+
+    joint, _ = ConfigHealthChecker._derive_expected_channels("rss_image", "m4raw", 4, 1)
+    grouped, _ = ConfigHealthChecker._derive_expected_channels(
+        "rss_image", "m4raw", 4, 2, stacked_combine="per_contrast"
+    )
+    assert (joint, grouped) == (1, 2)
+
+
+def test_data_efficiency_real_only_cell_passes_without_synthetic_manifest() -> None:
+    training = SimpleNamespace(
+        training_mode="data_efficiency_harness",
+        settings=[SimpleNamespace(name="R10", n_synthetic=0)],
+        real_paired_manifest="real.json",
+        synthetic_paired_manifest=None,
+    )
+    result = ConfigHealthChecker().check_data_efficiency_harness_settings_well_formed(
+        SimpleNamespace(training=training)
+    )
+    assert result.passed, result.message
+
+
+class TestVendorPromptWidthMatchesTheMap:
+    """model_kwargs.n_vendors sizes the prompt table; it must equal the vendor ids the data emits."""
+
+    @staticmethod
+    def _cfg(model_nv):
+        from types import SimpleNamespace
+
+        mc = SimpleNamespace(vendor_map={"siemens": 0, "ge": 1}, n_vendors=2)
+        model = SimpleNamespace(
+            model_type="vendor_aware_translation", model_kwargs={"n_vendors": model_nv}
+        )
+        return SimpleNamespace(data=SimpleNamespace(multi_contrast=mc), model=model)
+
+    def test_a_narrower_prompt_table_is_refused(self):
+        result = ConfigHealthChecker().check_vendor_model_support(self._cfg(1))
+        assert result.passed is False
+        assert "model.model_kwargs.n_vendors=1" in result.message
+
+    def test_a_matching_table_passes(self):
+        result = ConfigHealthChecker().check_vendor_model_support(self._cfg(2))
+        assert result.passed is True, result.message
+
+
+class TestBuilderReadModelKwargsAreConsumed:
+    """Keys ModelBuilder reads itself (backbone_checkpoint, vae_checkpoint_path) are not facades."""
+
+    class _Stage2:
+        def __init__(self, base_channels: int = 4) -> None:
+            pass
+
+    def _check(self, monkeypatch, model_kwargs: dict) -> list:
+        from spectramr.models import registry as registry_mod
+
+        monkeypatch.setattr(registry_mod, "get_model_class", lambda name: self._Stage2)
+        cfg = SimpleNamespace(model=SimpleNamespace(model_type="stage2", model_kwargs=model_kwargs))
+        return [r for r in ConfigHealthChecker().check_advertised_options(cfg) if not r.passed]
+
+    def test_a_builder_read_key_is_not_flagged(self, monkeypatch) -> None:
+        assert self._check(monkeypatch, {"backbone_checkpoint": "/x.safetensors"}) == []
+
+    def test_any_other_unread_key_still_is(self, monkeypatch) -> None:
+        """Planted: an unread knob beside it is still reported."""
+        failed = self._check(monkeypatch, {"backbone_checkpoint": "/x", "head_width": 3})
+        assert [r.yaml_keys for r in failed] == [["model.model_kwargs.head_width"]]

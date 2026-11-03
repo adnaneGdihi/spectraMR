@@ -286,11 +286,6 @@ class DiffusionScheduler:
             x_t.shape,
         )
 
-        # DDIM deterministic projection of x0
-        pred_x0 = (x_t - torch.sqrt(1.0 - alphas_cumprod_t) * predicted_noise) / torch.sqrt(
-            alphas_cumprod_t
-        )
-
         # Option: strictly follow analytical DDPM step with stochastic tracking
         # posterior variance sigma_t^2
         posterior_variance = (
@@ -312,3 +307,47 @@ class DiffusionScheduler:
         x_prev = model_mean + nonzero_mask * torch.sqrt(posterior_variance) * noise
 
         return x_prev
+
+    def predict_x0_from_eps(
+        self,
+        x_t: torch.Tensor,
+        timesteps: torch.Tensor,
+        predicted_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """Clean-image estimate ``x0_hat = (x_t - sqrt(1 - abar_t) eps) / sqrt(abar_t)``.
+
+        Exact when ``predicted_noise`` is the noise that produced ``x_t``.
+        """
+        device = self.device
+        x_t = x_t.to(device, non_blocking=True)
+        predicted_noise = predicted_noise.to(device, non_blocking=True)
+        timesteps = timesteps.to(device=device, dtype=torch.long)
+        sqrt_ab = self._extract(self.sqrt_alphas_cumprod.to(device), timesteps, x_t.shape)
+        sqrt_1m_ab = self._extract(
+            self.sqrt_one_minus_alphas_cumprod.to(device), timesteps, x_t.shape
+        )
+        return (x_t - sqrt_1m_ab * predicted_noise) / sqrt_ab
+
+    def ddim_step(
+        self,
+        x_t: torch.Tensor,
+        t: int,
+        t_prev: int,
+        predicted_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """Deterministic DDIM (eta=0) hop from integer ``t`` to ``t_prev < t``.
+
+        ``t_prev < 0`` is the final hop to ``x_0``. Used by strided pixel-space
+        epsilon sampling; the full-chain sampler is :meth:`denoise_step`.
+        """
+        device = self.device
+        x_t = x_t.to(device, non_blocking=True)
+        predicted_noise = predicted_noise.to(device, non_blocking=True)
+        abar_t = self.alphas_cumprod[t].to(device)
+        abar_prev = (
+            self.alphas_cumprod[t_prev].to(device)
+            if t_prev >= 0
+            else torch.ones((), device=device)
+        )
+        x0_hat = (x_t - torch.sqrt(1.0 - abar_t) * predicted_noise) / torch.sqrt(abar_t)
+        return torch.sqrt(abar_prev) * x0_hat + torch.sqrt(1.0 - abar_prev) * predicted_noise
